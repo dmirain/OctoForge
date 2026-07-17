@@ -1,6 +1,10 @@
-"""OpenAI-compatible embeddings client (POST /embeddings)."""
+"""Embeddings: the EmbeddingClient port and its OpenAI-compatible implementation.
 
-from typing import Any
+The port lives next to the concrete client (`llm/`) because several modules
+(instructions, datasets) depend on it; each receives it via constructor (DI).
+"""
+
+from typing import Any, Protocol
 
 import httpx
 
@@ -9,6 +13,14 @@ from octoforge_core.errors import LLMResponseError
 
 EMBEDDINGS_PATH = "/embeddings"
 PARSE_ERROR_MESSAGE = "Unexpected embeddings response payload"
+
+
+class EmbeddingClient(Protocol):
+    """Turns texts into dense vectors; one vector per input text, in order."""
+
+    async def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        """Return one embedding vector per input text, preserving order."""
+        ...
 
 
 class OpenAIEmbeddingClient:

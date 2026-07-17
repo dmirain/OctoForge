@@ -14,6 +14,8 @@ DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_INSTRUCTIONS_TOP_K = 5
 DEFAULT_AGENT_MAX_ITERATIONS = 10
 DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./octoforge.db"
+DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT = 50
+DEFAULT_DATASETS_QUERY_MAX_LIMIT = 200
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -39,6 +41,8 @@ class Settings(BaseSettings):
     external_call_auth_whitelist: list[ExternalCallAuthSettings] = Field(default_factory=list)
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS
     database_url: str = DEFAULT_DATABASE_URL
+    datasets_query_default_limit: int = DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT
+    datasets_query_max_limit: int = DEFAULT_DATASETS_QUERY_MAX_LIMIT
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

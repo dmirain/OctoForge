@@ -3,6 +3,8 @@
 import pytest
 
 from octoforge_web.config import (
+    DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT,
+    DEFAULT_DATASETS_QUERY_MAX_LIMIT,
     DEFAULT_EMBEDDING_BASE_URL,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_INSTRUCTIONS_TOP_K,
@@ -10,6 +12,8 @@ from octoforge_web.config import (
 )
 
 CUSTOM_TOP_K = 7
+CUSTOM_DATASETS_DEFAULT_LIMIT = 25
+CUSTOM_DATASETS_MAX_LIMIT = 500
 WHITELIST_JSON = (
     '[{"base_url_prefix": "https://internal.example.com/", '
     '"header_name": "X-Api-Key", "header_value": "s3cret"}]'
@@ -23,6 +27,8 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "OF_EMBEDDING_MODEL",
         "OF_INSTRUCTIONS_TOP_K",
         "OF_EXTERNAL_CALL_AUTH_WHITELIST",
+        "OF_DATASETS_QUERY_DEFAULT_LIMIT",
+        "OF_DATASETS_QUERY_MAX_LIMIT",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -33,6 +39,8 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.embedding_model == DEFAULT_EMBEDDING_MODEL
     assert settings.instructions_top_k == DEFAULT_INSTRUCTIONS_TOP_K
     assert settings.external_call_auth_whitelist == []
+    assert settings.datasets_query_default_limit == DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT
+    assert settings.datasets_query_max_limit == DEFAULT_DATASETS_QUERY_MAX_LIMIT
     assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
     assert settings.to_external_call_auth_whitelist() == ()
 
@@ -50,6 +58,16 @@ def test_embedding_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.api_key == "ollama"
     assert config.model == "nomic-embed-text"
     assert settings.instructions_top_k == CUSTOM_TOP_K
+
+
+def test_datasets_limits_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_DATASETS_QUERY_DEFAULT_LIMIT", str(CUSTOM_DATASETS_DEFAULT_LIMIT))
+    monkeypatch.setenv("OF_DATASETS_QUERY_MAX_LIMIT", str(CUSTOM_DATASETS_MAX_LIMIT))
+
+    settings = Settings()
+
+    assert settings.datasets_query_default_limit == CUSTOM_DATASETS_DEFAULT_LIMIT
+    assert settings.datasets_query_max_limit == CUSTOM_DATASETS_MAX_LIMIT
 
 
 def test_auth_whitelist_parsed_from_json_env(monkeypatch: pytest.MonkeyPatch) -> None:

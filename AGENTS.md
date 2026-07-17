@@ -12,12 +12,13 @@
 - актор диалога: `ConversationRunner`/`ConversationManager` — ключуются по `(user_id, channel)` (get-or-create), история пересобирается из БД, сообщения персистятся по ходу прогона, проактивные уведомления о задачах;
 - персист: SQLAlchemy async + SQLite, пакет `db/` (Base + `UTCDateTime`, ORM-модели dialogs/messages/tasks, фабрики engine/session, репозитории); `create_all` при старте, Alembic — при первой деструктивной миграции;
 - фоновые задачи за протоколом `TaskStore` (боевой `SqlAlchemyTaskStore`, `InMemoryTaskStore` — для тестов): `TaskRunner` + скилы `task_spawn`/`task_list`, отметка доставки `result_delivered`;
-- скилы: `Skill`/`SkillSpec`/`SkillContext(user_id, channel, dialog_id)`/`SkillRegistry`, типы `BASIC|DYNAMIC`; базовые `http_request`, `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`;
-- LLM-клиент: `complete()` + `stream()` (SSE, tools/tool_calls); клиент эмбеддингов `llm/embeddings.py` (OpenAI-совместимый POST /embeddings, конфиг `EmbeddingConfig` рядом с `LLMConfig`);
+- скилы: `Skill`/`SkillSpec`/`SkillContext(user_id, channel, dialog_id)`/`SkillRegistry`, типы `BASIC|DYNAMIC`; базовые `http_request`, `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`, `data_put`, `data_query`, `data_forget`;
+- LLM-клиент: `complete()` + `stream()` (SSE, tools/tool_calls); порт `EmbeddingClient` + OpenAI-совместимый клиент эмбеддингов `llm/embeddings.py` (POST /embeddings, конфиг `EmbeddingConfig` рядом с `LLMConfig`); порт общий для модулей инструкций и датасетов;
 - инструкции (этап B): обособленный пакет `instructions/` (граница `api.py` — Protocol `InstructionService`: `search`/`save`/`get_by_name`; локальная реализация — таблица `instructions`, cosine-ранжирование + буст точного title, сидирование); исполнение внешних вызовов — вне модуля: `net/` (`ExternalCallExecutor` поверх tool-записей, `SsrfGuard`, whitelist-авторизация из composition root);
+- датасеты (этап C): обособленный пакет `datasets/` (граница `api.py` — Protocol `DatasetService`; локальная реализация — таблицы `datasets`/`dataset_records`, валидация записей по JSON-схеме, cosine-поиск по дескрипторам с бустом точного имени, owner-изоляция на уровне SQL); скилы `data_put` (create-if-absent)/`data_query`/`data_forget`; дескрипторы участвуют в `instructions_search`; см. `docs/data-store.md`;
 - web: dialog API (`POST /api/dialog/messages`, `POST /api/dialog/cancel`, `GET /api/dialog/events` SSE) с заголовком `X-User-Id` (доверенная строка, без аутентификации), чат-UI со стримом и кнопкой «Стоп»; канал `"web"` объявлен в composition root.
 
-Не реализовано: пользователи/аутентификация (user_id — доверенная строка от клиента), редоставка недоставленных результатов задач при старте, датасеты (см. `docs/data-store.md`), влияние usage/success-статистики на ранг поиска инструкций и http-реализация фасада `InstructionService` (выделенный сервис), память, роутер и процессная модель (`docs/process-model.md`). План — `docs/design.md`.
+Не реализовано: пользователи/аутентификация (user_id — доверенная строка от клиента), редоставка недоставленных результатов задач при старте, влияние usage/success-статистики на ранг поиска инструкций и http-реализация фасадов `InstructionService`/`DatasetService` (выделенный сервис), память, роутер и процессная модель (`docs/process-model.md`). План — `docs/design.md`.
 
 ## Project overview
 
@@ -25,7 +26,7 @@ OctoForge — мультипользовательский LLM-агент: Pytho
 
 ## Repository layout
 
-- `core/` — библиотека `octoforge-core` (src-layout): домен, порты, `agent/` (events/control/loop/prompts/runner), `skills/` (base/registry/basic), `tasks/` (models/store/runner), `llm/` (events/openai/embeddings), `db/` (base/models/engine/repositories), `instructions/` (модуль инструкций: api/models/store/embedding/ranking/local/seed), `net/` (SSRF-гвард, исполнитель внешних вызовов). Не импортирует fastapi; sqlalchemy — только в `db/` и SQL-сторах (`db/repositories.py`, `instructions/store.py`).
+- `core/` — библиотека `octoforge-core` (src-layout): домен, порты, `agent/` (events/control/loop/prompts/runner), `skills/` (base/registry/basic), `tasks/` (models/store/runner), `llm/` (events/openai/embeddings — включая порт `EmbeddingClient`), `db/` (base/models/engine/repositories), `instructions/` (модуль инструкций: api/models/store/ranking/local/seed), `datasets/` (модуль датасетов: api/models/validation/store/ranking/service), `net/` (SSRF-гвард, исполнитель внешних вызовов). Не импортирует fastapi; sqlalchemy — только в `db/` и SQL-сторах (`db/repositories.py`, `instructions/store.py`, `datasets/store.py`).
 - `web/` — приложение `octoforge-web` (src-layout): FastAPI-обёртка, `api/` (dialog/sse/schemas), статика, composition root в `main.py`. Зависит от `octoforge-core`.
 - Корень: `Makefile`, `README.md`, `.env.example`, `docs/`.
 

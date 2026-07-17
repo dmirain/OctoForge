@@ -13,9 +13,9 @@ from octoforge_core.instructions.api import (
     InstructionType,
     SearchHit,
 )
-from octoforge_core.instructions.embedding import EmbeddingClient
 from octoforge_core.instructions.ranking import rank
 from octoforge_core.instructions.store import InstructionStore
+from octoforge_core.llm.embeddings import EmbeddingClient
 
 EMBEDDED_TEXT_SEPARATOR = "\n"
 

@@ -47,13 +47,15 @@ core/                          # библиотека octoforge-core — дом�
       control.py               # LoopControl — mailbox инъекций + флаг отмены
       loop.py                  # AgentLoop.stream(history, control, context) → AsyncIterator[LoopEvent]
       prompts.py               # DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn, уведомления,
-                               #   instructions_search / external_call / instruction_save)
+                               #   instructions_search / external_call / instruction_save,
+                               #   data_put / data_query / data_forget)
       runner.py                # ConversationRunner (актор), ConversationManager, ConversationEvent
     skills/
       base.py                  # Skill (Protocol), SkillSpec, SkillOrigin (BASIC|DYNAMIC), SkillContext
       registry.py, errors.py   # реестр + ошибки
       basic/                   # http_request.py, task_spawn.py, task_list.py,
-                               # instructions_search.py, instruction_save.py, external_call.py
+                               # instructions_search.py, instruction_save.py, external_call.py,
+                               # data_put.py, data_query.py, data_forget.py
     tasks/
       models.py                # Task, TaskKind (SKILL|PROMPT), TaskStatus (PENDING|RUNNING|DONE|FAILED)
       store.py                 # InMemoryTaskStore (реализация порта TaskStore, для тестов)
@@ -68,23 +70,32 @@ core/                          # библиотека octoforge-core — дом�
     llm/
       events.py                # StreamEvent: TextDelta | StreamFinished
       openai.py                # OpenAI-совместимый клиент: complete() + stream() (SSE, tools)
-      embeddings.py            # OpenAI-совместимый клиент эмбеддингов (POST /embeddings)
+      embeddings.py            # EmbeddingClient (Protocol-порт) + OpenAI-совместимый клиент
+                               #   (POST /embeddings); порт общий для instructions/ и datasets/
     instructions/              # обособленный модуль инструкций (только хранение/поиск/ранг)
       api.py                   # граница модуля: InstructionService (Protocol), Instruction,
                                #   InstructionType, SearchHit, InstructionNotFoundError
       models.py                # InstructionRow — таблица instructions, собственность модуля
       store.py                 # SQL-стор (сессии через async_sessionmaker, DI)
-      embedding.py             # EmbeddingClient (Protocol-порт эмбеддера)
       ranking.py               # чистые функции: cosine + буст точного title
       local.py                 # LocalInstructionService — локальная реализация фасада
       seed.py                  # SEED_INSTRUCTIONS + seed_if_empty (generic http tool + скилы-примеры)
+    datasets/                  # обособленный модуль датасетов (per-user трекеры, этап C)
+      api.py                   # граница модуля: DatasetService (Protocol), Dataset, DatasetRecord,
+                               #   DatasetSchema/FieldType, DatasetHit, ошибки модуля
+      models.py                # DatasetRow + DatasetRecordRow — таблицы datasets/dataset_records
+      validation.py            # parse_schema/dump_schema/validate_record (схема и записи)
+      store.py                 # SQL-стор (явный каскад удаления, MAX_SCAN_ROWS)
+      ranking.py               # свои чистые функции: cosine + буст точного имени (независимость)
+      service.py               # LocalDatasetService — локальная реализация фасада
     net/                       # исполнение внешних вызовов (core-сторона, вне модуля)
       guard.py                 # SsrfGuard: resolve хоста (resolver инъектируется) → ipaddress-проверки
       tool_spec.py             # ToolSpec + parse_tool_spec (JSON-формат tool-записи)
       external.py              # ExternalCallExecutor: шаблоны, whitelist-авторизация, SSRF-гвард
       errors.py                # SsrfBlockedError, ToolSpecError, ExternalCallError
     # дальше: skills/dynamic/ (Jinja-движок), память
-  tests/                       # test_agent_loop, test_conversation_runner, test_db_repositories,
+  tests/                       # test_agent_loop, test_conversation_runner, test_data_skills,
+                               # test_datasets, test_dataset_validation, test_db_repositories,
                                # test_embeddings, test_external_call, test_http_request_skill,
                                # test_instruction_skills, test_instructions_local,
                                # test_openai_client, test_openai_stream, test_skills_registry,
@@ -96,7 +107,7 @@ web/                           # приложение octoforge-web — FastAPI-
                                #   исполнитель external_call, акторы, TaskRunner; канал "web")
     config.py                  # Settings (env с префиксом OF_, включая OF_DATABASE_URL,
                                #   OF_EMBEDDING_*, OF_INSTRUCTIONS_TOP_K,
-                               #   OF_EXTERNAL_CALL_AUTH_WHITELIST)
+                               #   OF_EXTERNAL_CALL_AUTH_WHITELIST, OF_DATASETS_QUERY_*)
     deps.py                    # провайдеры зависимостей из app.state + заголовок X-User-Id
     api/
       dialog.py                # messages/cancel/events(SSE) по (user_id, channel)
@@ -164,9 +175,11 @@ web/                           # приложение octoforge-web — FastAPI-
 `DEFAULT_SYSTEM_PROMPT`: отвечать «сначала суть, потом детали» (прерывание полезно),
 «в фоне» → `task_spawn` и продолжить диалог, при system-уведомлении о задаче — коротко
 сообщить результат, для HTTP — `http_request`, статусы задач — `task_list`; перед
-нетривиальной задачей — `instructions_search` (знания/сценарии/тулы), вызов найденных
+нетривиальной задачей — `instructions_search` (знания/сценарии/тулы/датасеты), вызов найденных
 тулов — через `external_call`, после нового многошагового сценария — сохранить его
-через `instruction_save`.
+через `instruction_save`; трекинг структурированных данных (еда, вес, привычки) —
+датасеты: искать через `instructions_search`, писать через `data_put` (создавая датасет
+со схемой при отсутствии), читать/строить отчёты через `data_query`, удалять через `data_forget`.
 
 ### Стриминг LLM (`llm/openai.py`)
 
@@ -205,8 +218,8 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 Скил — единица, которую агент вызывает через LLM tool calling. Два типа:
 
 - **Базовые (`SkillOrigin.BASIC`)** — код проекта (`octoforge_core/skills/basic/`): `http_request`,
-  `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`.
-  Подключаются в composition root.
+  `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`,
+  `data_put`, `data_query`, `data_forget`. Подключаются в composition root.
 - **Динамические (`SkillOrigin.DYNAMIC`)** — Jinja-шаблоны из БД (появятся с БД). Реестр един:
   `SkillRegistry` хранит скилы обоих типов под уникальными именами.
 
@@ -269,6 +282,36 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   `OF_INSTRUCTIONS_TOP_K`), `instruction_save(type, title, content, tags?)`,
   `external_call(name, params?)`.
 
+## Датасеты пользовательских данных (этап C)
+
+Модель и обоснование — в [data-store.md](data-store.md). Реализация:
+
+- **Модуль `datasets/`** — обособленный, зеркалит `instructions/`: граница `api.py`
+  (Protocol `DatasetService`: `create_dataset`/`get_dataset`/`add_record`/`query_records`/
+  `delete_dataset`/`search`, DTO JSON-совместимые под будущую HTTP-границу). Локальная
+  реализация `LocalDatasetService`: таблицы `datasets` + `dataset_records` (собственность
+  модуля), эмбеддинг дескриптора `name + "\n" + description + "\n" + usage_notes` через
+  общий порт `EmbeddingClient` (`llm/embeddings.py`, перенесён туда из `instructions/`),
+  ранжирование — brute-force cosine + буст точного имени (свой `ranking.py`, от
+  instructions не зависит).
+- **Схема датасета** — JSON `{"fields": [{"name", "type", "required?"}]}`; типы
+  `string|integer|number|boolean|date|datetime` (`validation.py`: bool не считается
+  integer/number, date/datetime — ISO-строки; лишние поля записи разрешены). Валидация
+  записей — на стороне скилов (`data_put`), сервис доверяет вызывающему.
+- **Запросы записей**: SQL-фильтр по `created_at` + `ORDER BY created_at DESC` + cap
+  `MAX_SCAN_ROWS` (1000); фильтр `equals` — в памяти, тип-чувствительный (`5 != "5"`);
+  агрегация — LLM по выборке. Owner-изоляция — `WHERE owner_user_id` на уровне SQL
+  во всех операциях: чужой датасет неотличим от несуществующего.
+- **Скилы** — тонкие адаптеры: `data_put(dataset, record, description?, schema?,
+  usage_notes?, retention?)` (create-if-absent: при отсутствии датасета schema+description
+  обязательны; гонка create-after-get ловится `DatasetExistsError` → повторный get),
+  `data_query(dataset, equals?, date_from?, date_to?, limit?)` (date-only = весь день
+  UTC; лимиты `OF_DATASETS_QUERY_DEFAULT_LIMIT`/`OF_DATASETS_QUERY_MAX_LIMIT`),
+  `data_forget(dataset)` (явный каскад DELETE записей, ответ — счётчик).
+- **Дескрипторы в `instructions_search`**: скилу передан `DatasetService` (опциональный
+  параметр конструктора), хиты обоих фасадов сливаются по убыванию score; датасеты
+  форматируются как `[dataset] <name>` со сниппетом description + списком полей.
+
 ## Модель данных
 
 ORM-модели — в `octoforge_core/db/models.py`; доменные объекты — в `octoforge_core/domain.py`
@@ -288,14 +331,20 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   (knowledge|skill|tool, index), `title` (index), `content` (Text), `embedding` (JSON
   list[float]), `tags` (JSON list[str]), `version`, `usage_count`, `success_count`,
   `created_at`, `updated_at`; unique (`type`, `title`)
+- **datasets** (таблица модуля `datasets/`, см. выше): `id` (uuid str PK), `owner_user_id`
+  (str, index), `name`, `description`, `schema` (JSON: `{"fields": [...]}`), `usage_notes`,
+  `retention`, `embedding` (JSON list[float]), `version`, `created_at`, `updated_at`;
+  unique (`owner_user_id`, `name`)
+- **dataset_records**: `id`, `dataset_id` FK → datasets.id (index), `owner_user_id`
+  (str, index), `payload` (JSON), `created_at`; каскад удаления — явный DELETE в сторе
+  (SQLite без PRAGMA foreign_keys)
 
 Все `*_at` — timezone-aware UTC: `UTCDateTime` (`db/base.py`) принудительно выставляет UTC при
 чтении/записи (SQLite возвращает naive datetime). Создание схемы — `init_db` (`create_all`) в
 lifespan; Alembic появится при первой деструктивной миграции.
 
 План следующих этапов: **memories** (`user_id` nullable = global, `key`, `content`, `tags` JSON,
-даты; unique (`user_id`, `key`)) и **datasets** (дескрипторы + записи пользовательских данных) —
-см. [instructions.md](instructions.md), [data-store.md](data-store.md).
+даты; unique (`user_id`, `key`)) — см. [instructions.md](instructions.md), [plan.md](plan.md).
 
 ## API (`octoforge_web/api/`)
 
@@ -350,8 +399,18 @@ lifespan; Alembic появится при первой деструктивно�
   хост и не-http(s) URL заблокированы
 - `core/tests/test_instruction_skills.py` — адаптеры `instructions_search`/`instruction_save`/
   `external_call` (валидация аргументов + happy path на фейках)
-- `web/tests/test_config.py` — Settings: дефолты OF_EMBEDDING_*/top-k/whitelist, парсинг
-  JSON-whitelist из env
+- `core/tests/test_datasets.py` — контрактный набор фасада DatasetService на `:memory:`
+  (create/get, дубликат имени, одно имя у разных owner'ов, изоляция, query: equals с
+  тип-чувствительностью/диапазон дат/limit, delete каскадом со счётчиком, search с
+  ранжированием и бустом точного имени); сервис строится фабрикой-фикстурой, как у instructions
+- `core/tests/test_dataset_validation.py` — `parse_schema` (ок/ошибки, round-trip с
+  `dump_schema`) и `validate_record` (все типы, required, bool ≠ int/number, лишние поля)
+- `core/tests/test_data_skills.py` — `data_put` (создание со schema+description, отказ без
+  них, запись в существующий, нарушения схемы текстом), `data_query` (JSON-строки, фильтры,
+  лимиты, date-only границы, not-found текстом), `data_forget` (счётчик, not-found),
+  `instructions_search` с datasets (merged-выдача с `[dataset]`)
+- `web/tests/test_config.py` — Settings: дефолты OF_EMBEDDING_*/top-k/whitelist/лимитов
+  data_query, парсинг JSON-whitelist и лимитов из env
 - `web/tests/test_dialog_api.py` — get-or-create диалога, изоляция двух user_id, 400 без
   `X-User-Id`, messages/cancel/events (SSE через генератор), health, UI
 - `web/tests/test_sse.py` — сериализация событий в SSE-кадры
@@ -374,7 +433,7 @@ lifespan; Alembic появится при первой деструктивно�
 6. Динамические скилы: Jinja-движок + `skill.save/run`; скилы памяти (user/global)
 7. Агентный контекст: память в контексте, `GET /api/skills`, `GET /api/tasks`
 8. LLM-роутер и процессная модель диалога — решения согласованы, см. [process-model.md](process-model.md); реализация отложена
-9. Инструкции в БД (знание/скил/тул + векторный поиск) — см. [instructions.md](instructions.md); крон-задачи — см. [cron.md](cron.md); датасеты пользовательских данных — см. [data-store.md](data-store.md); реализация после БД
+9. Инструкции в БД (знание/скил/тул + векторный поиск, этап B ✅) — см. [instructions.md](instructions.md); датасеты пользовательских данных (этап C ✅) — см. [data-store.md](data-store.md); крон-задачи — см. [cron.md](cron.md); реализация после БД
 10. Бэклог из обзора openclaw (SSRF-гвард, формула поиска, каталог скилов, детали крона и пр.) — см. [openclaw-review.md](openclaw-review.md)
 
 ## Проверка

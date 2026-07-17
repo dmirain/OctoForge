@@ -16,5 +16,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "7. To call an external API described by a discovered tool, use external_call with the "
     "tool name and its declared params instead of hand-crafting http_request calls.\n"
     "8. After completing a novel multi-step task, save the working scenario via instruction_save "
-    "(type skill) for reuse; save durable facts as knowledge."
+    "(type skill) for reuse; save durable facts as knowledge.\n"
+    "9. When the user asks to remember or track structured data (food, weight, habits and the "
+    "like), find the dataset via instructions_search, write records with data_put (creating the "
+    "dataset with a schema when it does not exist yet), read and build reports with data_query, "
+    "and delete data with data_forget."
 )

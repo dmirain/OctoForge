@@ -18,9 +18,9 @@ from octoforge_core.instructions.api import (
     InstructionService,
     InstructionType,
 )
-from octoforge_core.instructions.embedding import EmbeddingClient
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.seed import SEED_INSTRUCTIONS, seed_if_empty
+from octoforge_core.llm.embeddings import EmbeddingClient
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 EMBEDDED_TEXT_SEPARATOR = "\n"

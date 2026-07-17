@@ -21,12 +21,16 @@ from octoforge_core import (
     init_db,
 )
 from octoforge_core.agent.prompts import DEFAULT_SYSTEM_PROMPT
+from octoforge_core.datasets.service import LocalDatasetService
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.seed import seed_if_empty
 from octoforge_core.llm.embeddings import OpenAIEmbeddingClient
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.net.external import ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.skills.basic.data_forget import DataForgetSkill
+from octoforge_core.skills.basic.data_put import DataPutSkill
+from octoforge_core.skills.basic.data_query import DataQuerySkill
 from octoforge_core.skills.basic.external_call import ExternalCallSkill
 from octoforge_core.skills.basic.http_request import HttpRequestSkill
 from octoforge_core.skills.basic.instruction_save import InstructionSaveSkill
@@ -71,6 +75,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     config=resolved_settings.to_embedding_config(),
                 )
                 instructions = LocalInstructionService(session_factory, embedder)
+                datasets = LocalDatasetService(session_factory, embedder)
                 # Seeding needs the embeddings endpoint; without a configured key
                 # it is skipped so the app still starts (embeddings stay optional
                 # until the first instructions_search/save call).
@@ -94,6 +99,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     InstructionsSearchSkill(
                         service=instructions,
                         default_k=resolved_settings.instructions_top_k,
+                        datasets=datasets,
                     ),
                     SkillOrigin.BASIC,
                 )
@@ -102,6 +108,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     ExternalCallSkill(executor=external_executor),
                     SkillOrigin.BASIC,
                 )
+                registry.register(DataPutSkill(service=datasets), SkillOrigin.BASIC)
+                registry.register(
+                    DataQuerySkill(
+                        service=datasets,
+                        default_limit=resolved_settings.datasets_query_default_limit,
+                        max_limit=resolved_settings.datasets_query_max_limit,
+                    ),
+                    SkillOrigin.BASIC,
+                )
+                registry.register(DataForgetSkill(service=datasets), SkillOrigin.BASIC)
                 loop = AgentLoop(
                     llm_client=llm_client,
                     registry=registry,
