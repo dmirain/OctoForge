@@ -46,24 +46,48 @@
 
 (instructions.md, openclaw-review.md бэклог п.1)
 
-1. Таблица `instructions` (`knowledge|skill|tool`: id, type, title, content, embedding
-   JSON, tags JSON, version, usage_count, success_count, даты) + порт `InstructionStore`
-   + SQL-реализация.
-2. Порт `EmbeddingClient` + OpenAI-совместимый клиент `llm/embeddings.py`; конфиг рядом
-   с `LLMConfig`; web Settings += `OF_EMBEDDING_*`.
-3. Поиск: cosine brute-force в сервисе (standalone-объёмы); точное совпадение `title` —
-   буст. Полная формула openclaw (70/30 + MMR + затухание) — отдельной итерацией.
-4. Рантайм-тулы как базовые скилы: `instructions_search`, `instruction_save`,
-   `external_call` (url-шаблон + схема параметров из tool-записи; служебная авторизация
-   только для белого списка base-url из конфига).
+**Ключевое требование — обособленный модуль.** Всё, что связано с инструкциями
+(хранение, поиск, ранжирование), — самодостаточный пакет `core/instructions/`,
+который легко выделить в отдельный сервис или заменить целиком. Граница модуля —
+единый фасад `InstructionService` (Protocol); петля и скилы видят только его, не зная
+про SQL, эмбеддинги и ранжирование. **Исполнение — на стороне core**: модуль только
+хранит, ищет и ранжирует; внешние вызовы выполняет core-исполнитель поверх записей,
+полученных через фасад. DTO фасада — JSON-совместимые объекты (под будущую
+HTTP-границу); таблицы модуля — его собственность, вынос в сервис не тянет чужие таблицы.
+
+1. Пакет `core/src/octoforge_core/instructions/`:
+   - `api.py` — фасад `InstructionService` (Protocol) + DTO (`Instruction`,
+     `InstructionType`, `SearchHit`): `search(query, k)`, `save(...)`,
+     `get_by_name(name)`;
+   - `local.py` + `store.py` + `models.py` + `ranking.py` — локальная реализация:
+     таблица `instructions` (`knowledge|skill|tool`: id, type, title, content, embedding
+     JSON, tags JSON, version, usage_count, success_count, даты), SQL-стор, cosine
+     brute-force (standalone-объёмы), буст точного `title`. Полная формула openclaw
+     (70/30 + MMR + затухание) — отдельной итерацией, подменой `ranking`;
+   - будущая `http.py` — реализация фасада клиентом выделенного сервиса (в этап не
+     входит; интерфейс сразу проектируем под неё). Выбор реализации — composition root.
+2. Исполнитель внешних вызовов — **вне модуля**, в core (`net/external.py`): читает
+   tool-запись через `get_by_name`, рендерит url-шаблон и параметры по схеме из записи,
+   подставляет служебную авторизацию только для белого списка base-url (конфиг
+   composition root), выполняет HTTP.
+3. Порт `EmbeddingClient` + OpenAI-совместимый клиент `llm/embeddings.py`; модуль
+   получает его конструктором (DI). Конфиг рядом с `LLMConfig`; web Settings +=
+   `OF_EMBEDDING_*`. Конфиг модуля (top-k и пр.) — в Settings, пробрасывается
+   конструктором, не читается из env напрямую.
+4. Рантайм-тулы `instructions_search`, `instruction_save` — тонкие скилы-адаптеры над
+   фасадом; `external_call` — скил над исполнителем из п.2 (фасад нужен ему только для
+   чтения tool-записи).
 5. SSRF-гвард (`core/net/guard.py`): resolve хоста → `ipaddress`-проверки
    (private/loopback/link-local/reserved, 169.254.169.254) → отказ; применяется в
-   `http_request` и `external_call`.
-6. Сидирование при пустой таблице: generic http tool + 1–2 скила-примера (lifespan).
+   `http_request` и в исполнителе `external_call`.
+6. Сидирование при пустой таблице: generic http tool + 1–2 скила-примера (seed-модуль
+   внутри пакета, вызов в lifespan).
 7. Системный промпт: правила `instructions_search`/`external_call`, когда сохранять
    новые инструкции.
-8. Тесты: embeddings client (mock), ранжирование, save, external_call (шаблоны,
-   whitelist, блок SSRF с мокнутым resolver), сидирование.
+8. Тесты: embeddings client (mock), локальная реализация фасада на `:memory:`
+   (search/save/ранжирование/сид), исполнитель external_call (шаблоны, whitelist, блок
+   SSRF с мокнутым resolver). Контрактные тесты фасада оформить так, чтобы они же могли
+   проверять будущую http-реализацию.
 
 ## Этап C. Датасеты пользовательских данных
 
