@@ -246,6 +246,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 7. Агентный контекст: память в контексте, персист сообщений, `GET /api/skills`, `GET /api/tasks`
 8. LLM-роутер и процессная модель диалога — решения согласованы, см. [process-model.md](process-model.md); реализация отложена
 9. Инструкции в БД (знание/скил/тул + векторный поиск) — см. [instructions.md](instructions.md); крон-задачи — см. [cron.md](cron.md); датасеты пользовательских данных — см. [data-store.md](data-store.md); реализация после БД
+10. Бэклог из обзора openclaw (SSRF-гвард, формула поиска, каталог скилов, детали крона и пр.) — см. [openclaw-review.md](openclaw-review.md)
 
 ## Проверка
 
