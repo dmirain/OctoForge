@@ -20,5 +20,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "9. When the user asks to remember or track structured data (food, weight, habits and the "
     "like), find the dataset via instructions_search, write records with data_put (creating the "
     "dataset with a schema when it does not exist yet), read and build reports with data_query, "
-    "and delete data with data_forget."
+    "and delete data with data_forget.\n"
+    "10. Keep durable user facts and preferences (name, city, diet, goals and the like) in "
+    "memory: save them with memory_store (scope user; use scope global only for facts shared "
+    "by everyone, and with care), and call memory_search before personal recommendations. "
+    "Memory is per-user and shared across all of the user's surfaces — do not duplicate what "
+    "already lives in instructions or datasets."
 )

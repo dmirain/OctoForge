@@ -8,12 +8,16 @@ from octoforge_web.config import (
     DEFAULT_EMBEDDING_BASE_URL,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_INSTRUCTIONS_TOP_K,
+    DEFAULT_MEMORY_SEARCH_DEFAULT_LIMIT,
+    DEFAULT_MEMORY_SEARCH_MAX_LIMIT,
     Settings,
 )
 
 CUSTOM_TOP_K = 7
 CUSTOM_DATASETS_DEFAULT_LIMIT = 25
 CUSTOM_DATASETS_MAX_LIMIT = 500
+CUSTOM_MEMORY_DEFAULT_LIMIT = 15
+CUSTOM_MEMORY_MAX_LIMIT = 80
 WHITELIST_JSON = (
     '[{"base_url_prefix": "https://internal.example.com/", '
     '"header_name": "X-Api-Key", "header_value": "s3cret"}]'
@@ -29,6 +33,8 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "OF_EXTERNAL_CALL_AUTH_WHITELIST",
         "OF_DATASETS_QUERY_DEFAULT_LIMIT",
         "OF_DATASETS_QUERY_MAX_LIMIT",
+        "OF_MEMORY_SEARCH_DEFAULT_LIMIT",
+        "OF_MEMORY_SEARCH_MAX_LIMIT",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -41,6 +47,8 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.external_call_auth_whitelist == []
     assert settings.datasets_query_default_limit == DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT
     assert settings.datasets_query_max_limit == DEFAULT_DATASETS_QUERY_MAX_LIMIT
+    assert settings.memory_search_default_limit == DEFAULT_MEMORY_SEARCH_DEFAULT_LIMIT
+    assert settings.memory_search_max_limit == DEFAULT_MEMORY_SEARCH_MAX_LIMIT
     assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
     assert settings.to_external_call_auth_whitelist() == ()
 
@@ -68,6 +76,16 @@ def test_datasets_limits_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert settings.datasets_query_default_limit == CUSTOM_DATASETS_DEFAULT_LIMIT
     assert settings.datasets_query_max_limit == CUSTOM_DATASETS_MAX_LIMIT
+
+
+def test_memory_limits_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_MEMORY_SEARCH_DEFAULT_LIMIT", str(CUSTOM_MEMORY_DEFAULT_LIMIT))
+    monkeypatch.setenv("OF_MEMORY_SEARCH_MAX_LIMIT", str(CUSTOM_MEMORY_MAX_LIMIT))
+
+    settings = Settings()
+
+    assert settings.memory_search_default_limit == CUSTOM_MEMORY_DEFAULT_LIMIT
+    assert settings.memory_search_max_limit == CUSTOM_MEMORY_MAX_LIMIT
 
 
 def test_auth_whitelist_parsed_from_json_env(monkeypatch: pytest.MonkeyPatch) -> None:

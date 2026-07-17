@@ -48,14 +48,16 @@ core/                          # библиотека octoforge-core — дом�
       loop.py                  # AgentLoop.stream(history, control, context) → AsyncIterator[LoopEvent]
       prompts.py               # DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn, уведомления,
                                #   instructions_search / external_call / instruction_save,
-                               #   data_put / data_query / data_forget)
+                               #   data_put / data_query / data_forget,
+                               #   memory_store / memory_search / memory_delete)
       runner.py                # ConversationRunner (актор), ConversationManager, ConversationEvent
     skills/
       base.py                  # Skill (Protocol), SkillSpec, SkillOrigin (BASIC|DYNAMIC), SkillContext
       registry.py, errors.py   # реестр + ошибки
       basic/                   # http_request.py, task_spawn.py, task_list.py,
                                # instructions_search.py, instruction_save.py, external_call.py,
-                               # data_put.py, data_query.py, data_forget.py
+                               # data_put.py, data_query.py, data_forget.py,
+                               # memory_store.py, memory_search.py, memory_delete.py
     tasks/
       models.py                # Task, TaskKind (SKILL|PROMPT), TaskStatus (PENDING|RUNNING|DONE|FAILED)
       store.py                 # InMemoryTaskStore (реализация порта TaskStore, для тестов)
@@ -88,16 +90,22 @@ core/                          # библиотека octoforge-core — дом�
       store.py                 # SQL-стор (явный каскад удаления, MAX_SCAN_ROWS)
       ranking.py               # свои чистые функции: cosine + буст точного имени (независимость)
       service.py               # LocalDatasetService — локальная реализация фасада
+    memory/                    # обособленный модуль памяти (per-user + global, этап D)
+      api.py                   # граница модуля: MemoryStore (Protocol-порт), Memory,
+                               #   MemoryScope (USER|GLOBAL), MemoryNotFoundError
+      models.py                # MemoryRow — таблица memories, собственность модуля
+      store.py                 # SqlAlchemyMemoryStore (upsert по (owner, key), LIKE-поиск)
     net/                       # исполнение внешних вызовов (core-сторона, вне модуля)
       guard.py                 # SsrfGuard: resolve хоста (resolver инъектируется) → ipaddress-проверки
       tool_spec.py             # ToolSpec + parse_tool_spec (JSON-формат tool-записи)
       external.py              # ExternalCallExecutor: шаблоны, whitelist-авторизация, SSRF-гвард
       errors.py                # SsrfBlockedError, ToolSpecError, ExternalCallError
-    # дальше: skills/dynamic/ (Jinja-движок), память
+    # дальше: skills/dynamic/ (Jinja-движок)
   tests/                       # test_agent_loop, test_conversation_runner, test_data_skills,
                                # test_datasets, test_dataset_validation, test_db_repositories,
                                # test_embeddings, test_external_call, test_http_request_skill,
                                # test_instruction_skills, test_instructions_local,
+                               # test_memory, test_memory_skills,
                                # test_openai_client, test_openai_stream, test_skills_registry,
                                # test_ssrf_guard, test_tasks
 web/                           # приложение octoforge-web — FastAPI-обёртка
@@ -107,7 +115,8 @@ web/                           # приложение octoforge-web — FastAPI-
                                #   исполнитель external_call, акторы, TaskRunner; канал "web")
     config.py                  # Settings (env с префиксом OF_, включая OF_DATABASE_URL,
                                #   OF_EMBEDDING_*, OF_INSTRUCTIONS_TOP_K,
-                               #   OF_EXTERNAL_CALL_AUTH_WHITELIST, OF_DATASETS_QUERY_*)
+                               #   OF_EXTERNAL_CALL_AUTH_WHITELIST, OF_DATASETS_QUERY_*,
+                               #   OF_MEMORY_SEARCH_*)
     deps.py                    # провайдеры зависимостей из app.state + заголовок X-User-Id
     api/
       dialog.py                # messages/cancel/events(SSE) по (user_id, channel)
@@ -219,7 +228,9 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 
 - **Базовые (`SkillOrigin.BASIC`)** — код проекта (`octoforge_core/skills/basic/`): `http_request`,
   `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`,
-  `data_put`, `data_query`, `data_forget`. Подключаются в composition root.
+  `data_put`, `data_query`, `data_forget`, `memory_store`, `memory_search`, `memory_delete`.
+  Подключаются в composition root. Имена скилов — с подчёркиваниями, не с точками:
+  точки в function-name несовместимы с OpenAI tool-calling (зафиксированное решение).
 - **Динамические (`SkillOrigin.DYNAMIC`)** — Jinja-шаблоны из БД (появятся с БД). Реестр един:
   `SkillRegistry` хранит скилы обоих типов под уникальными именами.
 
@@ -247,7 +258,6 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 
 ### Будущие базовые скилы (план)
 
-- `memory.store / memory.search / memory.delete` — скоп `user` или `global` (enum MemoryScope)
 - `skill.list / skill.run / skill.save / skill.delete` — каталог и запись динамических скилов
 
 ## Инструкции и внешние вызовы (этап B)
@@ -312,6 +322,37 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   параметр конструктора), хиты обоих фасадов сливаются по убыванию score; датасеты
   форматируются как `[dataset] <name>` со сниппетом description + списком полей.
 
+## Память (этап D)
+
+Модель (per-user, кросс-поверхностная) — в [dialogs.md](dialogs.md). Реализация:
+
+- **Модуль `memory/`** — обособленный, зеркалит `instructions/` и `datasets/`: граница
+  `api.py` (Protocol-порт `MemoryStore`: `put`/`get`/`search`/`delete`, DTO `Memory`
+  JSON-совместимый под будущую HTTP-границу, `MemoryScope(USER|GLOBAL)`). Локальная
+  реализация `SqlAlchemyMemoryStore`: таблица `memories` (собственность модуля).
+  Эмбеддингов нет — поиск ключевой.
+- **Скоупы**: `user_id` NULL = глобальная память (общие факты для всех); иначе запись
+  принадлежит пользователю и видна ему на всех поверхностях. `put` — upsert по
+  (owner, key): существующая запись замещается (id сохраняется, updated_at бампается),
+  возвращает `(Memory, created)`. Ограничение unique(user_id, key) НЕ защищает глобальные
+  ключи (NULL'ы различны в unique и в SQLite, и в Postgres), поэтому уникальность
+  обеспечивает сам стор: select по owner (NULL — через `is_(None)`) → update или insert.
+- **Поиск**: `search(user_id, query, limit)` — видимость «свои + глобальные», подстрока
+  case-insensitive по key ИЛИ content (SQL ILIKE с экранированием `%`/`_` — запрос остаётся
+  литеральной подстрокой), порядок `updated_at DESC` + key для детерминизма, пустой query
+  — пустой список без запроса в БД. `get`/`delete` — строго по (owner, key): глобальная
+  запись через user-скоуп не читается и не удаляется (`MemoryNotFoundError`).
+- **Скилы** — тонкие адаптеры: `memory_store(key, content, tags?, scope?)`,
+  `memory_search(query, limit?)` (лимиты `OF_MEMORY_SEARCH_DEFAULT_LIMIT`/
+  `OF_MEMORY_SEARCH_MAX_LIMIT`, сниппет 300 символов в одну строку),
+  `memory_delete(key, scope?)` (not-found — текстом, не исключением). Имена с
+  подчёркиваниями (`memory_store`, не `memory.store`): точки в function-name несовместимы
+  с OpenAI tool-calling — зафиксированное решение, действует для всех будущих скилов.
+- **Промпт**: правило 10 — устойчивые факты и предпочтения пользователя сохранять через
+  `memory_store` (scope=user; global — осторожно), перед персональными рекомендациями искать
+  через `memory_search`, не дублировать инструкции/датасеты. Автоинъекция памяти в контекст
+  агента — отдельной итерацией (шаг 7 «Порядка работ»).
+
 ## Модель данных
 
 ORM-модели — в `octoforge_core/db/models.py`; доменные объекты — в `octoforge_core/domain.py`
@@ -338,13 +379,14 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - **dataset_records**: `id`, `dataset_id` FK → datasets.id (index), `owner_user_id`
   (str, index), `payload` (JSON), `created_at`; каскад удаления — явный DELETE в сторе
   (SQLite без PRAGMA foreign_keys)
+- **memories** (таблица модуля `memory/`, см. выше): `id` (uuid str PK), `user_id`
+  (str, NULLABLE = global, index), `key`, `content`, `tags` (JSON list[str]),
+  `created_at`, `updated_at`; unique (`user_id`, `key`) — не действует для NULL owner'а,
+  уникальность глобальных ключей обеспечивает стор (upsert select-then-update)
 
 Все `*_at` — timezone-aware UTC: `UTCDateTime` (`db/base.py`) принудительно выставляет UTC при
 чтении/записи (SQLite возвращает naive datetime). Создание схемы — `init_db` (`create_all`) в
 lifespan; Alembic появится при первой деструктивной миграции.
-
-План следующих этапов: **memories** (`user_id` nullable = global, `key`, `content`, `tags` JSON,
-даты; unique (`user_id`, `key`)) — см. [instructions.md](instructions.md), [plan.md](plan.md).
 
 ## API (`octoforge_web/api/`)
 
@@ -409,15 +451,23 @@ lifespan; Alembic появится при первой деструктивно�
   них, запись в существующий, нарушения схемы текстом), `data_query` (JSON-строки, фильтры,
   лимиты, date-only границы, not-found текстом), `data_forget` (счётчик, not-found),
   `instructions_search` с datasets (merged-выдача с `[dataset]`)
+- `core/tests/test_memory.py` — контрактный набор порта MemoryStore на `:memory:` (put
+  create/upsert с сохранением id и бампом updated_at, get, изоляция owner'ов, глобальный
+  скоуп виден всем, повторный put глобального ключа без дублей, delete, search: подстрока
+  case-insensitive по key/content, литеральность LIKE-метасимволов, порядок updated_at DESC,
+  limit, пустой query, tags round-trip); стор строится фабрикой-фикстурой, как у datasets
+- `core/tests/test_memory_skills.py` — `memory_store`/`memory_search`/`memory_delete` на
+  реальном сторе `:memory:` (scope-парсинг и default, ошибки аргументов, формат ответов,
+  not-found тексты, изоляция и кросс-поверхностная видимость через SkillContext)
 - `web/tests/test_config.py` — Settings: дефолты OF_EMBEDDING_*/top-k/whitelist/лимитов
-  data_query, парсинг JSON-whitelist и лимитов из env
+  data_query и memory_search, парсинг JSON-whitelist и лимитов из env
 - `web/tests/test_dialog_api.py` — get-or-create диалога, изоляция двух user_id, 400 без
   `X-User-Id`, messages/cancel/events (SSE через генератор), health, UI
 - `web/tests/test_sse.py` — сериализация событий в SSE-кадры
 
 План:
 
-- `test_skills_engine.py`, `test_memory.py`, auth-тесты
+- `test_skills_engine.py`, auth-тесты
 
 ## Порядок работ
 
@@ -430,8 +480,8 @@ lifespan; Alembic появится при первой деструктивно�
 3. ✅ Петля + базовые скилы: `AgentLoop` (tool calling), `Skill/SkillSpec/SkillRegistry`, `http_request`
 4. ✅ Событийная петля + актор диалога + фоновые задачи (in-memory): стриминг токенов (SSE), инъекции, отмена, `task_spawn`/`task_list`, проактивные уведомления, системный промпт answer-first
 5. ✅ (без аутентификации: user_id — доверенная строка от клиента; users/токены отложены) БД (SQLAlchemy async, SQLite), перенос историй/задач в БД; диалоги keyed by (user, channel), поверхности — см. [dialogs.md](dialogs.md); две инсталляции (standalone/distributed) — см. [scaling.md](scaling.md)
-6. Динамические скилы: Jinja-движок + `skill.save/run`; скилы памяти (user/global)
-7. Агентный контекст: память в контексте, `GET /api/skills`, `GET /api/tasks`
+6. Динамические скилы: Jinja-движок + `skill.save/run`; скилы памяти (user/global) ✅ (этап D)
+7. Агентный контекст: память в контексте (автоинъекция), `GET /api/skills`, `GET /api/tasks`
 8. LLM-роутер и процессная модель диалога — решения согласованы, см. [process-model.md](process-model.md); реализация отложена
 9. Инструкции в БД (знание/скил/тул + векторный поиск, этап B ✅) — см. [instructions.md](instructions.md); датасеты пользовательских данных (этап C ✅) — см. [data-store.md](data-store.md); крон-задачи — см. [cron.md](cron.md); реализация после БД
 10. Бэклог из обзора openclaw (SSRF-гвард, формула поиска, каталог скилов, детали крона и пр.) — см. [openclaw-review.md](openclaw-review.md)

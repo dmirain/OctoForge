@@ -103,13 +103,14 @@ HTTP-границу); таблицы модуля — его собственн�
 5. Owner-изоляция в исполнителе по `SkillContext.user_id` (проверяет тул, не LLM).
 6. Тесты: создание/валидация/фильтры, изоляция юзеров, каскадное удаление.
 
-## Этап D. Память (per-user, кросс-поверхностная)
+## Этап D. Память (per-user, кросс-поверхностная) ✅
 
 (design.md «Модель данных», dialogs.md «факт модели»)
 
 1. Таблица `memories` (id, user_id nullable = global, key, content, tags JSON, даты;
    unique(user_id, key)) + порт `MemoryStore` + SQL-реализация.
-2. Скилы `memory.store` / `memory.search` / `memory.delete`, `MemoryScope(USER|GLOBAL)`.
+2. Скилы `memory_store` / `memory_search` / `memory_delete` (имена с подчёркиваниями:
+   точки несовместимы с OpenAI tool-calling), `MemoryScope(USER|GLOBAL)`.
 3. Промпт: когда класть/читать память; автоинъекция в контекст — отдельной итерацией.
 4. Тесты: скоупы, изоляция, unique-замещение по ключу.
 

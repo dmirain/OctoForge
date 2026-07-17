@@ -26,6 +26,8 @@ from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.seed import seed_if_empty
 from octoforge_core.llm.embeddings import OpenAIEmbeddingClient
 from octoforge_core.llm.openai import OpenAICompatibleClient
+from octoforge_core.memory.api import MemoryStore
+from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.external import ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.skills.basic.data_forget import DataForgetSkill
@@ -35,6 +37,9 @@ from octoforge_core.skills.basic.external_call import ExternalCallSkill
 from octoforge_core.skills.basic.http_request import HttpRequestSkill
 from octoforge_core.skills.basic.instruction_save import InstructionSaveSkill
 from octoforge_core.skills.basic.instructions_search import InstructionsSearchSkill
+from octoforge_core.skills.basic.memory_delete import MemoryDeleteSkill
+from octoforge_core.skills.basic.memory_search import MemorySearchSkill
+from octoforge_core.skills.basic.memory_store import MemoryStoreSkill
 from octoforge_core.skills.basic.task_list import TaskListSkill
 from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
 from octoforge_core.tasks.runner import TaskRunner
@@ -118,6 +123,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     SkillOrigin.BASIC,
                 )
                 registry.register(DataForgetSkill(service=datasets), SkillOrigin.BASIC)
+                memory = SqlAlchemyMemoryStore(session_factory)
+                _register_memory_skills(registry, memory, resolved_settings)
                 loop = AgentLoop(
                     llm_client=llm_client,
                     registry=registry,
@@ -156,6 +163,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(dialog_router)
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
+
+
+def _register_memory_skills(
+    registry: SkillRegistry,
+    store: MemoryStore,
+    settings: Settings,
+) -> None:
+    """Register the memory skills over the shared memory store."""
+    registry.register(MemoryStoreSkill(store=store), SkillOrigin.BASIC)
+    registry.register(
+        MemorySearchSkill(
+            store=store,
+            default_limit=settings.memory_search_default_limit,
+            max_limit=settings.memory_search_max_limit,
+        ),
+        SkillOrigin.BASIC,
+    )
+    registry.register(MemoryDeleteSkill(store=store), SkillOrigin.BASIC)
 
 
 app = create_app()
