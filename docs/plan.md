@@ -1,0 +1,146 @@
+# План реализации (дорожная карта этапов A–F)
+
+> Утверждённый план по документам `docs/*`. Живой: статусы обновляются по мере выполнения.
+> Источники: [design.md](design.md) (шаги 5–10), [dialogs.md](dialogs.md),
+> [instructions.md](instructions.md), [data-store.md](data-store.md),
+> [process-model.md](process-model.md), [cron.md](cron.md), [scaling.md](scaling.md),
+> [openclaw-review.md](openclaw-review.md).
+
+## Рамка
+
+- Аутентификацию **не делаем**: она будет на уровне клиента. Ядро и API принимают
+  `user_id` (непрозрачная строка, доверенная) и работают с ним. Таблица `users`,
+  токены, admin-secret — отложены (см. «Дальше»).
+- Порядок этапов A→F: каждый следующий опирается на предыдущий; между этапами — ревью.
+- Каждый этап = код + тесты + обновление документации в одном изменении;
+  `make check` зелёный в конце каждого этапа.
+
+## Этап A. БД + диалоги (user_id, channel) + персист сообщений и задач ✅
+
+(design.md шаг 5 без аутентификации, scaling.md этап 1, dialogs.md)
+
+1. Зависимости: core += `sqlalchemy[asyncio]`, `aiosqlite`; web Settings +=
+   `OF_DATABASE_URL` (default `sqlite+aiosqlite:///./octoforge.db`).
+2. `core/src/octoforge_core/db/`: `base.py` (Base + `UTCDateTime` TypeDecorator),
+   `models.py` (`dialogs`, `messages`, `tasks`; `user_id` — строковая колонка с
+   индексом, без таблицы `users`), `engine.py` (async engine/session, `create_all`
+   при старте; Alembic — при первой деструктивной миграции), `repositories.py`
+   (DialogRepository, MessageRepository, `SqlAlchemyTaskStore`; `InMemoryTaskStore`
+   остаётся для тестов).
+3. Ядро: `ConversationManager` ключуется по `(user_id, channel)`; runner пересобирает
+   историю из `messages`; сообщения персистятся; `SkillContext` += `user_id`, `channel`;
+   `Task.conversation_id` → `dialog_id`.
+4. Web API: `user_id` заголовком `X-User-Id` (400, если пустой); диалог — get-or-create:
+   `POST /api/dialog/messages`, `POST /api/dialog/cancel`, `GET /api/dialog/events`;
+   `/api/conversations/*` удалить.
+5. UI: поле имени = `user_id` (localStorage), уходит заголовком `X-User-Id`.
+6. Тесты: репозитории на SQLite `:memory:`, SqlAlchemyTaskStore, пересборка истории
+   после «перезапуска»; web — get-or-create, изоляция двух `user_id`, 400 без заголовка.
+7. Доки: design.md (шаг 5 → ✅, «Модель данных»/«API» — как реализовано), AGENTS.md
+   (core зависит от sqlalchemy; fastapi по-прежнему запрещён).
+
+**Проверка**: `make check`; ручной сценарий — два имени в UI, истории/задачи изолированы,
+перезапуск приложения не теряет диалог.
+
+## Этап B. Инструкции в БД + векторный поиск + external_call + SSRF-гвард
+
+(instructions.md, openclaw-review.md бэклог п.1)
+
+1. Таблица `instructions` (`knowledge|skill|tool`: id, type, title, content, embedding
+   JSON, tags JSON, version, usage_count, success_count, даты) + порт `InstructionStore`
+   + SQL-реализация.
+2. Порт `EmbeddingClient` + OpenAI-совместимый клиент `llm/embeddings.py`; конфиг рядом
+   с `LLMConfig`; web Settings += `OF_EMBEDDING_*`.
+3. Поиск: cosine brute-force в сервисе (standalone-объёмы); точное совпадение `title` —
+   буст. Полная формула openclaw (70/30 + MMR + затухание) — отдельной итерацией.
+4. Рантайм-тулы как базовые скилы: `instructions_search`, `instruction_save`,
+   `external_call` (url-шаблон + схема параметров из tool-записи; служебная авторизация
+   только для белого списка base-url из конфига).
+5. SSRF-гвард (`core/net/guard.py`): resolve хоста → `ipaddress`-проверки
+   (private/loopback/link-local/reserved, 169.254.169.254) → отказ; применяется в
+   `http_request` и `external_call`.
+6. Сидирование при пустой таблице: generic http tool + 1–2 скила-примера (lifespan).
+7. Системный промпт: правила `instructions_search`/`external_call`, когда сохранять
+   новые инструкции.
+8. Тесты: embeddings client (mock), ранжирование, save, external_call (шаблоны,
+   whitelist, блок SSRF с мокнутым resolver), сидирование.
+
+## Этап C. Датасеты пользовательских данных
+
+(data-store.md)
+
+1. Таблицы `datasets` (owner_user_id, name, description, schema JSON, usage_notes,
+   retention, embedding, version, даты) и `dataset_records` (dataset_id FK cascade,
+   owner_user_id, payload JSON, created_at).
+2. Порт `DatasetStore` + SQL-реализация; валидация записи по `schema` — исполнителем.
+3. Тулы `data_put` (create-if-absent), `data_query` (равенство полей, диапазон дат,
+   limit), `data_forget` (каскадное удаление).
+4. Дескрипторы участвуют в `instructions_search`.
+5. Owner-изоляция в исполнителе по `SkillContext.user_id` (проверяет тул, не LLM).
+6. Тесты: создание/валидация/фильтры, изоляция юзеров, каскадное удаление.
+
+## Этап D. Память (per-user, кросс-поверхностная)
+
+(design.md «Модель данных», dialogs.md «факт модели»)
+
+1. Таблица `memories` (id, user_id nullable = global, key, content, tags JSON, даты;
+   unique(user_id, key)) + порт `MemoryStore` + SQL-реализация.
+2. Скилы `memory.store` / `memory.search` / `memory.delete`, `MemoryScope(USER|GLOBAL)`.
+3. Промпт: когда класть/читать память; автоинъекция в контекст — отдельной итерацией.
+4. Тесты: скоупы, изоляция, unique-замещение по ключу.
+
+## Этап E. Процессная модель + LLM-роутер
+
+(process-model.md; крупный рефактор runner'а)
+
+1. `agent/router.py`: `RouteAction` (INJECT|START_NEW|CANCEL|PROMOTE), `RouteOp`,
+   `RouteDecision`, порт `MessageRouter`, `LLMRouter` (one-shot complete + tool
+   `route(ops)`, валидация, таймаут, фолбэк).
+2. Актор → менеджер процессов: narrative + `Process` (fg/bg), один форграунд, broadcast
+   только форграунда + маркеры; пакет операций применяется по порядку.
+3. `TaskStore` += `cancel`/`is_cancelled`/`count_active`; `TaskStatus` += `CANCELLED`;
+   `TaskKind` → `RUN`; глобальный `TaskRunner` упраздняется, фон — pump-процессы актора.
+4. `SkillContext` += порт `TaskSpawner` (лимит `OF_MAX_PROCESSES` → текст-отказ);
+   детерминированный guardrail лимита в акторе.
+5. События `ProcessSuspended/Resumed/Completed` → SSE + маркеры в UI.
+6. Гигиена истории (openclaw-review п.4): пометка прерванного тёрна; уведомление о
+   завершении фонового с защитой от двойной отправки.
+7. Тесты: роутер (mock LLM: пакеты, фолбэк, passthrough), процессы
+   (switch/promote/cancel/лимит/уведомления), регрессии runner'а.
+
+## Этап F. Крон-задачи
+
+(cron.md + openclaw-review п.5–6)
+
+1. Таблица `cron_jobs` (user_id, channel, title, schedule, timezone IANA, prompt,
+   enabled, next_fire_at, last_fire_at, claimed_by, created_at) + порт `CronStore`.
+2. Планировщик (asyncio-цикл, зависимость `croniter`, `zoneinfo`): выборка due,
+   CAS-захват (`claimed_by` + lease TTL), coalesce пропущенных, пересчёт `next_fire_at`;
+   догонялка с разбросом и лимитом реплея.
+3. HTTP API (скоуп по `X-User-Id`; служебные токены — позже, с аутентификацией):
+   `POST/GET/DELETE /api/cron/jobs`, `POST /api/cron/jobs/{id}/pause|resume`.
+4. Сид tool-записи «cron API» в instructions → агент создаёт задачи через
+   `external_call` (без выделенных скилов).
+5. Выстрел: `POST /api/dialogs/{key}/wake` → фоновый процесс (Этап E) с `prompt`,
+   процесс помечен id крон-задачи → уведомление; переполнение лимита → отложенное
+   уведомление о невозможности запуска.
+6. Тесты: расписание/таймзоны, claim CAS, coalesce, wake.
+
+## Дальше (за рамками плана)
+
+Настоящая аутентификация (`users`, токены, служебные токены для wake/cron);
+Telegram-адаптер (вторая поверхность + outbox); distributed-профиль (scaling.md этап 2);
+компакция истории по реальным токенам; секреты-заглушки; `GET /api/skills`,
+`GET /api/tasks`; полная формула поиска (70/30 + MMR); подтверждение новых скилов
+человеком.
+
+## Принятые решения по умолчанию
+
+- ORM и репозитории — в `core/db/`; core получает зависимость sqlalchemy (fastapi —
+  по-прежнему запрещён).
+- `user_id` — доверенная строка от клиента (`X-User-Id`); изоляция логическая, без
+  криптографии — до настоящей аутентификации.
+- `create_all` вместо Alembic до первой деструктивной миграции.
+- Outbox откладывается до второй поверхности (в standalone уведомления in-process).
+- Порядок B→C→D→E→F: инструкции/датасеты/память раньше роутера (в docs «отложен»),
+  крон после процессной модели (выстрел = фоновый процесс).
