@@ -4,18 +4,19 @@
 
 ## Project status
 
-Событийная петля с актором диалога и фоновыми задачами работает. Реализовано:
+Событийная петля с актором диалога, персистом в SQLite и фоновыми задачами работает. Реализовано:
 
 - монорепо из двух проектов: библиотека `core/` (`octoforge-core`) и web-приложение `web/` (`octoforge-web`) — у каждого свой `pyproject.toml`, зависимости и тесты;
 - петля как поток событий: `AgentLoop.stream(history, control, context) -> AsyncIterator[LoopEvent]` — токены, вызовы скилов, финал, отмена;
 - управление прогоном: `LoopControl` (инъекции сообщений + отмена с сохранением частичного ответа);
-- актор диалога: `ConversationRunner`/`ConversationManager` — сериализация команд, broadcast подписчикам, проактивные уведомления о задачах;
-- фоновые задачи (in-memory за протоколом `TaskStore`): `TaskRunner` + скилы `task_spawn`/`task_list`;
-- скилы: `Skill`/`SkillSpec`/`SkillContext`/`SkillRegistry`, типы `BASIC|DYNAMIC`; базовые `http_request`, `task_spawn`, `task_list`;
+- актор диалога: `ConversationRunner`/`ConversationManager` — ключуются по `(user_id, channel)` (get-or-create), история пересобирается из БД, сообщения персистятся по ходу прогона, проактивные уведомления о задачах;
+- персист: SQLAlchemy async + SQLite, пакет `db/` (Base + `UTCDateTime`, ORM-модели dialogs/messages/tasks, фабрики engine/session, репозитории); `create_all` при старте, Alembic — при первой деструктивной миграции;
+- фоновые задачи за протоколом `TaskStore` (боевой `SqlAlchemyTaskStore`, `InMemoryTaskStore` — для тестов): `TaskRunner` + скилы `task_spawn`/`task_list`, отметка доставки `result_delivered`;
+- скилы: `Skill`/`SkillSpec`/`SkillContext(user_id, channel, dialog_id)`/`SkillRegistry`, типы `BASIC|DYNAMIC`; базовые `http_request`, `task_spawn`, `task_list`;
 - LLM-клиент: `complete()` + `stream()` (SSE, tools/tool_calls);
-- web: conversations API (create/messages/cancel) + SSE `events`, чат-UI со стримом и кнопкой «Стоп».
+- web: dialog API (`POST /api/dialog/messages`, `POST /api/dialog/cancel`, `GET /api/dialog/events` SSE) с заголовком `X-User-Id` (доверенная строка, без аутентификации), чат-UI со стримом и кнопкой «Стоп»; канал `"web"` объявлен в composition root.
 
-Не реализовано: БД и персист, пользователи/аутентификация, инструкции в БД (знания/скилы/тулы/датасеты + векторный поиск, см. `docs/instructions.md`, `docs/data-store.md`), память, роутер и процессная модель (`docs/process-model.md`). План — `docs/design.md`.
+Не реализовано: пользователи/аутентификация (user_id — доверенная строка от клиента), редоставка недоставленных результатов задач при старте, инструкции в БД (знания/скилы/тулы/датасеты + векторный поиск, см. `docs/instructions.md`, `docs/data-store.md`), память, роутер и процессная модель (`docs/process-model.md`). План — `docs/design.md`.
 
 ## Project overview
 
@@ -23,8 +24,8 @@ OctoForge — мультипользовательский LLM-агент: Pytho
 
 ## Repository layout
 
-- `core/` — библиотека `octoforge-core` (src-layout): домен, порты, `agent/` (events/control/loop/prompts/runner), `skills/` (base/registry/basic), `tasks/` (models/store/runner), `llm/` (events/openai). Не импортирует fastapi/sqlalchemy.
-- `web/` — приложение `octoforge-web` (src-layout): FastAPI-обёртка, `api/` (conversations/sse/schemas), статика, composition root в `main.py`. Зависит от `octoforge-core`.
+- `core/` — библиотека `octoforge-core` (src-layout): домен, порты, `agent/` (events/control/loop/prompts/runner), `skills/` (base/registry/basic), `tasks/` (models/store/runner), `llm/` (events/openai), `db/` (base/models/engine/repositories). Не импортирует fastapi; sqlalchemy — только в `db/` и репозиториях.
+- `web/` — приложение `octoforge-web` (src-layout): FastAPI-обёртка, `api/` (dialog/sse/schemas), статика, composition root в `main.py`. Зависит от `octoforge-core`.
 - Корень: `Makefile`, `README.md`, `.env.example`, `docs/`.
 
 ## Build and test commands

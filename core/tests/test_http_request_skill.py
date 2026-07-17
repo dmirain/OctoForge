@@ -17,7 +17,7 @@ from octoforge_core.skills.errors import SkillArgumentsError
 
 TARGET_URL = "https://api.example.com/data"
 RESPONSE_BODY = "hello body"
-CTX = SkillContext(conversation_id="conv-test")
+CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 
 
 def make_skill(handler: Callable[[httpx.Request], httpx.Response]) -> HttpRequestSkill:

@@ -40,8 +40,8 @@ class TaskStore(Protocol):
         """Return the task by id or raise TaskNotFoundError."""
         ...
 
-    async def list(self, conversation_id: str) -> list[Task]:
-        """Return tasks of one conversation."""
+    async def list(self, dialog_id: str) -> list[Task]:
+        """Return tasks of one dialog."""
         ...
 
     async def next_pending(self) -> Task | None:
@@ -58,4 +58,8 @@ class TaskStore(Protocol):
 
     async def mark_failed(self, task: Task, error: str) -> None:
         """Mark the task as failed with an error."""
+        ...
+
+    async def mark_delivered(self, task_id: str) -> None:
+        """Mark the task result as delivered to its dialog."""
         ...

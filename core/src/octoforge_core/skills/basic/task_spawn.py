@@ -24,7 +24,7 @@ SPAWNED_TEMPLATE = "task {task_id} spawned"
 
 
 class TaskSpawnSkill:
-    """Creates a PROMPT background task for the current conversation."""
+    """Creates a PROMPT background task for the current dialog."""
 
     def __init__(self, store: TaskStore) -> None:
         self._store = store
@@ -45,7 +45,9 @@ class TaskSpawnSkill:
         if not isinstance(prompt, str) or not prompt:
             raise SkillArgumentsError("prompt must be a non-empty string")
         task = Task(
-            conversation_id=context.conversation_id,
+            dialog_id=context.dialog_id,
+            user_id=context.user_id,
+            channel=context.channel,
             title=title,
             kind=TaskKind.PROMPT,
             input={"prompt": prompt},

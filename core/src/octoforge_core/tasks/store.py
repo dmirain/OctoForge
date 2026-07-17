@@ -6,7 +6,7 @@ from octoforge_core.time import utc_now
 
 
 class InMemoryTaskStore:
-    """Dict-backed task store; to be replaced by the DB implementation."""
+    """Dict-backed task store; used in tests and as a behavioral reference."""
 
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
@@ -20,8 +20,8 @@ class InMemoryTaskStore:
         except KeyError as exc:
             raise TaskNotFoundError(task_id) from exc
 
-    async def list(self, conversation_id: str) -> list[Task]:
-        return [task for task in self._tasks.values() if task.conversation_id == conversation_id]
+    async def list(self, dialog_id: str) -> list[Task]:
+        return [task for task in self._tasks.values() if task.dialog_id == dialog_id]
 
     async def next_pending(self) -> Task | None:
         for task in self._tasks.values():
@@ -31,6 +31,7 @@ class InMemoryTaskStore:
 
     async def mark_running(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
+        task.started_at = utc_now()
 
     async def mark_done(self, task: Task, result: str) -> None:
         task.status = TaskStatus.DONE
@@ -41,3 +42,7 @@ class InMemoryTaskStore:
         task.status = TaskStatus.FAILED
         task.error = error
         task.finished_at = utc_now()
+
+    async def mark_delivered(self, task_id: str) -> None:
+        task = await self.get(task_id)
+        task.result_delivered = True

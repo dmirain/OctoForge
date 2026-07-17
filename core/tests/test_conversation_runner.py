@@ -5,8 +5,8 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.agent.errors import ConversationNotFoundError
 from octoforge_core.agent.events import (
     Cancelled,
     Failed,
@@ -16,23 +16,39 @@ from octoforge_core.agent.events import (
 )
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.runner import ConversationEvent, ConversationManager
-from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
+from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.repositories import DialogRepository, MessageRepository
+from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.ports import LLMClient, TaskStore
 from octoforge_core.skills.base import SkillContext, SkillOrigin, SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.store import InMemoryTaskStore
 
 PROMPT = "test system prompt"
 REPLY = "hello"
 BLOCKING_SKILL = "blocking"
 CALL_ID = "call-1"
 TASK_RESULT = "42"
+UNBLOCKED_OUTPUT = "unblocked"
 TIMEOUT_SECONDS = 2.0
 MAX_ITERATIONS = 3
 EXPECTED_LLM_CALLS = 3
 FIRST_CALL = 1
 SECOND_CALL = 2
+USER_ID = "user-1"
+CHANNEL = "web"
+MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+
+
+@pytest.fixture
+async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_engine(MEMORY_DATABASE_URL)
+    await init_db(engine)
+    yield create_session_factory(engine)
+    await engine.dispose()
 
 
 class ScriptedLLM:
@@ -107,7 +123,7 @@ class BlockingSkill:
     async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
         self.started.set()
         await self.release.wait()
-        return "unblocked"
+        return UNBLOCKED_OUTPUT
 
 
 class QuickSkill:
@@ -133,9 +149,38 @@ def reply(content: str = REPLY) -> ChatMessage:
     return ChatMessage(role=MessageRole.ASSISTANT, content=content)
 
 
-def make_manager(llm: ScriptedLLM, registry: SkillRegistry) -> ConversationManager:
+def make_task(dialog_id: str, title: str = "research") -> Task:
+    task = Task(
+        dialog_id=dialog_id,
+        user_id=USER_ID,
+        channel=CHANNEL,
+        title=title,
+        kind=TaskKind.PROMPT,
+        input={},
+    )
+    task.status = TaskStatus.DONE
+    task.result = TASK_RESULT
+    return task
+
+
+async def make_manager(
+    llm: LLMClient,
+    registry: SkillRegistry,
+    session_factory: async_sessionmaker[AsyncSession],
+    store: TaskStore | None = None,
+) -> ConversationManager:
     loop = AgentLoop(llm_client=llm, registry=registry, max_iterations=MAX_ITERATIONS)
-    return ConversationManager(loop=loop, system_prompt=PROMPT)
+    return ConversationManager(
+        loop=loop,
+        system_prompt=PROMPT,
+        dialogs=DialogRepository(session_factory),
+        messages=MessageRepository(session_factory),
+        tasks=store if store is not None else InMemoryTaskStore(),
+    )
+
+
+async def get_dialog(session_factory: async_sessionmaker[AsyncSession]) -> Dialog:
+    return await DialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
 
 
 def blocking_registry(skill: BlockingSkill) -> SkillRegistry:
@@ -164,10 +209,11 @@ async def collect_until(
             return events
 
 
-async def test_submit_streams_events_and_updates_history() -> None:
-    manager = make_manager(ScriptedLLM([reply()]), SkillRegistry())
-    conversation_id = manager.create_conversation()
-    runner = manager.get(conversation_id)
+async def test_submit_streams_events_and_updates_history(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = await make_manager(ScriptedLLM([reply()]), SkillRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("hi")
@@ -181,12 +227,13 @@ async def test_submit_streams_events_and_updates_history() -> None:
     assert history[-1].content == REPLY
 
 
-async def test_message_during_run_is_injected() -> None:
+async def test_message_during_run_is_injected(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     skill = BlockingSkill()
     llm = ScriptedLLM([assistant_call(), reply("after")])
-    manager = make_manager(llm, blocking_registry(skill))
-    conversation_id = manager.create_conversation()
-    runner = manager.get(conversation_id)
+    manager = await make_manager(llm, blocking_registry(skill), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("start")
@@ -200,12 +247,11 @@ async def test_message_during_run_is_injected() -> None:
     assert any(m.role is MessageRole.USER and m.content == "extra context" for m in second_request)
 
 
-async def test_cancel_stops_run() -> None:
+async def test_cancel_stops_run(session_factory: async_sessionmaker[AsyncSession]) -> None:
     skill = BlockingSkill()
     llm = ScriptedLLM([assistant_call()])
-    manager = make_manager(llm, blocking_registry(skill))
-    conversation_id = manager.create_conversation()
-    runner = manager.get(conversation_id)
+    manager = await make_manager(llm, blocking_registry(skill), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("start")
@@ -218,16 +264,18 @@ async def test_cancel_stops_run() -> None:
     assert isinstance(events[-1].payload, Cancelled)
 
 
-async def test_task_done_produces_proactive_message() -> None:
+async def test_task_done_produces_proactive_message_and_is_marked_delivered(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
     llm = ScriptedLLM([reply("task summary")])
-    manager = make_manager(llm, SkillRegistry())
-    conversation_id = manager.create_conversation()
-    runner = manager.get(conversation_id)
+    manager = await make_manager(llm, SkillRegistry(), session_factory, store=store)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    task = Task(conversation_id=conversation_id, title="research", kind=TaskKind.PROMPT, input={})
-    task.status = TaskStatus.DONE
-    task.result = TASK_RESULT
+    dialog = await get_dialog(session_factory)
+    task = make_task(dialog.id)
+    await store.add(task)
     await manager.notify_task_done(task)
     events = await collect_until(queue, is_terminal)
 
@@ -235,24 +283,39 @@ async def test_task_done_produces_proactive_message() -> None:
     system_messages = [m for m in llm.requests[0] if m.role is MessageRole.SYSTEM]
     assert any(TASK_RESULT in m.content for m in system_messages)
     assert any(m.role is MessageRole.SYSTEM and TASK_RESULT in m.content for m in runner.history())
+    assert (await store.get(task.id)).result_delivered is True
 
 
-async def test_injection_at_run_end_gets_own_run() -> None:
+async def test_notify_task_for_unknown_dialog_is_ignored(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    manager = await make_manager(ScriptedLLM([]), SkillRegistry(), session_factory, store=store)
+    task = make_task("missing-dialog")
+    await store.add(task)
+
+    await manager.notify_task_done(task)
+
+    assert (await store.get(task.id)).result_delivered is False
+
+
+async def test_injection_at_run_end_gets_own_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     llm = GatedLLM()
     registry = SkillRegistry()
     registry.register(QuickSkill(), SkillOrigin.BASIC)
-    loop = AgentLoop(llm_client=llm, registry=registry, max_iterations=MAX_ITERATIONS)
-    manager = ConversationManager(loop=loop, system_prompt=PROMPT)
-    conversation_id = manager.create_conversation()
-    runner = manager.get(conversation_id)
+    store = InMemoryTaskStore()
+    manager = await make_manager(llm, registry, session_factory, store=store)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("start")
     await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
 
-    task = Task(conversation_id=conversation_id, title="bg", kind=TaskKind.PROMPT, input={})
-    task.status = TaskStatus.DONE
-    task.result = TASK_RESULT
+    dialog = await get_dialog(session_factory)
+    task = make_task(dialog.id, title="bg")
+    await store.add(task)
     await manager.notify_task_done(task)
     llm.release.set()
 
@@ -264,15 +327,53 @@ async def test_injection_at_run_end_gets_own_run() -> None:
     assert any(m.role is MessageRole.SYSTEM and TASK_RESULT in m.content for m in third_request)
 
 
-async def test_notify_unknown_conversation_is_ignored() -> None:
-    manager = make_manager(ScriptedLLM([]), SkillRegistry())
-    task = Task(conversation_id="missing", title="t", kind=TaskKind.PROMPT, input={})
+async def test_user_message_is_persisted_before_run_finishes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    skill = BlockingSkill()
+    llm = ScriptedLLM([assistant_call(), reply("done")])
+    manager = await make_manager(llm, blocking_registry(skill), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
 
-    await manager.notify_task_done(task)
+    await runner.submit("start")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    dialog = await get_dialog(session_factory)
+    stored = await MessageRepository(session_factory).list(dialog.id)
+    assert stored == [ChatMessage(role=MessageRole.USER, content="start"), assistant_call()]
+
+    skill.release.set()
+    await collect_until(queue, is_terminal)
+
+    assert await MessageRepository(session_factory).list(dialog.id) == [
+        ChatMessage(role=MessageRole.USER, content="start"),
+        assistant_call(),
+        ChatMessage(role=MessageRole.TOOL, content=UNBLOCKED_OUTPUT, tool_call_id=CALL_ID),
+        reply("done"),
+    ]
 
 
-def test_get_unknown_conversation_raises() -> None:
-    manager = make_manager(ScriptedLLM([]), SkillRegistry())
+async def test_history_is_rebuilt_after_manager_restart(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    registry = SkillRegistry()
+    registry.register(QuickSkill(), SkillOrigin.BASIC)
+    llm = ScriptedLLM([assistant_call(), reply("after")])
+    manager = await make_manager(llm, registry, session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
 
-    with pytest.raises(ConversationNotFoundError):
-        manager.get("missing")
+    await runner.submit("start")
+    await collect_until(queue, is_terminal)
+
+    restarted = await make_manager(ScriptedLLM([]), registry, session_factory)
+    restored = await restarted.get_or_create_runner(USER_ID, CHANNEL)
+
+    assert restored.history() == [
+        ChatMessage(role=MessageRole.USER, content="start"),
+        assistant_call(),
+        ChatMessage(role=MessageRole.TOOL, content="ok", tool_call_id=CALL_ID),
+        reply("after"),
+    ]

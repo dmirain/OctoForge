@@ -34,7 +34,7 @@ def encode_heartbeat() -> str:
 
 def event_to_payload(event: ConversationEvent) -> dict[str, Any]:
     """Convert a conversation event into a JSON-serializable payload."""
-    base: dict[str, Any] = {"seq": event.seq, "conversation_id": event.conversation_id}
+    base: dict[str, Any] = {"seq": event.seq, "dialog_id": event.dialog_id}
     return base | _event_details(event.payload)
 
 

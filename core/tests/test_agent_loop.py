@@ -29,7 +29,7 @@ FINAL_CONTENT = "done"
 CALL_ID = "call-1"
 FAILURE_MESSAGE = "boom"
 INJECTED_CONTENT = "extra context"
-CTX = SkillContext(conversation_id="conv-test")
+CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 
 
 class ScriptedLLM:

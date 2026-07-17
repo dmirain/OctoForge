@@ -58,5 +58,9 @@ class TaskRunner:
         skill_name = str(task.input["skill"])
         skill = self._registry.get(skill_name)
         arguments = task.input.get("params", {})
-        context = SkillContext(conversation_id=task.conversation_id)
+        context = SkillContext(
+            user_id=task.user_id,
+            channel=task.channel,
+            dialog_id=task.dialog_id,
+        )
         return await skill.execute(arguments, context)

@@ -19,7 +19,7 @@ from octoforge_core.agent.runner import ConversationEvent
 
 from octoforge_web.api.sse import encode_frame, encode_heartbeat, event_to_payload
 
-CONVERSATION_ID = "conv-1"
+DIALOG_ID = "dlg-1"
 SEQ = 7
 CALL_ID = "call-1"
 SKILL_NAME = "http_request"
@@ -65,7 +65,7 @@ PAYLOAD_CASES: list[tuple[LoopEvent, dict[str, object]]] = [
 
 
 def make_envelope(payload: LoopEvent) -> ConversationEvent:
-    return ConversationEvent(conversation_id=CONVERSATION_ID, seq=SEQ, payload=payload)
+    return ConversationEvent(dialog_id=DIALOG_ID, seq=SEQ, payload=payload)
 
 
 @pytest.mark.parametrize(("event", "expected"), PAYLOAD_CASES)
@@ -74,14 +74,14 @@ def test_event_to_payload(event: LoopEvent, expected: dict[str, object]) -> None
 
     assert payload == {
         "seq": SEQ,
-        "conversation_id": CONVERSATION_ID,
+        "dialog_id": DIALOG_ID,
         **expected,
     }
 
 
 def test_event_to_payload_rejects_unknown() -> None:
     envelope = ConversationEvent(
-        conversation_id=CONVERSATION_ID,
+        dialog_id=DIALOG_ID,
         seq=SEQ,
         payload="not-an-event",  # type: ignore[arg-type]
     )

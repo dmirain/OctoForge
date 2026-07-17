@@ -1,4 +1,4 @@
-"""Basic skill that lists background tasks of the current conversation."""
+"""Basic skill that lists background tasks of the current dialog."""
 
 from typing import Any
 
@@ -7,13 +7,13 @@ from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.tasks.models import Task
 
 SKILL_NAME = "task_list"
-SKILL_DESCRIPTION = "List background tasks of this conversation with their statuses and results."
+SKILL_DESCRIPTION = "List background tasks of this dialog with their statuses and results."
 PARAMETERS_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 NO_TASKS_MESSAGE = "no tasks"
 
 
 class TaskListSkill:
-    """Lists tasks of the current conversation."""
+    """Lists tasks of the current dialog."""
 
     def __init__(self, store: TaskStore) -> None:
         self._store = store
@@ -27,7 +27,7 @@ class TaskListSkill:
         )
 
     async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
-        tasks = await self._store.list(context.conversation_id)
+        tasks = await self._store.list(context.dialog_id)
         if not tasks:
             return NO_TASKS_MESSAGE
         return "\n".join(self._format_task(task) for task in tasks)

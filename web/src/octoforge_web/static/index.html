@@ -143,7 +143,7 @@
     "use strict";
 
     const NAME_KEY = "octoforge.userName";
-    const CONVERSATION_KEY = "octoforge.conversationId";
+    const SSE_DATA_PREFIX = "data:";
 
     const messagesEl = document.getElementById("messages");
     const formEl = document.getElementById("composer");
@@ -152,11 +152,15 @@
     const nameEl = document.getElementById("name-input");
     const greetingEl = document.getElementById("greeting");
 
-    let conversationId = localStorage.getItem(CONVERSATION_KEY);
     let currentBubble = null;
+    let eventsAbort = null;
+
+    function userId() {
+      return nameEl.value.trim();
+    }
 
     function renderGreeting() {
-      const name = nameEl.value.trim();
+      const name = userId();
       greetingEl.textContent = name ? `Привет, ${name}!` : "";
     }
 
@@ -235,38 +239,86 @@
       }
     }
 
-    function connect() {
-      const source = new EventSource(`/api/conversations/${conversationId}/events`);
-      source.onmessage = (message) => handleEvent(JSON.parse(message.data));
+    function dispatchFrame(frame) {
+      for (const line of frame.split("\n")) {
+        if (line.startsWith(SSE_DATA_PREFIX)) {
+          handleEvent(JSON.parse(line.slice(SSE_DATA_PREFIX.length).trim()));
+        }
+      }
     }
 
-    async function ensureConversation() {
-      if (conversationId) return;
-      const response = await fetch("/api/conversations", { method: "POST" });
-      const data = await response.json();
-      conversationId = data.id;
-      localStorage.setItem(CONVERSATION_KEY, conversationId);
+    async function readEventStream(body) {
+      const reader = body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop();
+        for (const frame of frames) {
+          if (frame) dispatchFrame(frame);
+        }
+      }
+    }
+
+    async function connect() {
+      disconnect();
+      const id = userId();
+      if (!id) return;
+      const controller = new AbortController();
+      eventsAbort = controller;
+      try {
+        const response = await fetch("/api/dialog/events", {
+          headers: { "X-User-Id": id },
+          signal: controller.signal,
+        });
+        if (!response.ok || !response.body) {
+          throw new Error(`events failed: HTTP ${response.status}`);
+        }
+        await readEventStream(response.body);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          addMessage("error", "Соединение с сервером потеряно. Обновите страницу.");
+        }
+      }
+    }
+
+    function disconnect() {
+      if (eventsAbort) {
+        eventsAbort.abort();
+        eventsAbort = null;
+      }
     }
 
     nameEl.value = localStorage.getItem(NAME_KEY) || "";
     renderGreeting();
+    connect();
 
     nameEl.addEventListener("input", () => {
-      localStorage.setItem(NAME_KEY, nameEl.value.trim());
+      localStorage.setItem(NAME_KEY, userId());
       renderGreeting();
+      connect();
     });
 
     formEl.addEventListener("submit", async (event) => {
       event.preventDefault();
       const content = textEl.value.trim();
       if (!content) return;
+      const id = userId();
+      if (!id) {
+        addMessage("error", "Сначала представьтесь — имя используется как ваш идентификатор.");
+        nameEl.focus();
+        return;
+      }
       addMessage("user", content);
       textEl.value = "";
       setRunning(true);
       try {
-        await fetch(`/api/conversations/${conversationId}/messages`, {
+        await fetch("/api/dialog/messages", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "X-User-Id": id },
           body: JSON.stringify({ content }),
         });
       } catch (error) {
@@ -278,14 +330,13 @@
 
     stopEl.addEventListener("click", async () => {
       try {
-        await fetch(`/api/conversations/${conversationId}/cancel`, { method: "POST" });
+        await fetch("/api/dialog/cancel", {
+          method: "POST",
+          headers: { "X-User-Id": userId() },
+        });
       } catch (error) {
         addMessage("error", "Не удалось остановить выполнение.");
       }
-    });
-
-    ensureConversation().then(connect).catch(() => {
-      addMessage("error", "Не удалось создать диалог. Обновите страницу.");
     });
   </script>
 </body>

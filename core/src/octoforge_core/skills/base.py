@@ -25,7 +25,9 @@ class SkillSpec:
 class SkillContext:
     """Per-invocation context available to skills."""
 
-    conversation_id: str
+    user_id: str
+    channel: str
+    dialog_id: str
 
 
 class Skill(Protocol):

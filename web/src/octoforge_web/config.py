@@ -8,6 +8,7 @@ ENV_FILE = ".env"
 DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
 DEFAULT_AGENT_MAX_ITERATIONS = 10
+DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./octoforge.db"
 
 
 class Settings(BaseSettings):
@@ -19,6 +20,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = DEFAULT_LLM_MODEL
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS
+    database_url: str = DEFAULT_DATABASE_URL
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

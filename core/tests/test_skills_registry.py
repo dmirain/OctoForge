@@ -11,7 +11,7 @@ from octoforge_core.skills.registry import SkillRegistry
 SKILL_NAME = "dummy"
 OTHER_SKILL_NAME = "other"
 UNKNOWN_SKILL_NAME = "missing"
-CTX = SkillContext(conversation_id="conv-test")
+CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 
 
 class DummySkill:

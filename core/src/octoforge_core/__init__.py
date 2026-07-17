@@ -1,7 +1,6 @@
 """OctoForge agent core library."""
 
 from octoforge_core.agent.control import LoopControl
-from octoforge_core.agent.errors import ConversationNotFoundError
 from octoforge_core.agent.events import (
     AssistantMessage,
     Cancelled,
@@ -17,7 +16,10 @@ from octoforge_core.agent.events import (
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.runner import ConversationEvent, ConversationManager, ConversationRunner
 from octoforge_core.config import LLMConfig
-from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
+from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.errors import DialogNotFoundError
+from octoforge_core.db.repositories import DialogRepository, MessageRepository, SqlAlchemyTaskStore
+from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.ports import LLMClient, TaskStore
 from octoforge_core.skills.base import Skill, SkillContext, SkillOrigin, SkillSpec
@@ -37,8 +39,10 @@ __all__ = [
     "ChatMessage",
     "ConversationEvent",
     "ConversationManager",
-    "ConversationNotFoundError",
     "ConversationRunner",
+    "Dialog",
+    "DialogNotFoundError",
+    "DialogRepository",
     "DuplicateSkillError",
     "Failed",
     "Finished",
@@ -48,6 +52,7 @@ __all__ = [
     "LLMResponseError",
     "LoopControl",
     "LoopEvent",
+    "MessageRepository",
     "MessageRole",
     "Skill",
     "SkillArgumentsError",
@@ -56,6 +61,7 @@ __all__ = [
     "SkillOrigin",
     "SkillRegistry",
     "SkillSpec",
+    "SqlAlchemyTaskStore",
     "Task",
     "TaskKind",
     "TaskStatus",
@@ -65,5 +71,8 @@ __all__ = [
     "ToolCallCompleted",
     "ToolCallFailed",
     "ToolCallRequested",
+    "create_engine",
+    "create_session_factory",
+    "init_db",
     "utc_now",
 ]

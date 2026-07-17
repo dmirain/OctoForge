@@ -16,8 +16,8 @@ from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.runner import TaskRunner
 from octoforge_core.tasks.store import InMemoryTaskStore
 
-CTX = SkillContext(conversation_id="conv-1")
-OTHER_CTX = SkillContext(conversation_id="conv-2")
+CTX = SkillContext(user_id="user-1", channel="web", dialog_id="dlg-1")
+OTHER_CTX = SkillContext(user_id="user-2", channel="web", dialog_id="dlg-2")
 PROMPT_CONTENT = "solve 2+2"
 SOLVED = "4"
 FAILURE_MESSAGE = "llm down"
@@ -75,18 +75,31 @@ async def wait_for_status(store: InMemoryTaskStore, task_id: str, status: TaskSt
     return await asyncio.wait_for(_wait(), timeout=TIMEOUT_SECONDS)
 
 
+def make_task(ctx: SkillContext = CTX, title: str = "t") -> Task:
+    return Task(
+        dialog_id=ctx.dialog_id,
+        user_id=ctx.user_id,
+        channel=ctx.channel,
+        title=title,
+        kind=TaskKind.PROMPT,
+        input={"prompt": PROMPT_CONTENT},
+    )
+
+
 async def test_task_spawn_creates_pending_task() -> None:
     store = InMemoryTaskStore()
     skill = TaskSpawnSkill(store=store)
 
     output = await skill.execute({"title": "t", "prompt": PROMPT_CONTENT}, CTX)
 
-    tasks = await store.list(CTX.conversation_id)
+    tasks = await store.list(CTX.dialog_id)
     assert len(tasks) == 1
     task = tasks[0]
     assert task.status is TaskStatus.PENDING
     assert task.kind is TaskKind.PROMPT
     assert task.input == {"prompt": PROMPT_CONTENT}
+    assert task.dialog_id == CTX.dialog_id
+    assert task.user_id == CTX.user_id
     assert task.id in output
     assert task.created_at.tzinfo is not None
 
@@ -116,12 +129,7 @@ async def test_runner_executes_prompt_task_and_notifies() -> None:
         on_task_done=on_done,
         poll_interval_seconds=POLL_SECONDS,
     )
-    task = Task(
-        conversation_id=CTX.conversation_id,
-        title="t",
-        kind=TaskKind.PROMPT,
-        input={"prompt": PROMPT_CONTENT},
-    )
+    task = make_task()
     await store.add(task)
     worker = asyncio.create_task(runner.run_forever())
     try:
@@ -130,6 +138,7 @@ async def test_runner_executes_prompt_task_and_notifies() -> None:
         worker.cancel()
 
     assert stored.result == SOLVED
+    assert stored.started_at is not None
     assert stored.finished_at is not None
     assert stored.finished_at.tzinfo is not None
     assert [t.id for t in done] == [task.id]
@@ -148,12 +157,7 @@ async def test_runner_marks_task_failed() -> None:
         on_task_done=on_done,
         poll_interval_seconds=POLL_SECONDS,
     )
-    task = Task(
-        conversation_id=CTX.conversation_id,
-        title="t",
-        kind=TaskKind.PROMPT,
-        input={"prompt": PROMPT_CONTENT},
-    )
+    task = make_task()
     await store.add(task)
     worker = asyncio.create_task(runner.run_forever())
     try:
@@ -164,17 +168,11 @@ async def test_runner_marks_task_failed() -> None:
     assert stored.error == FAILURE_MESSAGE
 
 
-async def test_task_list_scoped_by_conversation() -> None:
+async def test_task_list_scoped_by_dialog() -> None:
     store = InMemoryTaskStore()
-    await store.add(
-        Task(conversation_id=CTX.conversation_id, title="a", kind=TaskKind.PROMPT, input={})
-    )
-    await store.add(
-        Task(conversation_id=CTX.conversation_id, title="b", kind=TaskKind.PROMPT, input={})
-    )
-    await store.add(
-        Task(conversation_id=OTHER_CTX.conversation_id, title="c", kind=TaskKind.PROMPT, input={})
-    )
+    await store.add(make_task(title="a"))
+    await store.add(make_task(title="b"))
+    await store.add(make_task(ctx=OTHER_CTX, title="c"))
     skill = TaskListSkill(store=store)
 
     own = await skill.execute({}, CTX)
@@ -190,3 +188,13 @@ async def test_task_list_empty() -> None:
     skill = TaskListSkill(store=InMemoryTaskStore())
 
     assert await skill.execute({}, CTX) == NO_TASKS_MESSAGE
+
+
+async def test_mark_delivered_sets_flag() -> None:
+    store = InMemoryTaskStore()
+    task = make_task()
+    await store.add(task)
+
+    await store.mark_delivered(task.id)
+
+    assert (await store.get(task.id)).result_delivered is True

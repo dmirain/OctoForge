@@ -1,0 +1,307 @@
+"""Tests for the SQLAlchemy persistence layer on in-memory SQLite."""
+
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.errors import DialogNotFoundError
+from octoforge_core.db.models import MessageRow
+from octoforge_core.db.repositories import (
+    DialogRepository,
+    MessageRepository,
+    SqlAlchemyTaskStore,
+)
+from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
+from octoforge_core.tasks.errors import TaskNotFoundError
+from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+
+MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+USER_ID = "user-1"
+OTHER_USER_ID = "user-2"
+CHANNEL = "web"
+OTHER_CHANNEL = "telegram"
+DIALOG_ID = "dlg-1"
+OTHER_DIALOG_ID = "dlg-2"
+TASK_TITLE = "research"
+TASK_RESULT = "42"
+TASK_ERROR = "boom"
+EXPECTED_DIALOG_COUNT = 3
+OWN_TASK_COUNT = 2
+FIRST_SEQ = 1
+SECOND_SEQ = 2
+THIRD_SEQ = 3
+CREATED_EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
+CREATED_LATER = datetime(2026, 1, 2, tzinfo=UTC)
+TOOL_CALL = ToolCall(id="call-1", name="http_request", arguments={"url": "https://example.com"})
+
+
+@pytest.fixture
+async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_engine(MEMORY_DATABASE_URL)
+    await init_db(engine)
+    yield create_session_factory(engine)
+    await engine.dispose()
+
+
+def make_task(
+    dialog_id: str = DIALOG_ID,
+    user_id: str = USER_ID,
+    title: str = TASK_TITLE,
+    created_at: datetime = CREATED_EARLIER,
+) -> Task:
+    return Task(
+        dialog_id=dialog_id,
+        user_id=user_id,
+        channel=CHANNEL,
+        title=title,
+        kind=TaskKind.PROMPT,
+        input={"prompt": "solve 2+2"},
+        created_at=created_at,
+    )
+
+
+async def test_get_or_create_creates_then_reuses_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = DialogRepository(session_factory)
+
+    first = await repo.get_or_create(USER_ID, CHANNEL)
+    second = await repo.get_or_create(USER_ID, CHANNEL)
+
+    assert first.id == second.id
+    assert second.user_id == USER_ID
+    assert second.channel == CHANNEL
+
+
+async def test_dialogs_are_unique_per_user_and_channel(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = DialogRepository(session_factory)
+
+    base = await repo.get_or_create(USER_ID, CHANNEL)
+    other_user = await repo.get_or_create(OTHER_USER_ID, CHANNEL)
+    other_channel = await repo.get_or_create(USER_ID, OTHER_CHANNEL)
+
+    assert len({base.id, other_user.id, other_channel.id}) == EXPECTED_DIALOG_COUNT
+
+
+async def test_get_returns_dialog_by_id(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    repo = DialogRepository(session_factory)
+    created = await repo.get_or_create(USER_ID, CHANNEL)
+
+    fetched = await repo.get(created.id)
+
+    assert fetched == created
+
+
+async def test_get_unknown_dialog_raises(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    repo = DialogRepository(session_factory)
+
+    with pytest.raises(DialogNotFoundError):
+        await repo.get("missing")
+
+
+async def test_dialog_timestamps_round_trip_as_utc(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = DialogRepository(session_factory)
+    created = await repo.get_or_create(USER_ID, CHANNEL)
+
+    fetched = await repo.get(created.id)
+
+    assert fetched.created_at.tzinfo == UTC
+    assert fetched.updated_at.tzinfo == UTC
+
+
+async def test_messages_get_monotonic_seq_and_order(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="two"))
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="three"))
+
+    stored = await messages.list(dialog.id)
+    assert [m.content for m in stored] == ["one", "two", "three"]
+    assert [m.role for m in stored] == [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.USER]
+    async with session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(MessageRow).where(MessageRow.dialog_id == dialog.id).order_by(MessageRow.seq)
+            )
+        ).all()
+    assert [row.seq for row in rows] == [FIRST_SEQ, SECOND_SEQ, THIRD_SEQ]
+    assert all(row.created_at.tzinfo == UTC for row in rows)
+
+
+async def test_message_tool_calls_round_trip(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    await messages.append(
+        dialog.id,
+        ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=(TOOL_CALL,)),
+    )
+    await messages.append(
+        dialog.id,
+        ChatMessage(role=MessageRole.TOOL, content="output", tool_call_id=TOOL_CALL.id),
+    )
+
+    stored = await messages.list(dialog.id)
+    assert stored[0].tool_calls == (TOOL_CALL,)
+    assert stored[0].tool_call_id is None
+    assert stored[1].tool_calls == ()
+    assert stored[1].tool_call_id == TOOL_CALL.id
+
+
+async def test_messages_are_isolated_per_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    first = await dialogs.get_or_create(USER_ID, CHANNEL)
+    second = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
+
+    await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="private"))
+
+    assert await messages.list(second.id) == []
+
+
+async def test_task_add_and_get(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    task = make_task()
+
+    await store.add(task)
+    stored = await store.get(task.id)
+
+    assert stored.id == task.id
+    assert stored.dialog_id == task.dialog_id
+    assert stored.user_id == task.user_id
+    assert stored.status is TaskStatus.PENDING
+    assert stored.kind is TaskKind.PROMPT
+    assert stored.result_delivered is False
+    assert stored.created_at.tzinfo == UTC
+
+
+async def test_get_unknown_task_raises(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+
+    with pytest.raises(TaskNotFoundError):
+        await store.get("missing")
+
+
+async def test_task_list_scoped_by_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    await store.add(make_task(title="a"))
+    await store.add(make_task(title="b"))
+    await store.add(make_task(dialog_id=OTHER_DIALOG_ID, user_id=OTHER_USER_ID, title="c"))
+
+    own = await store.list(DIALOG_ID)
+    other = await store.list(OTHER_DIALOG_ID)
+
+    assert [task.title for task in own] == ["a", "b"]
+    assert len(own) == OWN_TASK_COUNT
+    assert [task.title for task in other] == ["c"]
+
+
+async def test_next_pending_returns_oldest_pending(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    older = make_task(title="older", created_at=CREATED_EARLIER)
+    newer = make_task(title="newer", created_at=CREATED_LATER)
+    await store.add(newer)
+    await store.add(older)
+
+    pending = await store.next_pending()
+
+    assert pending is not None
+    assert pending.title == "older"
+
+
+async def test_next_pending_empty_when_nothing_pending(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    task = make_task()
+    await store.add(task)
+    await store.mark_running(task)
+
+    assert await store.next_pending() is None
+
+
+async def test_mark_running_sets_status_and_started_at(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    task = make_task()
+    await store.add(task)
+
+    await store.mark_running(task)
+
+    stored = await store.get(task.id)
+    assert stored.status is TaskStatus.RUNNING
+    assert stored.started_at is not None
+    assert stored.started_at.tzinfo == UTC
+    assert task.status is TaskStatus.RUNNING
+
+
+async def test_mark_done_sets_result_and_finished_at(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    task = make_task()
+    await store.add(task)
+
+    await store.mark_done(task, TASK_RESULT)
+
+    stored = await store.get(task.id)
+    assert stored.status is TaskStatus.DONE
+    assert stored.result == TASK_RESULT
+    assert stored.finished_at is not None
+    assert stored.finished_at.tzinfo == UTC
+    assert task.result == TASK_RESULT
+
+
+async def test_mark_failed_sets_error(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    task = make_task()
+    await store.add(task)
+
+    await store.mark_failed(task, TASK_ERROR)
+
+    stored = await store.get(task.id)
+    assert stored.status is TaskStatus.FAILED
+    assert stored.error == TASK_ERROR
+    assert stored.finished_at is not None
+
+
+async def test_mark_delivered_sets_flag(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    task = make_task()
+    await store.add(task)
+
+    await store.mark_delivered(task.id)
+
+    assert (await store.get(task.id)).result_delivered is True
+
+
+async def test_mark_delivered_unknown_task_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+
+    with pytest.raises(TaskNotFoundError):
+        await store.mark_delivered("missing")

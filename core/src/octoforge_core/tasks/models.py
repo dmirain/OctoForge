@@ -29,7 +29,9 @@ class TaskStatus(StrEnum):
 class Task:
     """A background unit of work spawned by the agent."""
 
-    conversation_id: str
+    dialog_id: str
+    user_id: str
+    channel: str
     title: str
     kind: TaskKind
     input: dict[str, Any]
@@ -37,5 +39,7 @@ class Task:
     status: TaskStatus = TaskStatus.PENDING
     result: str | None = None
     error: str | None = None
+    result_delivered: bool = False
     created_at: datetime = field(default_factory=utc_now)
+    started_at: datetime | None = None
     finished_at: datetime | None = None
