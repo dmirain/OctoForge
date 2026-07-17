@@ -21,8 +21,16 @@ from octoforge_core import (
     init_db,
 )
 from octoforge_core.agent.prompts import DEFAULT_SYSTEM_PROMPT
+from octoforge_core.instructions.local import LocalInstructionService
+from octoforge_core.instructions.seed import seed_if_empty
+from octoforge_core.llm.embeddings import OpenAIEmbeddingClient
 from octoforge_core.llm.openai import OpenAICompatibleClient
+from octoforge_core.net.external import ExternalCallExecutor
+from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.skills.basic.external_call import ExternalCallSkill
 from octoforge_core.skills.basic.http_request import HttpRequestSkill
+from octoforge_core.skills.basic.instruction_save import InstructionSaveSkill
+from octoforge_core.skills.basic.instructions_search import InstructionsSearchSkill
 from octoforge_core.skills.basic.task_list import TaskListSkill
 from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
 from octoforge_core.tasks.runner import TaskRunner
@@ -51,16 +59,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             async with (
                 httpx.AsyncClient(base_url=resolved_settings.llm_base_url) as llm_http,
-                httpx.AsyncClient() as skills_http,
+                httpx.AsyncClient(base_url=resolved_settings.embedding_base_url) as embed_http,
+                httpx.AsyncClient() as outbound_http,
             ):
                 llm_client = OpenAICompatibleClient(
                     http_client=llm_http,
                     config=resolved_settings.to_llm_config(),
                 )
+                embedder = OpenAIEmbeddingClient(
+                    http_client=embed_http,
+                    config=resolved_settings.to_embedding_config(),
+                )
+                instructions = LocalInstructionService(session_factory, embedder)
+                # Seeding needs the embeddings endpoint; without a configured key
+                # it is skipped so the app still starts (embeddings stay optional
+                # until the first instructions_search/save call).
+                if resolved_settings.embedding_api_key:
+                    await seed_if_empty(instructions)
+                guard = SsrfGuard()
+                external_executor = ExternalCallExecutor(
+                    service=instructions,
+                    http_client=outbound_http,
+                    guard=guard,
+                    auth_whitelist=resolved_settings.to_external_call_auth_whitelist(),
+                )
                 registry = SkillRegistry()
-                registry.register(HttpRequestSkill(http_client=skills_http), SkillOrigin.BASIC)
+                registry.register(
+                    HttpRequestSkill(http_client=outbound_http, guard=guard),
+                    SkillOrigin.BASIC,
+                )
                 registry.register(TaskSpawnSkill(store=task_store), SkillOrigin.BASIC)
                 registry.register(TaskListSkill(store=task_store), SkillOrigin.BASIC)
+                registry.register(
+                    InstructionsSearchSkill(
+                        service=instructions,
+                        default_k=resolved_settings.instructions_top_k,
+                    ),
+                    SkillOrigin.BASIC,
+                )
+                registry.register(InstructionSaveSkill(service=instructions), SkillOrigin.BASIC)
+                registry.register(
+                    ExternalCallSkill(executor=external_executor),
+                    SkillOrigin.BASIC,
+                )
                 loop = AgentLoop(
                     llm_client=llm_client,
                     registry=registry,

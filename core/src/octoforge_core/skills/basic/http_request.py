@@ -6,6 +6,7 @@ from typing import Any, Self
 
 import httpx
 
+from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.errors import SkillArgumentsError
 
@@ -90,14 +91,22 @@ class HttpRequestParams:
 
 
 class HttpRequestSkill:
-    """Skill that performs HTTP requests via an injected client."""
+    """Skill that performs HTTP requests via an injected client.
+
+    Redirects are not followed: the SSRF guard validates only the requested
+    URL, and following a redirect would re-enter unchecked address space.
+    (This matches the previous behavior — httpx never followed redirects here
+    by default — now made explicit.)
+    """
 
     def __init__(
         self,
         http_client: httpx.AsyncClient,
+        guard: SsrfGuard,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._http = http_client
+        self._guard = guard
         self._timeout = timeout_seconds
 
     @property
@@ -111,11 +120,13 @@ class HttpRequestSkill:
     async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
         """Validate arguments, perform the request and format the response."""
         params = HttpRequestParams.from_arguments(arguments)
+        await self._guard.check(params.url)
         response = await self._http.request(
             params.method.value,
             params.url,
             headers=params.headers,
             content=params.body,
+            follow_redirects=False,
             timeout=self._timeout,
         )
         body = response.text

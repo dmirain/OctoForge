@@ -37,7 +37,7 @@ core/                          # библиотека octoforge-core — дом�
   pyproject.toml               # deps: httpx, sqlalchemy[asyncio], aiosqlite; dev: pytest, pytest-asyncio, ruff, mypy
   src/octoforge_core/
     domain.py                  # ChatMessage, ToolCall, MessageRole, Dialog
-    config.py                  # LLMConfig
+    config.py                  # LLMConfig, EmbeddingConfig
     time.py                    # utc_now() — единая точка времени (UTC aware)
     errors.py                  # LLMResponseError
     ports.py                   # Protocol-порты: LLMClient, TaskStore
@@ -46,12 +46,14 @@ core/                          # библиотека octoforge-core — дом�
                                #   ToolCallRequested/Completed/Failed, Finished, Cancelled, Failed
       control.py               # LoopControl — mailbox инъекций + флаг отмены
       loop.py                  # AgentLoop.stream(history, control, context) → AsyncIterator[LoopEvent]
-      prompts.py               # DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn, уведомления)
+      prompts.py               # DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn, уведомления,
+                               #   instructions_search / external_call / instruction_save)
       runner.py                # ConversationRunner (актор), ConversationManager, ConversationEvent
     skills/
       base.py                  # Skill (Protocol), SkillSpec, SkillOrigin (BASIC|DYNAMIC), SkillContext
       registry.py, errors.py   # реестр + ошибки
-      basic/                   # http_request.py, task_spawn.py, task_list.py
+      basic/                   # http_request.py, task_spawn.py, task_list.py,
+                               # instructions_search.py, instruction_save.py, external_call.py
     tasks/
       models.py                # Task, TaskKind (SKILL|PROMPT), TaskStatus (PENDING|RUNNING|DONE|FAILED)
       store.py                 # InMemoryTaskStore (реализация порта TaskStore, для тестов)
@@ -66,23 +68,42 @@ core/                          # библиотека octoforge-core — дом�
     llm/
       events.py                # StreamEvent: TextDelta | StreamFinished
       openai.py                # OpenAI-совместимый клиент: complete() + stream() (SSE, tools)
+      embeddings.py            # OpenAI-совместимый клиент эмбеддингов (POST /embeddings)
+    instructions/              # обособленный модуль инструкций (только хранение/поиск/ранг)
+      api.py                   # граница модуля: InstructionService (Protocol), Instruction,
+                               #   InstructionType, SearchHit, InstructionNotFoundError
+      models.py                # InstructionRow — таблица instructions, собственность модуля
+      store.py                 # SQL-стор (сессии через async_sessionmaker, DI)
+      embedding.py             # EmbeddingClient (Protocol-порт эмбеддера)
+      ranking.py               # чистые функции: cosine + буст точного title
+      local.py                 # LocalInstructionService — локальная реализация фасада
+      seed.py                  # SEED_INSTRUCTIONS + seed_if_empty (generic http tool + скилы-примеры)
+    net/                       # исполнение внешних вызовов (core-сторона, вне модуля)
+      guard.py                 # SsrfGuard: resolve хоста (resolver инъектируется) → ipaddress-проверки
+      tool_spec.py             # ToolSpec + parse_tool_spec (JSON-формат tool-записи)
+      external.py              # ExternalCallExecutor: шаблоны, whitelist-авторизация, SSRF-гвард
+      errors.py                # SsrfBlockedError, ToolSpecError, ExternalCallError
     # дальше: skills/dynamic/ (Jinja-движок), память
   tests/                       # test_agent_loop, test_conversation_runner, test_db_repositories,
-                               # test_http_request_skill, test_openai_client, test_openai_stream,
-                               # test_skills_registry, test_tasks
+                               # test_embeddings, test_external_call, test_http_request_skill,
+                               # test_instruction_skills, test_instructions_local,
+                               # test_openai_client, test_openai_stream, test_skills_registry,
+                               # test_ssrf_guard, test_tasks
 web/                           # приложение octoforge-web — FastAPI-обёртка
   pyproject.toml               # deps: octoforge-core, fastapi, uvicorn, pydantic-settings
   src/octoforge_web/
-    main.py                    # app factory + composition root (DI: БД, LLM, реестр, акторы,
-                               #   TaskRunner; канал "web")
-    config.py                  # Settings (env с префиксом OF_, включая OF_DATABASE_URL)
+    main.py                    # app factory + composition root (DI: БД, LLM, эмбеддер, реестр,
+                               #   исполнитель external_call, акторы, TaskRunner; канал "web")
+    config.py                  # Settings (env с префиксом OF_, включая OF_DATABASE_URL,
+                               #   OF_EMBEDDING_*, OF_INSTRUCTIONS_TOP_K,
+                               #   OF_EXTERNAL_CALL_AUTH_WHITELIST)
     deps.py                    # провайдеры зависимостей из app.state + заголовок X-User-Id
     api/
       dialog.py                # messages/cancel/events(SSE) по (user_id, channel)
       sse.py                   # сериализация LoopEvent → SSE-кадры
       schemas.py               # pydantic-схемы запросов/ответов
     static/index.html          # чат-UI: SSE-стрим, шаги скилов, кнопка «Стоп», поле имени (= user_id)
-  tests/                       # test_dialog_api.py, test_sse.py
+  tests/                       # test_dialog_api.py, test_sse.py, test_config.py
 ```
 
 ## Петля агента: события, управление, актор
@@ -142,7 +163,10 @@ web/                           # приложение octoforge-web — FastAPI-
 
 `DEFAULT_SYSTEM_PROMPT`: отвечать «сначала суть, потом детали» (прерывание полезно),
 «в фоне» → `task_spawn` и продолжить диалог, при system-уведомлении о задаче — коротко
-сообщить результат, для HTTP — `http_request`, статусы задач — `task_list`.
+сообщить результат, для HTTP — `http_request`, статусы задач — `task_list`; перед
+нетривиальной задачей — `instructions_search` (знания/сценарии/тулы), вызов найденных
+тулов — через `external_call`, после нового многошагового сценария — сохранить его
+через `instruction_save`.
 
 ### Стриминг LLM (`llm/openai.py`)
 
@@ -181,7 +205,8 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 Скил — единица, которую агент вызывает через LLM tool calling. Два типа:
 
 - **Базовые (`SkillOrigin.BASIC`)** — код проекта (`octoforge_core/skills/basic/`): `http_request`,
-  `task_spawn`, `task_list`. Подключаются в composition root.
+  `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`.
+  Подключаются в composition root.
 - **Динамические (`SkillOrigin.DYNAMIC`)** — Jinja-шаблоны из БД (появятся с БД). Реестр един:
   `SkillRegistry` хранит скилы обоих типов под уникальными именами.
 
@@ -212,6 +237,38 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 - `memory.store / memory.search / memory.delete` — скоп `user` или `global` (enum MemoryScope)
 - `skill.list / skill.run / skill.save / skill.delete` — каталог и запись динамических скилов
 
+## Инструкции и внешние вызовы (этап B)
+
+Модель типов (знание/скил/тул, модульность, безопасность) — в [instructions.md](instructions.md).
+Реализация:
+
+- **Модуль `instructions/`** — самодостаточный: хранит, ищет и ранжирует записи трёх типов.
+  Граница — `api.py` (Protocol `InstructionService`: `search`/`save`/`get_by_name`, DTO
+  JSON-совместимые под будущую HTTP-границу). Локальная реализация `LocalInstructionService`:
+  таблица `instructions` (собственность модуля), эмбеддинг `title + "\n" + content` через порт
+  `EmbeddingClient` (OpenAI-совместимый клиент `llm/embeddings.py`), ранжирование — brute-force
+  cosine + буст точного `title` (`ranking.py`, чистые функции; полная формула 70/30 + MMR —
+  позже подменой модуля). `search` инкрементирует `usage_count` возвращённых хитов.
+  Сидирование `seed_if_empty` (generic weather tool + два скила-примера) — в lifespan;
+  запускается только при настроенном `OF_EMBEDDING_API_KEY` (без ключа приложение стартует
+  без сидов — эмбеддинги остаются опциональными до первого вызова search/save).
+- **Исполнение — вне модуля** (`net/`): `ExternalCallExecutor` читает tool-запись через
+  `get_by_name`, парсит `ToolSpec` (JSON: method, url_template, params_schema, auth),
+  валидирует параметры по схеме (required присутствуют, неизвестные запрещены), рендерит
+  url-шаблон подстановкой с `urllib.parse.quote`, проверяет URL гвардом, подставляет
+  служебную авторизацию только для белого списка base-url-префиксов (конфиг composition
+  root, `OF_EXTERNAL_CALL_AUTH_WHITELIST`) и выполняет запрос с `follow_redirects=False`
+  (редирект обошёл бы проверку гварда). Тело ответа режется до 8000 символов.
+- **SSRF-гвард** (`net/guard.py`): resolve хоста (resolver инъектируется, в тестах — stub)
+  → отказ, если ЛЮБОЙ из адресов private/loopback/link-local (включая 169.254.169.254)/
+  multicast/reserved/unspecified или не globally-routable (CGNAT 100.64/10). Применён в
+  `ExternalCallExecutor` и в скиле `http_request` (там тоже `follow_redirects=False` —
+  поведение не изменилось, httpx и раньше не следовал редиректам по умолчанию). Известное
+  ограничение TOCTOU/DNS-rebinding задокументировано в docstring гварда.
+- **Рантайм-скилы** — тонкие адаптеры: `instructions_search(query, k?)` (k по умолчанию —
+  `OF_INSTRUCTIONS_TOP_K`), `instruction_save(type, title, content, tags?)`,
+  `external_call(name, params?)`.
+
 ## Модель данных
 
 ORM-модели — в `octoforge_core/db/models.py`; доменные объекты — в `octoforge_core/domain.py`
@@ -227,14 +284,18 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - **tasks**: `id`, `dialog_id` FK (index), `user_id` (index), `channel`, `kind`, `title`,
   `input` (JSON), `status`, `result`, `error`, `result_delivered` (bool, default False),
   `created_at`, `started_at`, `finished_at`
+- **instructions** (таблица модуля `instructions/`, см. выше): `id` (uuid str PK), `type`
+  (knowledge|skill|tool, index), `title` (index), `content` (Text), `embedding` (JSON
+  list[float]), `tags` (JSON list[str]), `version`, `usage_count`, `success_count`,
+  `created_at`, `updated_at`; unique (`type`, `title`)
 
 Все `*_at` — timezone-aware UTC: `UTCDateTime` (`db/base.py`) принудительно выставляет UTC при
 чтении/записи (SQLite возвращает naive datetime). Создание схемы — `init_db` (`create_all`) в
 lifespan; Alembic появится при первой деструктивной миграции.
 
 План следующих этапов: **memories** (`user_id` nullable = global, `key`, `content`, `tags` JSON,
-даты; unique (`user_id`, `key`)) и **instructions** (знание/скил/тул + embedding) — см.
-[instructions.md](instructions.md), [data-store.md](data-store.md).
+даты; unique (`user_id`, `key`)) и **datasets** (дескрипторы + записи пользовательских данных) —
+см. [instructions.md](instructions.md), [data-store.md](data-store.md).
 
 ## API (`octoforge_web/api/`)
 
@@ -275,6 +336,22 @@ lifespan; Alembic появится при первой деструктивно�
 - `core/tests/test_tasks.py` — spawn/валидация, runner DONE/FAILED + колбэк, task_list по диалогу,
   mark_delivered, UTC-даты
 - `core/tests/test_http_request_skill.py`, `core/tests/test_skills_registry.py`
+- `core/tests/test_instructions_local.py` — контрактный набор фасада на `:memory:` (save/upsert
+  с бампом версии и пересчётом эмбеддинга, get_by_name с сужением по типу, ранжирование:
+  ближний вектор, буст точного title, k, инкремент usage_count, сидирование один раз);
+  сервис строится фабрикой-фикстурой — тот же набор позже прогонит http-реализацию
+- `core/tests/test_embeddings.py` — клиент эмбеддингов поверх мокнутого httpx-транспорта
+  (форма запроса, разбор ответа с переупорядочиванием по index, ошибки статуса и payload)
+- `core/tests/test_external_call.py` — парсинг/валидация ToolSpec, рендер шаблона с quoting,
+  валидация параметров, whitelist-заголовок только для своего префикса, блок SSRF,
+  редирект не следуется, обрезка тела
+- `core/tests/test_ssrf_guard.py` — stub-resolver: private/loopback/link-local/multicast/CGNAT/
+  IPv6 заблокированы, публичные разрешены, любой приватный из многих блокирует, неразрешимый
+  хост и не-http(s) URL заблокированы
+- `core/tests/test_instruction_skills.py` — адаптеры `instructions_search`/`instruction_save`/
+  `external_call` (валидация аргументов + happy path на фейках)
+- `web/tests/test_config.py` — Settings: дефолты OF_EMBEDDING_*/top-k/whitelist, парсинг
+  JSON-whitelist из env
 - `web/tests/test_dialog_api.py` — get-or-create диалога, изоляция двух user_id, 400 без
   `X-User-Id`, messages/cancel/events (SSE через генератор), health, UI
 - `web/tests/test_sse.py` — сериализация событий в SSE-кадры

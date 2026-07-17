@@ -15,7 +15,7 @@ from octoforge_core.agent.events import (
 )
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.runner import ConversationEvent, ConversationManager, ConversationRunner
-from octoforge_core.config import LLMConfig
+from octoforge_core.config import EmbeddingConfig, LLMConfig
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.errors import DialogNotFoundError
 from octoforge_core.db.repositories import DialogRepository, MessageRepository, SqlAlchemyTaskStore
@@ -44,6 +44,7 @@ __all__ = [
     "DialogNotFoundError",
     "DialogRepository",
     "DuplicateSkillError",
+    "EmbeddingConfig",
     "Failed",
     "Finished",
     "IterationStarted",

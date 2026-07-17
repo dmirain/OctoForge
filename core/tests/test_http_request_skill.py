@@ -6,6 +6,8 @@ from http import HTTPStatus
 import httpx
 import pytest
 
+from octoforge_core.net.errors import SsrfBlockedError
+from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.skills.base import SkillContext
 from octoforge_core.skills.basic.http_request import (
     MAX_RESPONSE_CHARS,
@@ -17,12 +19,28 @@ from octoforge_core.skills.errors import SkillArgumentsError
 
 TARGET_URL = "https://api.example.com/data"
 RESPONSE_BODY = "hello body"
+PUBLIC_IP = "93.184.216.34"
+PRIVATE_IP = "10.0.0.1"
 CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 
 
-def make_skill(handler: Callable[[httpx.Request], httpx.Response]) -> HttpRequestSkill:
+class StubResolver:
+    """HostResolver returning a scripted set of addresses."""
+
+    def __init__(self, ips: tuple[str, ...]) -> None:
+        self._ips = ips
+
+    async def resolve(self, host: str) -> tuple[str, ...]:
+        return self._ips
+
+
+def make_skill(
+    handler: Callable[[httpx.Request], httpx.Response],
+    ips: tuple[str, ...] = (PUBLIC_IP,),
+) -> HttpRequestSkill:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return HttpRequestSkill(http_client=client)
+    guard = SsrfGuard(resolver=StubResolver(ips))
+    return HttpRequestSkill(http_client=client, guard=guard)
 
 
 def test_spec_advertised_to_llm() -> None:
@@ -80,6 +98,20 @@ async def test_error_status_returned_not_raised() -> None:
     result = await skill.execute({"method": "GET", "url": TARGET_URL}, CTX)
 
     assert result == f"HTTP {HTTPStatus.NOT_FOUND}\nnope"
+
+
+async def test_ssrf_block_prevents_the_request() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK)
+
+    skill = make_skill(handler, ips=(PRIVATE_IP,))
+
+    with pytest.raises(SsrfBlockedError):
+        await skill.execute({"method": "GET", "url": TARGET_URL}, CTX)
+    assert captured == []
 
 
 async def test_long_body_is_truncated() -> None:
