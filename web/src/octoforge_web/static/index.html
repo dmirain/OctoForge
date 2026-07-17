@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OctoForge — чат</title>
+  <style>
+    :root {
+      --bg: #0f1420;
+      --panel: #1a2233;
+      --accent: #4f8cff;
+      --text: #e6ebf5;
+      --muted: #8b96ab;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .app {
+      width: 100%;
+      max-width: 760px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      padding: 16px;
+      gap: 12px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    header h1 {
+      font-size: 20px;
+      margin: 0;
+    }
+    #greeting {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    #name-input {
+      margin-left: auto;
+      background: var(--panel);
+      border: 1px solid var(--muted);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 6px 10px;
+      width: 180px;
+    }
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 8px;
+      background: var(--panel);
+      border-radius: 12px;
+    }
+    .msg {
+      max-width: 80%;
+      padding: 8px 12px;
+      border-radius: 12px;
+      white-space: pre-wrap;
+      line-height: 1.4;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--accent);
+      color: #fff;
+    }
+    .msg.assistant {
+      align-self: flex-start;
+      background: #2a3550;
+    }
+    .msg.assistant.interrupted {
+      opacity: 0.7;
+      border: 1px dashed var(--muted);
+    }
+    .msg.error {
+      align-self: flex-start;
+      background: #5c2731;
+    }
+    .step {
+      align-self: flex-start;
+      color: var(--muted);
+      font-size: 12px;
+      font-family: ui-monospace, monospace;
+      white-space: pre-wrap;
+    }
+    #composer {
+      display: flex;
+      gap: 8px;
+    }
+    #text {
+      flex: 1;
+      background: var(--panel);
+      border: 1px solid var(--muted);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 10px;
+      font-size: 15px;
+    }
+    button {
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      padding: 10px 18px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    #send { background: var(--accent); }
+    #stop {
+      background: #5c2731;
+      display: none;
+    }
+    #stop.visible { display: block; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>OctoForge</h1>
+      <span id="greeting"></span>
+      <input id="name-input" type="text" placeholder="Как вас зовут?" />
+    </header>
+    <div id="messages"></div>
+    <form id="composer">
+      <input id="text" type="text" placeholder="Сообщение..." autocomplete="off" />
+      <button id="send" type="submit">Отправить</button>
+      <button id="stop" type="button">Стоп</button>
+    </form>
+  </div>
+
+  <script>
+    "use strict";
+
+    const NAME_KEY = "octoforge.userName";
+    const CONVERSATION_KEY = "octoforge.conversationId";
+
+    const messagesEl = document.getElementById("messages");
+    const formEl = document.getElementById("composer");
+    const textEl = document.getElementById("text");
+    const stopEl = document.getElementById("stop");
+    const nameEl = document.getElementById("name-input");
+    const greetingEl = document.getElementById("greeting");
+
+    let conversationId = localStorage.getItem(CONVERSATION_KEY);
+    let currentBubble = null;
+
+    function renderGreeting() {
+      const name = nameEl.value.trim();
+      greetingEl.textContent = name ? `Привет, ${name}!` : "";
+    }
+
+    function scrollToBottom() {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function addMessage(role, content) {
+      const div = document.createElement("div");
+      div.className = `msg ${role}`;
+      div.textContent = content;
+      messagesEl.appendChild(div);
+      scrollToBottom();
+      return div;
+    }
+
+    function addStep(content) {
+      const div = document.createElement("div");
+      div.className = "step";
+      div.textContent = content;
+      messagesEl.appendChild(div);
+      scrollToBottom();
+    }
+
+    function appendDelta(text) {
+      if (!currentBubble) {
+        currentBubble = addMessage("assistant", "");
+      }
+      currentBubble.textContent += text;
+      scrollToBottom();
+    }
+
+    function finalizeBubble(content, interrupted) {
+      if (!currentBubble) {
+        currentBubble = addMessage("assistant", "");
+      }
+      currentBubble.textContent = content;
+      if (interrupted) {
+        currentBubble.classList.add("interrupted");
+      }
+      currentBubble = null;
+    }
+
+    function setRunning(running) {
+      stopEl.classList.toggle("visible", running);
+    }
+
+    function handleEvent(event) {
+      switch (event.type) {
+        case "text_delta":
+          appendDelta(event.text);
+          break;
+        case "assistant_message":
+          finalizeBubble(event.content, event.interrupted);
+          break;
+        case "tool_call_requested":
+          setRunning(true);
+          addStep(`→ ${event.name} ${JSON.stringify(event.arguments)}`);
+          break;
+        case "tool_call_completed":
+          addStep(`← ${event.name}: ${event.output.slice(0, 200)}`);
+          break;
+        case "tool_call_failed":
+          addStep(`✕ ${event.name}: ${event.error}`);
+          break;
+        case "finished":
+          setRunning(false);
+          break;
+        case "cancelled":
+          setRunning(false);
+          break;
+        case "failed":
+          addMessage("error", event.error);
+          setRunning(false);
+          break;
+      }
+    }
+
+    function connect() {
+      const source = new EventSource(`/api/conversations/${conversationId}/events`);
+      source.onmessage = (message) => handleEvent(JSON.parse(message.data));
+    }
+
+    async function ensureConversation() {
+      if (conversationId) return;
+      const response = await fetch("/api/conversations", { method: "POST" });
+      const data = await response.json();
+      conversationId = data.id;
+      localStorage.setItem(CONVERSATION_KEY, conversationId);
+    }
+
+    nameEl.value = localStorage.getItem(NAME_KEY) || "";
+    renderGreeting();
+
+    nameEl.addEventListener("input", () => {
+      localStorage.setItem(NAME_KEY, nameEl.value.trim());
+      renderGreeting();
+    });
+
+    formEl.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const content = textEl.value.trim();
+      if (!content) return;
+      addMessage("user", content);
+      textEl.value = "";
+      setRunning(true);
+      try {
+        await fetch(`/api/conversations/${conversationId}/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content }),
+        });
+      } catch (error) {
+        addMessage("error", "Не удалось отправить сообщение.");
+        setRunning(false);
+      }
+      textEl.focus();
+    });
+
+    stopEl.addEventListener("click", async () => {
+      try {
+        await fetch(`/api/conversations/${conversationId}/cancel`, { method: "POST" });
+      } catch (error) {
+        addMessage("error", "Не удалось остановить выполнение.");
+      }
+    });
+
+    ensureConversation().then(connect).catch(() => {
+      addMessage("error", "Не удалось создать диалог. Обновите страницу.");
+    });
+  </script>
+</body>
+</html>
