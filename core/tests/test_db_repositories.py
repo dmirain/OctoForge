@@ -116,6 +116,21 @@ async def test_dialog_timestamps_round_trip_as_utc(
     assert fetched.updated_at.tzinfo == UTC
 
 
+async def test_list_user_ids_by_channel(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = DialogRepository(session_factory)
+    await repo.get_or_create(USER_ID, CHANNEL)
+    await repo.get_or_create(OTHER_USER_ID, CHANNEL)
+    await repo.get_or_create(USER_ID, OTHER_CHANNEL)
+
+    web_users = await repo.list_user_ids_by_channel(CHANNEL)
+    telegram_users = await repo.list_user_ids_by_channel(OTHER_CHANNEL)
+
+    assert sorted(web_users) == [USER_ID, OTHER_USER_ID]
+    assert telegram_users == [USER_ID]
+
+
 async def test_messages_get_monotonic_seq_and_order(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

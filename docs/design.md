@@ -134,22 +134,32 @@ web/                           # приложение octoforge-web — FastAPI-
   pyproject.toml               # deps: octoforge-core, fastapi, uvicorn, pydantic-settings
   src/octoforge_web/
     main.py                    # app factory + composition root (DI: БД, LLM, эмбеддер, реестр,
-                               #   исполнитель external_call, LLMRouter, акторы, крон-планировщик;
-                               #   канал "web")
+                               #   исполнитель external_call, LLMRouter, акторы, крон-планировщик,
+                               #   telegram-адаптер; канал "web")
     config.py                  # Settings (env с префиксом OF_, включая OF_DATABASE_URL,
                                #   OF_EMBEDDING_*, OF_INSTRUCTIONS_TOP_K,
                                #   OF_EXTERNAL_CALL_AUTH_WHITELIST, OF_DATASETS_QUERY_*,
                                #   OF_MEMORY_SEARCH_*, OF_MAX_PROCESSES, OF_ROUTER_TIMEOUT_SECONDS,
-                               #   OF_SELF_BASE_URL, OF_CRON_*)
+                               #   OF_SELF_BASE_URL, OF_CRON_*, OF_TELEGRAM_*)
     deps.py                    # провайдеры зависимостей из app.state + заголовок X-User-Id
     api/
       dialog.py                # messages/cancel/events(SSE) по (user_id, channel)
       cron.py                  # cron jobs CRUD + pause/resume (query-параметры, X-User-Id)
       sse.py                   # сериализация LoopEvent → SSE-кадры (включая маркеры процессов)
       schemas.py               # pydantic-схемы запросов/ответов
+    telegram/                  # Telegram-адаптер (этап G): вторая поверхность, канал "telegram"
+      models.py                # pydantic-модели Bot API (update/message/chat/user, extra=ignore)
+      client.py                # порт TelegramClient + TelegramBotClient на httpx (getUpdates,
+                               #   sendMessage, editMessageText, sendChatAction)
+      bridge.py                # TelegramBridge: события runner'а → черновик с throttle-правками,
+                               #   чанкер 4096, статус-строки скилов; текст → runner.submit
+      poller.py                # TelegramPoller (long-poll, offset, backlog-drain, backoff) +
+                               #   TelegramBridgeRegistry (get-or-create + прогрев из БД)
     static/index.html          # чат-UI: SSE-стрим, шаги скилов, маркеры процессов,
                                #   кнопка «Стоп», поле имени (= user_id)
-  tests/                       # test_dialog_api.py, test_cron_api.py, test_sse.py, test_config.py
+  tests/                       # test_dialog_api.py, test_cron_api.py, test_sse.py, test_config.py,
+                               # test_seed.py, test_telegram_models.py, test_telegram_bridge.py,
+                               # test_telegram_poller.py
 ```
 
 ## Петля агента: события, управление, актор
@@ -485,6 +495,42 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   вызов в lifespan под тем же условием `OF_EMBEDDING_API_KEY`.
 - **Промпт**: правило 11 — см. «Системный промпт».
 
+## Telegram-адаптер (этап G)
+
+Решения о поверхностях — в [dialogs.md](dialogs.md). Реализация
+(`web/src/octoforge_web/telegram/`; core про транспорт не знает):
+
+- **Транспорт**: Bot API напрямую через httpx (без aiogram): `TelegramBotClient` (порт
+  `TelegramClient`) — `getUpdates` (long poll), `sendMessage`, `editMessageText`,
+  `sendChatAction`; `ok=false` → `TelegramApiError`, «message is not modified» глушится
+  в правках. Модели (`telegram/models.py`) — pydantic, `extra="ignore"`, алиас `from`;
+  тип чата — `TelegramChatType(StrEnum)`.
+- **Поверхность**: канал `"telegram"` объявлен адаптером; `user_id = "tg:<telegram user id>"`;
+  только личные чаты (группам и не-текстовым сообщениям — короткое уведомление).
+  Идентичности web/telegram не связываются (alice ≠ tg:123) — линкинг придёт с
+  аутентификацией; память per-user работает внутри каждой идентичности.
+- **Поллер** (`telegram/poller.py`): цикл long-poll в lifespan-задаче; offset в памяти;
+  при старте backlog сливается (`offset=-1`), старые сообщения не реплеятся; httpx/API-ошибки —
+  лог + backoff, цикл живёт; «ядовитый» update редуцируется до голого `update_id`, чтобы
+  offset не встал на нём. Команды: `/start` (приветствие), `/cancel` (отмена прогона).
+- **Мост** (`telegram/bridge.py`): `TelegramBridge` на чат: постоянная подписка на события
+  runner'а (подписка ДО submit — события не реплеятся), рендер в одно «черновое» сообщение:
+  дельты текста с throttle-правками (`OF_TELEGRAM_EDIT_THROTTLE_SECONDS`), статус-строки
+  скилов (⚙️/⚠️) и маркеры ухода/возврата процессов (⏸️/▶️) в порядке прихода;
+  `ProcessCompleted` не рисуется (завершения приходят текстом репорт-прогона). Переполнение
+  лимита 4096 — seal текущего сообщения и продолжение в новом; чанкер режет по границе
+  строки/слова. Plain text без parse_mode (никаких 400 на битой разметке). Зависимость
+  моста — `RunnerProvider` (callable → runner); в composition root это
+  `ConversationManager.get_or_create_runner`.
+- **Прогрев**: при старте мосты поднимаются для всех диалогов канала telegram из БД
+  (`DialogRepository.list_user_ids_by_channel`) — иначе крон-выстрелы и уведомления задач
+  после рестарта ушли бы в пустоту (подписчиков нет); chat_id выводится из `tg:<id>`.
+- **Конфиг**: `OF_TELEGRAM_BOT_TOKEN` (пусто = адаптер выключен),
+  `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` (30), `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` (1.5).
+- **Не входит**: группы/треды, webhook-режим, медиа и файлы, parse_mode, inline-кнопки,
+  связывание идентичностей, outbox при оффлайн-инстансе ([scaling.md](scaling.md)),
+  markdown-aware чанкер с учётом code fence ([streaming.md](streaming.md) п.4).
+
 ## Модель данных
 
 ORM-модели — в `octoforge_core/db/models.py`; доменные объекты — в `octoforge_core/domain.py`
@@ -643,6 +689,16 @@ lifespan; Alembic появится при первой деструктивно�
   delete 204/404 (чужая и несуществующая), pause/resume (resume пересчитывает
   next_fire_at; чужие → 404), 400 без `X-User-Id` на всех эндпоинтах
 - `web/tests/test_sse.py` — сериализация событий в SSE-кадры (включая маркеры процессов)
+- `web/tests/test_telegram_models.py` — парсинг update'ов Bot API (лишние поля игнорируются,
+  алиас `from`, неизвестный тип чата отклоняется)
+- `web/tests/test_telegram_bridge.py` — мост на реальном manager'е (ScriptedLLM) + fake
+  TelegramClient: дельты → одно редактируемое сообщение, статус-строки скилов перед ответом,
+  чанкинг >4096 (seal и продолжение), отмена и ошибка LLM — строками в черновике; чанкер
+  `split_message` (границы строки/слова, жёсткий рез)
+- `web/tests/test_telegram_poller.py` — команды `/start`/`/cancel`, уведомления группе и
+  не-тексту, текст → диалог → ответ, offset-продвижение и backlog-drain при старте,
+  восстановление после ошибок поллинга, `chat_id_from_user_id`, прогрев мостов (только
+  tg-префиксованные user_id)
 
 План:
 
@@ -664,6 +720,7 @@ lifespan; Alembic появится при первой деструктивно�
 8. ✅ LLM-роутер и процессная модель диалога (этап E) — см. [process-model.md](process-model.md)
 9. Инструкции в БД (знание/скил/тул + векторный поиск, этап B ✅) — см. [instructions.md](instructions.md); датасеты пользовательских данных (этап C ✅) — см. [data-store.md](data-store.md); крон-задачи (этап F ✅) — см. [cron.md](cron.md)
 10. Бэклог из обзора openclaw (SSRF-гвард, формула поиска, каталог скилов, детали крона и пр.) — см. [openclaw-review.md](openclaw-review.md)
+11. ✅ Telegram-адаптер (этап G): вторая поверхность (канал "telegram", user_id = tg:<id>), long-poll на httpx, мосты с throttle-правками, прогрев из БД — см. «Telegram-адаптер (этап G)» выше
 
 ## Проверка
 

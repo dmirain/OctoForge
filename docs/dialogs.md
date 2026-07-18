@@ -1,8 +1,8 @@
 # Поверхности, диалоги и их хранение
 
-> Согласованные решения. **Статус: частично реализовано (этапы A и D)**: диалоги (user_id, channel)
+> Согласованные решения. **Статус: реализовано (этапы A, D и G)**: диалоги (user_id, channel)
 > и хранение dialogs/messages/tasks — в БД; память (таблица memories + скилы) — реализована;
-> вторая поверхность и аутентификация — позже.
+> вторая поверхность (Telegram, этап G) — реализована; аутентификация — позже.
 
 ## Диалоги
 
@@ -44,4 +44,6 @@
 
 Акторы (`ConversationManager`) ключуются по `(user_id, channel)`; явный
 `POST /api/conversations` уступает место get-or-create диалога по (user, channel).
-Telegram-адаптер — ещё одна поверхность над тем же ядром (channel=telegram).
+Telegram-адаптер — ещё одна поверхность над тем же ядром (**реализовано**, этап G:
+канал `"telegram"`, `user_id = "tg:<telegram user id>"`, long-poll и мосты в
+`web/src/octoforge_web/telegram/` — см. [design.md](design.md) «Telegram-адаптер»).

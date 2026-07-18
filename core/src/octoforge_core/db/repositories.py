@@ -38,6 +38,14 @@ class DialogRepository:
                 raise DialogNotFoundError(dialog_id)
             return _to_dialog(row)
 
+    async def list_user_ids_by_channel(self, channel: str) -> list[str]:
+        """Return the user ids that have a dialog on the given channel."""
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(DialogRow.user_id).where(DialogRow.channel == channel)
+            )
+            return list(result.all())
+
     @staticmethod
     async def _find_row(session: AsyncSession, user_id: str, channel: str) -> DialogRow | None:
         result = await session.scalars(

@@ -62,6 +62,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.config import Settings
+from octoforge_web.telegram.bridge import RunnerProvider
+from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
+from octoforge_web.telegram.poller import TelegramBridgeRegistry, TelegramPoller
 
 STATIC_DIR = Path(__file__).parent / "static"
 APP_TITLE = "OctoForge"
@@ -147,12 +150,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.channel = WEB_CHANNEL
                 app.state.cron_store = cron_store
                 scheduler_task = _start_cron_scheduler(cron_store, manager, resolved_settings)
+                telegram = _start_telegram(
+                    resolved_settings, manager.get_or_create_runner, dialogs, outbound_http
+                )
                 try:
                     yield
                 finally:
-                    scheduler_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await scheduler_task
+                    await _stop_background_tasks(scheduler_task, telegram)
         finally:
             await engine.dispose()
 
@@ -236,6 +240,56 @@ def _start_cron_scheduler(
         ),
     )
     return asyncio.create_task(scheduler.run_forever())
+
+
+def _start_telegram(
+    settings: Settings,
+    runner_provider: RunnerProvider,
+    dialogs: DialogRepository,
+    http_client: httpx.AsyncClient,
+) -> tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None:
+    """Start the Telegram long-poll adapter when a bot token is configured."""
+    if not settings.telegram_bot_token:
+        return None
+    client = TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token)
+    registry = TelegramBridgeRegistry(
+        runner_provider=runner_provider,
+        client=client,
+        edit_throttle_seconds=settings.telegram_edit_throttle_seconds,
+    )
+    poller = TelegramPoller(
+        client=client,
+        registry=registry,
+        poll_timeout_seconds=settings.telegram_poll_timeout_seconds,
+    )
+    return registry, asyncio.create_task(_run_telegram(poller, registry, dialogs))
+
+
+async def _run_telegram(
+    poller: TelegramPoller,
+    registry: TelegramBridgeRegistry,
+    dialogs: DialogRepository,
+) -> None:
+    """Warm bridges for known Telegram dialogs, then poll for updates."""
+    user_ids = await dialogs.list_user_ids_by_channel(TELEGRAM_CHANNEL)
+    await registry.warm(user_ids)
+    await poller.run_forever()
+
+
+async def _stop_background_tasks(
+    scheduler_task: asyncio.Task[None],
+    telegram: tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None,
+) -> None:
+    """Stop the cron scheduler and the Telegram adapter, if it was started."""
+    scheduler_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await scheduler_task
+    if telegram is not None:
+        registry, poller_task = telegram
+        poller_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await poller_task
+        await registry.aclose()
 
 
 def _register_core_skills(

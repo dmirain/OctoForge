@@ -27,6 +27,8 @@ DEFAULT_CRON_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_CRON_LEASE_TTL_SECONDS = 60.0
 DEFAULT_CRON_REPLAY_LIMIT = 5
 DEFAULT_RERANKER_MODEL = ""
+DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30.0
+DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS = 1.5
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -66,6 +68,9 @@ class Settings(BaseSettings):
     cron_poll_interval_seconds: float = DEFAULT_CRON_POLL_INTERVAL_SECONDS
     cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
     cron_replay_limit: int = DEFAULT_CRON_REPLAY_LIMIT
+    telegram_bot_token: str = ""
+    telegram_poll_timeout_seconds: float = DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
+    telegram_edit_throttle_seconds: float = DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

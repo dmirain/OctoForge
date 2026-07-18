@@ -1,4 +1,4 @@
-# План реализации (дорожная карта этапов A–F)
+# План реализации (дорожная карта этапов A–G)
 
 > Утверждённый план по документам `docs/*`. Живой: статусы обновляются по мере выполнения.
 > Источники: [design.md](design.md) (шаги 5–10), [dialogs.md](dialogs.md),
@@ -151,14 +151,37 @@ HTTP-границу); таблицы модуля — его собственн�
    уведомление о невозможности запуска.
 6. Тесты: расписание/таймзоны, claim CAS, coalesce, wake.
 
+## Этап G. Telegram-адаптер ✅
+
+(dialogs.md, design.md «Telegram-адаптер»)
+
+1. Пакет `web/src/octoforge_web/telegram/` (core о транспорте не знает): `models.py`
+   (pydantic, `extra="ignore"`, алиас `from`, `TelegramChatType(StrEnum)`), `client.py`
+   (порт `TelegramClient` + `TelegramBotClient` на httpx — без aiogram), `bridge.py`
+   (рендер событий runner'а в черновик с throttle-правками, статус-строки скилов,
+   чанкер 4096), `poller.py` (long-poll, offset в памяти, backlog-drain, backoff) +
+   `TelegramBridgeRegistry`.
+2. Поверхность: канал `"telegram"`, `user_id = "tg:<telegram user id>"`, только личные
+   чаты; команды `/start` и `/cancel`; идентичности web/telegram не связываются.
+3. Зависимость моста — `RunnerProvider` (callable → runner); в composition root —
+   `ConversationManager.get_or_create_runner`; подписка на события ДО submit.
+4. Прогрев при старте: мосты для диалогов канала telegram из БД
+   (`DialogRepository.list_user_ids_by_channel`) — крон-выстрелы и уведомления
+   доставляются после рестарта.
+5. Конфиг: `OF_TELEGRAM_BOT_TOKEN` (пусто = выключен), `OF_TELEGRAM_POLL_TIMEOUT_SECONDS`,
+   `OF_TELEGRAM_EDIT_THROTTLE_SECONDS`.
+6. Тесты: модели, мост (дельты → правки, статус-строки, чанкинг, отмена/ошибка),
+   поллер (команды, offset, drain, восстановление, прогрев).
+
 ## Дальше (за рамками плана)
 
 Настоящая аутентификация (`users`, токены, служебные токены для wake/cron);
-Telegram-адаптер (вторая поверхность + outbox); distributed-профиль (scaling.md этап 2);
-компакция истории по реальным токенам; секреты-заглушки; `GET /api/skills`,
-`GET /api/tasks`; полная формула поиска (70/30 + MMR); подтверждение новых скилов
-человеком; раннее исполнение тулов (eager tool execution) — дизайн в
-[streaming.md](streaming.md).
+distributed-профиль (scaling.md этап 2); компакция истории по реальным токенам;
+секреты-заглушки; `GET /api/skills`, `GET /api/tasks`; полная формула поиска
+(70/30 + MMR); подтверждение новых скилов человеком; раннее исполнение тулов
+(eager tool execution) — дизайн в [streaming.md](streaming.md); живучесть задач
+(редоставка недоставленных результатов при старте, реанимация/фейл осиротевших
+процессов после рестарта); автоинъекция памяти в контекст; outbox для поверхностей.
 
 ## Принятые решения по умолчанию
 

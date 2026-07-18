@@ -17,6 +17,8 @@ from octoforge_web.config import (
     DEFAULT_MEMORY_SEARCH_MAX_LIMIT,
     DEFAULT_ROUTER_TIMEOUT_SECONDS,
     DEFAULT_SELF_BASE_URL,
+    DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS,
+    DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
     Settings,
 )
 
@@ -33,6 +35,9 @@ CUSTOM_CRON_LEASE_TTL = 120.0
 CUSTOM_CRON_REPLAY_LIMIT = 3
 CUSTOM_BATCH_SIZE = 32
 CUSTOM_RERANK_CANDIDATES = 15
+CUSTOM_TELEGRAM_TOKEN = "123:abc"
+CUSTOM_TELEGRAM_POLL_TIMEOUT = 45.0
+CUSTOM_TELEGRAM_EDIT_THROTTLE = 2.0
 LOCAL_EMBEDDING_MODEL = "intfloat/multilingual-e5-large-instruct"
 LOCAL_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 WHITELIST_JSON = (
@@ -62,6 +67,9 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "OF_CRON_POLL_INTERVAL_SECONDS",
         "OF_CRON_LEASE_TTL_SECONDS",
         "OF_CRON_REPLAY_LIMIT",
+        "OF_TELEGRAM_BOT_TOKEN",
+        "OF_TELEGRAM_POLL_TIMEOUT_SECONDS",
+        "OF_TELEGRAM_EDIT_THROTTLE_SECONDS",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -82,6 +90,9 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.cron_poll_interval_seconds == DEFAULT_CRON_POLL_INTERVAL_SECONDS
     assert settings.cron_lease_ttl_seconds == DEFAULT_CRON_LEASE_TTL_SECONDS
     assert settings.cron_replay_limit == DEFAULT_CRON_REPLAY_LIMIT
+    assert settings.telegram_bot_token == ""
+    assert settings.telegram_poll_timeout_seconds == DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
+    assert settings.telegram_edit_throttle_seconds == DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
     assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
     assert settings.to_embedding_config().backend == EmbeddingBackend.OPENAI
     assert settings.reranker_model == ""
@@ -146,6 +157,18 @@ def test_cron_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.cron_poll_interval_seconds == CUSTOM_CRON_POLL_INTERVAL
     assert settings.cron_lease_ttl_seconds == CUSTOM_CRON_LEASE_TTL
     assert settings.cron_replay_limit == CUSTOM_CRON_REPLAY_LIMIT
+
+
+def test_telegram_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_TELEGRAM_BOT_TOKEN", CUSTOM_TELEGRAM_TOKEN)
+    monkeypatch.setenv("OF_TELEGRAM_POLL_TIMEOUT_SECONDS", str(CUSTOM_TELEGRAM_POLL_TIMEOUT))
+    monkeypatch.setenv("OF_TELEGRAM_EDIT_THROTTLE_SECONDS", str(CUSTOM_TELEGRAM_EDIT_THROTTLE))
+
+    settings = Settings()
+
+    assert settings.telegram_bot_token == CUSTOM_TELEGRAM_TOKEN
+    assert settings.telegram_poll_timeout_seconds == CUSTOM_TELEGRAM_POLL_TIMEOUT
+    assert settings.telegram_edit_throttle_seconds == CUSTOM_TELEGRAM_EDIT_THROTTLE
 
 
 def test_auth_whitelist_parsed_from_json_env(monkeypatch: pytest.MonkeyPatch) -> None:
