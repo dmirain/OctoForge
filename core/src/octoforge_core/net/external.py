@@ -19,11 +19,17 @@ from octoforge_core.net.tool_spec import ToolSpec, parse_tool_spec
 
 MAX_BODY_CHARS = 8000
 TRUNCATED_SUFFIX = "\n...[truncated]"
+USER_ID_PLACEHOLDER = "{user_id}"
 
 
 @dataclass(frozen=True, slots=True)
 class ExternalCallAuth:
-    """Internal authorization injected for a whitelisted base-url prefix."""
+    """Internal authorization injected for a whitelisted base-url prefix.
+
+    `header_value` may contain the `{user_id}` placeholder, substituted with
+    the calling user's id at execution time; a call without a user id then
+    sends no header at all.
+    """
 
     base_url_prefix: str
     header_name: str
@@ -55,14 +61,19 @@ class ExternalCallExecutor:
         self._auth_whitelist = auth_whitelist
         self._timeout = timeout_seconds
 
-    async def execute(self, name: str, params: dict[str, str]) -> ExternalCallResult:
+    async def execute(
+        self,
+        name: str,
+        params: dict[str, str],
+        user_id: str | None = None,
+    ) -> ExternalCallResult:
         """Run the tool call `name` with validated params and return status + body."""
         instruction = await self._service.get_by_name(name, InstructionType.TOOL)
         spec = parse_tool_spec(instruction.content)
         validated = _validate_params(spec, params)
         url = _render_url(spec, validated)
         await self._guard.check(url)
-        headers = self._auth_headers_for(url)
+        headers = self._auth_headers_for(url, user_id)
         try:
             response = await self._http.request(
                 spec.method,
@@ -75,11 +86,19 @@ class ExternalCallExecutor:
             raise ExternalCallError(f"external call failed: {exc}") from exc
         return ExternalCallResult(status=response.status_code, body=_truncate(response.text))
 
-    def _auth_headers_for(self, url: str) -> dict[str, str]:
+    def _auth_headers_for(self, url: str, user_id: str | None) -> dict[str, str]:
         for entry in self._auth_whitelist:
             if url.startswith(entry.base_url_prefix):
-                return {entry.header_name: entry.header_value}
+                return _render_auth_header(entry, user_id)
         return {}
+
+
+def _render_auth_header(entry: ExternalCallAuth, user_id: str | None) -> dict[str, str]:
+    if USER_ID_PLACEHOLDER not in entry.header_value:
+        return {entry.header_name: entry.header_value}
+    if user_id is None:
+        return {}
+    return {entry.header_name: entry.header_value.replace(USER_ID_PLACEHOLDER, user_id)}
 
 
 def _validate_params(spec: ToolSpec, params: dict[str, str]) -> dict[str, str]:

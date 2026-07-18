@@ -34,7 +34,8 @@
 ```
 Makefile, README.md, .env.example
 core/                          # библиотека octoforge-core — домен и логика; fastapi запрещён
-  pyproject.toml               # deps: httpx, sqlalchemy[asyncio], aiosqlite; dev: pytest, pytest-asyncio, ruff, mypy
+  pyproject.toml               # deps: httpx, sqlalchemy[asyncio], aiosqlite, croniter;
+                               #   dev: pytest, pytest-asyncio, ruff, mypy
   src/octoforge_core/
     domain.py                  # ChatMessage, ToolCall, MessageRole, Dialog
     config.py                  # LLMConfig, EmbeddingConfig
@@ -52,9 +53,11 @@ core/                          # библиотека octoforge-core — дом�
       prompts.py               # DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn, уведомления,
                                #   instructions_search / external_call / instruction_save,
                                #   data_put / data_query / data_forget,
-                               #   memory_store / memory_search / memory_delete)
+                               #   memory_store / memory_search / memory_delete,
+                               #   крон-задачи через найденные cron-тулы)
       runner.py                # ConversationRunner (актор: нарратив + процессы fg/bg, bound
-                               #   TaskSpawner), ConversationManager, RunnerConfig, ConversationEvent
+                               #   TaskSpawner, wake для крон-выстрелов), ConversationManager,
+                               #   RunnerConfig, ConversationEvent
     skills/
       base.py                  # Skill (Protocol), SkillSpec, SkillOrigin (BASIC|DYNAMIC),
                                #   SkillContext (+ опциональный task_spawner)
@@ -100,13 +103,24 @@ core/                          # библиотека octoforge-core — дом�
                                #   MemoryScope (USER|GLOBAL), MemoryNotFoundError
       models.py                # MemoryRow — таблица memories, собственность модуля
       store.py                 # SqlAlchemyMemoryStore (upsert по (owner, key), LIKE-поиск)
+    cron/                      # обособленный модуль крон-задач (этап F)
+      api.py                   # граница модуля: CronStore/CronWaker (Protocol-порты), CronJob,
+                               #   ошибки, compute_next_fire/count_missed (croniter + zoneinfo)
+      models.py                # CronJobRow — таблица cron_jobs, собственность модуля
+      store.py                 # SqlAlchemyCronStore (CRUD + due-выборка + CAS-аренда)
+      scheduler.py             # CronScheduler (asyncio-цикл: claim → wake → complete_fire,
+                               #   coalesce пропущенных, разброс и лимит догонялки)
+      waker.py                 # ManagerCronWaker — адаптер порта на ConversationManager
     net/                       # исполнение внешних вызовов (core-сторона, вне модуля)
-      guard.py                 # SsrfGuard: resolve хоста (resolver инъектируется) → ipaddress-проверки
+      guard.py                 # SsrfGuard: resolve хоста (resolver инъектируется) → ipaddress-проверки;
+                               #   allowed_prefixes для собственного base URL (пропуск до resolve)
       tool_spec.py             # ToolSpec + parse_tool_spec (JSON-формат tool-записи)
-      external.py              # ExternalCallExecutor: шаблоны, whitelist-авторизация, SSRF-гвард
+      external.py              # ExternalCallExecutor: шаблоны, whitelist-авторизация
+                               #   (+ темплейт {user_id} в значении заголовка), SSRF-гвард
       errors.py                # SsrfBlockedError, ToolSpecError, ExternalCallError
     # дальше: skills/dynamic/ (Jinja-движок)
-  tests/                       # test_agent_loop, test_conversation_runner, test_data_skills,
+  tests/                       # test_agent_loop, test_conversation_runner, test_cron_store,
+                               # test_cron_scheduler, test_data_skills,
                                # test_datasets, test_dataset_validation, test_db_repositories,
                                # test_embeddings, test_external_call, test_http_request_skill,
                                # test_instruction_skills, test_instructions_local,
@@ -117,19 +131,22 @@ web/                           # приложение octoforge-web — FastAPI-
   pyproject.toml               # deps: octoforge-core, fastapi, uvicorn, pydantic-settings
   src/octoforge_web/
     main.py                    # app factory + composition root (DI: БД, LLM, эмбеддер, реестр,
-                               #   исполнитель external_call, LLMRouter, акторы; канал "web")
+                               #   исполнитель external_call, LLMRouter, акторы, крон-планировщик;
+                               #   канал "web")
     config.py                  # Settings (env с префиксом OF_, включая OF_DATABASE_URL,
                                #   OF_EMBEDDING_*, OF_INSTRUCTIONS_TOP_K,
                                #   OF_EXTERNAL_CALL_AUTH_WHITELIST, OF_DATASETS_QUERY_*,
-                               #   OF_MEMORY_SEARCH_*, OF_MAX_PROCESSES, OF_ROUTER_TIMEOUT_SECONDS)
+                               #   OF_MEMORY_SEARCH_*, OF_MAX_PROCESSES, OF_ROUTER_TIMEOUT_SECONDS,
+                               #   OF_SELF_BASE_URL, OF_CRON_*)
     deps.py                    # провайдеры зависимостей из app.state + заголовок X-User-Id
     api/
       dialog.py                # messages/cancel/events(SSE) по (user_id, channel)
+      cron.py                  # cron jobs CRUD + pause/resume (query-параметры, X-User-Id)
       sse.py                   # сериализация LoopEvent → SSE-кадры (включая маркеры процессов)
       schemas.py               # pydantic-схемы запросов/ответов
     static/index.html          # чат-UI: SSE-стрим, шаги скилов, маркеры процессов,
                                #   кнопка «Стоп», поле имени (= user_id)
-  tests/                       # test_dialog_api.py, test_sse.py, test_config.py
+  tests/                       # test_dialog_api.py, test_cron_api.py, test_sse.py, test_config.py
 ```
 
 ## Петля агента: события, управление, актор
@@ -237,7 +254,10 @@ CANCEL/PROMOTE). Пустой пакет — passthrough (актор тракт�
 тулов — через `external_call`, после нового многошагового сценария — сохранить его
 через `instruction_save`; трекинг структурированных данных (еда, вес, привычки) —
 датасеты: искать через `instructions_search`, писать через `data_put` (создавая датасет
-со схемой при отсутствии), читать/строить отчёты через `data_query`, удалять через `data_forget`.
+со схемой при отсутствии), читать/строить отчёты через `data_query`, удалять через `data_forget`;
+просьбы «по расписанию/периодически/напоминай» — найти cron-тулы через `instructions_search`
+и создать задачу через `external_call` (cron-выражение составить самому, таймзону уточнить
+или взять UTC), подтвердив создание пользователю.
 
 ### Стриминг LLM (`llm/openai.py`)
 
@@ -413,6 +433,48 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   через `memory_search`, не дублировать инструкции/датасеты. Автоинъекция памяти в контекст
   агента — отдельной итерацией (шаг 7 «Порядка работ»).
 
+## Крон-задачи (этап F)
+
+Модель, надёжность и принятые решения — в [cron.md](cron.md). Реализация:
+
+- **Модуль `cron/`** — обособленный, зеркалит `datasets/` и `memory/`: граница `api.py`
+  (Protocol `CronStore` — CRUD, due-выборка `list_due`, CAS-аренда `claim`/`release_claim`/
+  `complete_fire`; Protocol `CronWaker`; DTO `CronJob`; ошибки `CronJobNotFoundError`/
+  `CronScheduleError`; чистые функции расписания `compute_next_fire`/`count_missed` на
+  croniter + zoneinfo — новая зависимость `croniter`; без py.typed → локальный
+  `ignore_missing_imports` с комментарием в `core/pyproject.toml`). Локальная реализация
+  `SqlAlchemyCronStore`: таблица `cron_jobs` (собственность модуля). Расписание считается
+  croniter'ом по IANA-таймзоне задачи; хранение и сравнения — aware UTC.
+- **Планировщик** (`cron/scheduler.py`): `CronScheduler` — asyncio-задача в lifespan,
+  `owner` = uuid инстанса, knobs из Settings через `CronSchedulerConfig`. Тик (метод
+  `tick(now)` тестируем без сна): due-выборка (enabled, `next_fire_at <= now`, аренда
+  свободна или протухла по lease TTL, ORDER BY `next_fire_at`, LIMIT replay_limit) →
+  CAS `claim` одним UPDATE (проигравший гонку пропускает) → wake (prompt + суффикс про
+  пропущенные прогоны при coalesce) → `complete_fire` с пересчётом `next_fire_at` от
+  момента выстрела; исключение из waker → `release_claim`, задача остаётся due. Между
+  выстрелами тика — разброс 0.5 с (константа `REPLAY_STAGGER_SECONDS`).
+- **Выстрел в акторе**: `ConversationManager.wake` → get-or-create runner →
+  `ConversationRunner.wake(title, prompt, cron_job_id)` — общий со `spawn_task` приватный
+  хелпер, но `Task.input += {"cron_job_id"}`; переполнение лимита процессов → системная
+  заметка `CRON_LIMIT_NOTE_TEMPLATE` в нарратив (через `_publish_system_note`), а не
+  текст-отказ. Уведомление о результате — существующий путь завершения фоновой задачи.
+- **Своё API как внешнее**: SSRF-гвард += `allowed_prefixes` (пропуск до resolve; в
+  composition root — только `OF_SELF_BASE_URL`); `ExternalCallAuth.header_value` +=
+  темплейт `{user_id}` (подстановка из `SkillContext.user_id`; вызов без user_id → без
+  заголовка); скил `external_call` передаёт `context.user_id`. В whitelist composition
+  root программно добавляется запись `(self_base_url, "X-User-Id", "{user_id}")`.
+- **HTTP API** (`web/api/cron.py`, префикс `/api/cron`, скоуп по `X-User-Id`, параметры —
+  query string, т.к. `external_call` не умеет тела запросов): `POST /jobs` (201;
+  валидация schedule через croniter и timezone через zoneinfo → 422 с detail;
+  `next_fire_at` от now), `GET /jobs`, `DELETE /jobs/{id}` (204; чужая/нет → 404),
+  `POST /jobs/{id}/pause|resume` (resume пересчитывает `next_fire_at` от now — без
+  мгновенной догонялки; чужие → 404).
+- **Сид**: `seed_cron_tools_if_absent(service, base_url)` — 5 тулов (`cron_create_job`/
+  `cron_list_jobs`/`cron_delete_job`/`cron_pause_job`/`cron_resume_job`) + скил-сценарий
+  `schedule_a_recurring_report`; маркер `cron_create_job` независим от weather-сида;
+  вызов в lifespan под тем же условием `OF_EMBEDDING_API_KEY`.
+- **Промпт**: правило 11 — см. «Системный промпт».
+
 ## Модель данных
 
 ORM-модели — в `octoforge_core/db/models.py`; доменные объекты — в `octoforge_core/domain.py`
@@ -446,6 +508,11 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   (str, NULLABLE = global, index), `key`, `content`, `tags` (JSON list[str]),
   `created_at`, `updated_at`; unique (`user_id`, `key`) — не действует для NULL owner'а,
   уникальность глобальных ключей обеспечивает стор (upsert select-then-update)
+- **cron_jobs** (таблица модуля `cron/`, см. выше): `id` (uuid str PK), `user_id`
+  (str, index), `channel`, `title`, `schedule` (cron-выражение), `timezone` (IANA),
+  `prompt`, `enabled` (bool), `next_fire_at`, `last_fire_at` (nullable), `claimed_by`
+  (nullable), `claimed_at` (nullable), `created_at`; индекс (`enabled`, `next_fire_at`)
+  для due-выборки; пара (`claimed_by`, `claimed_at`) — аренда планировщика (lease TTL)
 
 Все `*_at` — timezone-aware UTC: `UTCDateTime` (`db/base.py`) принудительно выставляет UTC при
 чтении/записи (SQLite возвращает naive datetime). Создание схемы — `init_db` (`create_all`) в
@@ -469,10 +536,17 @@ lifespan; Alembic появится при первой деструктивно�
   строка-маркер о переключениях/завершениях процессов, «Стоп», поле имени =
   user_id, уходит заголовком `X-User-Id`; EventSource не умеет кастомные заголовки, поэтому
   стрим читается через fetch)
+- крон-задачи (`/api/cron`, скоуп по `X-User-Id`, параметры — query string):
+  `POST /api/cron/jobs?title=&schedule=&prompt=&timezone=` → 201 + JSON задачи
+  (невалидные cron-выражение/таймзона → 422; `next_fire_at` вычисляется от now);
+  `GET /api/cron/jobs` → список задач юзера; `DELETE /api/cron/jobs/{id}` → 204
+  (чужая/несуществующая → 404); `POST /api/cron/jobs/{id}/pause` → enabled=false;
+  `POST /api/cron/jobs/{id}/resume` → enabled=true с `next_fire_at` от now
 
 План:
 
-- аутентификация: `users`, токены (`POST /api/users` с admin-secret, `Authorization: Bearer`)
+- аутентификация: `users`, токены (`POST /api/users` с admin-secret, `Authorization: Bearer`),
+  служебные токены для wake/cron
 - `GET /api/skills`, `GET /api/tasks`
 - `GET /ws` — при необходимости двунаправленного канала
 
@@ -489,7 +563,8 @@ lifespan; Alembic появится при первой деструктивно�
   лимит (max=1) → отказ-заметка инъекцией (fg занят) и репорт-прогоном (fg свободен);
   task_spawn через скил → bg-процесс → уведомление + репорт + `result_delivered`;
   уведомление инъекцией в занятый fg; гигиена прерванного тёрна; недочитанная инъекция
-  получает собственный процесс; пересборка нарратива после «перезапуска» менеджера
+  получает собственный процесс; пересборка нарратива после «перезапуска» менеджера;
+  wake крон-задачи → bg-процесс с `cron_job_id` в `Task.input`, лимит → системная заметка
   (SQLite :memory:; роутер — детерминированный fake, не LLM)
 - `core/tests/test_router.py` — LLMRouter на mock LLMClient: passthrough без вызова при
   пустом снимке, парсинг пакетов ops, отбрасывание невалидных (action, лишний/чужой/пустой
@@ -503,16 +578,31 @@ lifespan; Alembic появится при первой деструктивно�
 - `core/tests/test_http_request_skill.py`, `core/tests/test_skills_registry.py`
 - `core/tests/test_instructions_local.py` — контрактный набор фасада на `:memory:` (save/upsert
   с бампом версии и пересчётом эмбеддинга, get_by_name с сужением по типу, ранжирование:
-  ближний вектор, буст точного title, k, инкремент usage_count, сидирование один раз);
-  сервис строится фабрикой-фикстурой — тот же набор позже прогонит http-реализацию
+  ближний вектор, буст точного title, k, инкремент usage_count, сидирование один раз;
+  сид крон-тулов: записи указывают на self base URL, идемпотентность, независимость от
+  weather-маркера); сервис строится фабрикой-фикстурой — тот же набор позже прогонит
+  http-реализацию
 - `core/tests/test_embeddings.py` — клиент эмбеддингов поверх мокнутого httpx-транспорта
   (форма запроса, разбор ответа с переупорядочиванием по index, ошибки статуса и payload)
 - `core/tests/test_external_call.py` — парсинг/валидация ToolSpec, рендер шаблона с quoting,
   валидация параметров, whitelist-заголовок только для своего префикса, блок SSRF,
-  редирект не следуется, обрезка тела
+  редирект не следуется, обрезка тела; темплейт `{user_id}` в значении заголовка
+  (подстановка, отсутствие user_id → без заголовка, статичное значение неизменно),
+  allowlist-префикс пропускает loopback, скил передаёт `context.user_id`
 - `core/tests/test_ssrf_guard.py` — stub-resolver: private/loopback/link-local/multicast/CGNAT/
   IPv6 заблокированы, публичные разрешены, любой приватный из многих блокирует, неразрешимый
-  хост и не-http(s) URL заблокированы
+  хост и не-http(s) URL заблокированы; allowed_prefixes — пропуск без resolve, остальные
+  URL проверяются по-прежнему
+- `core/tests/test_cron_store.py` — SQL-стор крона на `:memory:`: CRUD, изоляция юзеров
+  (delete/set_enabled чужого → CronJobNotFoundError), list_due (enabled, окно, свежая и
+  протухшая аренда, порядок, лимит), claim CAS (гонка, сдвинутый next_fire_at, перехват
+  протухшей аренды), release_claim, complete_fire
+- `core/tests/test_cron_scheduler.py` — реальный стор + записывающий fake-waker: выстрел
+  due с пересчётом next_fire_at в будущее, будущая/disabled не стреляют, coalesce
+  пропущенных с суффиксом, лимит реплея (остаток ждёт следующий тик), failed wake →
+  release_claim, чужая свежая аренда → пропуск; compute_next_fire по таймзоне
+  (Europe/Moscow 9:00 = 06:00 UTC), невалидные schedule/timezone → CronScheduleError,
+  count_missed (минус текущий выстрел, cap)
 - `core/tests/test_instruction_skills.py` — адаптеры `instructions_search`/`instruction_save`/
   `external_call` (валидация аргументов + happy path на фейках)
 - `core/tests/test_datasets.py` — контрактный набор фасада DatasetService на `:memory:`
@@ -535,9 +625,13 @@ lifespan; Alembic появится при первой деструктивно�
   not-found тексты, изоляция и кросс-поверхностная видимость через SkillContext)
 - `web/tests/test_config.py` — Settings: дефолты OF_EMBEDDING_*/top-k/whitelist/лимитов
   data_query и memory_search, max_processes и router_timeout_seconds (дефолты и env),
-  парсинг JSON-whitelist и лимитов из env
+  self_base_url и OF_CRON_* (дефолты и env), парсинг JSON-whitelist и лимитов из env
 - `web/tests/test_dialog_api.py` — get-or-create диалога, изоляция двух user_id, 400 без
   `X-User-Id`, messages/cancel/events (SSE через генератор), health, UI
+- `web/tests/test_cron_api.py` — create (201 + поля, next_fire_at в будущем, default UTC),
+  невалидные schedule/timezone/пропущенный параметр → 422, list с изоляцией двух юзеров,
+  delete 204/404 (чужая и несуществующая), pause/resume (resume пересчитывает
+  next_fire_at; чужие → 404), 400 без `X-User-Id` на всех эндпоинтах
 - `web/tests/test_sse.py` — сериализация событий в SSE-кадры (включая маркеры процессов)
 
 План:
@@ -558,7 +652,7 @@ lifespan; Alembic появится при первой деструктивно�
 6. Динамические скилы: Jinja-движок + `skill.save/run`; скилы памяти (user/global) ✅ (этап D)
 7. Агентный контекст: память в контексте (автоинъекция), `GET /api/skills`, `GET /api/tasks`
 8. ✅ LLM-роутер и процессная модель диалога (этап E) — см. [process-model.md](process-model.md)
-9. Инструкции в БД (знание/скил/тул + векторный поиск, этап B ✅) — см. [instructions.md](instructions.md); датасеты пользовательских данных (этап C ✅) — см. [data-store.md](data-store.md); крон-задачи — см. [cron.md](cron.md); реализация после БД
+9. Инструкции в БД (знание/скил/тул + векторный поиск, этап B ✅) — см. [instructions.md](instructions.md); датасеты пользовательских данных (этап C ✅) — см. [data-store.md](data-store.md); крон-задачи (этап F ✅) — см. [cron.md](cron.md)
 10. Бэклог из обзора openclaw (SSRF-гвард, формула поиска, каталог скилов, детали крона и пр.) — см. [openclaw-review.md](openclaw-review.md)
 
 ## Проверка

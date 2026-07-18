@@ -20,6 +20,10 @@ DEFAULT_MEMORY_SEARCH_DEFAULT_LIMIT = 10
 DEFAULT_MEMORY_SEARCH_MAX_LIMIT = 50
 DEFAULT_MAX_PROCESSES = 5
 DEFAULT_ROUTER_TIMEOUT_SECONDS = 10.0
+DEFAULT_SELF_BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_CRON_POLL_INTERVAL_SECONDS = 1.0
+DEFAULT_CRON_LEASE_TTL_SECONDS = 60.0
+DEFAULT_CRON_REPLAY_LIMIT = 5
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -51,6 +55,10 @@ class Settings(BaseSettings):
     memory_search_max_limit: int = DEFAULT_MEMORY_SEARCH_MAX_LIMIT
     max_processes: int = DEFAULT_MAX_PROCESSES
     router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
+    self_base_url: str = DEFAULT_SELF_BASE_URL
+    cron_poll_interval_seconds: float = DEFAULT_CRON_POLL_INTERVAL_SECONDS
+    cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
+    cron_replay_limit: int = DEFAULT_CRON_REPLAY_LIMIT
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

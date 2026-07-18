@@ -19,8 +19,15 @@ from octoforge_core.instructions.api import (
     InstructionType,
 )
 from octoforge_core.instructions.local import LocalInstructionService
-from octoforge_core.instructions.seed import SEED_INSTRUCTIONS, seed_if_empty
+from octoforge_core.instructions.seed import (
+    SEED_CRON_MARKER_TOOL_TITLE,
+    SEED_INSTRUCTIONS,
+    SEED_WEATHER_TOOL_TITLE,
+    seed_cron_tools_if_absent,
+    seed_if_empty,
+)
 from octoforge_core.llm.embeddings import EmbeddingClient
+from octoforge_core.net.tool_spec import parse_tool_spec
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 EMBEDDED_TEXT_SEPARATOR = "\n"
@@ -296,3 +303,69 @@ async def test_seed_if_empty_is_a_no_op_the_second_time(
     for seed in SEED_INSTRUCTIONS:
         stored = await service.get_by_name(seed.title, seed.kind)
         assert stored.version == VERSION_CREATED
+
+
+SELF_BASE_URL = "http://127.0.0.1:8000"
+CRON_TOOL_TITLES = (
+    SEED_CRON_MARKER_TOOL_TITLE,
+    "cron_list_jobs",
+    "cron_delete_job",
+    "cron_pause_job",
+    "cron_resume_job",
+)
+CRON_SKILL_TITLE = "schedule_a_recurring_report"
+CRON_CREATE_PARAMS = ("title", "schedule", "prompt", "timezone")
+
+
+class LenientEmbedder:
+    """EmbeddingClient stub returning the same vector for every text."""
+
+    async def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        return tuple(V_RIGHT for _ in texts)
+
+
+def make_lenient_service(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> InstructionService:
+    return LocalInstructionService(session_factory, LenientEmbedder())
+
+
+async def test_seed_cron_tools_seeds_records_pointing_at_the_base_url(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+
+    await seed_cron_tools_if_absent(service, SELF_BASE_URL)
+
+    for title in CRON_TOOL_TITLES:
+        stored = await service.get_by_name(title, InstructionType.TOOL)
+        assert stored.version == VERSION_CREATED
+        assert "cron" in stored.tags
+    create_spec = parse_tool_spec(
+        (await service.get_by_name(SEED_CRON_MARKER_TOOL_TITLE, InstructionType.TOOL)).content
+    )
+    assert create_spec.method == "POST"
+    assert create_spec.url_template.startswith(f"{SELF_BASE_URL}/api/cron/jobs?")
+    assert tuple(create_spec.params) == CRON_CREATE_PARAMS
+    scenario = await service.get_by_name(CRON_SKILL_TITLE, InstructionType.SKILL)
+    assert SEED_CRON_MARKER_TOOL_TITLE in scenario.content
+
+
+async def test_seed_cron_tools_is_idempotent_and_independent_of_the_weather_marker(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+
+    await seed_cron_tools_if_absent(service, SELF_BASE_URL)
+    await seed_cron_tools_if_absent(service, SELF_BASE_URL)
+
+    # a repeated seed would have re-saved and bumped versions
+    stored = await service.get_by_name(SEED_CRON_MARKER_TOOL_TITLE, InstructionType.TOOL)
+    assert stored.version == VERSION_CREATED
+    with pytest.raises(InstructionNotFoundError):
+        await service.get_by_name(SEED_WEATHER_TOOL_TITLE, InstructionType.TOOL)
+
+    # ...and the other way around: the cron marker does not block the weather seed
+    await seed_if_empty(service)
+    weather = await service.get_by_name(SEED_WEATHER_TOOL_TITLE, InstructionType.TOOL)
+    assert weather.version == VERSION_CREATED

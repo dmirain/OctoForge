@@ -4,6 +4,7 @@ import asyncio
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Any
 
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
@@ -44,6 +45,9 @@ LIMIT_REFUSAL_TEMPLATE = (
 )
 SPAWN_REFUSAL_TEMPLATE = (
     "cannot spawn: process limit ({limit}) reached; active: {titles} — ask the user what to cancel"
+)
+CRON_LIMIT_NOTE_TEMPLATE = (
+    "Cron job '{title}' could not start: process limit ({limit}) reached; active: {titles}"
 )
 SPAWNED_TEMPLATE = "task {task_id} spawned"
 BACKGROUND_TASK_PROMPT = (
@@ -158,13 +162,40 @@ class ConversationRunner:
             return SPAWN_REFUSAL_TEMPLATE.format(
                 limit=self._max_processes, titles=self._active_titles()
             )
+        task = await self._spawn_process_task(title, prompt, cron_job_id=None)
+        return SPAWNED_TEMPLATE.format(task_id=task.id)
+
+    async def wake(self, title: str, prompt: str, cron_job_id: str) -> None:
+        """Start a cron-fired background process tagged with its cron job id.
+
+        Unlike `spawn_task`, hitting the process limit publishes a system note
+        (the delayed impossibility notification) instead of returning a text.
+        """
+        if len(self._processes) >= self._max_processes:
+            note = CRON_LIMIT_NOTE_TEMPLATE.format(
+                title=title, limit=self._max_processes, titles=self._active_titles()
+            )
+            await self._publish_system_note(note)
+            return
+        await self._spawn_process_task(title, prompt, cron_job_id=cron_job_id)
+
+    async def _spawn_process_task(
+        self,
+        title: str,
+        prompt: str,
+        cron_job_id: str | None,
+    ) -> Task:
+        """Create a RUN task with its background process; the limit check is the caller's."""
+        task_input: dict[str, Any] = {"title": title, "prompt": prompt}
+        if cron_job_id is not None:
+            task_input["cron_job_id"] = cron_job_id
         task = Task(
             dialog_id=self._dialog.id,
             user_id=self._dialog.user_id,
             channel=self._dialog.channel,
             title=title,
             kind=TaskKind.RUN,
-            input={"title": title, "prompt": prompt},
+            input=task_input,
         )
         await self._tasks.add(task)
         await self._tasks.mark_running(task)
@@ -177,7 +208,7 @@ class ConversationRunner:
                 ChatMessage(role=MessageRole.USER, content=prompt),
             ],
         )
-        return SPAWNED_TEMPLATE.format(task_id=task.id)
+        return task
 
     def subscribe(self) -> asyncio.Queue[ConversationEvent]:
         """Attach a subscriber queue receiving broadcast events."""
@@ -510,3 +541,15 @@ class ConversationManager:
                 runner.start()
                 self._runners[dialog.id] = runner
             return runner
+
+    async def wake(
+        self,
+        user_id: str,
+        channel: str,
+        title: str,
+        prompt: str,
+        cron_job_id: str,
+    ) -> None:
+        """Deliver a cron firing into the user's dialog as a background process."""
+        runner = await self.get_or_create_runner(user_id, channel)
+        await runner.wake(title, prompt, cron_job_id)

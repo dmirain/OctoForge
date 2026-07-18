@@ -25,5 +25,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "memory: save them with memory_store (scope user; use scope global only for facts shared "
     "by everyone, and with care), and call memory_search before personal recommendations. "
     "Memory is per-user and shared across all of the user's surfaces — do not duplicate what "
-    "already lives in instructions or datasets."
+    "already lives in instructions or datasets.\n"
+    "11. When the user asks for something on a schedule, periodically or as a reminder "
+    "('every morning', 'each day', 'remind me'), find the cron tools via instructions_search "
+    "and create the job with external_call (compose the cron expression yourself; ask for the "
+    "user's timezone or use UTC when unknown). Confirm the created job to the user."
 )

@@ -46,7 +46,7 @@ class ExternalCallSkill:
         if not isinstance(name, str) or not name.strip():
             raise SkillArgumentsError("name must be a non-empty string")
         params = _parse_params(arguments.get("params"))
-        result = await self._executor.execute(name, params)
+        result = await self._executor.execute(name, params, user_id=context.user_id)
         return f"HTTP {result.status}\n{result.body}"
 
 

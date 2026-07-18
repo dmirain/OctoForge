@@ -23,6 +23,8 @@ from octoforge_core.net.external import (
 )
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tool_spec import parse_tool_spec
+from octoforge_core.skills.base import SkillContext
+from octoforge_core.skills.basic.external_call import ExternalCallSkill
 
 PUBLIC_IP = "93.184.216.34"
 PRIVATE_IP = "10.0.0.1"
@@ -105,12 +107,13 @@ def make_executor(
     records: dict[str, str] | None = None,
     ips: tuple[str, ...] = (PUBLIC_IP,),
     whitelist: tuple[ExternalCallAuth, ...] = (),
+    allowed_prefixes: tuple[str, ...] = (),
 ) -> ExternalCallExecutor:
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return ExternalCallExecutor(
         service=FakeInstructionService(records or {TOOL_NAME: WEATHER_TOOL_CONTENT}),
         http_client=http_client,
-        guard=SsrfGuard(resolver=StubResolver(ips)),
+        guard=SsrfGuard(resolver=StubResolver(ips), allowed_prefixes=allowed_prefixes),
         auth_whitelist=whitelist,
     )
 
@@ -321,3 +324,84 @@ async def test_upstream_connection_error_raises_call_error() -> None:
 
     with pytest.raises(ExternalCallError):
         await executor.execute(TOOL_NAME, {"city": "London"})
+
+
+# --- per-user auth templating and the self-API allowlist ----------------------
+
+USER_A = "alice"
+USER_ID_HEADER = "X-User-Id"
+USER_ID_TEMPLATE = "{user_id}"
+SELF_TOOL_NAME = "cron_list_jobs"
+SELF_BASE_URL = "http://127.0.0.1:8000"
+LOOPBACK_IP = "127.0.0.1"
+SELF_TOOL_CONTENT = json.dumps(
+    {
+        "method": "GET",
+        "url_template": f"{SELF_BASE_URL}/api/cron/jobs",
+        "params_schema": {},
+        "auth": "none",
+    }
+)
+
+
+def make_self_executor(
+    captured: list[httpx.Request],
+    header_value: str = USER_ID_TEMPLATE,
+) -> ExternalCallExecutor:
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="[]")
+
+    return make_executor(
+        handler,
+        records={SELF_TOOL_NAME: SELF_TOOL_CONTENT},
+        ips=(LOOPBACK_IP,),  # would be blocked without the allowlisted prefix
+        whitelist=(
+            ExternalCallAuth(
+                base_url_prefix=SELF_BASE_URL,
+                header_name=USER_ID_HEADER,
+                header_value=header_value,
+            ),
+        ),
+        allowed_prefixes=(SELF_BASE_URL,),
+    )
+
+
+async def test_user_id_template_is_substituted_into_the_auth_header() -> None:
+    captured: list[httpx.Request] = []
+    executor = make_self_executor(captured)
+
+    result = await executor.execute(SELF_TOOL_NAME, {}, user_id=USER_A)
+
+    assert result.status == HTTPStatus.OK  # loopback passed the guard via the allowlist
+    assert captured[0].headers[USER_ID_HEADER] == USER_A
+
+
+async def test_user_id_template_without_a_user_sends_no_header() -> None:
+    captured: list[httpx.Request] = []
+    executor = make_self_executor(captured)
+
+    await executor.execute(SELF_TOOL_NAME, {})
+
+    assert captured[0].headers.get(USER_ID_HEADER) is None
+
+
+async def test_static_auth_value_is_sent_unchanged_even_with_a_user() -> None:
+    captured: list[httpx.Request] = []
+    executor = make_self_executor(captured, header_value=AUTH_VALUE)
+
+    await executor.execute(SELF_TOOL_NAME, {}, user_id=USER_A)
+
+    assert captured[0].headers[USER_ID_HEADER] == AUTH_VALUE
+
+
+async def test_skill_passes_the_context_user_id_to_the_executor() -> None:
+    captured: list[httpx.Request] = []
+    executor = make_self_executor(captured)
+    skill = ExternalCallSkill(executor=executor)
+    context = SkillContext(user_id=USER_A, channel="web", dialog_id="dialog-1")
+
+    output = await skill.execute({"name": SELF_TOOL_NAME, "params": {}}, context)
+
+    assert output.startswith(f"HTTP {HTTPStatus.OK}")
+    assert captured[0].headers[USER_ID_HEADER] == USER_A

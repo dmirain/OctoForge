@@ -43,13 +43,26 @@ class SystemResolver:
 
 
 class SsrfGuard:
-    """Checks outbound URLs before the HTTP client is allowed to follow them."""
+    """Checks outbound URLs before the HTTP client is allowed to follow them.
 
-    def __init__(self, resolver: HostResolver | None = None) -> None:
+    `allowed_prefixes` skip the resolve-and-check pipeline entirely. Reserve
+    them for the composition root's own base URL (the application calling its
+    own HTTP API, which may sit on a loopback address) — never for
+    user-controlled targets.
+    """
+
+    def __init__(
+        self,
+        resolver: HostResolver | None = None,
+        allowed_prefixes: tuple[str, ...] = (),
+    ) -> None:
         self._resolver = resolver if resolver is not None else SystemResolver()
+        self._allowed_prefixes = allowed_prefixes
 
     async def check(self, url: str) -> None:
         """Raise SsrfBlockedError unless the URL is http(s) and publicly routed."""
+        if any(url.startswith(prefix) for prefix in self._allowed_prefixes):
+            return
         host = self._public_host(url)
         try:
             addresses = await self._resolver.resolve(host)

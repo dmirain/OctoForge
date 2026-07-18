@@ -113,3 +113,25 @@ async def test_ip_literal_host_is_checked() -> None:
 
     with pytest.raises(SsrfBlockedError):
         await guard.check(f"http://{CLOUD_METADATA_IP}/latest/meta-data")
+
+
+SELF_BASE_URL = "http://127.0.0.1:8000"
+
+
+async def test_allowed_prefix_skips_resolution() -> None:
+    resolver = StubResolver((PRIVATE_IP,))
+    guard = SsrfGuard(resolver=resolver, allowed_prefixes=(SELF_BASE_URL,))
+
+    await guard.check(f"{SELF_BASE_URL}/api/cron/jobs")  # loopback, but allowlisted
+
+    assert resolver.calls == []
+
+
+async def test_non_prefixed_urls_are_still_checked() -> None:
+    resolver = StubResolver((PRIVATE_IP,))
+    guard = SsrfGuard(resolver=resolver, allowed_prefixes=(SELF_BASE_URL,))
+
+    with pytest.raises(SsrfBlockedError):
+        await guard.check(TARGET_URL)
+
+    assert resolver.calls == [RESOLVED_HOST]

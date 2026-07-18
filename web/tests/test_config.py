@@ -3,6 +3,9 @@
 import pytest
 
 from octoforge_web.config import (
+    DEFAULT_CRON_LEASE_TTL_SECONDS,
+    DEFAULT_CRON_POLL_INTERVAL_SECONDS,
+    DEFAULT_CRON_REPLAY_LIMIT,
     DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT,
     DEFAULT_DATASETS_QUERY_MAX_LIMIT,
     DEFAULT_EMBEDDING_BASE_URL,
@@ -12,6 +15,7 @@ from octoforge_web.config import (
     DEFAULT_MEMORY_SEARCH_DEFAULT_LIMIT,
     DEFAULT_MEMORY_SEARCH_MAX_LIMIT,
     DEFAULT_ROUTER_TIMEOUT_SECONDS,
+    DEFAULT_SELF_BASE_URL,
     Settings,
 )
 
@@ -22,6 +26,10 @@ CUSTOM_MEMORY_DEFAULT_LIMIT = 15
 CUSTOM_MEMORY_MAX_LIMIT = 80
 CUSTOM_MAX_PROCESSES = 9
 CUSTOM_ROUTER_TIMEOUT = 2.5
+CUSTOM_SELF_BASE_URL = "http://10.0.0.5:9000"
+CUSTOM_CRON_POLL_INTERVAL = 2.5
+CUSTOM_CRON_LEASE_TTL = 120.0
+CUSTOM_CRON_REPLAY_LIMIT = 3
 WHITELIST_JSON = (
     '[{"base_url_prefix": "https://internal.example.com/", '
     '"header_name": "X-Api-Key", "header_value": "s3cret"}]'
@@ -41,6 +49,10 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "OF_MEMORY_SEARCH_MAX_LIMIT",
         "OF_MAX_PROCESSES",
         "OF_ROUTER_TIMEOUT_SECONDS",
+        "OF_SELF_BASE_URL",
+        "OF_CRON_POLL_INTERVAL_SECONDS",
+        "OF_CRON_LEASE_TTL_SECONDS",
+        "OF_CRON_REPLAY_LIMIT",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -57,6 +69,10 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.memory_search_max_limit == DEFAULT_MEMORY_SEARCH_MAX_LIMIT
     assert settings.max_processes == DEFAULT_MAX_PROCESSES
     assert settings.router_timeout_seconds == DEFAULT_ROUTER_TIMEOUT_SECONDS
+    assert settings.self_base_url == DEFAULT_SELF_BASE_URL
+    assert settings.cron_poll_interval_seconds == DEFAULT_CRON_POLL_INTERVAL_SECONDS
+    assert settings.cron_lease_ttl_seconds == DEFAULT_CRON_LEASE_TTL_SECONDS
+    assert settings.cron_replay_limit == DEFAULT_CRON_REPLAY_LIMIT
     assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
     assert settings.to_external_call_auth_whitelist() == ()
 
@@ -104,6 +120,20 @@ def test_process_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert settings.max_processes == CUSTOM_MAX_PROCESSES
     assert settings.router_timeout_seconds == CUSTOM_ROUTER_TIMEOUT
+
+
+def test_cron_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_SELF_BASE_URL", CUSTOM_SELF_BASE_URL)
+    monkeypatch.setenv("OF_CRON_POLL_INTERVAL_SECONDS", str(CUSTOM_CRON_POLL_INTERVAL))
+    monkeypatch.setenv("OF_CRON_LEASE_TTL_SECONDS", str(CUSTOM_CRON_LEASE_TTL))
+    monkeypatch.setenv("OF_CRON_REPLAY_LIMIT", str(CUSTOM_CRON_REPLAY_LIMIT))
+
+    settings = Settings()
+
+    assert settings.self_base_url == CUSTOM_SELF_BASE_URL
+    assert settings.cron_poll_interval_seconds == CUSTOM_CRON_POLL_INTERVAL
+    assert settings.cron_lease_ttl_seconds == CUSTOM_CRON_LEASE_TTL
+    assert settings.cron_replay_limit == CUSTOM_CRON_REPLAY_LIMIT
 
 
 def test_auth_whitelist_parsed_from_json_env(monkeypatch: pytest.MonkeyPatch) -> None:

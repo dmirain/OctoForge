@@ -818,3 +818,70 @@ async def test_narrative_is_rebuilt_after_manager_restart(
         ChatMessage(role=MessageRole.USER, content="start"),
         reply("after"),
     ]
+
+
+CRON_JOB_ID = "cron-job-1"
+CRON_TITLE = "morning report"
+CRON_PROMPT = "prepare the daily report"
+
+
+async def test_wake_runs_cron_tagged_background_process(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
+    store = InMemoryTaskStore()
+    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    await collect_completions(queue, 2)
+
+    tasks = await store.list(runner.dialog_id)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.title == CRON_TITLE
+    assert task.status is TaskStatus.DONE
+    assert task.result == TASK_RESULT
+    assert task.input["cron_job_id"] == CRON_JOB_ID
+    notification = runner.history()[-2]
+    assert notification.role is MessageRole.SYSTEM
+    assert CRON_TITLE in notification.content
+    assert TASK_RESULT in notification.content
+    assert runner.history()[-1] == reply("report answer")
+    background_request = llm.background_requests[0]
+    assert background_request[0].content == BACKGROUND_TASK_PROMPT
+    assert background_request[1] == ChatMessage(role=MessageRole.USER, content=CRON_PROMPT)
+
+
+async def test_wake_over_the_process_limit_publishes_a_system_note(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    skill = BlockingSkill()
+    llm = ScriptedLLM([blocking_call(), reply("after")])
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        llm,
+        blocking_registry(skill),
+        session_factory,
+        ManagerOptions(store=store, max_processes=ONE_PROCESS),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("start")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    await runner.wake(CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+
+    await wait_for_condition(lambda: any("could not start" in m.content for m in runner.history()))
+    note = runner.history()[-1]
+    assert note.role is MessageRole.SYSTEM
+    assert f"Cron job '{CRON_TITLE}' could not start" in note.content
+    assert "process limit (1)" in note.content
+    assert "start" in note.content
+    assert await store.list(runner.dialog_id) == []  # no task was created
+
+    skill.release.set()
+    await collect_until(queue, is_completed)
