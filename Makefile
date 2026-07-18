@@ -1,7 +1,7 @@
 VENV := .venv
 BIN := $(VENV)/bin
 
-.PHONY: install lint format typecheck test check run
+.PHONY: install lint format typecheck test check run run-telegram
 
 install:
 	python3 -m venv $(VENV)
@@ -27,3 +27,6 @@ check: lint typecheck test
 
 run:
 	$(BIN)/uvicorn octoforge_web.main:app --reload --reload-dir web/src
+
+run-telegram:
+	$(BIN)/python -m octoforge_web.telegram

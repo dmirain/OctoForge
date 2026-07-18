@@ -1,4 +1,4 @@
-"""FastAPI application factory and composition root."""
+"""FastAPI application factory and composition root (shared by standalone surfaces)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -76,89 +77,115 @@ USER_ID_HEADER_VALUE_TEMPLATE = "{user_id}"
 logger = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class Runtime:
+    """Assembled services shared by the HTTP app and standalone surfaces."""
+
+    settings: Settings
+    conversation_manager: ConversationManager
+    channel: str
+    cron_store: CronStore
+
+
+@asynccontextmanager
+async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
+    """Build all services and background tasks; no HTTP listener is involved.
+
+    Shared composition root: the FastAPI lifespan wraps it, standalone
+    surfaces (the Telegram-only runner) use it directly.
+    """
+    engine = create_engine(settings.database_url)
+    await init_db(engine)
+    session_factory = create_session_factory(engine)
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    task_store = SqlAlchemyTaskStore(session_factory)
+    cron_store = SqlAlchemyCronStore(session_factory)
+    try:
+        async with (
+            httpx.AsyncClient(base_url=settings.llm_base_url) as llm_http,
+            httpx.AsyncClient(base_url=settings.embedding_base_url) as embed_http,
+            httpx.AsyncClient() as outbound_http,
+        ):
+            llm_client = OpenAICompatibleClient(
+                http_client=llm_http,
+                config=settings.to_llm_config(),
+            )
+            embedder = _build_embedder(settings, embed_http)
+            reranker = _build_reranker(settings)
+            instructions = LocalInstructionService(
+                session_factory,
+                embedder,
+                reranker=reranker,
+                rerank_candidates=settings.reranker_candidates,
+            )
+            datasets = LocalDatasetService(session_factory, embedder)
+            await _seed_instructions(instructions, settings)
+            # The app's own base URL is allowlisted so tool records can
+            # target our loopback HTTP API (cron jobs) past the SSRF guard.
+            guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
+            external_executor = ExternalCallExecutor(
+                service=instructions,
+                http_client=outbound_http,
+                guard=guard,
+                auth_whitelist=_external_call_whitelist(settings),
+            )
+            registry = SkillRegistry()
+            _register_core_skills(registry, outbound_http, guard, task_store)
+            _register_instruction_skills(
+                registry, instructions, datasets, external_executor, settings
+            )
+            _register_dataset_skills(registry, datasets, settings)
+            memory = SqlAlchemyMemoryStore(session_factory)
+            _register_memory_skills(registry, memory, settings)
+            loop = AgentLoop(
+                llm_client=llm_client,
+                registry=registry,
+                max_iterations=settings.agent_max_iterations,
+            )
+            manager = ConversationManager(
+                config=RunnerConfig(
+                    loop=loop,
+                    system_prompt=DEFAULT_SYSTEM_PROMPT,
+                    router=LLMRouter(
+                        llm_client,
+                        timeout_seconds=settings.router_timeout_seconds,
+                    ),
+                    max_processes=settings.max_processes,
+                ),
+                dialogs=dialogs,
+                messages=messages,
+                tasks=task_store,
+            )
+            scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
+            telegram = _start_telegram(
+                settings, manager.get_or_create_runner, dialogs, outbound_http
+            )
+            try:
+                yield Runtime(
+                    settings=settings,
+                    conversation_manager=manager,
+                    channel=WEB_CHANNEL,
+                    cron_store=cron_store,
+                )
+            finally:
+                await _stop_background_tasks(scheduler_task, telegram)
+    finally:
+        await engine.dispose()
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the FastAPI application with all dependencies wired."""
     resolved_settings = settings or Settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        engine = create_engine(resolved_settings.database_url)
-        await init_db(engine)
-        session_factory = create_session_factory(engine)
-        dialogs = DialogRepository(session_factory)
-        messages = MessageRepository(session_factory)
-        task_store = SqlAlchemyTaskStore(session_factory)
-        cron_store = SqlAlchemyCronStore(session_factory)
-        try:
-            async with (
-                httpx.AsyncClient(base_url=resolved_settings.llm_base_url) as llm_http,
-                httpx.AsyncClient(base_url=resolved_settings.embedding_base_url) as embed_http,
-                httpx.AsyncClient() as outbound_http,
-            ):
-                llm_client = OpenAICompatibleClient(
-                    http_client=llm_http,
-                    config=resolved_settings.to_llm_config(),
-                )
-                embedder = _build_embedder(resolved_settings, embed_http)
-                reranker = _build_reranker(resolved_settings)
-                instructions = LocalInstructionService(
-                    session_factory,
-                    embedder,
-                    reranker=reranker,
-                    rerank_candidates=resolved_settings.reranker_candidates,
-                )
-                datasets = LocalDatasetService(session_factory, embedder)
-                await _seed_instructions(instructions, resolved_settings)
-                # The app's own base URL is allowlisted so tool records can
-                # target our loopback HTTP API (cron jobs) past the SSRF guard.
-                guard = SsrfGuard(allowed_prefixes=(resolved_settings.self_base_url,))
-                external_executor = ExternalCallExecutor(
-                    service=instructions,
-                    http_client=outbound_http,
-                    guard=guard,
-                    auth_whitelist=_external_call_whitelist(resolved_settings),
-                )
-                registry = SkillRegistry()
-                _register_core_skills(registry, outbound_http, guard, task_store)
-                _register_instruction_skills(
-                    registry, instructions, datasets, external_executor, resolved_settings
-                )
-                _register_dataset_skills(registry, datasets, resolved_settings)
-                memory = SqlAlchemyMemoryStore(session_factory)
-                _register_memory_skills(registry, memory, resolved_settings)
-                loop = AgentLoop(
-                    llm_client=llm_client,
-                    registry=registry,
-                    max_iterations=resolved_settings.agent_max_iterations,
-                )
-                manager = ConversationManager(
-                    config=RunnerConfig(
-                        loop=loop,
-                        system_prompt=DEFAULT_SYSTEM_PROMPT,
-                        router=LLMRouter(
-                            llm_client,
-                            timeout_seconds=resolved_settings.router_timeout_seconds,
-                        ),
-                        max_processes=resolved_settings.max_processes,
-                    ),
-                    dialogs=dialogs,
-                    messages=messages,
-                    tasks=task_store,
-                )
-                app.state.settings = resolved_settings
-                app.state.conversation_manager = manager
-                app.state.channel = WEB_CHANNEL
-                app.state.cron_store = cron_store
-                scheduler_task = _start_cron_scheduler(cron_store, manager, resolved_settings)
-                telegram = _start_telegram(
-                    resolved_settings, manager.get_or_create_runner, dialogs, outbound_http
-                )
-                try:
-                    yield
-                finally:
-                    await _stop_background_tasks(scheduler_task, telegram)
-        finally:
-            await engine.dispose()
+        async with runtime(resolved_settings) as rt:
+            app.state.settings = rt.settings
+            app.state.conversation_manager = rt.conversation_manager
+            app.state.channel = rt.channel
+            app.state.cron_store = rt.cron_store
+            yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)
 

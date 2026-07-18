@@ -155,11 +155,14 @@ web/                           # приложение octoforge-web — FastAPI-
                                #   чанкер 4096, статус-строки скилов; текст → runner.submit
       poller.py                # TelegramPoller (long-poll, offset, backlog-drain, backoff) +
                                #   TelegramBridgeRegistry (get-or-create + прогрев из БД)
+      __main__.py              # standalone-запуск: только Telegram-адаптер, без HTTP API
+                               #   (python -m octoforge_web.telegram; порт не слушается)
     static/index.html          # чат-UI: SSE-стрим, шаги скилов, маркеры процессов,
                                #   кнопка «Стоп», поле имени (= user_id)
   tests/                       # test_dialog_api.py, test_cron_api.py, test_sse.py, test_config.py,
                                # test_seed.py, test_telegram_models.py, test_telegram_bridge.py,
-                               # test_telegram_poller.py
+                               # test_telegram_poller.py, test_telegram_client.py,
+                               # test_telegram_standalone.py
 ```
 
 ## Петля агента: события, управление, актор
@@ -527,6 +530,13 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   после рестарта ушли бы в пустоту (подписчиков нет); chat_id выводится из `tg:<id>`.
 - **Конфиг**: `OF_TELEGRAM_BOT_TOKEN` (пусто = адаптер выключен),
   `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` (30), `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` (1.5).
+- **Standalone-режим** (`telegram/__main__.py`): `python -m octoforge_web.telegram` поднимает
+  только адаптер и крон-планировщик на общем composition root'е (`runtime()` в `main.py`,
+  вынесен из FastAPI-lifespan) — FastAPI-приложение не создаётся, порт не слушается, только
+  исходящие соединения (Bot API, LLM, эмбеддинги). Без токена процесс отказывается стартовать;
+  остановка по SIGINT/SIGTERM.
+- **Токен в логах**: HTTP-статусы Bot API конвертируются в `TelegramApiError` без URL
+  (`raise ... from None`) — токен из пути запроса не попадает в логи.
 - **Не входит**: группы/треды, webhook-режим, медиа и файлы, parse_mode, inline-кнопки,
   связывание идентичностей, outbox при оффлайн-инстансе ([scaling.md](scaling.md)),
   markdown-aware чанкер с учётом code fence ([streaming.md](streaming.md) п.4).

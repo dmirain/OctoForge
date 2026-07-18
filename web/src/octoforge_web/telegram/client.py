@@ -93,7 +93,11 @@ class TelegramBotClient:
         response = await self._http.post(
             f"{self._base_url}/{method}", json=payload, timeout=timeout
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # The request URL carries the bot token; keep it out of logs.
+            raise TelegramApiError(f"{method}: HTTP {exc.response.status_code}") from None
         body: dict[str, Any] = response.json()
         if not body.get("ok"):
             description = body.get("description", "unknown error")
