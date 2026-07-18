@@ -37,6 +37,8 @@ async def run_standalone(settings: Settings) -> None:
 def main() -> None:
     """Console entry: configure logging and run the standalone surface."""
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    # httpx logs full request URLs at INFO — and Bot API URLs carry the token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     asyncio.run(run_standalone(Settings()))
 
 
