@@ -1,6 +1,9 @@
 """FastAPI application factory and composition root."""
 
+from __future__ import annotations
+
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -24,16 +27,20 @@ from octoforge_core import (
 from octoforge_core.agent.prompts import DEFAULT_SYSTEM_PROMPT
 from octoforge_core.agent.router import LLMRouter
 from octoforge_core.agent.runner import RunnerConfig
+from octoforge_core.config import EmbeddingBackend
 from octoforge_core.cron.api import CronStore
 from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.cron.waker import ManagerCronWaker
 from octoforge_core.datasets.service import LocalDatasetService
+from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.seed import seed_cron_tools_if_absent, seed_if_empty
-from octoforge_core.llm.embeddings import OpenAIEmbeddingClient
+from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
+from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.openai import OpenAICompatibleClient
+from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient, RerankerConfig
 from octoforge_core.memory.api import MemoryStore
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
@@ -50,6 +57,7 @@ from octoforge_core.skills.basic.memory_search import MemorySearchSkill
 from octoforge_core.skills.basic.memory_store import MemoryStoreSkill
 from octoforge_core.skills.basic.task_list import TaskListSkill
 from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
+from sqlalchemy.exc import SQLAlchemyError
 
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
@@ -61,6 +69,8 @@ HEALTH_STATUS = "ok"
 WEB_CHANNEL = "web"
 USER_ID_HEADER = "X-User-Id"
 USER_ID_HEADER_VALUE_TEMPLATE = "{user_id}"
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -86,11 +96,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     http_client=llm_http,
                     config=resolved_settings.to_llm_config(),
                 )
-                embedder = OpenAIEmbeddingClient(
-                    http_client=embed_http,
-                    config=resolved_settings.to_embedding_config(),
+                embedder = _build_embedder(resolved_settings, embed_http)
+                reranker = _build_reranker(resolved_settings)
+                instructions = LocalInstructionService(
+                    session_factory,
+                    embedder,
+                    reranker=reranker,
+                    rerank_candidates=resolved_settings.reranker_candidates,
                 )
-                instructions = LocalInstructionService(session_factory, embedder)
                 datasets = LocalDatasetService(session_factory, embedder)
                 await _seed_instructions(instructions, resolved_settings)
                 # The app's own base URL is allowlisted so tool records can
@@ -158,14 +171,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 async def _seed_instructions(instructions: InstructionService, settings: Settings) -> None:
     """Seed the baseline and cron tool records when embeddings are configured.
 
-    Seeding needs the embeddings endpoint; without a configured key it is
-    skipped so the app still starts (embeddings stay optional until the first
-    instructions_search/save call).
+    Seeding needs working embeddings; when no usable backend is configured it
+    is skipped so the app still starts (embeddings stay optional until the
+    first instructions_search/save call). A failing embeddings backend or
+    database must not take the app down: log a warning and start without the
+    baseline records (seeding retries on the next restart).
     """
-    if not settings.embedding_api_key:
+    if not settings.embeddings_configured():
         return
-    await seed_if_empty(instructions)
-    await seed_cron_tools_if_absent(instructions, settings.self_base_url)
+    try:
+        await seed_if_empty(instructions)
+        await seed_cron_tools_if_absent(instructions, settings.self_base_url)
+    except (httpx.HTTPError, LLMResponseError, SQLAlchemyError):
+        logger.warning(
+            "Instruction seeding failed; starting without baseline records",
+            exc_info=True,
+        )
+
+
+def _build_embedder(settings: Settings, http_client: httpx.AsyncClient) -> EmbeddingClient:
+    """Choose the embeddings backend: local sentence-transformers or HTTP."""
+    if settings.embedding_backend == EmbeddingBackend.LOCAL:
+        return SentenceTransformerEmbedder(
+            model_name=settings.embedding_model,
+            batch_size=settings.embedding_batch_size,
+        )
+    return OpenAIEmbeddingClient(
+        http_client=http_client,
+        config=settings.to_embedding_config(),
+    )
+
+
+def _build_reranker(settings: Settings) -> RerankerClient | None:
+    """Build the optional cross-encoder reranker (empty model = disabled)."""
+    if not settings.reranker_model:
+        return None
+    return CrossEncoderReranker(RerankerConfig(model=settings.reranker_model))
 
 
 def _external_call_whitelist(settings: Settings) -> tuple[ExternalCallAuth, ...]:

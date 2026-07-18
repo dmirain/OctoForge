@@ -28,6 +28,7 @@ from octoforge_core.agent.router import (
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
     INTERRUPTED_NOTE,
+    REPORT_NUDGE,
     ConversationEvent,
     ConversationManager,
     RunnerConfig,
@@ -184,7 +185,7 @@ class BranchLLM:
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        if messages and messages[0].content == BACKGROUND_TASK_PROMPT:
+        if messages and messages[0].content.startswith(BACKGROUND_TASK_PROMPT):
             self.background_requests.append(list(messages))
             if self.gate_background:
                 await self.background_release.wait()
@@ -637,7 +638,9 @@ async def test_process_limit_starts_report_run_when_foreground_is_free(
     assert TASK_TITLE in refusal.content
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
     assert [item.message.content for item in finished] == ["report answer"]
-    assert llm.main_requests[-1][-1].content == refusal.content
+    report_branch = llm.main_requests[-1]
+    assert report_branch[-2].content == refusal.content
+    assert report_branch[-1] == ChatMessage(role=MessageRole.USER, content=REPORT_NUDGE)
 
     llm.background_release.set()
     events = await collect_completions(queue, 2)
@@ -709,8 +712,11 @@ async def test_task_spawn_skill_runs_background_process_and_reports(
 
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
     assert [item.message.content for item in finished] == ["report answer"]
+    report_request = llm.main_requests[-1]
+    assert report_request[-1] == ChatMessage(role=MessageRole.USER, content=REPORT_NUDGE)
     background_request = llm.background_requests[0]
-    assert background_request[0].content == BACKGROUND_TASK_PROMPT
+    assert background_request[0].content.startswith(BACKGROUND_TASK_PROMPT)
+    assert "Current date and time" in background_request[0].content
     assert background_request[1] == ChatMessage(role=MessageRole.USER, content=TASK_PROMPT)
 
 
@@ -850,7 +856,7 @@ async def test_wake_runs_cron_tagged_background_process(
     assert TASK_RESULT in notification.content
     assert runner.history()[-1] == reply("report answer")
     background_request = llm.background_requests[0]
-    assert background_request[0].content == BACKGROUND_TASK_PROMPT
+    assert background_request[0].content.startswith(BACKGROUND_TASK_PROMPT)
     assert background_request[1] == ChatMessage(role=MessageRole.USER, content=CRON_PROMPT)
 
 

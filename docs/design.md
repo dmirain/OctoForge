@@ -82,12 +82,15 @@ core/                          # библиотека octoforge-core — дом�
       openai.py                # OpenAI-совместимый клиент: complete() + stream() (SSE, tools)
       embeddings.py            # EmbeddingClient (Protocol-порт) + OpenAI-совместимый клиент
                                #   (POST /embeddings); порт общий для instructions/ и datasets/
+      local_embeddings.py      # локальный бэкенд эмбеддингов: sentence-transformers bi-encoder
+                               #   (как в b2e), L2-нормализация, вычисление в asyncio.to_thread
+      reranker.py              # RerankerClient (Protocol-порт) + кросс-энкодер (MPS при наличии)
     instructions/              # обособленный модуль инструкций (только хранение/поиск/ранг)
       api.py                   # граница модуля: InstructionService (Protocol), Instruction,
                                #   InstructionType, SearchHit, InstructionNotFoundError
       models.py                # InstructionRow — таблица instructions, собственность модуля
       store.py                 # SQL-стор (сессии через async_sessionmaker, DI)
-      ranking.py               # чистые функции: cosine + буст точного title
+      ranking.py               # чистые функции: cosine + буст точного title + реранк-мерж
       local.py                 # LocalInstructionService — локальная реализация фасада
       seed.py                  # SEED_INSTRUCTIONS + seed_if_empty (generic http tool + скилы-примеры)
     datasets/                  # обособленный модуль датасетов (per-user трекеры, этап C)
@@ -211,6 +214,10 @@ web/                           # приложение octoforge-web — FastAPI-
   (занят) или репорт-прогон (свободен). User-сообщение остаётся в нарративе.
 - **Репорт-прогон** — обычный fg-процесс с title="report" поверх нарратива, где последнее
   сообщение — system-заметка; стартует только на свободном fg (guardrail не применяется).
+  Ветка завершается user-nudge'ом («кратко сообщи результат пользователю»): на хвост из
+  system-заметки часть моделей отвечает пустотой (весь вывод уходит в reasoning-поле).
+- **Текущая дата в системном промпте**: ветки процессов (fg и bg) получают системный промпт
+  с суффиксом текущей даты/времени UTC (`_with_current_date`) — иначе модель гадает год.
 - **Завершение процесса**: `Finished` → финал в нарратив + персист (task-backed →
   `mark_done`); `Failed` → task-backed → `mark_failed`; отмена → task-backed →
   `store.cancel` + гигиена: прерванное assistant-сообщение с непустым текстом из хвоста
@@ -349,12 +356,15 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   Граница — `api.py` (Protocol `InstructionService`: `search`/`save`/`get_by_name`, DTO
   JSON-совместимые под будущую HTTP-границу). Локальная реализация `LocalInstructionService`:
   таблица `instructions` (собственность модуля), эмбеддинг `title + "\n" + content` через порт
-  `EmbeddingClient` (OpenAI-совместимый клиент `llm/embeddings.py`), ранжирование — brute-force
-  cosine + буст точного `title` (`ranking.py`, чистые функции; полная формула 70/30 + MMR —
-  позже подменой модуля). `search` инкрементирует `usage_count` возвращённых хитов.
+  `EmbeddingClient` (два бэкенда: OpenAI-совместимый `llm/embeddings.py` и локальный
+  sentence-transformers `llm/local_embeddings.py`; выбор — `OF_EMBEDDING_BACKEND`), ранжирование —
+  brute-force cosine + буст точного `title` (`ranking.py`, чистые функции; полная формула
+  70/30 + MMR — позже подменой модуля) + опциональный реранк шортлиста кросс-энкодером
+  (`OF_RERANKER_MODEL`; двухстадийная схема как в b2e: cosine-шортлист `rerank_candidates` →
+  cross-encoder → top-k). `search` инкрементирует `usage_count` возвращённых хитов.
   Сидирование `seed_if_empty` (generic weather tool + два скила-примера) — в lifespan;
-  запускается только при настроенном `OF_EMBEDDING_API_KEY` (без ключа приложение стартует
-  без сидов — эмбеддинги остаются опциональными до первого вызова search/save).
+  запускается при `embeddings_configured()` (local-бэкенд или заданный ключ); падение
+  сидирования не роняет старт — warning в лог, приложение работает без сидов.
 - **Исполнение — вне модуля** (`net/`): `ExternalCallExecutor` читает tool-запись через
   `get_by_name`, парсит `ToolSpec` (JSON: method, url_template, params_schema, auth),
   валидирует параметры по схеме (required присутствуют, неизвестные запрещены), рендерит

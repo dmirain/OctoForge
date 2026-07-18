@@ -16,7 +16,7 @@ from octoforge_core.agent.events import (
     ToolCallFailed,
     ToolCallRequested,
 )
-from octoforge_core.agent.loop import MAX_ITERATIONS_MESSAGE, AgentLoop
+from octoforge_core.agent.loop import ERROR_OUTPUT_PREFIX, MAX_ITERATIONS_MESSAGE, AgentLoop
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
@@ -28,6 +28,7 @@ SKILL_OUTPUT = "skill output"
 FINAL_CONTENT = "done"
 CALL_ID = "call-1"
 FAILURE_MESSAGE = "boom"
+TIMEOUT_CLASS_NAME = "TimeoutError"
 INJECTED_CONTENT = "extra context"
 CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 
@@ -108,6 +109,17 @@ class FailingSkill:
 
     async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
         raise RuntimeError(FAILURE_MESSAGE)
+
+
+class EmptyFailingSkill:
+    """Skill stub raising an exception whose str() is empty."""
+
+    @property
+    def spec(self) -> SkillSpec:
+        return SkillSpec(name=SKILL_NAME, description="empty failing stub", parameters_schema={})
+
+    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+        raise TimeoutError
 
 
 class InjectingSkill:
@@ -229,7 +241,20 @@ async def test_skill_failure_emits_event_and_continues() -> None:
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
     failed = next(e for e in events if isinstance(e, ToolCallFailed))
-    assert failed.error == FAILURE_MESSAGE
+    assert failed.error == f"RuntimeError: {FAILURE_MESSAGE}"
+    assert isinstance(events[-1], Finished)
+
+
+async def test_skill_failure_with_empty_message_uses_class_name() -> None:
+    llm = ScriptedLLM([assistant_with_call(), final_reply()])
+    loop = AgentLoop(llm_client=llm, registry=make_registry(EmptyFailingSkill()), max_iterations=3)
+
+    events = await collect(loop.stream([user_message()], LoopControl(), CTX))
+
+    failed = next(e for e in events if isinstance(e, ToolCallFailed))
+    assert failed.error == TIMEOUT_CLASS_NAME
+    tool_message = next(m for m in llm.requests[1] if m.role == MessageRole.TOOL)
+    assert tool_message.content == f"{ERROR_OUTPUT_PREFIX}{TIMEOUT_CLASS_NAME}"
     assert isinstance(events[-1], Finished)
 
 

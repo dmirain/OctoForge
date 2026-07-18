@@ -1,6 +1,7 @@
 """Tests for the web settings (env parsing and core config conversion)."""
 
 import pytest
+from octoforge_core.config import EmbeddingBackend
 
 from octoforge_web.config import (
     DEFAULT_CRON_LEASE_TTL_SECONDS,
@@ -30,6 +31,10 @@ CUSTOM_SELF_BASE_URL = "http://10.0.0.5:9000"
 CUSTOM_CRON_POLL_INTERVAL = 2.5
 CUSTOM_CRON_LEASE_TTL = 120.0
 CUSTOM_CRON_REPLAY_LIMIT = 3
+CUSTOM_BATCH_SIZE = 32
+CUSTOM_RERANK_CANDIDATES = 15
+LOCAL_EMBEDDING_MODEL = "intfloat/multilingual-e5-large-instruct"
+LOCAL_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 WHITELIST_JSON = (
     '[{"base_url_prefix": "https://internal.example.com/", '
     '"header_name": "X-Api-Key", "header_value": "s3cret"}]'
@@ -41,6 +46,10 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "OF_EMBEDDING_BASE_URL",
         "OF_EMBEDDING_API_KEY",
         "OF_EMBEDDING_MODEL",
+        "OF_EMBEDDING_BACKEND",
+        "OF_EMBEDDING_BATCH_SIZE",
+        "OF_RERANKER_MODEL",
+        "OF_RERANKER_CANDIDATES",
         "OF_INSTRUCTIONS_TOP_K",
         "OF_EXTERNAL_CALL_AUTH_WHITELIST",
         "OF_DATASETS_QUERY_DEFAULT_LIMIT",
@@ -74,6 +83,9 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.cron_lease_ttl_seconds == DEFAULT_CRON_LEASE_TTL_SECONDS
     assert settings.cron_replay_limit == DEFAULT_CRON_REPLAY_LIMIT
     assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
+    assert settings.to_embedding_config().backend == EmbeddingBackend.OPENAI
+    assert settings.reranker_model == ""
+    assert not settings.embeddings_configured()
     assert settings.to_external_call_auth_whitelist() == ()
 
 
@@ -147,3 +159,34 @@ def test_auth_whitelist_parsed_from_json_env(monkeypatch: pytest.MonkeyPatch) ->
     assert entry.base_url_prefix == "https://internal.example.com/"
     assert entry.header_name == "X-Api-Key"
     assert entry.header_value == "s3cret"
+
+
+def test_local_embeddings_backend_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_EMBEDDING_BACKEND", "local")
+    monkeypatch.setenv("OF_EMBEDDING_MODEL", LOCAL_EMBEDDING_MODEL)
+    monkeypatch.setenv("OF_EMBEDDING_BATCH_SIZE", str(CUSTOM_BATCH_SIZE))
+    monkeypatch.setenv("OF_RERANKER_MODEL", LOCAL_RERANKER_MODEL)
+    monkeypatch.setenv("OF_RERANKER_CANDIDATES", str(CUSTOM_RERANK_CANDIDATES))
+
+    settings = Settings()
+    config = settings.to_embedding_config()
+
+    assert config.backend == EmbeddingBackend.LOCAL
+    assert config.model == LOCAL_EMBEDDING_MODEL
+    assert config.batch_size == CUSTOM_BATCH_SIZE
+    assert settings.reranker_model == LOCAL_RERANKER_MODEL
+    assert settings.reranker_candidates == CUSTOM_RERANK_CANDIDATES
+    assert settings.embeddings_configured()
+
+
+def test_openai_backend_requires_api_key_to_count_as_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OF_EMBEDDING_BACKEND", "openai")
+    monkeypatch.delenv("OF_EMBEDDING_API_KEY", raising=False)
+
+    assert not Settings().embeddings_configured()
+
+    monkeypatch.setenv("OF_EMBEDDING_API_KEY", "sk-test")
+
+    assert Settings().embeddings_configured()

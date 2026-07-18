@@ -16,7 +16,7 @@ from octoforge_core.agent.events import (
     ProcessResumed,
     ProcessSuspended,
 )
-from octoforge_core.agent.loop import AgentLoop
+from octoforge_core.agent.loop import AgentLoop, format_error
 from octoforge_core.agent.router import (
     MessageRouter,
     ProcessInfo,
@@ -31,10 +31,15 @@ from octoforge_core.ports import TaskStore
 from octoforge_core.skills.base import SkillContext
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.spawner import TaskSpawner
+from octoforge_core.time import utc_now
 
 SUBSCRIBER_QUEUE_SIZE = 100
 TITLE_MAX_LENGTH = 60
 REPORT_TITLE = "report"
+REPORT_NUDGE = (
+    "The system notification above is new: briefly report it to the user "
+    "in the user's language, then stop."
+)
 INTERRUPTED_NOTE = "[The previous assistant message was interrupted and may be incomplete.]"
 TASK_DONE_TEMPLATE = (
     "Background task '{title}' has finished with status {status}.\nResult:\n{result}"
@@ -54,6 +59,8 @@ BACKGROUND_TASK_PROMPT = (
     "You are solving a background task. User message is the task. "
     "Produce the final answer as the result."
 )
+CURRENT_DATE_TEMPLATE = "\nCurrent date and time: {now} (UTC)."
+CURRENT_DATE_FORMAT = "%Y-%m-%d %H:%M"
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +70,11 @@ class ConversationEvent:
     dialog_id: str
     seq: int
     payload: LoopEvent
+
+
+def _with_current_date(prompt: str) -> str:
+    """Append the current UTC date/time so the model stops guessing it."""
+    return prompt + CURRENT_DATE_TEMPLATE.format(now=utc_now().strftime(CURRENT_DATE_FORMAT))
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +216,9 @@ class ConversationRunner:
             title=title,
             task_id=task.id,
             branch=[
-                ChatMessage(role=MessageRole.SYSTEM, content=BACKGROUND_TASK_PROMPT),
+                ChatMessage(
+                    role=MessageRole.SYSTEM, content=_with_current_date(BACKGROUND_TASK_PROMPT)
+                ),
                 ChatMessage(role=MessageRole.USER, content=prompt),
             ],
         )
@@ -330,7 +344,7 @@ class ConversationRunner:
         )
         await self._publish_system_note(note)
 
-    def _start_new(self, title: str) -> None:
+    def _start_new(self, title: str, trail: ChatMessage | None = None) -> None:
         """Start a foreground process over the current narrative, suspending the old one."""
         self._suspend_foreground()
         process = self._create_process(
@@ -338,15 +352,26 @@ class ConversationRunner:
             title=title,
             task_id=None,
             branch=[
-                ChatMessage(role=MessageRole.SYSTEM, content=self._system_prompt),
+                ChatMessage(
+                    role=MessageRole.SYSTEM, content=_with_current_date(self._system_prompt)
+                ),
                 *self._narrative,
+                *([trail] if trail is not None else []),
             ],
         )
         self._foreground_id = process.id
 
     def _start_report_run(self) -> None:
-        """Start a foreground run reacting to the latest narrative note (fg is free)."""
-        self._start_new(title=REPORT_TITLE)
+        """Start a foreground run reacting to the latest narrative note (fg is free).
+
+        A trailing system note leaves some models without anything to answer
+        to (they reason but emit no content), so the run ends with a user-role
+        nudge asking for the report.
+        """
+        self._start_new(
+            title=REPORT_TITLE,
+            trail=ChatMessage(role=MessageRole.USER, content=REPORT_NUDGE),
+        )
 
     def _suspend_foreground(self) -> None:
         foreground = self._foreground()
@@ -397,7 +422,7 @@ class ConversationRunner:
                 if isinstance(event, (Finished, Cancelled, Failed)):
                     terminal = event
         except Exception as exc:  # loop failures are broadcast, not raised
-            terminal = Failed(error=str(exc))
+            terminal = Failed(error=format_error(exc))
             if self._foreground_id == process.id:
                 self._broadcast(terminal)
         status = await self._finalize(process, terminal)

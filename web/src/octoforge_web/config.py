@@ -1,6 +1,8 @@
 """Application settings."""
 
 from octoforge_core import EmbeddingConfig, LLMConfig
+from octoforge_core.config import DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddingBackend
+from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES
 from octoforge_core.net.external import ExternalCallAuth
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,6 +26,7 @@ DEFAULT_SELF_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CRON_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_CRON_LEASE_TTL_SECONDS = 60.0
 DEFAULT_CRON_REPLAY_LIMIT = 5
+DEFAULT_RERANKER_MODEL = ""
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -45,6 +48,10 @@ class Settings(BaseSettings):
     embedding_base_url: str = DEFAULT_EMBEDDING_BASE_URL
     embedding_api_key: str = ""
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    embedding_backend: EmbeddingBackend = EmbeddingBackend.OPENAI
+    embedding_batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE
+    reranker_model: str = DEFAULT_RERANKER_MODEL
+    reranker_candidates: int = DEFAULT_RERANK_CANDIDATES
     instructions_top_k: int = DEFAULT_INSTRUCTIONS_TOP_K
     external_call_auth_whitelist: list[ExternalCallAuthSettings] = Field(default_factory=list)
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS
@@ -74,7 +81,17 @@ class Settings(BaseSettings):
             base_url=self.embedding_base_url,
             api_key=self.embedding_api_key,
             model=self.embedding_model,
+            backend=self.embedding_backend,
+            batch_size=self.embedding_batch_size,
         )
+
+    def embeddings_configured(self) -> bool:
+        """Whether an embeddings backend is usable (drives seeding at startup).
+
+        The LOCAL backend needs no credentials; the OPENAI backend is usable
+        only with an API key.
+        """
+        return self.embedding_backend == EmbeddingBackend.LOCAL or bool(self.embedding_api_key)
 
     def to_external_call_auth_whitelist(self) -> tuple[ExternalCallAuth, ...]:
         """Build the executor's auth whitelist from the settings entries."""

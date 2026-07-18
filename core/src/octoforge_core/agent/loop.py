@@ -155,4 +155,17 @@ class AgentLoop:
             skill = self._registry.get(call.name)
             return await skill.execute(call.arguments, context), None
         except Exception as exc:  # skill failures are reported back to the LLM
-            return f"{ERROR_OUTPUT_PREFIX}{exc}", str(exc)
+            error = format_error(exc)
+            return f"{ERROR_OUTPUT_PREFIX}{error}", error
+
+
+def format_error(exc: Exception) -> str:
+    """Render an exception for the LLM/user, prefixed with its class name.
+
+    Some exceptions (e.g. httpx timeouts) have an empty `str()` — the class
+    name is then the only usable signal.
+    """
+    message = str(exc)
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__

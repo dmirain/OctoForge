@@ -1,4 +1,4 @@
-"""Pure ranking functions: cosine similarity plus exact-title boost.
+"""Pure ranking functions: cosine similarity, exact-title boost, rerank merge.
 
 Standalone volumes allow brute-force cosine over the whole table; the full
 openclaw formula (70/30 + MMR + decay) is a later iteration that swaps this
@@ -60,6 +60,22 @@ def rank(
     ]
     scored.sort(key=lambda hit: (-hit.score, hit.instruction.title))
     return scored[:k]
+
+
+def rerank(hits: list[SearchHit], scores: tuple[float, ...], k: int) -> list[SearchHit]:
+    """Replace hit scores with cross-encoder scores and return the top-k.
+
+    `scores` aligns with `hits` by position (zip is strict: a length mismatch
+    is a bug and raises). Ties break by title for determinism.
+    """
+    if k <= 0:
+        return []
+    rescored = [
+        SearchHit(instruction=hit.instruction, score=score)
+        for hit, score in zip(hits, scores, strict=True)
+    ]
+    rescored.sort(key=lambda hit: (-hit.score, hit.instruction.title))
+    return rescored[:k]
 
 
 def _score(

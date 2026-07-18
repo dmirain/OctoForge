@@ -12,6 +12,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2",
     "aiosqlite>=0.19",
     "croniter>=6,<7",
+    "sentence-transformers>=3",
 ]
 
 [project.optional-dependencies]
