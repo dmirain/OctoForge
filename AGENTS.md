@@ -4,22 +4,23 @@
 
 ## Project status
 
-Событийная петля с актором диалога, персистом в SQLite и фоновыми задачами работает. Реализовано:
+Событийная петля с актором диалога (процессная модель + LLM-роутер), персистом в SQLite и фоновыми задачами-процессами работает. Реализовано:
 
 - монорепо из двух проектов: библиотека `core/` (`octoforge-core`) и web-приложение `web/` (`octoforge-web`) — у каждого свой `pyproject.toml`, зависимости и тесты;
 - петля как поток событий: `AgentLoop.stream(history, control, context) -> AsyncIterator[LoopEvent]` — токены, вызовы скилов, финал, отмена;
 - управление прогоном: `LoopControl` (инъекции сообщений + отмена с сохранением частичного ответа);
-- актор диалога: `ConversationRunner`/`ConversationManager` — ключуются по `(user_id, channel)` (get-or-create), история пересобирается из БД, сообщения персистятся по ходу прогона, проактивные уведомления о задачах;
-- персист: SQLAlchemy async + SQLite, пакет `db/` (Base + `UTCDateTime`, ORM-модели dialogs/messages/tasks, фабрики engine/session, репозитории); `create_all` при старте, Alembic — при первой деструктивной миграции;
-- фоновые задачи за протоколом `TaskStore` (боевой `SqlAlchemyTaskStore`, `InMemoryTaskStore` — для тестов): `TaskRunner` + скилы `task_spawn`/`task_list`, отметка доставки `result_delivered`;
-- скилы: `Skill`/`SkillSpec`/`SkillContext(user_id, channel, dialog_id)`/`SkillRegistry`, типы `BASIC|DYNAMIC`; базовые `http_request`, `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`, `data_put`, `data_query`, `data_forget`;
+- процессная модель диалога (этап E): актор `ConversationRunner` владеет нарративом (user-сообщения + финалы процессов + system-уведомления; только он персистится) и процессами (fg/bg, в памяти); broadcast — события форграунда + маркеры `ProcessSuspended`/`ProcessResumed`/`ProcessCompleted`; `ConversationManager` — runners по `(user_id, channel)` (get-or-create), конструктор через `RunnerConfig`;
+- LLM-роутер (`agent/router.py`): порт `MessageRouter` (пакет `RouteOp`: INJECT/START_NEW/CANCEL/PROMOTE), `LLMRouter` — one-shot `complete()` с tool `route(ops)`, таймаут (`OF_ROUTER_TIMEOUT_SECONDS`), валидация ops, фолбэк; детерминированный guardrail лимита процессов (`OF_MAX_PROCESSES`) в акторе;
+- персист: SQLAlchemy async + SQLite, пакет `db/` (Base + `UTCDateTime`, ORM-модели dialogs/messages/tasks, фабрики engine/session, репозитории); `create_all` при старте, Alembic — при первой деструктивной миграции; `seq` сообщений присваивается атомарно подзапросом в INSERT;
+- фоновые задачи = фоновые процессы актора (этап E): `TaskKind.RUN`, `TaskStatus` (+CANCELLED), порт `TaskStore` (+cancel/is_cancelled/count_active; `next_pending` и глобальный `TaskRunner` удалены); спавн — порт `TaskSpawner` (`tasks/spawner.py`), bound-реализация в акторе; скилы `task_spawn`/`task_list`, уведомление о завершении с отметкой `result_delivered` (репорт-прогон или инъекция);
+- скилы: `Skill`/`SkillSpec`/`SkillContext(user_id, channel, dialog_id, task_spawner?)`/`SkillRegistry`, типы `BASIC|DYNAMIC`; базовые `http_request`, `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`, `data_put`, `data_query`, `data_forget`;
 - LLM-клиент: `complete()` + `stream()` (SSE, tools/tool_calls); порт `EmbeddingClient` + OpenAI-совместимый клиент эмбеддингов `llm/embeddings.py` (POST /embeddings, конфиг `EmbeddingConfig` рядом с `LLMConfig`); порт общий для модулей инструкций и датасетов;
 - инструкции (этап B): обособленный пакет `instructions/` (граница `api.py` — Protocol `InstructionService`: `search`/`save`/`get_by_name`; локальная реализация — таблица `instructions`, cosine-ранжирование + буст точного title, сидирование); исполнение внешних вызовов — вне модуля: `net/` (`ExternalCallExecutor` поверх tool-записей, `SsrfGuard`, whitelist-авторизация из composition root);
 - датасеты (этап C): обособленный пакет `datasets/` (граница `api.py` — Protocol `DatasetService`; локальная реализация — таблицы `datasets`/`dataset_records`, валидация записей по JSON-схеме, cosine-поиск по дескрипторам с бустом точного имени, owner-изоляция на уровне SQL); скилы `data_put` (create-if-absent)/`data_query`/`data_forget`; дескрипторы участвуют в `instructions_search`; см. `docs/data-store.md`;
 - память (этап D): обособленный пакет `memory/` (граница `api.py` — Protocol `MemoryStore`, DTO `Memory`, `MemoryScope(USER|GLOBAL)`; таблица `memories`, `user_id` NULL = глобальный скоуп, upsert по (owner, key) в самом сторе — unique-констрейнт NULL не ловит; LIKE-поиск «свои + глобальные», без эмбеддингов); скилы `memory_store`/`memory_search`/`memory_delete`; автоинъекция в контекст — следующая итерация; см. `docs/dialogs.md`;
-- web: dialog API (`POST /api/dialog/messages`, `POST /api/dialog/cancel`, `GET /api/dialog/events` SSE) с заголовком `X-User-Id` (доверенная строка, без аутентификации), чат-UI со стримом и кнопкой «Стоп»; канал `"web"` объявлен в composition root.
+- web: dialog API (`POST /api/dialog/messages`, `POST /api/dialog/cancel`, `GET /api/dialog/events` SSE) с заголовком `X-User-Id` (доверенная строка, без аутентификации), чат-UI со стримом, маркерами процессов и кнопкой «Стоп»; канал `"web"` объявлен в composition root.
 
-Не реализовано: пользователи/аутентификация (user_id — доверенная строка от клиента), редоставка недоставленных результатов задач при старте, влияние usage/success-статистики на ранг поиска инструкций и http-реализация фасадов `InstructionService`/`DatasetService`/`MemoryStore` (выделенный сервис), автоинъекция памяти в контекст, роутер и процессная модель (`docs/process-model.md`). План — `docs/design.md`.
+Не реализовано: пользователи/аутентификация (user_id — доверенная строка от клиента), редоставка недоставленных результатов задач при старте и реанимация/фейл задач, осиротевших при рестарте (процессы — в памяти, PENDING/RUNNING теряют исполнителя), влияние usage/success-статистики на ранг поиска инструкций и http-реализация фасадов `InstructionService`/`DatasetService`/`MemoryStore` (выделенный сервис), автоинъекция памяти в контекст, крон (`docs/cron.md`). План — `docs/design.md`.
 
 ## Project overview
 
@@ -27,7 +28,7 @@ OctoForge — мультипользовательский LLM-агент: Pytho
 
 ## Repository layout
 
-- `core/` — библиотека `octoforge-core` (src-layout): домен, порты, `agent/` (events/control/loop/prompts/runner), `skills/` (base/registry/basic), `tasks/` (models/store/runner), `llm/` (events/openai/embeddings — включая порт `EmbeddingClient`), `db/` (base/models/engine/repositories), `instructions/` (модуль инструкций: api/models/store/ranking/local/seed), `datasets/` (модуль датасетов: api/models/validation/store/ranking/service), `memory/` (модуль памяти: api/models/store), `net/` (SSRF-гвард, исполнитель внешних вызовов). Не импортирует fastapi; sqlalchemy — только в `db/` и SQL-сторах (`db/repositories.py`, `instructions/store.py`, `datasets/store.py`, `memory/store.py`).
+- `core/` — библиотека `octoforge-core` (src-layout): домен, порты, `agent/` (events/control/loop/router/prompts/runner), `skills/` (base/registry/basic), `tasks/` (models/store/spawner/errors), `llm/` (events/openai/embeddings — включая порт `EmbeddingClient`), `db/` (base/models/engine/repositories), `instructions/` (модуль инструкций: api/models/store/ranking/local/seed), `datasets/` (модуль датасетов: api/models/validation/store/ranking/service), `memory/` (модуль памяти: api/models/store), `net/` (SSRF-гвард, исполнитель внешних вызовов). Не импортирует fastapi; sqlalchemy — только в `db/` и SQL-сторах (`db/repositories.py`, `instructions/store.py`, `datasets/store.py`, `memory/store.py`).
 - `web/` — приложение `octoforge-web` (src-layout): FastAPI-обёртка, `api/` (dialog/sse/schemas), статика, composition root в `main.py`. Зависит от `octoforge-core`.
 - Корень: `Makefile`, `README.md`, `.env.example`, `docs/`.
 

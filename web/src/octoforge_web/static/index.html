@@ -95,6 +95,12 @@
       font-family: ui-monospace, monospace;
       white-space: pre-wrap;
     }
+    .marker {
+      align-self: center;
+      color: var(--muted);
+      font-size: 12px;
+      font-style: italic;
+    }
     #composer {
       display: flex;
       gap: 8px;
@@ -185,6 +191,14 @@
       scrollToBottom();
     }
 
+    function addMarker(content) {
+      const div = document.createElement("div");
+      div.className = "marker";
+      div.textContent = content;
+      messagesEl.appendChild(div);
+      scrollToBottom();
+    }
+
     function appendDelta(text) {
       if (!currentBubble) {
         currentBubble = addMessage("assistant", "");
@@ -235,6 +249,15 @@
         case "failed":
           addMessage("error", event.error);
           setRunning(false);
+          break;
+        case "process_suspended":
+          addMarker(`процесс отложен: ${event.title}`);
+          break;
+        case "process_resumed":
+          addMarker(`процесс возобновлён: ${event.title}`);
+          break;
+        case "process_completed":
+          addMarker(`процесс завершён (${event.status}): ${event.title}`);
           break;
       }
     }

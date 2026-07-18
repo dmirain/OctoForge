@@ -12,8 +12,7 @@ from octoforge_core.time import utc_now
 class TaskKind(StrEnum):
     """Kinds of background work."""
 
-    SKILL = "skill"
-    PROMPT = "prompt"
+    RUN = "run"
 
 
 class TaskStatus(StrEnum):
@@ -23,6 +22,7 @@ class TaskStatus(StrEnum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(slots=True)

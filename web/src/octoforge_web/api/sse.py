@@ -1,6 +1,7 @@
 """Serialization of conversation events to SSE frames."""
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 from octoforge_core import LoopEvent
@@ -10,6 +11,9 @@ from octoforge_core.agent.events import (
     Failed,
     Finished,
     IterationStarted,
+    ProcessCompleted,
+    ProcessResumed,
+    ProcessSuspended,
     TextDelta,
     ToolCallCompleted,
     ToolCallFailed,
@@ -40,37 +44,78 @@ def event_to_payload(event: ConversationEvent) -> dict[str, Any]:
 
 def _event_details(payload: LoopEvent) -> dict[str, Any]:
     """Build the type-tagged payload body for one loop event."""
+    for extract in _DETAIL_EXTRACTORS:
+        details = extract(payload)
+        if details is not None:
+            return details
+    raise ValueError(UNKNOWN_EVENT_MESSAGE)
+
+
+def _stream_event_details(payload: LoopEvent) -> dict[str, Any] | None:
     if isinstance(payload, IterationStarted):
-        details: dict[str, Any] = {"type": "iteration_started", "index": payload.index}
-    elif isinstance(payload, TextDelta):
-        details = {"type": "text_delta", "text": payload.text}
-    elif isinstance(payload, AssistantMessage):
-        details = {
+        return {"type": "iteration_started", "index": payload.index}
+    if isinstance(payload, TextDelta):
+        return {"type": "text_delta", "text": payload.text}
+    if isinstance(payload, AssistantMessage):
+        return {
             "type": "assistant_message",
             "role": payload.message.role.value,
             "content": payload.message.content,
             "interrupted": payload.interrupted,
         }
-    elif isinstance(payload, ToolCallRequested):
-        details = {
+    return None
+
+
+def _tool_event_details(payload: LoopEvent) -> dict[str, Any] | None:
+    if isinstance(payload, ToolCallRequested):
+        return {
             "type": "tool_call_requested",
             "name": payload.call.name,
             "arguments": payload.call.arguments,
         }
-    elif isinstance(payload, ToolCallCompleted):
-        details = {
-            "type": "tool_call_completed",
-            "name": payload.call.name,
-            "output": payload.output,
+    if isinstance(payload, ToolCallCompleted):
+        return {"type": "tool_call_completed", "name": payload.call.name, "output": payload.output}
+    if isinstance(payload, ToolCallFailed):
+        return {"type": "tool_call_failed", "name": payload.call.name, "error": payload.error}
+    return None
+
+
+def _terminal_event_details(payload: LoopEvent) -> dict[str, Any] | None:
+    if isinstance(payload, Finished):
+        return {"type": "finished", "content": payload.message.content}
+    if isinstance(payload, Cancelled):
+        return {"type": "cancelled"}
+    if isinstance(payload, Failed):
+        return {"type": "failed", "error": payload.error}
+    return None
+
+
+def _process_event_details(payload: LoopEvent) -> dict[str, Any] | None:
+    if isinstance(payload, ProcessSuspended):
+        return {
+            "type": "process_suspended",
+            "process_id": payload.process_id,
+            "title": payload.title,
         }
-    elif isinstance(payload, ToolCallFailed):
-        details = {"type": "tool_call_failed", "name": payload.call.name, "error": payload.error}
-    elif isinstance(payload, Finished):
-        details = {"type": "finished", "content": payload.message.content}
-    elif isinstance(payload, Cancelled):
-        details = {"type": "cancelled"}
-    elif isinstance(payload, Failed):
-        details = {"type": "failed", "error": payload.error}
-    else:
-        raise ValueError(UNKNOWN_EVENT_MESSAGE)
-    return details
+    if isinstance(payload, ProcessResumed):
+        return {
+            "type": "process_resumed",
+            "process_id": payload.process_id,
+            "title": payload.title,
+        }
+    if isinstance(payload, ProcessCompleted):
+        return {
+            "type": "process_completed",
+            "process_id": payload.process_id,
+            "title": payload.title,
+            "status": payload.status,
+        }
+    return None
+
+
+_DETAIL_EXTRACTORS: tuple[Callable[[LoopEvent], dict[str, Any] | None], ...] = (
+    _stream_event_details,
+    _tool_event_details,
+    _terminal_event_details,
+    _process_event_details,
+)

@@ -35,7 +35,6 @@ FIRST_SEQ = 1
 SECOND_SEQ = 2
 THIRD_SEQ = 3
 CREATED_EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
-CREATED_LATER = datetime(2026, 1, 2, tzinfo=UTC)
 TOOL_CALL = ToolCall(id="call-1", name="http_request", arguments={"url": "https://example.com"})
 
 
@@ -58,8 +57,8 @@ def make_task(
         user_id=user_id,
         channel=CHANNEL,
         title=title,
-        kind=TaskKind.PROMPT,
-        input={"prompt": "solve 2+2"},
+        kind=TaskKind.RUN,
+        input={"title": title, "prompt": "solve 2+2"},
         created_at=created_at,
     )
 
@@ -188,7 +187,7 @@ async def test_task_add_and_get(session_factory: async_sessionmaker[AsyncSession
     assert stored.dialog_id == task.dialog_id
     assert stored.user_id == task.user_id
     assert stored.status is TaskStatus.PENDING
-    assert stored.kind is TaskKind.PROMPT
+    assert stored.kind is TaskKind.RUN
     assert stored.result_delivered is False
     assert stored.created_at.tzinfo == UTC
 
@@ -216,22 +215,32 @@ async def test_task_list_scoped_by_dialog(
     assert [task.title for task in other] == ["c"]
 
 
-async def test_next_pending_returns_oldest_pending(
+async def test_cancel_marks_task_cancelled(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
-    older = make_task(title="older", created_at=CREATED_EARLIER)
-    newer = make_task(title="newer", created_at=CREATED_LATER)
-    await store.add(newer)
-    await store.add(older)
+    task = make_task()
+    await store.add(task)
 
-    pending = await store.next_pending()
+    await store.cancel(task.id)
 
-    assert pending is not None
-    assert pending.title == "older"
+    stored = await store.get(task.id)
+    assert stored.status is TaskStatus.CANCELLED
+    assert stored.finished_at is not None
+    assert stored.finished_at.tzinfo == UTC
+    assert await store.is_cancelled(task.id)
 
 
-async def test_next_pending_empty_when_nothing_pending(
+async def test_cancel_unknown_task_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+
+    with pytest.raises(TaskNotFoundError):
+        await store.cancel("missing")
+
+
+async def test_is_cancelled_false_for_missing_or_running(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
@@ -239,7 +248,27 @@ async def test_next_pending_empty_when_nothing_pending(
     await store.add(task)
     await store.mark_running(task)
 
-    assert await store.next_pending() is None
+    assert not await store.is_cancelled("missing")
+    assert not await store.is_cancelled(task.id)
+
+
+async def test_count_active_counts_pending_and_running_of_the_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    pending = make_task(title="pending")
+    running = make_task(title="running")
+    done = make_task(title="done")
+    cancelled = make_task(title="cancelled")
+    other = make_task(dialog_id=OTHER_DIALOG_ID, user_id=OTHER_USER_ID, title="other")
+    for task in (pending, running, done, cancelled, other):
+        await store.add(task)
+    await store.mark_running(running)
+    await store.mark_done(done, TASK_RESULT)
+    await store.cancel(cancelled.id)
+
+    assert await store.count_active(DIALOG_ID) == OWN_TASK_COUNT
+    assert await store.count_active(OTHER_DIALOG_ID) == 1
 
 
 async def test_mark_running_sets_status_and_started_at(

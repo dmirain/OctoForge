@@ -3,7 +3,7 @@
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.errors import DialogNotFoundError
@@ -53,10 +53,28 @@ class MessageRepository:
         self._session_factory = session_factory
 
     async def append(self, dialog_id: str, message: ChatMessage) -> None:
-        """Append a message assigning it the next seq within the dialog."""
+        """Append a message assigning it the next seq within the dialog.
+
+        The seq is computed inside the INSERT statement, so concurrent writers
+        (the actor and the process pumps) cannot assign the same seq.
+        """
         async with self._session_factory() as session:
-            seq = await self._next_seq(session, dialog_id)
-            session.add(_to_message_row(dialog_id, seq, message))
+            next_seq = (
+                select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
+                .where(MessageRow.dialog_id == dialog_id)
+                .scalar_subquery()
+            )
+            await session.execute(
+                insert(MessageRow).values(
+                    id=uuid.uuid4().hex,
+                    dialog_id=dialog_id,
+                    seq=next_seq,
+                    role=message.role.value,
+                    content=message.content,
+                    tool_calls=_tool_calls_to_json(message.tool_calls),
+                    tool_call_id=message.tool_call_id,
+                )
+            )
             dialog = await session.get(DialogRow, dialog_id)
             if dialog is not None:
                 dialog.updated_at = utc_now()
@@ -69,13 +87,6 @@ class MessageRepository:
                 select(MessageRow).where(MessageRow.dialog_id == dialog_id).order_by(MessageRow.seq)
             )
             return [_to_chat_message(row) for row in result.all()]
-
-    @staticmethod
-    async def _next_seq(session: AsyncSession, dialog_id: str) -> int:
-        current = await session.scalar(
-            select(func.max(MessageRow.seq)).where(MessageRow.dialog_id == dialog_id)
-        )
-        return 1 if current is None else current + 1
 
 
 class SqlAlchemyTaskStore:
@@ -103,17 +114,6 @@ class SqlAlchemyTaskStore:
             )
             return [_to_task(row) for row in result.all()]
 
-    async def next_pending(self) -> Task | None:
-        async with self._session_factory() as session:
-            result = await session.scalars(
-                select(TaskRow)
-                .where(TaskRow.status == TaskStatus.PENDING.value)
-                .order_by(TaskRow.created_at)
-                .limit(1)
-            )
-            row = result.first()
-            return None if row is None else _to_task(row)
-
     async def mark_running(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         task.started_at = utc_now()
@@ -130,6 +130,30 @@ class SqlAlchemyTaskStore:
         task.error = error
         task.finished_at = utc_now()
         await self._update(task)
+
+    async def cancel(self, task_id: str) -> None:
+        async with self._session_factory() as session:
+            row = await session.get(TaskRow, task_id)
+            if row is None:
+                raise TaskNotFoundError(task_id)
+            row.status = TaskStatus.CANCELLED.value
+            row.finished_at = utc_now()
+            await session.commit()
+
+    async def is_cancelled(self, task_id: str) -> bool:
+        async with self._session_factory() as session:
+            row = await session.get(TaskRow, task_id)
+            return row is not None and row.status == TaskStatus.CANCELLED.value
+
+    async def count_active(self, dialog_id: str) -> int:
+        async with self._session_factory() as session:
+            count = await session.scalar(
+                select(func.count(TaskRow.id)).where(
+                    TaskRow.dialog_id == dialog_id,
+                    TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value)),
+                )
+            )
+            return int(count or 0)
 
     async def mark_delivered(self, task_id: str) -> None:
         async with self._session_factory() as session:
@@ -159,18 +183,6 @@ def _to_dialog(row: DialogRow) -> Dialog:
         channel=row.channel,
         created_at=row.created_at,
         updated_at=row.updated_at,
-    )
-
-
-def _to_message_row(dialog_id: str, seq: int, message: ChatMessage) -> MessageRow:
-    return MessageRow(
-        id=uuid.uuid4().hex,
-        dialog_id=dialog_id,
-        seq=seq,
-        role=message.role.value,
-        content=message.content,
-        tool_calls=_tool_calls_to_json(message.tool_calls),
-        tool_call_id=message.tool_call_id,
     )
 
 

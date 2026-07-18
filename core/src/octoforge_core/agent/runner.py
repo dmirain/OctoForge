@@ -1,21 +1,54 @@
-"""Per-dialog actor: serializes commands, persists history and broadcasts loop events."""
+"""Per-dialog actor: owns the narrative and the processes answering user questions."""
 
 import asyncio
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 
 from octoforge_core.agent.control import LoopControl
-from octoforge_core.agent.events import Failed, LoopEvent
+from octoforge_core.agent.events import (
+    Cancelled,
+    Failed,
+    Finished,
+    LoopEvent,
+    ProcessCompleted,
+    ProcessResumed,
+    ProcessSuspended,
+)
 from octoforge_core.agent.loop import AgentLoop
+from octoforge_core.agent.router import (
+    MessageRouter,
+    ProcessInfo,
+    ProcessPlace,
+    RouteAction,
+    RouteDecision,
+    RouteOp,
+)
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.ports import TaskStore
 from octoforge_core.skills.base import SkillContext
-from octoforge_core.tasks.models import Task
+from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.spawner import TaskSpawner
 
 SUBSCRIBER_QUEUE_SIZE = 100
+TITLE_MAX_LENGTH = 60
+REPORT_TITLE = "report"
+INTERRUPTED_NOTE = "[The previous assistant message was interrupted and may be incomplete.]"
 TASK_DONE_TEMPLATE = (
     "Background task '{title}' has finished with status {status}.\nResult:\n{result}"
+)
+LIMIT_REFUSAL_TEMPLATE = (
+    "The user asked: '{message}' — but the process limit ({limit}) is reached and the "
+    "request was not started. Propose cancelling one of the active processes: {titles}."
+)
+SPAWN_REFUSAL_TEMPLATE = (
+    "cannot spawn: process limit ({limit}) reached; active: {titles} — ask the user what to cancel"
+)
+SPAWNED_TEMPLATE = "task {task_id} spawned"
+BACKGROUND_TASK_PROMPT = (
+    "You are solving a background task. User message is the task. "
+    "Produce the final answer as the result."
 )
 
 
@@ -30,7 +63,10 @@ class ConversationEvent:
 
 @dataclass(frozen=True, slots=True)
 class _Submit:
+    """A message to route; recorded ones already live in the narrative."""
+
     message: ChatMessage
+    recorded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,34 +75,61 @@ class _Cancel:
 
 
 @dataclass(frozen=True, slots=True)
-class _TaskDone:
-    task: Task
+class _ProcessTerminated:
+    process_id: str
+    task_id: str | None
 
 
-_Command = _Submit | _Cancel | _TaskDone
+_Command = _Submit | _Cancel | _ProcessTerminated
+
+
+@dataclass(slots=True)
+class _Process:
+    """One question being processed: its own loop run and history branch."""
+
+    id: str
+    title: str
+    task_id: str | None
+    control: LoopControl
+    branch: list[ChatMessage]
+    pump: asyncio.Task[None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerConfig:
+    """Behavior parameters shared by the conversation runners of one manager."""
+
+    loop: AgentLoop
+    system_prompt: str
+    router: MessageRouter
+    max_processes: int
 
 
 class ConversationRunner:
-    """Actor owning a dialog's history, loop runs and subscribers."""
+    """Actor owning a dialog's narrative, processes and subscribers."""
 
     def __init__(
         self,
         dialog: Dialog,
-        loop: AgentLoop,
-        system_prompt: str,
+        config: RunnerConfig,
         messages: MessageRepository,
+        tasks: TaskStore,
         history: list[ChatMessage],
     ) -> None:
         self._dialog = dialog
-        self._loop = loop
-        self._system_prompt = system_prompt
+        self._loop = config.loop
+        self._system_prompt = config.system_prompt
+        self._router = config.router
+        self._max_processes = config.max_processes
         self._messages = messages
-        self._history = history
+        self._tasks = tasks
+        self._narrative = history
+        self._processes: dict[str, _Process] = {}
+        self._foreground_id: str | None = None
+        self._spawner: TaskSpawner = _DialogTaskSpawner(self)
         self._inbox: asyncio.Queue[_Command] = asyncio.Queue()
         self._subscribers: set[asyncio.Queue[ConversationEvent]] = set()
         self._seq = 0
-        self._control: LoopControl | None = None
-        self._run_task: asyncio.Task[None] | None = None
         self._actor_task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -75,22 +138,46 @@ class ConversationRunner:
             self._actor_task = asyncio.create_task(self._run_actor())
 
     async def stop(self) -> None:
-        """Cancel the current run and the actor itself."""
-        self._handle_cancel()
+        """Cancel all processes and the actor itself."""
+        for process in self._processes.values():
+            process.control.cancel()
         if self._actor_task is not None:
             self._actor_task.cancel()
 
     async def submit(self, content: str) -> None:
-        """Submit a user message; injected mid-run or starts a new run."""
+        """Submit a user message; the router decides how it maps to processes."""
         await self._inbox.put(_Submit(ChatMessage(role=MessageRole.USER, content=content)))
 
     async def cancel(self) -> None:
-        """Cancel the current run, if any."""
+        """Cancel the foreground process, if any (explicit user request)."""
         await self._inbox.put(_Cancel())
 
-    async def notify_task_done(self, task: Task) -> None:
-        """Deliver a finished background task to the dialog."""
-        await self._inbox.put(_TaskDone(task))
+    async def spawn_task(self, title: str, prompt: str) -> str:
+        """Create a RUN task with its background process; refuse when the limit is hit."""
+        if len(self._processes) >= self._max_processes:
+            return SPAWN_REFUSAL_TEMPLATE.format(
+                limit=self._max_processes, titles=self._active_titles()
+            )
+        task = Task(
+            dialog_id=self._dialog.id,
+            user_id=self._dialog.user_id,
+            channel=self._dialog.channel,
+            title=title,
+            kind=TaskKind.RUN,
+            input={"title": title, "prompt": prompt},
+        )
+        await self._tasks.add(task)
+        await self._tasks.mark_running(task)
+        self._create_process(
+            process_id=task.id,
+            title=title,
+            task_id=task.id,
+            branch=[
+                ChatMessage(role=MessageRole.SYSTEM, content=BACKGROUND_TASK_PROMPT),
+                ChatMessage(role=MessageRole.USER, content=prompt),
+            ],
+        )
+        return SPAWNED_TEMPLATE.format(task_id=task.id)
 
     def subscribe(self) -> asyncio.Queue[ConversationEvent]:
         """Attach a subscriber queue receiving broadcast events."""
@@ -103,8 +190,8 @@ class ConversationRunner:
         self._subscribers.discard(queue)
 
     def history(self) -> list[ChatMessage]:
-        """Return a copy of the dialog history."""
-        return list(self._history)
+        """Return a copy of the dialog narrative."""
+        return list(self._narrative)
 
     @property
     def dialog_id(self) -> str:
@@ -115,74 +202,248 @@ class ConversationRunner:
         while True:
             command = await self._inbox.get()
             if isinstance(command, _Submit):
-                await self._handle_submit(command.message)
+                await self._handle_submit(command)
             elif isinstance(command, _Cancel):
                 self._handle_cancel()
-            elif isinstance(command, _TaskDone):
-                await self._handle_task_done(command.task)
+            elif isinstance(command, _ProcessTerminated):
+                await self._handle_terminated(command)
 
-    def _is_running(self) -> bool:
-        return self._run_task is not None and not self._run_task.done()
-
-    async def _handle_submit(self, message: ChatMessage) -> None:
-        if self._is_running() and self._control is not None:
-            self._control.inject(message)
-            return
-        await self._persist(message)
-        self._history.append(message)
-        self._start_run()
+    async def _handle_submit(self, command: _Submit) -> None:
+        message = command.message
+        if not command.recorded:
+            await self._persist(message)
+            self._narrative.append(message)
+        decision = await self._router.route(self._snapshot(), message.content, self._max_processes)
+        await self._apply_decision(message, decision)
 
     def _handle_cancel(self) -> None:
-        if self._control is not None:
-            self._control.cancel()
+        foreground = self._foreground()
+        if foreground is not None:
+            foreground.control.cancel()
 
-    async def _handle_task_done(self, task: Task) -> None:
-        notification = ChatMessage(role=MessageRole.SYSTEM, content=self._format_task_done(task))
-        if self._is_running() and self._control is not None:
-            self._control.inject(notification)
+    async def _handle_terminated(self, command: _ProcessTerminated) -> None:
+        """Deliver a finished task result to the dialog exactly once."""
+        if command.task_id is None:
             return
-        await self._persist(notification)
-        self._history.append(notification)
-        self._start_run()
+        task = await self._tasks.get(command.task_id)
+        if task.status not in (TaskStatus.DONE, TaskStatus.FAILED) or task.result_delivered:
+            return
+        await self._tasks.mark_delivered(task.id)
+        await self._publish_system_note(self._format_task_done(task))
 
-    def _start_run(self) -> None:
-        control = LoopControl()
-        self._control = control
-        self._run_task = asyncio.create_task(self._pump(control))
+    def _snapshot(self) -> tuple[ProcessInfo, ...]:
+        return tuple(
+            ProcessInfo(
+                id=process.id,
+                title=process.title,
+                place=(
+                    ProcessPlace.FOREGROUND
+                    if process.id == self._foreground_id
+                    else ProcessPlace.BACKGROUND
+                ),
+            )
+            for process in self._processes.values()
+        )
 
-    async def _pump(self, control: LoopControl) -> None:
+    async def _apply_decision(self, message: ChatMessage, decision: RouteDecision) -> None:
+        ops = decision.ops or (RouteOp(action=RouteAction.START_NEW),)
+        cancelled: set[str] = set()
+        for op in ops:
+            if op.action is RouteAction.CANCEL:
+                if op.target_id is not None and self._cancel_process(op.target_id):
+                    cancelled.add(op.target_id)
+            elif op.action is RouteAction.INJECT:
+                await self._apply_inject(message, cancelled)
+            elif op.action is RouteAction.START_NEW:
+                await self._apply_start_new(message, cancelled)
+            elif op.action is RouteAction.PROMOTE:
+                await self._apply_promote(message, op.target_id, cancelled)
+
+    async def _apply_inject(self, message: ChatMessage, cancelled: set[str]) -> None:
+        foreground = self._foreground()
+        if foreground is not None:
+            foreground.control.inject(message)
+            return
+        await self._apply_start_new(message, cancelled)
+
+    async def _apply_start_new(self, message: ChatMessage, cancelled: set[str]) -> None:
+        if self._exceeds_limit(cancelled):
+            await self._reject_for_limit(message)
+            return
+        self._start_new(title=message.content[:TITLE_MAX_LENGTH])
+
+    async def _apply_promote(
+        self,
+        message: ChatMessage,
+        target_id: str | None,
+        cancelled: set[str],
+    ) -> None:
+        target = self._processes.get(target_id) if target_id is not None else None
+        if target is None or target.id == self._foreground_id:
+            return  # only an active background process can be promoted
+        if self._exceeds_limit(cancelled):
+            await self._reject_for_limit(message)
+            return
+        self._suspend_foreground()
+        self._foreground_id = target.id
+        self._broadcast(ProcessResumed(process_id=target.id, title=target.title))
+
+    def _exceeds_limit(self, cancelled: set[str]) -> bool:
+        return len(self._processes) - len(cancelled) + 1 > self._max_processes
+
+    async def _reject_for_limit(self, message: ChatMessage) -> None:
+        note = LIMIT_REFUSAL_TEMPLATE.format(
+            message=message.content,
+            limit=self._max_processes,
+            titles=self._active_titles(),
+        )
+        await self._publish_system_note(note)
+
+    def _start_new(self, title: str) -> None:
+        """Start a foreground process over the current narrative, suspending the old one."""
+        self._suspend_foreground()
+        process = self._create_process(
+            process_id=uuid.uuid4().hex,
+            title=title,
+            task_id=None,
+            branch=[
+                ChatMessage(role=MessageRole.SYSTEM, content=self._system_prompt),
+                *self._narrative,
+            ],
+        )
+        self._foreground_id = process.id
+
+    def _start_report_run(self) -> None:
+        """Start a foreground run reacting to the latest narrative note (fg is free)."""
+        self._start_new(title=REPORT_TITLE)
+
+    def _suspend_foreground(self) -> None:
+        foreground = self._foreground()
+        if foreground is None:
+            return
+        self._foreground_id = None
+        self._broadcast(ProcessSuspended(process_id=foreground.id, title=foreground.title))
+
+    def _cancel_process(self, target_id: str) -> bool:
+        process = self._processes.get(target_id)
+        if process is None:
+            return False
+        process.control.cancel()
+        return True
+
+    def _create_process(
+        self,
+        *,
+        process_id: str,
+        title: str,
+        task_id: str | None,
+        branch: list[ChatMessage],
+    ) -> _Process:
+        process = _Process(
+            id=process_id,
+            title=title,
+            task_id=task_id,
+            control=LoopControl(),
+            branch=branch,
+        )
+        process.pump = asyncio.create_task(self._pump_process(process))
+        self._processes[process.id] = process
+        return process
+
+    async def _pump_process(self, process: _Process) -> None:
+        """Stream the process loop, broadcasting events only while it is the foreground."""
         context = SkillContext(
             user_id=self._dialog.user_id,
             channel=self._dialog.channel,
             dialog_id=self._dialog.id,
+            task_spawner=self._spawner,
         )
-        old_size = len(self._history)
-        working = [
-            ChatMessage(role=MessageRole.SYSTEM, content=self._system_prompt),
-            *self._history,
-        ]
-        persisted = len(working)
+        terminal: LoopEvent = Failed(error="loop ended without a terminal event")
         try:
-            async for event in self._loop.stream(working, control, context):
-                self._broadcast(event)
-                persisted = await self._persist_new(working, persisted)
+            async for event in self._loop.stream(process.branch, process.control, context):
+                if self._foreground_id == process.id:
+                    self._broadcast(event)
+                if isinstance(event, (Finished, Cancelled, Failed)):
+                    terminal = event
         except Exception as exc:  # loop failures are broadcast, not raised
-            self._broadcast(Failed(error=str(exc)))
-        finally:
-            await self._persist_new(working, persisted)
-            self._history.extend(working[old_size + 1 :])
-            self._control = None
-            for leftover in control.drain():
-                self._inbox.put_nowait(_Submit(leftover))
+            terminal = Failed(error=str(exc))
+            if self._foreground_id == process.id:
+                self._broadcast(terminal)
+        status = await self._finalize(process, terminal)
+        self._remove_process(process)
+        self._broadcast(
+            ProcessCompleted(process_id=process.id, title=process.title, status=status.value)
+        )
+        self._inbox.put_nowait(_ProcessTerminated(process_id=process.id, task_id=process.task_id))
+        for leftover in process.control.drain():
+            self._inbox.put_nowait(_Submit(leftover, recorded=True))
+
+    async def _finalize(self, process: _Process, terminal: LoopEvent) -> TaskStatus:
+        """Fold the run outcome into the narrative and the task store."""
+        if isinstance(terminal, Finished):
+            await self._persist(terminal.message)
+            self._narrative.append(terminal.message)
+            await self._resolve_task(process, result=terminal.message.content)
+            return TaskStatus.DONE
+        if isinstance(terminal, Failed):
+            await self._fail_task(process, terminal.error)
+            return TaskStatus.FAILED
+        await self._cancel_task(process)
+        await self._salvage_interrupted_turn(process)
+        return TaskStatus.CANCELLED
+
+    async def _resolve_task(self, process: _Process, result: str) -> None:
+        if process.task_id is None:
+            return
+        task = await self._tasks.get(process.task_id)
+        await self._tasks.mark_done(task, result)
+
+    async def _fail_task(self, process: _Process, error: str) -> None:
+        if process.task_id is None:
+            return
+        task = await self._tasks.get(process.task_id)
+        await self._tasks.mark_failed(task, error)
+
+    async def _cancel_task(self, process: _Process) -> None:
+        if process.task_id is not None:
+            await self._tasks.cancel(process.task_id)
+
+    async def _salvage_interrupted_turn(self, process: _Process) -> None:
+        """Keep a cancelled run's partial answer in the narrative, flagged as incomplete."""
+        last = process.branch[-1] if process.branch else None
+        if last is None or last.role is not MessageRole.ASSISTANT or not last.content:
+            return
+        note = ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE)
+        await self._persist(last)
+        await self._persist(note)
+        self._narrative.extend((last, note))
+
+    def _remove_process(self, process: _Process) -> None:
+        self._processes.pop(process.id, None)
+        if self._foreground_id == process.id:
+            self._foreground_id = None
+
+    def _foreground(self) -> _Process | None:
+        if self._foreground_id is None:
+            return None
+        return self._processes.get(self._foreground_id)
+
+    def _active_titles(self) -> str:
+        return ", ".join(process.title for process in self._processes.values())
+
+    async def _publish_system_note(self, content: str) -> None:
+        """Record a system note in the narrative and route it: inject or report run."""
+        note = ChatMessage(role=MessageRole.SYSTEM, content=content)
+        await self._persist(note)
+        self._narrative.append(note)
+        foreground = self._foreground()
+        if foreground is not None:
+            foreground.control.inject(note)
+        else:
+            self._start_report_run()
 
     async def _persist(self, message: ChatMessage) -> None:
         await self._messages.append(self._dialog.id, message)
-
-    async def _persist_new(self, working: list[ChatMessage], persisted: int) -> int:
-        """Store messages appended to the working history since the last flush."""
-        for message in working[persisted:]:
-            await self._persist(message)
-        return len(working)
 
     def _broadcast(self, event: LoopEvent) -> None:
         self._seq += 1
@@ -201,19 +462,27 @@ class ConversationRunner:
         return TASK_DONE_TEMPLATE.format(title=task.title, status=task.status.value, result=result)
 
 
+class _DialogTaskSpawner:
+    """TaskSpawner port bound to one dialog: tasks become actor background processes."""
+
+    def __init__(self, runner: ConversationRunner) -> None:
+        self._runner = runner
+
+    async def spawn(self, title: str, prompt: str) -> str:
+        return await self._runner.spawn_task(title, prompt)
+
+
 class ConversationManager:
     """Owns one runner per dialog, keyed by (user_id, channel)."""
 
     def __init__(
         self,
-        loop: AgentLoop,
-        system_prompt: str,
+        config: RunnerConfig,
         dialogs: DialogRepository,
         messages: MessageRepository,
         tasks: TaskStore,
     ) -> None:
-        self._loop = loop
-        self._system_prompt = system_prompt
+        self._config = config
         self._dialogs = dialogs
         self._messages = messages
         self._tasks = tasks
@@ -223,8 +492,8 @@ class ConversationManager:
     async def get_or_create_runner(self, user_id: str, channel: str) -> ConversationRunner:
         """Return the live runner for (user_id, channel); the dialog is created on first contact.
 
-        The runner history is rebuilt from the persisted messages, so a dialog
-        survives process restarts.
+        The runner narrative is rebuilt from the persisted messages, so a dialog
+        survives process restarts (in-flight processes do not).
         """
         async with self._lock:
             dialog = await self._dialogs.get_or_create(user_id, channel)
@@ -233,19 +502,11 @@ class ConversationManager:
                 history = await self._messages.list(dialog.id)
                 runner = ConversationRunner(
                     dialog=dialog,
-                    loop=self._loop,
-                    system_prompt=self._system_prompt,
+                    config=self._config,
                     messages=self._messages,
+                    tasks=self._tasks,
                     history=history,
                 )
                 runner.start()
                 self._runners[dialog.id] = runner
             return runner
-
-    async def notify_task_done(self, task: Task) -> None:
-        """Deliver a finished task to its dialog and mark the result delivered."""
-        runner = self._runners.get(task.dialog_id)
-        if runner is None:
-            return
-        await runner.notify_task_done(task)
-        await self._tasks.mark_delivered(task.id)

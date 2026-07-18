@@ -8,8 +8,10 @@ from octoforge_web.config import (
     DEFAULT_EMBEDDING_BASE_URL,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_INSTRUCTIONS_TOP_K,
+    DEFAULT_MAX_PROCESSES,
     DEFAULT_MEMORY_SEARCH_DEFAULT_LIMIT,
     DEFAULT_MEMORY_SEARCH_MAX_LIMIT,
+    DEFAULT_ROUTER_TIMEOUT_SECONDS,
     Settings,
 )
 
@@ -18,6 +20,8 @@ CUSTOM_DATASETS_DEFAULT_LIMIT = 25
 CUSTOM_DATASETS_MAX_LIMIT = 500
 CUSTOM_MEMORY_DEFAULT_LIMIT = 15
 CUSTOM_MEMORY_MAX_LIMIT = 80
+CUSTOM_MAX_PROCESSES = 9
+CUSTOM_ROUTER_TIMEOUT = 2.5
 WHITELIST_JSON = (
     '[{"base_url_prefix": "https://internal.example.com/", '
     '"header_name": "X-Api-Key", "header_value": "s3cret"}]'
@@ -35,6 +39,8 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "OF_DATASETS_QUERY_MAX_LIMIT",
         "OF_MEMORY_SEARCH_DEFAULT_LIMIT",
         "OF_MEMORY_SEARCH_MAX_LIMIT",
+        "OF_MAX_PROCESSES",
+        "OF_ROUTER_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -49,6 +55,8 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.datasets_query_max_limit == DEFAULT_DATASETS_QUERY_MAX_LIMIT
     assert settings.memory_search_default_limit == DEFAULT_MEMORY_SEARCH_DEFAULT_LIMIT
     assert settings.memory_search_max_limit == DEFAULT_MEMORY_SEARCH_MAX_LIMIT
+    assert settings.max_processes == DEFAULT_MAX_PROCESSES
+    assert settings.router_timeout_seconds == DEFAULT_ROUTER_TIMEOUT_SECONDS
     assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
     assert settings.to_external_call_auth_whitelist() == ()
 
@@ -86,6 +94,16 @@ def test_memory_limits_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert settings.memory_search_default_limit == CUSTOM_MEMORY_DEFAULT_LIMIT
     assert settings.memory_search_max_limit == CUSTOM_MEMORY_MAX_LIMIT
+
+
+def test_process_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_MAX_PROCESSES", str(CUSTOM_MAX_PROCESSES))
+    monkeypatch.setenv("OF_ROUTER_TIMEOUT_SECONDS", str(CUSTOM_ROUTER_TIMEOUT))
+
+    settings = Settings()
+
+    assert settings.max_processes == CUSTOM_MAX_PROCESSES
+    assert settings.router_timeout_seconds == CUSTOM_ROUTER_TIMEOUT
 
 
 def test_auth_whitelist_parsed_from_json_env(monkeypatch: pytest.MonkeyPatch) -> None:

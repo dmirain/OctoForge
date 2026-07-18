@@ -2,10 +2,8 @@
 
 from typing import Any
 
-from octoforge_core.ports import TaskStore
 from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.errors import SkillArgumentsError
-from octoforge_core.tasks.models import Task, TaskKind
 
 SKILL_NAME = "task_spawn"
 SKILL_DESCRIPTION = (
@@ -20,14 +18,11 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
     },
     "required": ["title", "prompt"],
 }
-SPAWNED_TEMPLATE = "task {task_id} spawned"
+NO_SPAWNER_MESSAGE = "task spawning is not available in this context"
 
 
 class TaskSpawnSkill:
-    """Creates a PROMPT background task for the current dialog."""
-
-    def __init__(self, store: TaskStore) -> None:
-        self._store = store
+    """Delegates task spawning to the TaskSpawner bound to the skill context."""
 
     @property
     def spec(self) -> SkillSpec:
@@ -44,13 +39,6 @@ class TaskSpawnSkill:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             raise SkillArgumentsError("prompt must be a non-empty string")
-        task = Task(
-            dialog_id=context.dialog_id,
-            user_id=context.user_id,
-            channel=context.channel,
-            title=title,
-            kind=TaskKind.PROMPT,
-            input={"prompt": prompt},
-        )
-        await self._store.add(task)
-        return SPAWNED_TEMPLATE.format(task_id=task.id)
+        if context.task_spawner is None:
+            raise SkillArgumentsError(NO_SPAWNER_MESSAGE)
+        return await context.task_spawner.spawn(title, prompt)

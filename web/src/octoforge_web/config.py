@@ -18,6 +18,8 @@ DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT = 50
 DEFAULT_DATASETS_QUERY_MAX_LIMIT = 200
 DEFAULT_MEMORY_SEARCH_DEFAULT_LIMIT = 10
 DEFAULT_MEMORY_SEARCH_MAX_LIMIT = 50
+DEFAULT_MAX_PROCESSES = 5
+DEFAULT_ROUTER_TIMEOUT_SECONDS = 10.0
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -47,6 +49,8 @@ class Settings(BaseSettings):
     datasets_query_max_limit: int = DEFAULT_DATASETS_QUERY_MAX_LIMIT
     memory_search_default_limit: int = DEFAULT_MEMORY_SEARCH_DEFAULT_LIMIT
     memory_search_max_limit: int = DEFAULT_MEMORY_SEARCH_MAX_LIMIT
+    max_processes: int = DEFAULT_MAX_PROCESSES
+    router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

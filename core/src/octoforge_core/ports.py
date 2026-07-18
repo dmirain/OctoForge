@@ -44,10 +44,6 @@ class TaskStore(Protocol):
         """Return tasks of one dialog."""
         ...
 
-    async def next_pending(self) -> Task | None:
-        """Return the oldest pending task, if any."""
-        ...
-
     async def mark_running(self, task: Task) -> None:
         """Mark the task as running."""
         ...
@@ -58,6 +54,18 @@ class TaskStore(Protocol):
 
     async def mark_failed(self, task: Task, error: str) -> None:
         """Mark the task as failed with an error."""
+        ...
+
+    async def cancel(self, task_id: str) -> None:
+        """Mark the task as cancelled or raise TaskNotFoundError."""
+        ...
+
+    async def is_cancelled(self, task_id: str) -> bool:
+        """Return True when the task exists and is cancelled."""
+        ...
+
+    async def count_active(self, dialog_id: str) -> int:
+        """Return the number of pending or running tasks of the dialog."""
         ...
 
     async def mark_delivered(self, task_id: str) -> None:

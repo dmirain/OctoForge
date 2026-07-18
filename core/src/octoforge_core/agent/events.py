@@ -69,6 +69,31 @@ class Failed:
     error: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessSuspended:
+    """Actor marker: the foreground process moved to the background."""
+
+    process_id: str
+    title: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessResumed:
+    """Actor marker: a background process became the foreground."""
+
+    process_id: str
+    title: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessCompleted:
+    """Actor marker: a process reached a terminal status (TaskStatus values)."""
+
+    process_id: str
+    title: str
+    status: str
+
+
 LoopEvent = (
     IterationStarted
     | TextDelta
@@ -79,4 +104,7 @@ LoopEvent = (
     | Finished
     | Cancelled
     | Failed
+    | ProcessSuspended
+    | ProcessResumed
+    | ProcessCompleted
 )

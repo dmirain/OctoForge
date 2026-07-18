@@ -43,25 +43,30 @@ core/                          # библиотека octoforge-core — дом�
     ports.py                   # Protocol-порты: LLMClient, TaskStore
     agent/
       events.py                # LoopEvent: IterationStarted, TextDelta, AssistantMessage,
-                               #   ToolCallRequested/Completed/Failed, Finished, Cancelled, Failed
+                               #   ToolCallRequested/Completed/Failed, Finished, Cancelled, Failed,
+                               #   ProcessSuspended/Resumed/Completed (маркеры актора)
       control.py               # LoopControl — mailbox инъекций + флаг отмены
       loop.py                  # AgentLoop.stream(history, control, context) → AsyncIterator[LoopEvent]
+      router.py                # MessageRouter (Protocol), RouteAction/RouteOp/RouteDecision,
+                               #   ProcessInfo/ProcessPlace, LLMRouter (one-shot tool call, таймаут, фолбэк)
       prompts.py               # DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn, уведомления,
                                #   instructions_search / external_call / instruction_save,
                                #   data_put / data_query / data_forget,
                                #   memory_store / memory_search / memory_delete)
-      runner.py                # ConversationRunner (актор), ConversationManager, ConversationEvent
+      runner.py                # ConversationRunner (актор: нарратив + процессы fg/bg, bound
+                               #   TaskSpawner), ConversationManager, RunnerConfig, ConversationEvent
     skills/
-      base.py                  # Skill (Protocol), SkillSpec, SkillOrigin (BASIC|DYNAMIC), SkillContext
+      base.py                  # Skill (Protocol), SkillSpec, SkillOrigin (BASIC|DYNAMIC),
+                               #   SkillContext (+ опциональный task_spawner)
       registry.py, errors.py   # реестр + ошибки
       basic/                   # http_request.py, task_spawn.py, task_list.py,
                                # instructions_search.py, instruction_save.py, external_call.py,
                                # data_put.py, data_query.py, data_forget.py,
                                # memory_store.py, memory_search.py, memory_delete.py
     tasks/
-      models.py                # Task, TaskKind (SKILL|PROMPT), TaskStatus (PENDING|RUNNING|DONE|FAILED)
+      models.py                # Task, TaskKind (RUN), TaskStatus (PENDING|RUNNING|DONE|FAILED|CANCELLED)
       store.py                 # InMemoryTaskStore (реализация порта TaskStore, для тестов)
-      runner.py                # TaskRunner — фоновое выполнение задач
+      spawner.py               # TaskSpawner (Protocol-порт спавна фоновых задач)
       errors.py                # TaskNotFoundError
     db/
       base.py                  # Declarative Base + UTCDateTime (aware UTC на чтении/записи)
@@ -106,23 +111,24 @@ core/                          # библиотека octoforge-core — дом�
                                # test_embeddings, test_external_call, test_http_request_skill,
                                # test_instruction_skills, test_instructions_local,
                                # test_memory, test_memory_skills,
-                               # test_openai_client, test_openai_stream, test_skills_registry,
-                               # test_ssrf_guard, test_tasks
+                               # test_openai_client, test_openai_stream, test_router,
+                               # test_skills_registry, test_ssrf_guard, test_tasks
 web/                           # приложение octoforge-web — FastAPI-обёртка
   pyproject.toml               # deps: octoforge-core, fastapi, uvicorn, pydantic-settings
   src/octoforge_web/
     main.py                    # app factory + composition root (DI: БД, LLM, эмбеддер, реестр,
-                               #   исполнитель external_call, акторы, TaskRunner; канал "web")
+                               #   исполнитель external_call, LLMRouter, акторы; канал "web")
     config.py                  # Settings (env с префиксом OF_, включая OF_DATABASE_URL,
                                #   OF_EMBEDDING_*, OF_INSTRUCTIONS_TOP_K,
                                #   OF_EXTERNAL_CALL_AUTH_WHITELIST, OF_DATASETS_QUERY_*,
-                               #   OF_MEMORY_SEARCH_*)
+                               #   OF_MEMORY_SEARCH_*, OF_MAX_PROCESSES, OF_ROUTER_TIMEOUT_SECONDS)
     deps.py                    # провайдеры зависимостей из app.state + заголовок X-User-Id
     api/
       dialog.py                # messages/cancel/events(SSE) по (user_id, channel)
-      sse.py                   # сериализация LoopEvent → SSE-кадры
+      sse.py                   # сериализация LoopEvent → SSE-кадры (включая маркеры процессов)
       schemas.py               # pydantic-схемы запросов/ответов
-    static/index.html          # чат-UI: SSE-стрим, шаги скилов, кнопка «Стоп», поле имени (= user_id)
+    static/index.html          # чат-UI: SSE-стрим, шаги скилов, маркеры процессов,
+                               #   кнопка «Стоп», поле имени (= user_id)
   tests/                       # test_dialog_api.py, test_sse.py, test_config.py
 ```
 
@@ -137,7 +143,11 @@ web/                           # приложение octoforge-web — FastAPI-
 - `TextDelta(text)` — токен ответа по мере стриминга LLM;
 - `AssistantMessage(message, interrupted)` — завершённое сообщение итерации (interrupted — обрыв по отмене);
 - `ToolCallRequested / ToolCallCompleted(output) / ToolCallFailed(error)` — шаги скилов;
-- `Finished(message)` — финальный ответ; `Cancelled` — отмена; `Failed(error)` — срыв без ответа.
+- `Finished(message)` — финальный ответ; `Cancelled` — отмена; `Failed(error)` — срыв без ответа;
+- `ProcessSuspended / ProcessResumed(process_id, title)` и
+  `ProcessCompleted(process_id, title, status)` — маркеры уровня актора (не петли):
+  форграунд ушёл в фон / фон стал форграундом / процесс завершился со статусом
+  (значение TaskStatus); эмитятся актором, в union `LoopEvent` входят для общего канала доставки.
 
 `history` мутируется на месте (в неё дописываются новые сообщения) — владелец списка (актор)
 забирает накопленное в историю диалога.
@@ -153,31 +163,70 @@ web/                           # приложение octoforge-web — FastAPI-
 Инъекция никогда не вклинивается между assistant(tool_calls) и его tool-результатами —
 только на безопасных границах итераций.
 
-### Актор диалога (`agent/runner.py`)
+### Актор диалога: нарратив и процессы (`agent/runner.py`)
 
-`ConversationRunner` — актор на диалог: единый inbox команд (`_Submit`, `_Cancel`, `_TaskDone`)
-сериализует всё, что происходит с диалогом. Хранит историю (in-memory, при создании пересобранную
-из БД), владеет текущим `LoopControl`, ведёт подписчиков (очереди для SSE-broadcast, seq
-нумерация событий).
+`ConversationRunner` — актор на диалог: единый inbox команд (`_Submit`, `_Cancel`,
+`_ProcessTerminated`) сериализует всё, что происходит с диалогом. Владеет **нарративом**
+(in-memory, при создании пересобранным из БД) и **процессами** (`dict[id, _Process]`,
+один форграунд), ведёт подписчиков (очереди для SSE-broadcast, seq нумерация событий).
+Модель и правила — [process-model.md](process-model.md).
 
-- диалог = (user_id, channel): `ConversationManager.get_or_create_runner(user_id, channel)` —
-  get-or-create строки `dialogs` через `DialogRepository` (явного создания диалога нет, он
-  существует по факту обращения — см. [dialogs.md](dialogs.md)); история пересобирается из
-  `messages` (включая tool-сообщения и прерванные ответы) — диалог переживает перезапуск.
-- сообщения персистятся: пользовательское — синхронно при submit (до старта прогона);
-  assistant/tool — по мере дописывания в рабочую историю во время прогона (актор следит за
-  «хвостом» истории и пишет каждое новое сообщение со следующим `seq`); прерванные частичные
-  ответы тоже сохраняются.
-- submit в idle → новый прогон; submit во время прогона → инъекция в `LoopControl` (руление).
-- `notify_task_done` в idle → system-сообщение с результатом + прогон (проактивное сообщение
-  пользователю); во время прогона → инъекция. Передав уведомление актору, менеджер помечает
-  задачу `result_delivered=True` (`TaskStore.mark_delivered`).
-- инъекции не теряются: сообщения, не дочитанные прогоном к его концу (mailbox), переставляются
-  обратно в inbox актора и получают собственный прогон — уведомление о задаче, пришедшее на
-  последней итерации, всё равно будет озвучено пользователю.
-- `ConversationManager` — реестр runner'ов по dialog_id (создание под lock'ом), точка входа
-  для `TaskRunner.on_task_done`. Канал для ядра — непрозрачная строка; конкретные значения
-  (`"web"`, будущий `"telegram"`) объявляют адаптеры в composition root.
+- **Процесс** — обработка одного вопроса: свой прогон петли со своей веткой истории
+  (`[system prompt] + копия нарратива` на момент старта; ветка дальше живёт своей жизнью).
+  Форграунд ровно один: его события петли broadcast'ятся подписчикам (проверка места на
+  каждое событие — место может смениться mid-run); фоновые работают молча. Маркеры
+  `ProcessSuspended`/`ProcessResumed`/`ProcessCompleted` broadcast'ятся всегда.
+- **Нарратив** = user-сообщения + финальные ответы завершённых процессов + system-
+  уведомления (о задачах, об отказах по лимиту) + salvaged-фрагменты прерванных ответов.
+  Только нарратив персистится в `messages` (user — при submit до роутинга; финалы и
+  заметки — по факту); промежуточные assistant/tool-сообщения ветки не персистятся.
+  Диалог переживает перезапуск за счёт пересборки нарратива; **процессы — нет**
+  (in-memory; регрессия-допущение: задачи PENDING/RUNNING после рестарта осиротевают).
+- **submit**: user-сообщение → нарратив + персист → снимок процессов →
+  `router.route(snapshot, message, max_processes)` → пакет операций применяется по
+  порядку (пустой пакет ≡ `[START_NEW]`). Операции: `INJECT` (в форграунд; fg свободен →
+  семантика START_NEW), `START_NEW` (занятый fg уходит в фон с `ProcessSuspended`),
+  `PROMOTE(target)` (bg → fg с `ProcessResumed`), `CANCEL(target)` (fg-слот освобождается
+  по факту терминации, автовозврата нет).
+- **Guardrail лимита** (детерминированный, `OF_MAX_PROCESSES`): перед START_NEW/PROMOTE —
+  `активных − отменённых этим пакетом + 1 > max` → операция не выполняется; вместо неё
+  system-заметка «лимит достигнут, предложи отменить одну из: <titles>» — инъекция в fg
+  (занят) или репорт-прогон (свободен). User-сообщение остаётся в нарративе.
+- **Репорт-прогон** — обычный fg-процесс с title="report" поверх нарратива, где последнее
+  сообщение — system-заметка; стартует только на свободном fg (guardrail не применяется).
+- **Завершение процесса**: `Finished` → финал в нарратив + персист (task-backed →
+  `mark_done`); `Failed` → task-backed → `mark_failed`; отмена → task-backed →
+  `store.cancel` + гигиена: прерванное assistant-сообщение с непустым текстом из хвоста
+  ветки + system-заметка о неполноте дописываются в нарратив. Затем: процесс убирается,
+  broadcast `ProcessCompleted(status)` (значения TaskStatus), в inbox —
+  `_ProcessTerminated`; недочитанные инъекции (`control.drain()`) возвращаются в inbox
+  как `_Submit(recorded=True)` (уже в нарративе, повторно не персистятся).
+- **Уведомление о задаче** (обработка `_ProcessTerminated`): task-backed процесс
+  завершился DONE/FAILED и результат ещё не доставлен → `mark_delivered` + system-
+  уведомление с результатом → нарратив + персист → инъекция в fg (занят) или репорт-
+  прогон (свободен). Отменённые задачи не уведомляют.
+- `cancel()` (web API) отменяет только форграунд; `stop()` — все процессы и сам актор.
+- `ConversationManager` — реестр runner'ов по dialog_id (создание под lock'ом),
+  get-or-create диалога по (user_id, channel); конструктор принимает `RunnerConfig`
+  (loop, system_prompt, router, max_processes) + репозитории. Канал для ядра —
+  непрозрачная строка; конкретные значения (`"web"`, будущий `"telegram"`) объявляют
+  адаптеры в composition root.
+
+### Роутер сообщений (`agent/router.py`)
+
+Каждое входящее сообщение проходит `MessageRouter` (Protocol):
+`route(processes, message, max_processes) -> RouteDecision` — пакет `RouteOp`
+(`RouteAction`: INJECT | START_NEW | CANCEL | PROMOTE; target_id обязателен у
+CANCEL/PROMOTE). Пустой пакет — passthrough (актор трактует как `[START_NEW]`).
+`ProcessInfo` — снимок активного процесса (id, title, place: FOREGROUND|BACKGROUND).
+
+Первая реализация — `LLMRouter(llm, timeout_seconds)`: пустой снимок → passthrough без
+вызова LLM; иначе one-shot `complete()` с tool `route(ops)` (компактный системный
+промпт со списком процессов, лимитом и правилами из process-model.md; сообщение
+пользователя — отдельным user-сообщением) под `asyncio.wait_for`. Нет tool_call,
+ошибка или таймаут → фолбэк: есть форграунд → `[START_NEW]`, иначе пусто. Невалидные
+операции (неизвестный action, лишний/отсутствующий target, target не из снимка)
+отбрасываются; валидный остаток — решение (может стать пустым).
 
 ### Системный промпт (`agent/prompts.py`)
 
@@ -192,31 +241,41 @@ web/                           # приложение octoforge-web — FastAPI-
 
 ### Стриминг LLM (`llm/openai.py`)
 
-`complete()` — обычный (non-streaming) вызов, используется фоновыми задачами.
+`complete()` — обычный (non-streaming) вызов, используется LLM-роутером (one-shot с tool call).
 `stream()` — `stream=true`: парсинг SSE-чанков (delta.content → `TextDelta`,
 delta.tool_calls — аккумуляция по index со склейкой arguments), в конце `StreamFinished(message)`.
 `aclose()` на генераторе обрывает HTTP-соединение — основа отмены.
 
 ## Фоновые задачи
 
+Задача — это фоновый процесс актора, подкреплённый записью в `TaskStore`
+(исполнение = pump-процесс; глобальный поллер упразднён).
+
 - `tasks/models.py`: `Task` (id, dialog_id, user_id, channel, title, kind, input, status,
   result, error, result_delivered, created_at/started_at/finished_at — через `utc_now()`);
-  `TaskKind(SKILL|PROMPT)`, `TaskStatus(PENDING|RUNNING|DONE|FAILED)`. `channel` и `user_id`
+  `TaskKind(RUN)`, `TaskStatus(PENDING|RUNNING|DONE|FAILED|CANCELLED)`. `channel` и `user_id`
   денормализованы в задачу: уведомление уходит на поверхность, с которой задача запущена,
   без join'а к dialogs.
-- `TaskStore` (Protocol в `ports.py`): add/get/list(dialog_id)/next_pending/mark_running/
-  mark_done/mark_failed/mark_delivered. Реализации: `SqlAlchemyTaskStore`
-  (`db/repositories.py`, боевой путь) и `InMemoryTaskStore` (тесты); актор и раннер от
-  реализации не зависят.
-- `tasks/runner.py`: `TaskRunner` — asyncio-цикл: берёт PENDING, выполняет (PROMPT → `llm.complete`;
-  SKILL → скил из реестра), фиксирует DONE/FAILED, вызывает колбэк `on_task_done(task)`
-  (в web — `ConversationManager.notify_task_done`). Старт/стоп — в lifespan.
-- результат считается доставленным, когда менеджер передал его актору диалога
-  (`result_delivered=True`). Редоставка результатов, оставшихся недоставленными после
-  перезапуска (диалог ещё не поднят в менеджере), **не реализована** — отдельная итерация.
+- `TaskStore` (Protocol в `ports.py`): add/get/list(dialog_id)/mark_running/mark_done/
+  mark_failed/cancel/is_cancelled/count_active/mark_delivered. Реализации:
+  `SqlAlchemyTaskStore` (`db/repositories.py`, боевой путь) и `InMemoryTaskStore` (тесты);
+  `next_pending` из порта удалён вместе с поллером.
+- **Спавн**: скил `task_spawn` делегирует порту `TaskSpawner` (`tasks/spawner.py`),
+  который актор биндит на диалог (`SkillContext.task_spawner`, опциональный — контексты
+  вне актора обходятся без него). Спавнер проверяет лимит процессов (отказ текстом),
+  создаёт `Task(kind=RUN, input={title, prompt})`, сразу `mark_running` и поднимает
+  bg-процесс с id = task.id, коротким системным промптом фоновой задачи и
+  user-сообщением из prompt. Спавн — всегда в фон (вызывается из работающего fg).
+- **Завершение**: терминальный статус процесса мапится на задачу (DONE → mark_done с
+  финальным ответом, FAILED → mark_failed, отмена → cancel). Уведомление в диалог —
+  по факту терминации (см. «Актор диалога»), ровно один раз (`result_delivered`).
+- **Регрессия-допущение**: процессы живут в памяти — после рестарта приложения задачи в
+  статусах PENDING/RUNNING осиротевают (их процессы не восстанавливаются). Редоставка
+  недоставленных результатов и реанимация/фейл осиротевших задач — в списке
+  «не реализовано» (см. AGENTS.md).
 
-Скилы задач: `task_spawn` (title + prompt → PROMPT-задача текущего диалога) и
-`task_list` (задачи диалога со статусами и результатами).
+Скилы задач: `task_spawn` (title + prompt → фоновая задача-процесс текущего диалога) и
+`task_list` (задачи диалога со статусами, включая cancelled, и результатами).
 
 ## Скилы
 
@@ -236,7 +295,8 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 
 Абстракция (`skills/base.py`): `SkillSpec` (name, description, parameters_schema — JSON Schema);
 `Skill` (Protocol): `spec` + `async execute(arguments, context) -> str`;
-`SkillContext` — per-invocation контекст (user_id, channel, dialog_id; позже память).
+`SkillContext` — per-invocation контекст (user_id, channel, dialog_id + опциональный
+`task_spawner: TaskSpawner | None` — None вне актора, `task_spawn` тогда отказывает).
 Аргументы валидирует сам скил (`SkillArgumentsError`).
 
 ### Динамические скилы (план, после появления БД)
@@ -363,10 +423,13 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - **dialogs**: `id` (uuid str PK), `user_id` (str, index), `channel` (str), `created_at`,
   `updated_at`; unique (`user_id`, `channel`)
 - **messages**: `id`, `dialog_id` FK (index), `seq` (int, монотонно растёт в рамках диалога;
-  unique (`dialog_id`, `seq`)), `role` (значение MessageRole), `content`, `tool_calls`
-  (JSON, nullable), `tool_call_id` (nullable), `created_at`
-- **tasks**: `id`, `dialog_id` FK (index), `user_id` (index), `channel`, `kind`, `title`,
-  `input` (JSON), `status`, `result`, `error`, `result_delivered` (bool, default False),
+  unique (`dialog_id`, `seq`); присваивается подзапросом `max(seq)+1` прямо в INSERT —
+  конкурирующие писатели, актор и pump'ы процессов, не конфликтуют), `role` (значение
+  MessageRole), `content`, `tool_calls` (JSON, nullable), `tool_call_id` (nullable),
+  `created_at`. Пишется только нарратив (см. «Актор диалога»), не полные ветки прогонов
+- **tasks**: `id`, `dialog_id` FK (index), `user_id` (index), `channel`, `kind`
+  (RUN), `title`, `input` (JSON: `{"title", "prompt"}`), `status` (PENDING|RUNNING|DONE|
+  FAILED|CANCELLED), `result`, `error`, `result_delivered` (bool, default False),
   `created_at`, `started_at`, `finished_at`
 - **instructions** (таблица модуля `instructions/`, см. выше): `id` (uuid str PK), `type`
   (knowledge|skill|tool, index), `title` (index), `content` (Text), `embedding` (JSON
@@ -394,14 +457,16 @@ lifespan; Alembic появится при первой деструктивно�
 
 - все эндпоинты диалога требуют заголовок `X-User-Id` (доверенная строка до появления
   аутентификации); отсутствующий/пустой → 400
-- `POST /api/dialog/messages` `{content}` → 202 `{status: "accepted"}` — сообщение; во время
-  прогона становится инъекцией
-- `POST /api/dialog/cancel` → 202 — мягкая отмена текущего прогона
+- `POST /api/dialog/messages` `{content}` → 202 `{status: "accepted"}` — сообщение уходит
+  роутеру: новый процесс, инъекция в форграунд, отмена или promote — по его решению
+- `POST /api/dialog/cancel` → 202 — мягкая отмена форграунд-процесса (явная просьба)
 - `GET /api/dialog/events` — SSE-подписка на события диалога (`iteration_started`,
-  `text_delta`, `assistant_message`, `tool_call_*`, `finished`, `cancelled`, `failed`;
+  `text_delta`, `assistant_message`, `tool_call_*`, `finished`, `cancelled`, `failed`,
+  маркеры процессов `process_suspended`/`process_resumed`/`process_completed`;
   heartbeat-комментарии; в кадрах `seq` и `dialog_id`); диалог создаётся при первом обращении,
   поэтому подписаться можно до первого сообщения
-- `GET /health`, `GET /` — чат-UI (SSE-стрим токенов, шаги скилов, «Стоп», поле имени =
+- `GET /health`, `GET /` — чат-UI (SSE-стрим токенов, шаги скилов, серая курсивная
+  строка-маркер о переключениях/завершениях процессов, «Стоп», поле имени =
   user_id, уходит заголовком `X-User-Id`; EventSource не умеет кастомные заголовки, поэтому
   стрим читается через fetch)
 
@@ -418,14 +483,23 @@ lifespan; Alembic появится при первой деструктивно�
 - `core/tests/test_openai_stream.py` — SSE-парсинг (дельты, склейка tool_calls, [DONE]), `aclose`
 - `core/tests/test_openai_client.py` — non-streaming вызов, tools, tool-история, ошибки
 - `core/tests/test_agent_loop.py` — события прогона, инъекция mid-run, отмена с частичным текстом, ошибка скила, лимит итераций
-- `core/tests/test_conversation_runner.py` — submit → события, inject во время прогона, cancel,
-  task_done → проактивное сообщение + `result_delivered`, персист сообщений по ходу прогона,
-  пересборка истории после «перезапуска» менеджера (SQLite :memory:)
+- `core/tests/test_conversation_runner.py` — процессы: submit → fg-стрим + ProcessCompleted;
+  новый вопрос mid-run → ProcessSuspended + новый fg (bg дорабатывает молча); INJECT-руление;
+  PROMOTE → ProcessResumed; CANCEL по решению роутера; cancel() снимает только форграунд;
+  лимит (max=1) → отказ-заметка инъекцией (fg занят) и репорт-прогоном (fg свободен);
+  task_spawn через скил → bg-процесс → уведомление + репорт + `result_delivered`;
+  уведомление инъекцией в занятый fg; гигиена прерванного тёрна; недочитанная инъекция
+  получает собственный процесс; пересборка нарратива после «перезапуска» менеджера
+  (SQLite :memory:; роутер — детерминированный fake, не LLM)
+- `core/tests/test_router.py` — LLMRouter на mock LLMClient: passthrough без вызова при
+  пустом снимке, парсинг пакетов ops, отбрасывание невалидных (action, лишний/чужой/пустой
+  target), фолбэки (нет tool_call, ошибка, таймаут), форма запроса (процессы, лимит, tool spec)
 - `core/tests/test_db_repositories.py` — диалоги (get-or-create, уникальность пары), сообщения
   (seq/порядок, tool_calls round-trip, изоляция), UTCDateTime round-trip, SqlAlchemyTaskStore
-  (те же сценарии, что у InMemoryTaskStore, + mark_delivered)
-- `core/tests/test_tasks.py` — spawn/валидация, runner DONE/FAILED + колбэк, task_list по диалогу,
-  mark_delivered, UTC-даты
+  (те же сценарии, что у InMemoryTaskStore, + cancel/is_cancelled/count_active, mark_delivered)
+- `core/tests/test_tasks.py` — task_spawn через fake-спавнер (делегация, отказ текстом,
+  отсутствие спавнера — SkillArgumentsError), валидация, task_list по диалогу со статусом
+  cancelled, InMemoryTaskStore: cancel/is_cancelled/count_active, mark_delivered, UTC-даты
 - `core/tests/test_http_request_skill.py`, `core/tests/test_skills_registry.py`
 - `core/tests/test_instructions_local.py` — контрактный набор фасада на `:memory:` (save/upsert
   с бампом версии и пересчётом эмбеддинга, get_by_name с сужением по типу, ранжирование:
@@ -460,10 +534,11 @@ lifespan; Alembic появится при первой деструктивно�
   реальном сторе `:memory:` (scope-парсинг и default, ошибки аргументов, формат ответов,
   not-found тексты, изоляция и кросс-поверхностная видимость через SkillContext)
 - `web/tests/test_config.py` — Settings: дефолты OF_EMBEDDING_*/top-k/whitelist/лимитов
-  data_query и memory_search, парсинг JSON-whitelist и лимитов из env
+  data_query и memory_search, max_processes и router_timeout_seconds (дефолты и env),
+  парсинг JSON-whitelist и лимитов из env
 - `web/tests/test_dialog_api.py` — get-or-create диалога, изоляция двух user_id, 400 без
   `X-User-Id`, messages/cancel/events (SSE через генератор), health, UI
-- `web/tests/test_sse.py` — сериализация событий в SSE-кадры
+- `web/tests/test_sse.py` — сериализация событий в SSE-кадры (включая маркеры процессов)
 
 План:
 
@@ -482,7 +557,7 @@ lifespan; Alembic появится при первой деструктивно�
 5. ✅ (без аутентификации: user_id — доверенная строка от клиента; users/токены отложены) БД (SQLAlchemy async, SQLite), перенос историй/задач в БД; диалоги keyed by (user, channel), поверхности — см. [dialogs.md](dialogs.md); две инсталляции (standalone/distributed) — см. [scaling.md](scaling.md)
 6. Динамические скилы: Jinja-движок + `skill.save/run`; скилы памяти (user/global) ✅ (этап D)
 7. Агентный контекст: память в контексте (автоинъекция), `GET /api/skills`, `GET /api/tasks`
-8. LLM-роутер и процессная модель диалога — решения согласованы, см. [process-model.md](process-model.md); реализация отложена
+8. ✅ LLM-роутер и процессная модель диалога (этап E) — см. [process-model.md](process-model.md)
 9. Инструкции в БД (знание/скил/тул + векторный поиск, этап B ✅) — см. [instructions.md](instructions.md); датасеты пользовательских данных (этап C ✅) — см. [data-store.md](data-store.md); крон-задачи — см. [cron.md](cron.md); реализация после БД
 10. Бэклог из обзора openclaw (SSRF-гвард, формула поиска, каталог скилов, детали крона и пр.) — см. [openclaw-review.md](openclaw-review.md)
 

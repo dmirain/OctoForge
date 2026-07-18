@@ -10,6 +10,9 @@ from octoforge_core.agent.events import (
     Failed,
     Finished,
     IterationStarted,
+    ProcessCompleted,
+    ProcessResumed,
+    ProcessSuspended,
     TextDelta,
     ToolCallCompleted,
     ToolCallFailed,
@@ -27,6 +30,9 @@ OUTPUT = "skill output"
 ERROR = "boom"
 CONTENT = "answer"
 ITERATION_INDEX = 2
+PROCESS_ID = "proc-1"
+TITLE = "research"
+STATUS = "done"
 
 ASSISTANT = ChatMessage(role=MessageRole.ASSISTANT, content=CONTENT)
 CALL = ToolCall(id=CALL_ID, name=SKILL_NAME, arguments={"q": 1})
@@ -61,6 +67,23 @@ PAYLOAD_CASES: list[tuple[LoopEvent, dict[str, object]]] = [
     (Finished(message=ASSISTANT), {"type": "finished", "content": CONTENT}),
     (Cancelled(), {"type": "cancelled"}),
     (Failed(error=ERROR), {"type": "failed", "error": ERROR}),
+    (
+        ProcessSuspended(process_id=PROCESS_ID, title=TITLE),
+        {"type": "process_suspended", "process_id": PROCESS_ID, "title": TITLE},
+    ),
+    (
+        ProcessResumed(process_id=PROCESS_ID, title=TITLE),
+        {"type": "process_resumed", "process_id": PROCESS_ID, "title": TITLE},
+    ),
+    (
+        ProcessCompleted(process_id=PROCESS_ID, title=TITLE, status=STATUS),
+        {
+            "type": "process_completed",
+            "process_id": PROCESS_ID,
+            "title": TITLE,
+            "status": STATUS,
+        },
+    ),
 ]
 
 

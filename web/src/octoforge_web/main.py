@@ -1,8 +1,7 @@
 """FastAPI application factory and composition root."""
 
-import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -21,6 +20,8 @@ from octoforge_core import (
     init_db,
 )
 from octoforge_core.agent.prompts import DEFAULT_SYSTEM_PROMPT
+from octoforge_core.agent.router import LLMRouter
+from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.datasets.service import LocalDatasetService
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.seed import seed_if_empty
@@ -42,7 +43,6 @@ from octoforge_core.skills.basic.memory_search import MemorySearchSkill
 from octoforge_core.skills.basic.memory_store import MemoryStoreSkill
 from octoforge_core.skills.basic.task_list import TaskListSkill
 from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
-from octoforge_core.tasks.runner import TaskRunner
 
 from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.config import Settings
@@ -98,7 +98,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     HttpRequestSkill(http_client=outbound_http, guard=guard),
                     SkillOrigin.BASIC,
                 )
-                registry.register(TaskSpawnSkill(store=task_store), SkillOrigin.BASIC)
+                registry.register(TaskSpawnSkill(), SkillOrigin.BASIC)
                 registry.register(TaskListSkill(store=task_store), SkillOrigin.BASIC)
                 registry.register(
                     InstructionsSearchSkill(
@@ -131,26 +131,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     max_iterations=resolved_settings.agent_max_iterations,
                 )
                 manager = ConversationManager(
-                    loop=loop,
-                    system_prompt=DEFAULT_SYSTEM_PROMPT,
+                    config=RunnerConfig(
+                        loop=loop,
+                        system_prompt=DEFAULT_SYSTEM_PROMPT,
+                        router=LLMRouter(
+                            llm_client,
+                            timeout_seconds=resolved_settings.router_timeout_seconds,
+                        ),
+                        max_processes=resolved_settings.max_processes,
+                    ),
                     dialogs=dialogs,
                     messages=messages,
                     tasks=task_store,
                 )
-                task_runner = TaskRunner(
-                    store=task_store,
-                    llm_client=llm_client,
-                    registry=registry,
-                    on_task_done=manager.notify_task_done,
-                )
-                runner_task = asyncio.create_task(task_runner.run_forever())
                 app.state.settings = resolved_settings
                 app.state.conversation_manager = manager
                 app.state.channel = WEB_CHANNEL
                 yield
-                runner_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await runner_task
         finally:
             await engine.dispose()
 

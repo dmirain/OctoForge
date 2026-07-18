@@ -20,6 +20,8 @@ from octoforge_core import (
     SkillSpec,
 )
 from octoforge_core.agent.events import Cancelled, Failed, Finished
+from octoforge_core.agent.router import ProcessInfo, RouteDecision
+from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.models import DialogRow
 from octoforge_core.llm.events import StreamEvent, StreamFinished
@@ -45,6 +47,7 @@ TEST_BASE_URL = "http://test-llm/v1"
 EVENTS_TIMEOUT_SECONDS = 5.0
 FINISHED_TYPE = "finished"
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+MAX_PROCESSES = 5
 USER_A = "alice"
 USER_B = "bob"
 CHANNEL = "web"
@@ -80,6 +83,18 @@ class ScriptedLLM:
         yield StreamFinished(message=reply)
 
 
+class PassthroughRouter:
+    """MessageRouter stub always passing through (the actor starts a new process)."""
+
+    async def route(
+        self,
+        processes: tuple[ProcessInfo, ...],
+        message: str,
+        max_processes: int,
+    ) -> RouteDecision:
+        return RouteDecision()
+
+
 def reply(content: str = REPLY_CONTENT) -> ChatMessage:
     return ChatMessage(role=MessageRole.ASSISTANT, content=content)
 
@@ -94,8 +109,12 @@ async def make_manager(
         max_iterations=MAX_ITERATIONS,
     )
     return ConversationManager(
-        loop=loop,
-        system_prompt=SYSTEM_PROMPT,
+        config=RunnerConfig(
+            loop=loop,
+            system_prompt=SYSTEM_PROMPT,
+            router=PassthroughRouter(),
+            max_processes=MAX_PROCESSES,
+        ),
         dialogs=DialogRepository(session_factory),
         messages=MessageRepository(session_factory),
         tasks=InMemoryTaskStore(),
