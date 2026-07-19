@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_poll_timeout_seconds: float = DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
     telegram_edit_throttle_seconds: float = DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
+    serper_token: str = ""
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

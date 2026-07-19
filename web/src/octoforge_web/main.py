@@ -65,6 +65,7 @@ from octoforge_core.skills.basic.memory_search import MemorySearchSkill
 from octoforge_core.skills.basic.memory_store import MemoryStoreSkill
 from octoforge_core.skills.basic.task_list import TaskListSkill
 from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
+from octoforge_core.skills.basic.web_search import WebSearchSkill
 from sqlalchemy.exc import SQLAlchemyError
 
 from octoforge_web.api.cron import router as cron_router
@@ -139,6 +140,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             )
             registry = SkillRegistry()
             _register_core_skills(registry, outbound_http, guard, task_store, cron_store)
+            if settings.serper_token:
+                registry.register(
+                    WebSearchSkill(http_client=outbound_http, api_key=settings.serper_token),
+                    SkillOrigin.BASIC,
+                )
             _register_instruction_skills(
                 registry, instructions, datasets, external_executor, settings
             )
