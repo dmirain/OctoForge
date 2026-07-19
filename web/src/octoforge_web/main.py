@@ -37,7 +37,7 @@ from octoforge_core.datasets.service import LocalDatasetService
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.local import LocalInstructionService
-from octoforge_core.instructions.seed import seed_cron_tools_if_absent, seed_if_empty
+from octoforge_core.instructions.seed import migrate_cron_tools_to_native, seed_if_empty
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.openai import OpenAICompatibleClient
@@ -46,6 +46,13 @@ from octoforge_core.memory.api import MemoryStore
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.skills.basic.cron_jobs import (
+    CronCreateSkill,
+    CronDeleteSkill,
+    CronListSkill,
+    CronPauseSkill,
+    CronResumeSkill,
+)
 from octoforge_core.skills.basic.data_forget import DataForgetSkill
 from octoforge_core.skills.basic.data_put import DataPutSkill
 from octoforge_core.skills.basic.data_query import DataQuerySkill
@@ -131,7 +138,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 auth_whitelist=_external_call_whitelist(settings),
             )
             registry = SkillRegistry()
-            _register_core_skills(registry, outbound_http, guard, task_store)
+            _register_core_skills(registry, outbound_http, guard, task_store, cron_store)
             _register_instruction_skills(
                 registry, instructions, datasets, external_executor, settings
             )
@@ -200,7 +207,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 async def _seed_instructions(instructions: InstructionService, settings: Settings) -> None:
-    """Seed the baseline and cron tool records when embeddings are configured.
+    """Seed the baseline records and migrate cron tools when embeddings work.
 
     Seeding needs working embeddings; when no usable backend is configured it
     is skipped so the app still starts (embeddings stay optional until the
@@ -212,7 +219,7 @@ async def _seed_instructions(instructions: InstructionService, settings: Setting
         return
     try:
         await seed_if_empty(instructions)
-        await seed_cron_tools_if_absent(instructions, settings.self_base_url)
+        await migrate_cron_tools_to_native(instructions)
     except (httpx.HTTPError, LLMResponseError, SQLAlchemyError):
         logger.warning(
             "Instruction seeding failed; starting without baseline records",
@@ -324,14 +331,20 @@ def _register_core_skills(
     outbound_http: httpx.AsyncClient,
     guard: SsrfGuard,
     task_store: SqlAlchemyTaskStore,
+    cron_store: CronStore,
 ) -> None:
-    """Register the HTTP and background-task skills."""
+    """Register the HTTP, background-task and cron skills."""
     registry.register(
         HttpRequestSkill(http_client=outbound_http, guard=guard),
         SkillOrigin.BASIC,
     )
     registry.register(TaskSpawnSkill(), SkillOrigin.BASIC)
     registry.register(TaskListSkill(store=task_store), SkillOrigin.BASIC)
+    registry.register(CronCreateSkill(store=cron_store), SkillOrigin.BASIC)
+    registry.register(CronListSkill(store=cron_store), SkillOrigin.BASIC)
+    registry.register(CronDeleteSkill(store=cron_store), SkillOrigin.BASIC)
+    registry.register(CronPauseSkill(store=cron_store), SkillOrigin.BASIC)
+    registry.register(CronResumeSkill(store=cron_store), SkillOrigin.BASIC)
 
 
 def _register_instruction_skills(

@@ -95,3 +95,10 @@ class InstructionService(Protocol):
         record wins. Raises `InstructionNotFoundError` when nothing matches.
         """
         ...
+
+    async def delete(self, name: str, kind: InstructionType) -> None:
+        """Delete the instruction identified by (kind, title).
+
+        Raises `InstructionNotFoundError` when nothing matches.
+        """
+        ...

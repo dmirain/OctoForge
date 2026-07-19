@@ -71,6 +71,11 @@ class LocalInstructionService:
             raise InstructionNotFoundError(name)
         return instruction
 
+    async def delete(self, name: str, kind: InstructionType) -> None:
+        """Delete the record; raise InstructionNotFoundError when absent."""
+        if not await self._store.delete_by_title(name, kind):
+            raise InstructionNotFoundError(name)
+
     def _shortlist_size(self, k: int) -> int:
         return max(k, self._rerank_candidates) if self._reranker is not None else k
 

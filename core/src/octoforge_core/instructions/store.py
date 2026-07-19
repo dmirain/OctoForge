@@ -5,8 +5,10 @@ Follows the `db/repositories.py` style: sessions come from an injected
 """
 
 import uuid
+from typing import Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.instructions.api import Instruction, InstructionType
@@ -87,6 +89,18 @@ class InstructionStore:
                 .values(usage_count=InstructionRow.usage_count + 1)
             )
             await session.commit()
+
+    async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
+        """Delete the record identified by (kind, title); return True when removed."""
+        async with self._session_factory() as session:
+            statement = delete(InstructionRow).where(
+                InstructionRow.type == kind.value,
+                InstructionRow.title == title,
+            )
+            # DML executes into a CursorResult at runtime; narrow for rowcount.
+            result = cast(CursorResult[Any], await session.execute(statement))
+            await session.commit()
+            return result.rowcount > 0
 
     @staticmethod
     async def _find_row(
