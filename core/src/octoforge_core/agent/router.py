@@ -100,13 +100,18 @@ ROUTER_SYSTEM_PROMPT = (
     "Decide what the user message means for these processes and ALWAYS answer with "
     "the route tool.\n"
     "Rules:\n"
-    "1. A comment or detail about the current foreground work -> ops: [inject].\n"
-    "2. A new independent question -> ops: [start_new].\n"
-    "3. Cancel a process only on an explicit user request -> ops: [cancel(target_id)].\n"
-    "4. 'Bring back task X' -> ops: [promote(target_id)].\n"
-    "5. 'Stop everything' -> one cancel op per active process, optionally followed "
+    "1. While a foreground process is active, inject is the default: comments, "
+    "details, refinements and even follow-up questions about the current work "
+    "are answered inside the current run -> ops: [inject].\n"
+    "2. start_new is ONLY for a message clearly unrelated to every active process "
+    "and requiring a separate task -> ops: [start_new].\n"
+    "3. Never combine inject and start_new in one package: an injected message "
+    "stays in the current run and must not also spawn a background process.\n"
+    "4. Cancel a process only on an explicit user request -> ops: [cancel(target_id)].\n"
+    "5. 'Bring back task X' -> ops: [promote(target_id)].\n"
+    "6. 'Stop everything' -> one cancel op per active process, optionally followed "
     "by start_new.\n"
-    "6. Respect the limit: active processes minus your cancel ops plus one must not "
+    "7. Respect the limit: active processes minus your cancel ops plus one must not "
     "exceed the limit, otherwise do not emit start_new/promote."
 )
 
@@ -147,7 +152,7 @@ class LLMRouter:
             for raw in (raw_ops if isinstance(raw_ops, list) else [])
             if (op := _parse_op(raw, known_ids)) is not None
         )
-        return RouteDecision(ops=ops)
+        return RouteDecision(ops=_resolve_conflicts(ops))
 
 
 def _build_messages(
@@ -169,8 +174,15 @@ def _build_messages(
 def _fallback(processes: tuple[ProcessInfo, ...]) -> RouteDecision:
     """Deterministic decision used when the LLM answer is missing or unusable."""
     if any(process.place is ProcessPlace.FOREGROUND for process in processes):
-        return RouteDecision(ops=(RouteOp(action=RouteAction.START_NEW),))
+        return RouteDecision(ops=(RouteOp(action=RouteAction.INJECT),))
     return RouteDecision()
+
+
+def _resolve_conflicts(ops: tuple[RouteOp, ...]) -> tuple[RouteOp, ...]:
+    """Drop start_new ops when the message is injected into the foreground run."""
+    if any(op.action is RouteAction.INJECT for op in ops):
+        return tuple(op for op in ops if op.action is not RouteAction.START_NEW)
+    return ops
 
 
 def _parse_op(raw: object, known_ids: set[str]) -> RouteOp | None:

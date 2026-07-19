@@ -114,7 +114,6 @@ async def test_ops_are_parsed_from_the_route_tool_call() -> None:
     llm = ScriptedLLM(
         reply=route_reply(
             [
-                {"action": "inject", "target_id": None},
                 {"action": "cancel", "target_id": BG_ID},
                 {"action": "promote", "target_id": BG_ID},
                 {"action": "start_new", "target_id": None},
@@ -126,10 +125,70 @@ async def test_ops_are_parsed_from_the_route_tool_call() -> None:
     decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
 
     assert decision.ops == (
-        RouteOp(action=RouteAction.INJECT),
         RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),
         RouteOp(action=RouteAction.PROMOTE, target_id=BG_ID),
         RouteOp(action=RouteAction.START_NEW),
+    )
+
+
+async def test_inject_drops_start_new_regardless_of_order() -> None:
+    llm = ScriptedLLM(
+        reply=route_reply(
+            [
+                {"action": "inject", "target_id": None},
+                {"action": "start_new", "target_id": None},
+            ]
+        )
+    )
+    router = make_router(llm)
+
+    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
+
+
+async def test_start_new_before_inject_is_also_dropped() -> None:
+    llm = ScriptedLLM(
+        reply=route_reply(
+            [
+                {"action": "start_new", "target_id": None},
+                {"action": "inject", "target_id": None},
+            ]
+        )
+    )
+    router = make_router(llm)
+
+    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
+
+
+async def test_start_new_without_inject_is_kept() -> None:
+    llm = ScriptedLLM(reply=route_reply([{"action": "start_new", "target_id": None}]))
+    router = make_router(llm)
+
+    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
+
+
+async def test_inject_drops_start_new_but_keeps_cancel() -> None:
+    llm = ScriptedLLM(
+        reply=route_reply(
+            [
+                {"action": "cancel", "target_id": BG_ID},
+                {"action": "inject", "target_id": None},
+                {"action": "start_new", "target_id": None},
+            ]
+        )
+    )
+    router = make_router(llm)
+
+    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (
+        RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),
+        RouteOp(action=RouteAction.INJECT),
     )
 
 
@@ -178,13 +237,13 @@ async def test_all_invalid_ops_yield_an_empty_decision() -> None:
     assert decision.ops == ()
 
 
-async def test_missing_tool_call_falls_back_to_start_new_with_foreground() -> None:
+async def test_missing_tool_call_falls_back_to_inject_with_foreground() -> None:
     llm = ScriptedLLM(reply=plain_reply())
     router = make_router(llm)
 
     decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
 
-    assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
+    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
 
 
 async def test_missing_tool_call_falls_back_to_empty_without_foreground() -> None:
@@ -202,7 +261,18 @@ async def test_llm_error_falls_back() -> None:
 
     decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
 
-    assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
+    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
+
+
+async def test_prompt_prefers_inject_and_forbids_combining() -> None:
+    llm = ScriptedLLM(reply=route_reply([]))
+    router = make_router(llm)
+
+    await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    system = llm.last_messages[0]
+    assert "inject is the default" in system.content
+    assert "Never combine inject and start_new" in system.content
 
 
 async def test_llm_timeout_falls_back() -> None:
