@@ -65,7 +65,8 @@ core/                          # библиотека octoforge-core — дом�
       basic/                   # http_request.py, task_spawn.py, task_list.py,
                                # instructions_search.py, instruction_save.py, external_call.py,
                                # data_put.py, data_query.py, data_forget.py,
-                               # memory_store.py, memory_search.py, memory_delete.py
+                               # memory_store.py, memory_search.py, memory_delete.py,
+                               # cron_jobs.py (cron_create/list/delete/pause/resume), web_search.py
     tasks/
       models.py                # Task, TaskKind (RUN), TaskStatus (PENDING|RUNNING|DONE|FAILED|CANCELLED)
       store.py                 # InMemoryTaskStore (реализация порта TaskStore, для тестов)
@@ -140,7 +141,7 @@ web/                           # приложение octoforge-web — FastAPI-
                                #   OF_EMBEDDING_*, OF_INSTRUCTIONS_TOP_K,
                                #   OF_EXTERNAL_CALL_AUTH_WHITELIST, OF_DATASETS_QUERY_*,
                                #   OF_MEMORY_SEARCH_*, OF_MAX_PROCESSES, OF_ROUTER_TIMEOUT_SECONDS,
-                               #   OF_SELF_BASE_URL, OF_CRON_*, OF_TELEGRAM_*)
+                               #   OF_SELF_BASE_URL, OF_CRON_*, OF_TELEGRAM_*, OF_SERPER_TOKEN)
     deps.py                    # провайдеры зависимостей из app.state + заголовок X-User-Id
     api/
       dialog.py                # messages/cancel/events(SSE) по (user_id, channel)
@@ -153,6 +154,7 @@ web/                           # приложение octoforge-web — FastAPI-
                                #   sendMessage, editMessageText, sendChatAction)
       bridge.py                # TelegramBridge: события runner'а → черновик с throttle-правками,
                                #   чанкер 4096, статус-строки скилов; текст → runner.submit
+      markdown.py              # markdown → Telegram-HTML (parse_mode=HTML) + split_html_safe
       poller.py                # TelegramPoller (long-poll, offset, backlog-drain, backoff) +
                                #   TelegramBridgeRegistry (get-or-create + прогрев из БД)
       __main__.py              # standalone-запуск: только Telegram-адаптер, без HTTP API
@@ -162,7 +164,7 @@ web/                           # приложение octoforge-web — FastAPI-
   tests/                       # test_dialog_api.py, test_cron_api.py, test_sse.py, test_config.py,
                                # test_seed.py, test_telegram_models.py, test_telegram_bridge.py,
                                # test_telegram_poller.py, test_telegram_client.py,
-                               # test_telegram_standalone.py
+                               # test_telegram_standalone.py, test_telegram_markdown.py
 ```
 
 ## Петля агента: события, управление, актор
@@ -259,11 +261,13 @@ CANCEL/PROMOTE). Пустой пакет — passthrough (актор тракт�
 
 Первая реализация — `LLMRouter(llm, timeout_seconds)`: пустой снимок → passthrough без
 вызова LLM; иначе one-shot `complete()` с tool `route(ops)` (компактный системный
-промпт со списком процессов, лимитом и правилами из process-model.md; сообщение
-пользователя — отдельным user-сообщением) под `asyncio.wait_for`. Нет tool_call,
-ошибка или таймаут → фолбэк: есть форграунд → `[START_NEW]`, иначе пусто. Невалидные
-операции (неизвестный action, лишний/отсутствующий target, target не из снимка)
-отбрасываются; валидный остаток — решение (может стать пустым).
+промпт со списком процессов, лимитом и правилами: при активном форграунде дефолт —
+inject, start_new только для очевидно несвязанного вопроса; сообщение пользователя —
+отдельным user-сообщением) под `asyncio.wait_for`. Нет tool_call, ошибка или таймаут →
+фолбэк: есть форграунд → `[INJECT]`, иначе пусто. Невалидные операции (неизвестный
+action, лишний/отсутствующий target, target не из снимка) отбрасываются; пакет с
+INJECT теряет все START_NEW (детерминированный guardrail против увода вопроса в фон);
+валидный остаток — решение (может стать пустым).
 
 ### Системный промпт (`agent/prompts.py`)
 
@@ -275,9 +279,11 @@ CANCEL/PROMOTE). Пустой пакет — passthrough (актор тракт�
 через `instruction_save`; трекинг структурированных данных (еда, вес, привычки) —
 датасеты: искать через `instructions_search`, писать через `data_put` (создавая датасет
 со схемой при отсутствии), читать/строить отчёты через `data_query`, удалять через `data_forget`;
-просьбы «по расписанию/периодически/напоминай» — найти cron-тулы через `instructions_search`
-и создать задачу через `external_call` (cron-выражение составить самому, таймзону уточнить
-или взять UTC), подтвердив создание пользователю.
+просьбы «по расписанию/периодически/напоминай» — скил `cron_create` (cron-выражение
+составить самому, таймзону уточнить или взять UTC), управление — `cron_list`/`cron_pause`/
+`cron_resume`/`cron_delete`, подтвердив создание пользователю; факты из веба — скил
+`web_search`; разметка ответов — простая (`**bold**` для акцентов и заголовков, списки
+дефисом, код в fenced-блоках, таблицы избегать) — рендерится и в web, и в Telegram.
 
 ### Стриминг LLM (`llm/openai.py`)
 
@@ -327,7 +333,8 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 
 - **Базовые (`SkillOrigin.BASIC`)** — код проекта (`octoforge_core/skills/basic/`): `http_request`,
   `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`,
-  `data_put`, `data_query`, `data_forget`, `memory_store`, `memory_search`, `memory_delete`.
+  `data_put`, `data_query`, `data_forget`, `memory_store`, `memory_search`, `memory_delete`,
+  `cron_create`, `cron_list`, `cron_delete`, `cron_pause`, `cron_resume`, `web_search`.
   Подключаются в composition root. Имена скилов — с подчёркиваниями, не с точками:
   точки в function-name несовместимы с OpenAI tool-calling (зафиксированное решение).
 - **Динамические (`SkillOrigin.DYNAMIC`)** — Jinja-шаблоны из БД (появятся с БД). Реестр един:
@@ -486,16 +493,19 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   темплейт `{user_id}` (подстановка из `SkillContext.user_id`; вызов без user_id → без
   заголовка); скил `external_call` передаёт `context.user_id`. В whitelist composition
   root программно добавляется запись `(self_base_url, "X-User-Id", "{user_id}")`.
+- **Нативные скилы** (`skills/basic/cron_jobs.py`): `cron_create`/`cron_list`/
+  `cron_delete`/`cron_pause`/`cron_resume` над `CronStore` — семантика HTTP-эндпоинтов
+  (owner-скоуп, resume пересчитывает `next_fire_at` от now), но без loopback-вызовов:
+  работают и в standalone Telegram-раннере. Регистрируются в composition root на всех
+  поверхностях; agent-managed крон больше не зависит от поднятого HTTP API.
 - **HTTP API** (`web/api/cron.py`, префикс `/api/cron`, скоуп по `X-User-Id`, параметры —
-  query string, т.к. `external_call` не умеет тела запросов): `POST /jobs` (201;
-  валидация schedule через croniter и timezone через zoneinfo → 422 с detail;
-  `next_fire_at` от now), `GET /jobs`, `DELETE /jobs/{id}` (204; чужая/нет → 404),
-  `POST /jobs/{id}/pause|resume` (resume пересчитывает `next_fire_at` от now — без
-  мгновенной догонялки; чужие → 404).
-- **Сид**: `seed_cron_tools_if_absent(service, base_url)` — 5 тулов (`cron_create_job`/
-  `cron_list_jobs`/`cron_delete_job`/`cron_pause_job`/`cron_resume_job`) + скил-сценарий
-  `schedule_a_recurring_report`; маркер `cron_create_job` независим от weather-сида;
-  вызов в lifespan под тем же условием `OF_EMBEDDING_API_KEY`.
+  query string): `POST /jobs` (201; валидация schedule через croniter и timezone через
+  zoneinfo → 422 с detail; `next_fire_at` от now), `GET /jobs`, `DELETE /jobs/{id}`
+  (204; чужая/нет → 404), `POST /jobs/{id}/pause|resume`. Остаётся для внешних клиентов.
+- **Сид**: `migrate_cron_tools_to_native(service)` — удаляет HTTP-сид-тулы крона
+  (`cron_create_job` и др.) через `InstructionService.delete` и обновляет скил-сценарий
+  `schedule_a_recurring_report` на нативные скилы; идемпотентна, вызов в lifespan под
+  тем же условием рабочих эмбеддингов.
 - **Промпт**: правило 11 — см. «Системный промпт».
 
 ## Telegram-адаптер (этап G)
@@ -521,10 +531,18 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   дельты текста с throttle-правками (`OF_TELEGRAM_EDIT_THROTTLE_SECONDS`), статус-строки
   скилов (⚙️/⚠️) и маркеры ухода/возврата процессов (⏸️/▶️) в порядке прихода;
   `ProcessCompleted` не рисуется (завершения приходят текстом репорт-прогона). Переполнение
-  лимита 4096 — seal текущего сообщения и продолжение в новом; чанкер режет по границе
-  строки/слова. Plain text без parse_mode (никаких 400 на битой разметке). Зависимость
+  лимита 4096 — seal текущего сообщения и продолжение в новом (запечатанные головы в
+  `_Draft.sealed_chunks`, буфер копится сырым). Зависимость
   моста — `RunnerProvider` (callable → runner); в composition root это
   `ConversationManager.get_or_create_runner`.
+- **Разметка** (`telegram/markdown.py`): ответы модели идут с `parse_mode="HTML"`: сырой
+  markdown буфера конвертируется в Telegram-HTML (`markdown_to_telegram_html` — bold/italic/
+  strike, inline/fenced code, ссылки, заголовки как `<b>`, цитаты, списки `•`, экранирование),
+  разбиение — `split_html_safe` (срез по границе строки/слова, никогда внутри тега; стек
+  открытых тегов закрывается в голове и переоткрывается в хвосте). На ошибку Bot API
+  «can't parse entities» клиент повторяет отправку без parse_mode (plain text-фолбэк).
+  Rich Messages из Bot API 10.1 (sendRichMessage/Draft) осознанно не используем: свежее
+  API, наш поток построен на editMessageText.
 - **Прогрев**: при старте мосты поднимаются для всех диалогов канала telegram из БД
   (`DialogRepository.list_user_ids_by_channel`) — иначе крон-выстрелы и уведомления задач
   после рестарта ушли бы в пустоту (подписчиков нет); chat_id выводится из `tg:<id>`.
@@ -537,9 +555,9 @@ delta.tool_calls — аккумуляция по index со склейкой arg
   остановка по SIGINT/SIGTERM.
 - **Токен в логах**: HTTP-статусы Bot API конвертируются в `TelegramApiError` без URL
   (`raise ... from None`) — токен из пути запроса не попадает в логи.
-- **Не входит**: группы/треды, webhook-режим, медиа и файлы, parse_mode, inline-кнопки,
+- **Не входит**: группы/треды, webhook-режим, медиа и файлы, inline-кнопки,
   связывание идентичностей, outbox при оффлайн-инстансе ([scaling.md](scaling.md)),
-  markdown-aware чанкер с учётом code fence ([streaming.md](streaming.md) п.4).
+  Rich Messages (Bot API 10.1+), таблицы в разметке (промпт просит код-блоки).
 
 ## Модель данных
 

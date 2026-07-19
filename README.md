@@ -43,9 +43,10 @@ make check  # ruff (lint + format) → mypy → pytest для обоих про�
 - чат без аутентификации: `user_id` — доверенная строка (заголовок `X-User-Id`, в UI — поле имени);
 - персист диалогов, сообщений и задач в SQLite; изоляция по `(user_id, channel)`, история переживает рестарт;
 - агентная петля со стримом токенов и отменой; процессная модель (фон/форграунд) с LLM-роутером входящих сообщений;
-- инструкции в БД (знания/скилы/тулы) с векторным поиском, `external_call` с SSRF-гвардом, сид примеров (wttr.in, крон-тулы);
+- инструкции в БД (знания/скилы/тулы) с векторным поиском, `external_call` с SSRF-гвардом, сид примеров (wttr.in);
 - датасеты пользовательских данных (`data_put`/`data_query`/`data_forget`), память (`memory_store`/`memory_search`/`memory_delete`);
-- крон-задачи: HTTP API `/api/cron/*`, планировщик с CAS-арендой, создание задач агентом через `external_call`;
+- крон-задачи: планировщик с CAS-арендой, HTTP API `/api/cron/*` для внешних клиентов, нативные скилы `cron_create`/`cron_list`/`cron_delete`/`cron_pause`/`cron_resume` для агента;
+- поиск в вебе через serper.dev: скил `web_search` (при заданном `OF_SERPER_TOKEN`);
 - telegram-адаптер: канал `"telegram"` (`user_id = tg:<id>`), long-poll бот на httpx, черновик с
   throttle-правками, прогрев мостов из БД; вместе с web или standalone без HTTP API (`make run-telegram`).
 
