@@ -16,6 +16,7 @@ CHAT_ACTION_TYPING = "typing"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 LONG_POLL_TIMEOUT_MARGIN_SECONDS = 10.0
 NOT_MODIFIED_MARKER = "message is not modified"
+CANT_PARSE_ENTITIES_MARKER = "can't parse entities"
 ALLOWED_UPDATES = ("message",)
 
 logger = logging.getLogger(__name__)
@@ -32,11 +33,13 @@ class TelegramClient(Protocol):
         """Fetch updates after `offset`, long-polling up to `timeout_seconds`."""
         ...
 
-    async def send_message(self, chat_id: int, text: str) -> int:
+    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> int:
         """Send a text message; return its message id."""
         ...
 
-    async def edit_message_text(self, chat_id: int, message_id: int, text: str) -> None:
+    async def edit_message_text(
+        self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
+    ) -> None:
         """Replace the text of an existing message."""
         ...
 
@@ -65,24 +68,42 @@ class TelegramBotClient:
             raise TelegramApiError("getUpdates: unexpected result shape")
         return _parse_updates(result)
 
-    async def send_message(self, chat_id: int, text: str) -> int:
-        result = await self._call("sendMessage", {"chat_id": chat_id, "text": text})
+    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> int:
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
+        result = await self._call_with_parse_fallback("sendMessage", payload)
         if not isinstance(result, dict) or "message_id" not in result:
             raise TelegramApiError("sendMessage: unexpected result shape")
         return int(result["message_id"])
 
-    async def edit_message_text(self, chat_id: int, message_id: int, text: str) -> None:
+    async def edit_message_text(
+        self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
+    ) -> None:
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
         try:
-            await self._call(
-                "editMessageText",
-                {"chat_id": chat_id, "message_id": message_id, "text": text},
-            )
+            await self._call_with_parse_fallback("editMessageText", payload)
         except TelegramApiError as exc:
             if NOT_MODIFIED_MARKER not in str(exc):
                 raise
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         await self._call("sendChatAction", {"chat_id": chat_id, "action": action})
+
+    async def _call_with_parse_fallback(
+        self, method: str, payload: dict[str, Any]
+    ) -> dict[str, Any] | list[Any]:
+        """Call `method`, retrying without parse_mode when the API rejects the markup."""
+        try:
+            return await self._call(method, payload)
+        except TelegramApiError as exc:
+            if "parse_mode" not in payload or CANT_PARSE_ENTITIES_MARKER not in str(exc):
+                raise
+            logger.warning("%s rejected the markup; retrying as plain text", method)
+            plain = {key: value for key, value in payload.items() if key != "parse_mode"}
+            return await self._call(method, plain)
 
     async def _call(
         self,
@@ -93,17 +114,29 @@ class TelegramBotClient:
         response = await self._http.post(
             f"{self._base_url}/{method}", json=payload, timeout=timeout
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            # The request URL carries the bot token; keep it out of logs.
-            raise TelegramApiError(f"{method}: HTTP {exc.response.status_code}") from None
-        body: dict[str, Any] = response.json()
+        body = _parse_body(response)
+        if body is None:
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                # The request URL carries the bot token; keep it out of logs.
+                raise TelegramApiError(f"{method}: HTTP {exc.response.status_code}") from None
+            raise TelegramApiError(f"{method}: unexpected response shape")
+        # Error statuses still carry a JSON body with the failure description.
         if not body.get("ok"):
             description = body.get("description", "unknown error")
             raise TelegramApiError(f"{method}: {description}")
         result = body.get("result")
         return result if isinstance(result, (dict, list)) else {}
+
+
+def _parse_body(response: httpx.Response) -> dict[str, Any] | None:
+    """Parse the response JSON object, or None when the body is not one."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
 
 
 def _parse_updates(items: list[Any]) -> list[TelegramUpdate]:

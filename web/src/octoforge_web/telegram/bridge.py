@@ -28,6 +28,7 @@ from octoforge_web.telegram.client import (
     TelegramApiError,
     TelegramClient,
 )
+from octoforge_web.telegram.markdown import markdown_to_telegram_html, split_html_safe
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ SUSPENDED_LINE_TEMPLATE = "⏸️ «{title}» ушёл в фон"
 RESUMED_LINE_TEMPLATE = "▶️ «{title}» снова активен"
 CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
-MIN_BOUNDARY_RATIO = 2
+PARSE_MODE_HTML = "HTML"
 
 
 @dataclass(slots=True)
@@ -49,6 +50,7 @@ class _Draft:
     message_id: int | None = None
     buffer: str = ""
     delivered_text: str = ""
+    sealed_chunks: int = 0
 
 
 class TelegramBridge:
@@ -154,20 +156,29 @@ class TelegramBridge:
             await self._flush_draft()
 
     async def _flush_draft(self) -> None:
-        text = self._draft.buffer.rstrip("\n")
-        while len(text) > MAX_MESSAGE_LENGTH:
-            head, text = split_head(text)
-            await self._deliver(head)
-            self._draft = _Draft(buffer=text)  # seal the head, continue in a fresh message
-        if text and text != self._draft.delivered_text:
-            await self._deliver(text)
+        raw = self._draft.buffer.rstrip("\n")
+        if not raw:
+            return
+        # The buffer holds raw Markdown; the 4096 limit applies to its HTML form.
+        chunks = split_html_safe(markdown_to_telegram_html(raw), MAX_MESSAGE_LENGTH)
+        while self._draft.sealed_chunks < len(chunks) - 1:
+            await self._deliver(chunks[self._draft.sealed_chunks])
+            self._draft.message_id = None  # seal the head, continue in a fresh message
+            self._draft.delivered_text = ""
+            self._draft.sealed_chunks += 1
+        if chunks[-1] != self._draft.delivered_text:
+            await self._deliver(chunks[-1])
 
-    async def _deliver(self, text: str) -> None:
+    async def _deliver(self, html: str) -> None:
         if self._draft.message_id is None:
-            self._draft.message_id = await self._client.send_message(self._chat_id, text)
+            self._draft.message_id = await self._client.send_message(
+                self._chat_id, html, parse_mode=PARSE_MODE_HTML
+            )
         else:
-            await self._client.edit_message_text(self._chat_id, self._draft.message_id, text)
-        self._draft.delivered_text = text
+            await self._client.edit_message_text(
+                self._chat_id, self._draft.message_id, html, parse_mode=PARSE_MODE_HTML
+            )
+        self._draft.delivered_text = html
 
 
 def _status_line(event: LoopEvent) -> str | None:
@@ -181,34 +192,3 @@ def _status_line(event: LoopEvent) -> str | None:
         return RESUMED_LINE_TEMPLATE.format(title=event.title)
     # ProcessCompleted is not rendered: completions already arrive as report-run text.
     return None
-
-
-def split_head(text: str, limit: int = MAX_MESSAGE_LENGTH) -> tuple[str, str]:
-    """Cut `text` into a Telegram-sized head chunk and the remaining tail."""
-    cut = _find_cut(text, limit)
-    return text[:cut], _drop_boundary(text[cut:])
-
-
-def split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
-    """Split `text` into Telegram-sized chunks, preferring line/word boundaries."""
-    chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        head, remaining = split_head(remaining, limit)
-        chunks.append(head)
-    chunks.append(remaining)
-    return chunks
-
-
-def _find_cut(text: str, limit: int) -> int:
-    for separator in ("\n", " "):
-        cut = text.rfind(separator, 0, limit)
-        if cut >= limit // MIN_BOUNDARY_RATIO:
-            return cut
-    return limit
-
-
-def _drop_boundary(text: str) -> str:
-    if text[:1] in ("\n", " "):
-        return text[1:]
-    return text

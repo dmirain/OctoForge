@@ -11,6 +11,7 @@ BOT_TOKEN = "123:secret-token"
 CHAT_ID = 42
 MESSAGE_ID = 7
 UPDATE_ID = 10
+EXPECTED_REQUEST_COUNT = 2
 
 
 def json_response(payload: dict[str, object], status_code: int = 200) -> httpx.Response:
@@ -25,6 +26,41 @@ async def test_send_message_returns_message_id() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
         assert await client.send_message(CHAT_ID, "hi") == MESSAGE_ID
+
+
+async def test_send_message_passes_parse_mode_in_the_payload() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["parse_mode"] == "HTML"
+        assert payload["text"] == "<b>hi</b>"
+        return json_response({"ok": True, "result": {"message_id": MESSAGE_ID}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        assert await client.send_message(CHAT_ID, "<b>hi</b>", parse_mode="HTML") == MESSAGE_ID
+
+
+async def test_send_message_retries_without_parse_mode_on_entity_errors() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if "parse_mode" in payload:
+            return json_response(
+                {"ok": False, "description": "Bad Request: can't parse entities"},
+                status_code=400,
+            )
+        return json_response({"ok": True, "result": {"message_id": MESSAGE_ID}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        result = await client.send_message(CHAT_ID, "<b>oops</b>", parse_mode="HTML")
+
+    assert result == MESSAGE_ID
+    assert len(requests) == EXPECTED_REQUEST_COUNT
+    assert requests[0]["parse_mode"] == "HTML"
+    assert "parse_mode" not in requests[1]
 
 
 async def test_get_updates_parses_models() -> None:

@@ -23,7 +23,7 @@ from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.tasks.store import InMemoryTaskStore
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_web.telegram.bridge import RunnerProvider
+from octoforge_web.telegram.bridge import PARSE_MODE_HTML, RunnerProvider
 from octoforge_web.telegram.client import USER_ID_PREFIX
 from octoforge_web.telegram.models import (
     TelegramChat,
@@ -71,8 +71,8 @@ class FakeTelegramClient:
         self._batches = list(batches) if batches is not None else []
         self.poll_calls: list[tuple[int | None, float]] = []
         self.failures: list[Exception] = []
-        self.sent: list[tuple[int, str]] = []
-        self.edited: list[tuple[int, int, str]] = []
+        self.sent: list[tuple[int, str, str | None]] = []
+        self.edited: list[tuple[int, int, str, str | None]] = []
         self._next_message_id = 0
 
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[TelegramUpdate]:
@@ -84,13 +84,15 @@ class FakeTelegramClient:
         await asyncio.sleep(IDLE_BATCH_SECONDS)
         return []
 
-    async def send_message(self, chat_id: int, text: str) -> int:
+    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> int:
         self._next_message_id += 1
-        self.sent.append((chat_id, text))
+        self.sent.append((chat_id, text, parse_mode))
         return self._next_message_id
 
-    async def edit_message_text(self, chat_id: int, message_id: int, text: str) -> None:
-        self.edited.append((chat_id, message_id, text))
+    async def edit_message_text(
+        self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
+    ) -> None:
+        self.edited.append((chat_id, message_id, text, parse_mode))
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         pass
@@ -213,7 +215,7 @@ async def test_start_command_greets_without_runner() -> None:
 
     await poller.dispatch(make_update(FIRST_UPDATE_ID, text=COMMAND_START))
 
-    assert client.sent == [(TELEGRAM_USER_ID, GREETING_TEXT)]
+    assert client.sent == [(TELEGRAM_USER_ID, GREETING_TEXT, None)]
 
 
 async def test_group_chat_gets_a_notice() -> None:
@@ -222,7 +224,7 @@ async def test_group_chat_gets_a_notice() -> None:
 
     await poller.dispatch(make_update(FIRST_UPDATE_ID, chat_type=TelegramChatType.GROUP))
 
-    assert client.sent == [(TELEGRAM_USER_ID, GROUP_NOTICE)]
+    assert client.sent == [(TELEGRAM_USER_ID, GROUP_NOTICE, None)]
 
 
 async def test_non_text_message_gets_a_notice() -> None:
@@ -231,7 +233,7 @@ async def test_non_text_message_gets_a_notice() -> None:
 
     await poller.dispatch(make_update(FIRST_UPDATE_ID, text=None))
 
-    assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE)]
+    assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE, None)]
 
 
 async def test_text_message_reaches_the_dialog_and_renders_the_reply(
@@ -245,7 +247,7 @@ async def test_text_message_reaches_the_dialog_and_renders_the_reply(
     await poller.dispatch(make_update(FIRST_UPDATE_ID, text="ping"))
     await wait_until(lambda: bool(client.sent))
 
-    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY)
+    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
 
 
 async def test_cancel_command_is_accepted(

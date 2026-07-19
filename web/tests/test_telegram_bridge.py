@@ -28,9 +28,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.telegram.bridge import (
     CANCELLED_LINE,
+    PARSE_MODE_HTML,
     TOOL_LINE_TEMPLATE,
     TelegramBridge,
-    split_message,
 )
 from octoforge_web.telegram.client import MAX_MESSAGE_LENGTH, USER_ID_PREFIX
 
@@ -56,21 +56,23 @@ class FakeTelegramClient:
     """TelegramClient stub recording the outbound calls."""
 
     def __init__(self) -> None:
-        self.sent: list[tuple[int, str]] = []
-        self.edited: list[tuple[int, int, str]] = []
+        self.sent: list[tuple[int, str, str | None]] = []
+        self.edited: list[tuple[int, int, str, str | None]] = []
         self.actions: list[tuple[int, str]] = []
         self._next_message_id = 0
 
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[Any]:
         raise NotImplementedError
 
-    async def send_message(self, chat_id: int, text: str) -> int:
+    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> int:
         self._next_message_id += 1
-        self.sent.append((chat_id, text))
+        self.sent.append((chat_id, text, parse_mode))
         return self._next_message_id
 
-    async def edit_message_text(self, chat_id: int, message_id: int, text: str) -> None:
-        self.edited.append((chat_id, message_id, text))
+    async def edit_message_text(
+        self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
+    ) -> None:
+        self.edited.append((chat_id, message_id, text, parse_mode))
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         self.actions.append((chat_id, action))
@@ -265,7 +267,7 @@ async def test_single_delta_sends_one_message(
     await bridge.handle_text("hi")
     await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
 
-    assert client.sent == [(CHAT_ID, REPLY)]
+    assert client.sent == [(CHAT_ID, REPLY, PARSE_MODE_HTML)]
     assert client.edited == []
     await bridge.aclose()
 
@@ -280,8 +282,8 @@ async def test_deltas_stream_into_one_edited_message(
     await bridge.handle_text("hi")
     await wait_until(lambda: client.current_text() == "hello" if client.sent else False)
 
-    assert client.sent == [(CHAT_ID, "hel")]
-    assert client.edited == [(CHAT_ID, 1, "hello")]
+    assert client.sent == [(CHAT_ID, "hel", PARSE_MODE_HTML)]
+    assert client.edited == [(CHAT_ID, 1, "hello", PARSE_MODE_HTML)]
     await bridge.aclose()
 
 
@@ -297,8 +299,8 @@ async def test_long_reply_is_split_into_telegram_sized_messages(
     await wait_until(lambda: len(client.sent) == EXPECTED_MESSAGE_COUNT)
 
     head, tail = client.sent
-    assert head == (CHAT_ID, "x" * MAX_MESSAGE_LENGTH)
-    assert tail == (CHAT_ID, LONG_REPLY_TAIL)
+    assert head == (CHAT_ID, "x" * MAX_MESSAGE_LENGTH, PARSE_MODE_HTML)
+    assert tail == (CHAT_ID, LONG_REPLY_TAIL, PARSE_MODE_HTML)
     assert client.edited == []
     await bridge.aclose()
 
@@ -319,8 +321,8 @@ async def test_tool_call_renders_status_line_before_the_answer(
     expected = f"{tool_line}\n{REPLY}"
     await wait_until(lambda: client.current_text() == expected if client.sent else False)
 
-    assert client.sent == [(CHAT_ID, tool_line)]
-    assert client.edited == [(CHAT_ID, 1, expected)]
+    assert client.sent == [(CHAT_ID, tool_line, PARSE_MODE_HTML)]
+    assert client.edited == [(CHAT_ID, 1, expected, PARSE_MODE_HTML)]
     await bridge.aclose()
 
 
@@ -358,33 +360,17 @@ async def test_llm_failure_appends_the_error_line(
     await bridge.aclose()
 
 
-def test_split_message_keeps_short_text() -> None:
-    assert split_message("hello", MAX_MESSAGE_LENGTH) == ["hello"]
+async def test_markdown_reply_is_delivered_as_html(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    content = "**жирный**\n```\ncode\n```"
+    expected_html = "<b>жирный</b>\n<pre>code</pre>"
+    manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
+    bridge = make_bridge(client, manager)
 
+    await bridge.handle_text("hi")
+    await wait_until(lambda: client.current_text() == expected_html if client.sent else False)
 
-def test_split_message_prefers_newline_boundaries() -> None:
-    limit = 10
-    text = "aaa\nbbb\ncccddd"
-
-    chunks = split_message(text, limit)
-
-    assert chunks == ["aaa\nbbb", "cccddd"]
-
-
-def test_split_message_prefers_space_boundaries() -> None:
-    limit = 10
-    text = "aaa bbb ccc ddd"
-
-    chunks = split_message(text, limit)
-
-    assert chunks == ["aaa bbb", "ccc ddd"]
-
-
-def test_split_message_hard_cuts_without_boundaries() -> None:
-    limit = 10
-    text = "x" * 25
-
-    chunks = split_message(text, limit)
-
-    assert chunks == ["x" * 10, "x" * 10, "x" * 5]
-    assert all(len(chunk) <= limit for chunk in chunks)
+    assert client.sent == [(CHAT_ID, expected_html, PARSE_MODE_HTML)]
+    await bridge.aclose()
