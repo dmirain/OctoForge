@@ -1,8 +1,8 @@
 """Per-dialog actor: owns the narrative and the processes answering user questions."""
 
 import asyncio
+import logging
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +32,8 @@ from octoforge_core.skills.base import SkillContext
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.spawner import TaskSpawner
 from octoforge_core.time import utc_now
+
+logger = logging.getLogger(__name__)
 
 SUBSCRIBER_QUEUE_SIZE = 100
 TITLE_MAX_LENGTH = 60
@@ -146,12 +148,22 @@ class ConversationRunner:
         self._inbox: asyncio.Queue[_Command] = asyncio.Queue()
         self._subscribers: set[asyncio.Queue[ConversationEvent]] = set()
         self._seq = 0
+        self._dropped_events = 0
         self._actor_task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         """Start consuming the inbox."""
         if self._actor_task is None:
             self._actor_task = asyncio.create_task(self._run_actor())
+            self._actor_task.add_done_callback(self._on_actor_done)
+
+    def _on_actor_done(self, task: asyncio.Task[None]) -> None:
+        """Surface an unexpected actor exit; a cancelled stop() is expected."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("actor task exited unexpectedly: dialog=%s", self._dialog.id, exc_info=exc)
 
     async def stop(self) -> None:
         """Cancel all processes and the actor itself."""
@@ -246,12 +258,22 @@ class ConversationRunner:
     async def _run_actor(self) -> None:
         while True:
             command = await self._inbox.get()
-            if isinstance(command, _Submit):
-                await self._handle_submit(command)
-            elif isinstance(command, _Cancel):
-                self._handle_cancel()
-            elif isinstance(command, _ProcessTerminated):
-                await self._handle_terminated(command)
+            try:
+                await self._dispatch(command)
+            except Exception:  # one bad command must not zombie the whole dialog
+                logger.exception(
+                    "actor command failed: dialog=%s command=%s",
+                    self._dialog.id,
+                    type(command).__name__,
+                )
+
+    async def _dispatch(self, command: _Command) -> None:
+        if isinstance(command, _Submit):
+            await self._handle_submit(command)
+        elif isinstance(command, _Cancel):
+            self._handle_cancel()
+        elif isinstance(command, _ProcessTerminated):
+            await self._handle_terminated(command)
 
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
@@ -407,7 +429,24 @@ class ConversationRunner:
         return process
 
     async def _pump_process(self, process: _Process) -> None:
-        """Stream the process loop, broadcasting events only while it is the foreground."""
+        """Stream the process loop, then always finalize and release the slot.
+
+        Finalization writes to the store; even if that fails, the process is
+        removed and its termination is signalled so the slot is never leaked.
+        """
+        terminal = await self._stream_terminal(process)
+        status = TaskStatus.FAILED
+        try:
+            status = await self._finalize(process, terminal)
+        except Exception:  # a store failure must not wedge the process slot
+            logger.exception(
+                "process finalize failed: dialog=%s process=%s", self._dialog.id, process.id
+            )
+        finally:
+            self._terminate_process(process, status)
+
+    async def _stream_terminal(self, process: _Process) -> LoopEvent:
+        """Run the loop stream, broadcasting events only while it is the foreground."""
         context = SkillContext(
             user_id=self._dialog.user_id,
             channel=self._dialog.channel,
@@ -422,10 +461,16 @@ class ConversationRunner:
                 if isinstance(event, (Finished, Cancelled, Failed)):
                     terminal = event
         except Exception as exc:  # loop failures are broadcast, not raised
+            logger.exception(
+                "process loop crashed: dialog=%s process=%s", self._dialog.id, process.id
+            )
             terminal = Failed(error=format_error(exc))
             if self._foreground_id == process.id:
                 self._broadcast(terminal)
-        status = await self._finalize(process, terminal)
+        return terminal
+
+    def _terminate_process(self, process: _Process, status: TaskStatus) -> None:
+        """Remove the process, announce completion and requeue any drained injections."""
         self._remove_process(process)
         self._broadcast(
             ProcessCompleted(process_id=process.id, title=process.title, status=status.value)
@@ -509,8 +554,16 @@ class ConversationRunner:
             payload=event,
         )
         for queue in self._subscribers:
-            with suppress(asyncio.QueueFull):  # slow subscribers drop events
+            try:
                 queue.put_nowait(envelope)
+            except asyncio.QueueFull:  # slow subscribers drop events; keep it countable
+                self._dropped_events += 1
+                logger.debug(
+                    "dropped SSE event: dialog=%s seq=%s dropped_total=%s",
+                    self._dialog.id,
+                    self._seq,
+                    self._dropped_events,
+                )
 
     @staticmethod
     def _format_task_done(task: Task) -> str:

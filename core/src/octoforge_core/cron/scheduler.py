@@ -8,6 +8,7 @@ limit (openclaw-review item 5).
 """
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -19,6 +20,8 @@ from octoforge_core.cron.api import (
     count_missed,
 )
 from octoforge_core.time import utc_now
+
+logger = logging.getLogger(__name__)
 
 REPLAY_STAGGER_SECONDS = 0.5
 MISSED_RUNS_SUFFIX_TEMPLATE = "\n[{count} scheduled runs were missed and coalesced into this one.]"
@@ -85,6 +88,7 @@ class CronScheduler:
             )
         except Exception:
             # delivery failed: free the lease so the job can fire on a later tick
+            logger.exception("cron wake delivery failed: job=%s user=%s", job.id, job.user_id)
             await self._store.release_claim(job.id)
             return
         await self._store.complete_fire(

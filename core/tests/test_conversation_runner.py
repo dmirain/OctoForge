@@ -42,7 +42,7 @@ from octoforge_core.ports import LLMClient, TaskStore
 from octoforge_core.skills.base import SkillContext, SkillOrigin, SkillSpec
 from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
 from octoforge_core.skills.registry import SkillRegistry
-from octoforge_core.tasks.models import TaskStatus
+from octoforge_core.tasks.models import Task, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore
 
 PROMPT = "test system prompt"
@@ -891,3 +891,71 @@ async def test_wake_over_the_process_limit_publishes_a_system_note(
 
     skill.release.set()
     await collect_until(queue, is_completed)
+
+
+class FailingFinalizeStore(InMemoryTaskStore):
+    """Task store whose first mark_done raises, to exercise finalize failure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_mark_done = True
+
+    async def mark_done(self, task: Task, result: str) -> None:
+        if self.fail_next_mark_done:
+            self.fail_next_mark_done = False
+            raise RuntimeError("store unavailable")
+        await super().mark_done(task, result)
+
+
+async def test_actor_survives_a_failing_command(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    router = FakeRouter()
+    seen = {"calls": 0}
+
+    def handler(processes: tuple[ProcessInfo, ...], message: str) -> RouteDecision:
+        seen["calls"] += 1
+        if seen["calls"] == FIRST_CALL:
+            raise RuntimeError("router boom")
+        return RouteDecision()
+
+    router.handler = handler
+    manager = make_manager(
+        ScriptedLLM([reply()]),
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(router=router),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")  # router raises: the actor must log and stay alive
+    await runner.submit("second")  # processed normally, proving the actor survived
+
+    events = await collect_until(queue, is_completed)
+    done = completions(events)
+    assert [item.status for item in done] == [TaskStatus.DONE.value]
+    assert seen["calls"] == SECOND_CALL
+
+
+async def test_process_slot_released_when_finalize_fails(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = FailingFinalizeStore()
+    manager = make_manager(
+        ScriptedLLM([reply("bg1"), reply("bg2")]),
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(store=store, max_processes=ONE_PROCESS),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.spawn_task("t1", "p1")  # finalize fails inside mark_done
+    await collect_completions(queue, 1)  # completion is still announced
+
+    # the slot must be freed despite the finalize failure: a second spawn is accepted
+    result = await runner.spawn_task("t2", "p2")
+    assert "spawned" in result
+    assert "process limit" not in result
+    await collect_completions(queue, 1)
