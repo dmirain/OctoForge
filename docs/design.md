@@ -75,7 +75,9 @@ core/                          # библиотека octoforge-core — дом�
     db/
       base.py                  # Declarative Base + UTCDateTime (aware UTC на чтении/записи)
       models.py                # ORM-модели: DialogRow, MessageRow, TaskRow
-      engine.py                # create_engine/create_session_factory (DI) + init_db (create_all)
+      engine.py                # create_engine/create_session_factory (DI) + bootstrap_schema
+                               #   (Alembic upgrade/stamp) + init_db (create_all, fallback/тесты)
+      migrations/              # Alembic env.py + baseline-ревизия (autogenerate из метаданных)
       repositories.py          # DialogRepository, MessageRepository, SqlAlchemyTaskStore
       errors.py                # DialogNotFoundError
     llm/
@@ -239,12 +241,20 @@ web/                           # приложение octoforge-web — FastAPI-
   ветки + system-заметка о неполноте дописываются в нарратив. Затем: процесс убирается,
   broadcast `ProcessCompleted(status)` (значения TaskStatus), в inbox —
   `_ProcessTerminated`; недочитанные инъекции (`control.drain()`) возвращаются в inbox
-  как `_Submit(recorded=True)` (уже в нарративе, повторно не персистятся).
+  как `_Submit(recorded=True)` (уже в нарративе, повторно не персистятся). Финализация
+  обёрнута в `try/finally` (`_pump_process`): даже при сбое записи в стор процесс всегда
+  убирается из `_processes` и слот `max_processes` освобождается.
 - **Уведомление о задаче** (обработка `_ProcessTerminated`): task-backed процесс
   завершился DONE/FAILED и результат ещё не доставлен → `mark_delivered` + system-
   уведомление с результатом → нарратив + персист → инъекция в fg (занят) или репорт-
   прогон (свободен). Отменённые задачи не уведомляют.
 - `cancel()` (web API) отменяет только форграунд; `stop()` — все процессы и сам актор.
+- **Супервизия и наблюдаемость**: цикл актора (`_run_actor`) ловит исключения обработки
+  команды и логирует их — одна сбойная команда (например, ошибка стора в submit) не
+  превращает диалог в зомби; `add_done_callback` логирует неожиданный выход актора.
+  Ранее немые `except` (краш петли, сбой финализации, сбой доставки cron-wake) теперь
+  логируются; потеря SSE-события по `QueueFull` считается (`_dropped_events`), а не
+  молча глотается. В `core/` есть логгеры модулей (`runner`, `cron/scheduler`).
 - `ConversationManager` — реестр runner'ов по dialog_id (создание под lock'ом),
   get-or-create диалога по (user_id, channel); конструктор принимает `RunnerConfig`
   (loop, system_prompt, router, max_processes) + репозитории. Канал для ядра —
@@ -599,8 +609,11 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   для due-выборки; пара (`claimed_by`, `claimed_at`) — аренда планировщика (lease TTL)
 
 Все `*_at` — timezone-aware UTC: `UTCDateTime` (`db/base.py`) принудительно выставляет UTC при
-чтении/записи (SQLite возвращает naive datetime). Создание схемы — `init_db` (`create_all`) в
-lifespan; Alembic появится при первой деструктивной миграции.
+чтении/записи (SQLite возвращает naive datetime). Схема ведётся Alembic-миграциями
+(`db/migrations/`, baseline автогенерён из ORM-метаданных): на старте composition root
+вызывает `bootstrap_schema` — свежая или уже-управляемая БД мигрируется до head; БД, созданная
+до Alembic (таблицы есть, `alembic_version` нет), штампуется на baseline. `init_db` (`create_all`)
+остаётся для тестов и как fallback в composition root, если миграции не удалось применить.
 
 ## API (`octoforge_web/api/`)
 
@@ -616,7 +629,9 @@ lifespan; Alembic появится при первой деструктивно�
   маркеры процессов `process_suspended`/`process_resumed`/`process_completed`;
   heartbeat-комментарии; в кадрах `seq` и `dialog_id`); диалог создаётся при первом обращении,
   поэтому подписаться можно до первого сообщения
-- `GET /health`, `GET /` — чат-UI (SSE-стрим токенов, шаги скилов, серая курсивная
+- `GET /health` — liveness (`{status: ok}`); `GET /health/ready` — readiness: проверяет
+  `SELECT 1` к БД, при недоступности возвращает 503 `{status: not-ready}`
+- `GET /` — чат-UI (SSE-стрим токенов, шаги скилов, серая курсивная
   строка-маркер о переключениях/завершениях процессов, «Стоп», поле имени =
   user_id, уходит заголовком `X-User-Id`; EventSource не умеет кастомные заголовки, поэтому
   стрим читается через fetch)
