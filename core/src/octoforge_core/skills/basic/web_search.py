@@ -15,9 +15,7 @@ TRUNCATED_SUFFIX = "\n...[truncated]"
 NO_RESULTS_MESSAGE = "no results"
 
 SKILL_NAME = "web_search"
-SKILL_DESCRIPTION = (
-    "Search the web (Google via serper.dev); returns titles, links and snippets."
-)
+SKILL_DESCRIPTION = "Search the web (Google via serper.dev); returns titles, links and snippets."
 PARAMETERS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {

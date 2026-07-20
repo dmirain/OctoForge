@@ -268,6 +268,13 @@ def test_health(client: TestClient) -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_health_ready_reports_database(client: TestClient) -> None:
+    response = client.get("/health/ready")
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"status": "ready", "database": "ok"}
+
+
 def test_index_page_is_served(client: TestClient) -> None:
     response = client.get("/")
 

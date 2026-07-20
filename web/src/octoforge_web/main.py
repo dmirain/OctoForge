@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from fastapi.staticfiles import StaticFiles
 from octoforge_core import (
     AgentLoop,
@@ -67,8 +67,9 @@ from octoforge_core.skills.basic.memory_store import MemoryStoreSkill
 from octoforge_core.skills.basic.task_list import TaskListSkill
 from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
 from octoforge_core.skills.basic.web_search import WebSearchSkill
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
@@ -79,7 +80,10 @@ from octoforge_web.telegram.poller import TelegramBridgeRegistry, TelegramPoller
 
 STATIC_DIR = Path(__file__).parent / "static"
 APP_TITLE = "OctoForge"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 HEALTH_STATUS = "ok"
+READY_STATUS = "ready"
+NOT_READY_STATUS = "not-ready"
 WEB_CHANNEL = "web"
 USER_ID_HEADER = "X-User-Id"
 USER_ID_HEADER_VALUE_TEMPLATE = "{user_id}"
@@ -95,6 +99,7 @@ class Runtime:
     conversation_manager: ConversationManager
     channel: str
     cron_store: CronStore
+    session_factory: async_sessionmaker[AsyncSession]
 
 
 @asynccontextmanager
@@ -182,6 +187,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     conversation_manager=manager,
                     channel=WEB_CHANNEL,
                     cron_store=cron_store,
+                    session_factory=session_factory,
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, telegram)
@@ -189,8 +195,15 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
         await engine.dispose()
 
 
+def _configure_logging() -> None:
+    """Ensure application and core logs reach a handler (idempotent)."""
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the FastAPI application with all dependencies wired."""
+    _configure_logging()
     resolved_settings = settings or Settings()
 
     @asynccontextmanager
@@ -200,6 +213,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.conversation_manager = rt.conversation_manager
             app.state.channel = rt.channel
             app.state.cron_store = rt.cron_store
+            app.state.session_factory = rt.session_factory
             yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)
@@ -207,6 +221,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": HEALTH_STATUS}
+
+    @app.get("/health/ready")
+    async def ready(response: Response) -> dict[str, str]:
+        """Readiness probe: verify the database answers a trivial query."""
+        session_factory: async_sessionmaker[AsyncSession] = app.state.session_factory
+        try:
+            async with session_factory() as session:
+                await session.execute(text("SELECT 1"))
+        except SQLAlchemyError:
+            logger.warning("readiness check failed: database unavailable", exc_info=True)
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"status": NOT_READY_STATUS, "database": "down"}
+        return {"status": READY_STATUS, "database": "ok"}
 
     app.include_router(dialog_router)
     app.include_router(cron_router)
