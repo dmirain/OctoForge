@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import (
 from octoforge_core.db.base import Base
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+_BASELINE_REVISION = "675056c8fffd"
 
 
 def create_engine(database_url: str) -> AsyncEngine:
@@ -42,10 +43,12 @@ async def bootstrap_schema(engine: AsyncEngine) -> None:
 
     A fresh database has every table created by the baseline migration; a
     database that predates Alembic (tables but no `alembic_version`) is stamped
-    at head (its schema is assumed current); an already-managed database is
-    upgraded. The transaction is committed explicitly: Alembic leaves it open
-    (the caller owns the connection), and closing an async connection would
-    roll it back, losing the version row and ALTERs.
+    at the baseline revision (its schema is assumed to match `create_all`,
+    which is what created it) and then upgraded, so later ALTER migrations
+    still apply; an already-managed database is upgraded. The transaction is
+    committed explicitly: Alembic leaves it open (the caller owns the
+    connection), and closing an async connection would roll it back, losing
+    the version row and ALTERs.
     """
     async with engine.connect() as connection:
         await connection.run_sync(_bootstrap_sync)
@@ -56,9 +59,9 @@ def _bootstrap_sync(connection: Connection) -> None:
     tables = set(inspect(connection).get_table_names())
     config = _alembic_config(connection)
     if tables and "alembic_version" not in tables:
-        command.stamp(config, "head")  # adopt a pre-Alembic database at baseline
-    else:
-        command.upgrade(config, "head")  # fresh or already-managed database
+        # adopt a pre-Alembic database at baseline, then run later migrations
+        command.stamp(config, _BASELINE_REVISION)
+    command.upgrade(config, "head")  # fresh, legacy, or already-managed database
 
 
 def _alembic_config(connection: Connection) -> Config:

@@ -564,6 +564,9 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `retry_count`), лимит исчерпан → фиксация фейла, задача живёт по расписанию; CANCELLED →
   без ретрая. Колонки приезжают Alembic-ревизией `2b8f4c1a9e07`; `bootstrap_schema` теперь
   явно коммитит транзакцию миграций (баг: неявный откат терял version-запись и ALTER'ы).
+  Добавление колонок в ревизии условное (пропуск уже существующих): legacy-БД штампуется
+  на baseline даже когда её `create_all` был новее и колонки уже есть (баг: stamp на head
+  помечал такую БД актуальной, и ALTER'ы никогда не применялись).
 - **One-shot напоминания**: флаг `one_shot` в `cron_jobs` и `cron_create` (и в HTTP
   `POST /jobs`); расписание — датированное cron-выражение (`minute hour day month *`),
   агент строит сам под ближайшее будущее вхождение; после первого DONE задача удаляется.
@@ -689,7 +692,9 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 чтении/записи (SQLite возвращает naive datetime). Схема ведётся Alembic-миграциями
 (`db/migrations/`, baseline автогенерён из ORM-метаданных): на старте composition root
 вызывает `bootstrap_schema` — свежая или уже-управляемая БД мигрируется до head; БД, созданная
-до Alembic (таблицы есть, `alembic_version` нет), штампуется на baseline. `init_db` (`create_all`)
+до Alembic (таблицы есть, `alembic_version` нет), штампуется на baseline и догоняется до head
+(ALTER-миграции добавляют колонки условно — legacy-БД могла быть создана более новым
+`create_all`). `init_db` (`create_all`)
 остаётся для тестов и как fallback в composition root, если миграции не удалось применить.
 
 ## API (`octoforge_web/api/`)

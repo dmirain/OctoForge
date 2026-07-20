@@ -2,9 +2,10 @@
 
 from pathlib import Path
 
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import Connection, inspect
+from sqlalchemy import Connection, inspect, text
 
 # Importing the models registers every table on Base.metadata for the drift check.
 import octoforge_core.cron.models
@@ -13,7 +14,13 @@ import octoforge_core.db.models
 import octoforge_core.instructions.models
 import octoforge_core.memory.models  # noqa: F401
 from octoforge_core.db.base import Base
-from octoforge_core.db.engine import bootstrap_schema, create_engine, init_db
+from octoforge_core.db.engine import (
+    _BASELINE_REVISION,
+    _alembic_config,
+    bootstrap_schema,
+    create_engine,
+    init_db,
+)
 
 EXPECTED_TABLES = frozenset(
     {
@@ -76,3 +83,33 @@ async def test_bootstrap_stamps_pre_alembic_database(tmp_path: Path) -> None:
         await engine.dispose()
     assert "alembic_version" in tables
     assert tables >= EXPECTED_TABLES
+
+
+def _legacy_baseline_schema(connection: Connection) -> None:
+    """Recreate a pre-Alembic database stuck at the baseline schema."""
+    command.upgrade(_alembic_config(connection), _BASELINE_REVISION)
+    connection.execute(text("DROP TABLE alembic_version"))
+
+
+def _cron_job_columns(connection: Connection) -> set[str]:
+    return {column["name"] for column in inspect(connection).get_columns("cron_jobs")}
+
+
+def _alembic_head(connection: Connection) -> str:
+    row = connection.execute(text("SELECT version_num FROM alembic_version")).one()
+    return str(row[0])
+
+
+async def test_bootstrap_upgrades_stale_legacy_database(tmp_path: Path) -> None:
+    engine = create_engine(_database_url(tmp_path))
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(_legacy_baseline_schema)
+        await bootstrap_schema(engine)  # stamp at baseline, then apply later migrations
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(_cron_job_columns)
+            head = await connection.run_sync(_alembic_head)
+    finally:
+        await engine.dispose()
+    assert {"one_shot", "last_status", "last_error", "retry_count"} <= columns
+    assert head != _BASELINE_REVISION
