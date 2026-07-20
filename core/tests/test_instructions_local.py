@@ -27,6 +27,7 @@ from octoforge_core.instructions.seed import (
     migrate_cron_tools_to_native,
     seed_if_empty,
 )
+from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -66,10 +67,18 @@ class StubEmbedder:
 ServiceFactory = Callable[[async_sessionmaker[AsyncSession], EmbeddingClient], InstructionService]
 
 
+def build_local_service(
+    session_factory: async_sessionmaker[AsyncSession],
+    embedder: EmbeddingClient,
+) -> InstructionService:
+    """Assemble the default local implementation over the SQL store."""
+    return LocalInstructionService(SqlAlchemyInstructionStore(session_factory), embedder)
+
+
 @pytest.fixture
 def service_factory() -> ServiceFactory:
     """The implementation under test; swap to run the suite over another one."""
-    return LocalInstructionService
+    return build_local_service
 
 
 @pytest.fixture
@@ -315,7 +324,7 @@ class LenientEmbedder:
 def make_lenient_service(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> InstructionService:
-    return LocalInstructionService(session_factory, LenientEmbedder())
+    return LocalInstructionService(SqlAlchemyInstructionStore(session_factory), LenientEmbedder())
 
 
 async def test_delete_removes_the_record(

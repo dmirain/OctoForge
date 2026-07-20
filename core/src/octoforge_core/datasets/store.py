@@ -1,7 +1,10 @@
-"""SQLAlchemy storage of the datasets module (module-internal).
+"""SQLAlchemy storage of the datasets module.
 
 Follows the `instructions/store.py` style: sessions come from an injected
 `async_sessionmaker`, ORM rows are mapped to facade DTOs at the boundary.
+Implements the `DatasetStore` port from `datasets/api.py`; the vector-search
+capability (`DatasetVectorSearch`) is deliberately not implemented — this
+store ranks brute-force in the process.
 """
 
 import uuid
@@ -17,19 +20,15 @@ from octoforge_core.datasets.api import (
     DatasetExistsError,
     DatasetRecord,
     DatasetSchema,
+    EmbeddedDataset,
 )
 from octoforge_core.datasets.models import DatasetRecordRow, DatasetRow
-from octoforge_core.datasets.ranking import EmbeddedDataset
 from octoforge_core.datasets.validation import dump_schema, parse_schema
 
 FIRST_VERSION = 1
-# Upper bound of rows scanned per query: the SQL side filters the created_at
-# range and caps the scan, the equals filter then applies in Python (tracker
-# datasets are small, so no JSON-field indexes are needed).
-MAX_SCAN_ROWS = 1000
 
 
-class DatasetStore:
+class SqlAlchemyDatasetStore:
     """SQL persistence for dataset descriptors and their records."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:

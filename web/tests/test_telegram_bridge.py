@@ -15,6 +15,7 @@ from octoforge_core import (
     SkillRegistry,
     SkillSpec,
 )
+from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ProcessInfo, RouteDecision
 from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
@@ -229,7 +230,7 @@ async def make_manager(
     return ConversationManager(
         config=RunnerConfig(
             loop=loop,
-            system_prompt=SYSTEM_PROMPT,
+            prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: SYSTEM_PROMPT}),
             router=PassthroughRouter(),
             max_processes=MAX_PROCESSES,
         ),

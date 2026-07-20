@@ -17,6 +17,7 @@ from octoforge_core.agent.events import (
     ProcessSuspended,
 )
 from octoforge_core.agent.loop import AgentLoop, format_error
+from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, PromptProvider
 from octoforge_core.agent.router import (
     MessageRouter,
     ProcessInfo,
@@ -118,7 +119,7 @@ class RunnerConfig:
     """Behavior parameters shared by the conversation runners of one manager."""
 
     loop: AgentLoop
-    system_prompt: str
+    prompts: PromptProvider
     router: MessageRouter
     max_processes: int
 
@@ -136,7 +137,7 @@ class ConversationRunner:
     ) -> None:
         self._dialog = dialog
         self._loop = config.loop
-        self._system_prompt = config.system_prompt
+        self._prompts = config.prompts
         self._router = config.router
         self._max_processes = config.max_processes
         self._messages = messages
@@ -375,7 +376,8 @@ class ConversationRunner:
             task_id=None,
             branch=[
                 ChatMessage(
-                    role=MessageRole.SYSTEM, content=_with_current_date(self._system_prompt)
+                    role=MessageRole.SYSTEM,
+                    content=_with_current_date(self._prompts.get(SYSTEM_PROMPT_NAME)),
                 ),
                 *self._narrative,
                 *([trail] if trail is not None else []),

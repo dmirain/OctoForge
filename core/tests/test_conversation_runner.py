@@ -19,6 +19,7 @@ from octoforge_core.agent.events import (
     ToolCallRequested,
 )
 from octoforge_core.agent.loop import AgentLoop
+from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import (
     ProcessInfo,
     RouteAction,
@@ -294,7 +295,7 @@ def make_manager(
     loop = AgentLoop(llm_client=llm, registry=registry, max_iterations=MAX_ITERATIONS)
     config = RunnerConfig(
         loop=loop,
-        system_prompt=PROMPT,
+        prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: PROMPT}),
         router=resolved.router if resolved.router is not None else FakeRouter(),
         max_processes=resolved.max_processes,
     )

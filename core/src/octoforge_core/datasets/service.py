@@ -1,14 +1,13 @@
 """Local in-process implementation of the DatasetService facade.
 
-SQL storage + brute-force cosine ranking; chosen in the composition root and
-replaceable (e.g. by an HTTP client of a dedicated datasets service) without
-changes to call sites.
+The storage layer is the `DatasetStore` port injected through the
+constructor: the shipped `SqlAlchemyDatasetStore` ranks brute-force in the
+process, an installer can substitute a pgvector/vector-DB store
+(implementing `DatasetVectorSearch`) without touching this service.
 """
 
 from datetime import datetime
 from typing import Any
-
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.datasets.api import (
     Dataset,
@@ -16,23 +15,29 @@ from octoforge_core.datasets.api import (
     DatasetNotFoundError,
     DatasetRecord,
     DatasetSchema,
+    DatasetStore,
+    DatasetVectorSearch,
+    EmbeddedDataset,
 )
 from octoforge_core.datasets.ranking import rank
-from octoforge_core.datasets.store import MAX_SCAN_ROWS, DatasetStore
 from octoforge_core.llm.embeddings import EmbeddingClient
 
 EMBEDDED_TEXT_SEPARATOR = "\n"
+# Upper bound of rows scanned per query: the store filters the created_at
+# range and caps the scan, the equals filter then applies in Python (tracker
+# datasets are small, so no JSON-field indexes are needed).
+MAX_SCAN_ROWS = 1000
 
 
 class LocalDatasetService:
-    """DatasetService over the module-owned SQL tables and an embedder."""
+    """DatasetService over an injected store and an embedder."""
 
     def __init__(
         self,
-        session_factory: async_sessionmaker[AsyncSession],
+        store: DatasetStore,
         embedder: EmbeddingClient,
     ) -> None:
-        self._store = DatasetStore(session_factory)
+        self._store = store
         self._embedder = embedder
 
     async def create_dataset(  # noqa: PLR0913 — facade signature from the module boundary
@@ -103,12 +108,28 @@ class LocalDatasetService:
         return records_count
 
     async def search(self, owner_user_id: str, query: str, k: int) -> list[DatasetHit]:
-        """Embed the query and rank this owner's descriptors by cosine."""
+        """Embed the query and rank this owner's candidates by cosine.
+
+        Candidates come from the store: vector-capable stores run the search
+        on their side, the rest hand over all of the owner's descriptors for
+        brute-force cosine.
+        """
         if not query.strip():
             return []
         (query_embedding,) = await self._embedder.embed((query,))
-        candidates = await self._store.list_with_embeddings(owner_user_id)
+        candidates = await self._candidates(owner_user_id, query_embedding, k)
         return rank(candidates, query, query_embedding, k)
+
+    async def _candidates(
+        self,
+        owner_user_id: str,
+        query_embedding: tuple[float, ...],
+        k: int,
+    ) -> list[EmbeddedDataset]:
+        """Fetch the ranking input: vector search on the store side when supported."""
+        if isinstance(self._store, DatasetVectorSearch):
+            return await self._store.search_by_vector(owner_user_id, query_embedding, k)
+        return await self._store.list_with_embeddings(owner_user_id)
 
 
 def _embedded_text(name: str, description: str, usage_notes: str) -> str:

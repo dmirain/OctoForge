@@ -1,6 +1,9 @@
 """Tests for the web settings (env parsing and core config conversion)."""
 
+from pathlib import Path
+
 import pytest
+from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, SYSTEM_PROMPT_NAME
 from octoforge_core.config import EmbeddingBackend
 
 from octoforge_web.config import (
@@ -213,3 +216,31 @@ def test_openai_backend_requires_api_key_to_count_as_configured(
     monkeypatch.setenv("OF_EMBEDDING_API_KEY", "sk-test")
 
     assert Settings().embeddings_configured()
+
+
+def test_prompt_sources_default_to_no_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OF_SYSTEM_PROMPT_SOURCE", raising=False)
+    monkeypatch.delenv("OF_ROUTER_PROMPT_SOURCE", raising=False)
+
+    assert Settings().to_prompt_files() == {}
+
+
+def test_prompt_sources_parsed_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_SYSTEM_PROMPT_SOURCE", "file:/etc/octoforge/system.txt")
+    monkeypatch.setenv("OF_ROUTER_PROMPT_SOURCE", "file:/etc/octoforge/router.txt")
+
+    files = Settings().to_prompt_files()
+
+    assert files == {
+        SYSTEM_PROMPT_NAME: Path("/etc/octoforge/system.txt"),
+        ROUTER_PROMPT_NAME: Path("/etc/octoforge/router.txt"),
+    }
+
+
+def test_prompt_source_with_unsupported_scheme_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OF_SYSTEM_PROMPT_SOURCE", "https://example.com/prompt.txt")
+
+    with pytest.raises(ValueError, match="unsupported prompt source"):
+        Settings().to_prompt_files()

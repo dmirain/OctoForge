@@ -11,6 +11,7 @@ from octoforge_core.db.engine import create_engine, create_session_factory, init
 from octoforge_core.instructions.api import Instruction, InstructionType, SearchHit
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.ranking import rerank
+from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.time import utc_now
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -114,7 +115,7 @@ async def test_service_reranks_cosine_shortlist(
     embedder.vectors[QUERY] = V_EXACT
     reranker = StubReranker(scores=(SCORE_LOW, SCORE_HIGH))
     service = LocalInstructionService(
-        session_factory,
+        SqlAlchemyInstructionStore(session_factory),
         embedder,
         reranker=reranker,
         rerank_candidates=RERANK_CANDIDATES,
@@ -139,7 +140,7 @@ async def test_service_without_reranker_keeps_cosine_order(
 ) -> None:
     embedder = StubEmbedder()
     embedder.vectors[QUERY] = V_EXACT
-    service = LocalInstructionService(session_factory, embedder)
+    service = LocalInstructionService(SqlAlchemyInstructionStore(session_factory), embedder)
     for title, vector in ((TITLE_A, V_EXACT), (TITLE_B, V_CLOSE)):
         embedder.vectors[f"{title}\n{CONTENT}"] = vector
         await service.save(InstructionType.KNOWLEDGE, title, CONTENT)

@@ -29,8 +29,9 @@
 ## Реализация (этап C)
 
 - **Модуль `datasets/`** — обособленный, зеркалит `instructions/`: граница `api.py`
-  (Protocol `DatasetService` + JSON-friendly DTO), локальная реализация
-  `LocalDatasetService` (SQL + cosine), свой `store.py`/`models.py`/`ranking.py`
+  (Protocol `DatasetService` + JSON-friendly DTO + порт хранилища `DatasetStore`),
+  локальная реализация `LocalDatasetService` (cosine поверх инъектируемого стора,
+  дефолт — `SqlAlchemyDatasetStore`), свой `store.py`/`models.py`/`ranking.py`
   (независим от instructions: своя cosine-функция и буст точного имени +2.0).
   Порт `EmbeddingClient` перенесён в `llm/embeddings.py` (общий для обоих модулей).
 - **Формат схемы** (JSON): `{"fields": [{"name": "item", "type": "string",

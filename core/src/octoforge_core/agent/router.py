@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, PromptProvider
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.ports import LLMClient
 from octoforge_core.skills.base import SkillSpec
@@ -93,35 +94,19 @@ ROUTE_TOOL_SPEC = SkillSpec(
     },
 )
 
-ROUTER_SYSTEM_PROMPT = (
-    "You are the message router of a conversation.\n"
-    "Active processes (limit {limit}):\n"
-    "{processes}\n"
-    "Decide what the user message means for these processes and ALWAYS answer with "
-    "the route tool.\n"
-    "Rules:\n"
-    "1. While a foreground process is active, inject is the default: comments, "
-    "details, refinements and even follow-up questions about the current work "
-    "are answered inside the current run -> ops: [inject].\n"
-    "2. start_new is ONLY for a message clearly unrelated to every active process "
-    "and requiring a separate task -> ops: [start_new].\n"
-    "3. Never combine inject and start_new in one package: an injected message "
-    "stays in the current run and must not also spawn a background process.\n"
-    "4. Cancel a process only on an explicit user request -> ops: [cancel(target_id)].\n"
-    "5. 'Bring back task X' -> ops: [promote(target_id)].\n"
-    "6. 'Stop everything' -> one cancel op per active process, optionally followed "
-    "by start_new.\n"
-    "7. Respect the limit: active processes minus your cancel ops plus one must not "
-    "exceed the limit, otherwise do not emit start_new/promote."
-)
-
 
 class LLMRouter:
-    """MessageRouter implementation doing a one-shot LLM tool call."""
+    """MessageRouter implementation doing a one-shot LLM tool call.
 
-    def __init__(self, llm: LLMClient, timeout_seconds: float) -> None:
+    The system prompt template comes from the injected `PromptProvider`
+    (`ROUTER_PROMPT_NAME`); it may use the `{limit}` and `{processes}`
+    placeholders.
+    """
+
+    def __init__(self, llm: LLMClient, timeout_seconds: float, prompts: PromptProvider) -> None:
         self._llm = llm
         self._timeout_seconds = timeout_seconds
+        self._prompts = prompts
 
     async def route(
         self,
@@ -135,7 +120,7 @@ class LLMRouter:
         try:
             reply = await asyncio.wait_for(
                 self._llm.complete(
-                    _build_messages(processes, message, max_processes),
+                    self._build_messages(processes, message, max_processes),
                     tools=[ROUTE_TOOL_SPEC],
                 ),
                 timeout=self._timeout_seconds,
@@ -154,21 +139,22 @@ class LLMRouter:
         )
         return RouteDecision(ops=_resolve_conflicts(ops))
 
-
-def _build_messages(
-    processes: tuple[ProcessInfo, ...],
-    message: str,
-    max_processes: int,
-) -> list[ChatMessage]:
-    lines = "\n".join(
-        f"- id={process.id} | place={process.place.value} | title={process.title}"
-        for process in processes
-    )
-    system = ROUTER_SYSTEM_PROMPT.format(limit=max_processes, processes=lines)
-    return [
-        ChatMessage(role=MessageRole.SYSTEM, content=system),
-        ChatMessage(role=MessageRole.USER, content=message),
-    ]
+    def _build_messages(
+        self,
+        processes: tuple[ProcessInfo, ...],
+        message: str,
+        max_processes: int,
+    ) -> list[ChatMessage]:
+        lines = "\n".join(
+            f"- id={process.id} | place={process.place.value} | title={process.title}"
+            for process in processes
+        )
+        template = self._prompts.get(ROUTER_PROMPT_NAME)
+        system = template.format(limit=max_processes, processes=lines)
+        return [
+            ChatMessage(role=MessageRole.SYSTEM, content=system),
+            ChatMessage(role=MessageRole.USER, content=message),
+        ]
 
 
 def _fallback(processes: tuple[ProcessInfo, ...]) -> RouteDecision:

@@ -19,6 +19,7 @@ from octoforge_core.datasets.api import (
     FieldType,
 )
 from octoforge_core.datasets.service import LocalDatasetService
+from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
     Instruction,
@@ -80,7 +81,7 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 
 @pytest.fixture
 def service(session_factory: async_sessionmaker[AsyncSession]) -> DatasetService:
-    return LocalDatasetService(session_factory, StubEmbedder())
+    return LocalDatasetService(SqlAlchemyDatasetStore(session_factory), StubEmbedder())
 
 
 async def create_food_dataset(service: DatasetService) -> Dataset:

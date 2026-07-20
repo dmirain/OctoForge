@@ -50,11 +50,12 @@ core/                          # библиотека octoforge-core — дом�
       loop.py                  # AgentLoop.stream(history, control, context) → AsyncIterator[LoopEvent]
       router.py                # MessageRouter (Protocol), RouteAction/RouteOp/RouteDecision,
                                #   ProcessInfo/ProcessPlace, LLMRouter (one-shot tool call, таймаут, фолбэк)
-      prompts.py               # DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn, уведомления,
-                               #   instructions_search / external_call / instruction_save,
+      prompts.py               # порты промптов: PromptProvider (Protocol) + StaticPromptProvider
+                               #   поверх вшитых DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn,
+                               #   уведомления, instructions_search / external_call / instruction_save,
                                #   data_put / data_query / data_forget,
-                               #   memory_store / memory_search / memory_delete,
-                               #   крон-задачи через найденные cron-тулы)
+                               #   memory_store / memory_search / memory_delete, крон, web_search)
+                               #   и ROUTER_SYSTEM_PROMPT; имена SYSTEM/ROUTER_PROMPT_NAME
       runner.py                # ConversationRunner (актор: нарратив + процессы fg/bg, bound
                                #   TaskSpawner, wake для крон-выстрелов), ConversationManager,
                                #   RunnerConfig, ConversationEvent
@@ -90,33 +91,46 @@ core/                          # библиотека octoforge-core — дом�
       reranker.py              # RerankerClient (Protocol-порт) + кросс-энкодер (MPS при наличии)
     instructions/              # обособленный модуль инструкций (только хранение/поиск/ранг)
       api.py                   # граница модуля: InstructionService (Protocol), Instruction,
-                               #   InstructionType, SearchHit, InstructionNotFoundError
+                               #   InstructionType, SearchHit, InstructionNotFoundError,
+                               #   порт хранилища InstructionStore + EmbeddedInstruction +
+                               #   capability-порт InstructionVectorSearch (runtime_checkable)
       models.py                # InstructionRow — таблица instructions, собственность модуля
-      store.py                 # SQL-стор (сессии через async_sessionmaker, DI)
+      store.py                 # SqlAlchemyInstructionStore (сессии через async_sessionmaker, DI)
       ranking.py               # чистые функции: cosine + буст точного title + реранк-мерж
       local.py                 # LocalInstructionService — локальная реализация фасада
+                               #   (store инъектируется; vector-capable store → search_by_vector)
       seed.py                  # SEED_INSTRUCTIONS + seed_if_empty (generic http tool + скилы-примеры)
     datasets/                  # обособленный модуль датасетов (per-user трекеры, этап C)
       api.py                   # граница модуля: DatasetService (Protocol), Dataset, DatasetRecord,
-                               #   DatasetSchema/FieldType, DatasetHit, ошибки модуля
+                               #   DatasetSchema/FieldType, DatasetHit, ошибки модуля,
+                               #   порт хранилища DatasetStore + EmbeddedDataset +
+                               #   capability-порт DatasetVectorSearch (runtime_checkable)
       models.py                # DatasetRow + DatasetRecordRow — таблицы datasets/dataset_records
       validation.py            # parse_schema/dump_schema/validate_record (схема и записи)
-      store.py                 # SQL-стор (явный каскад удаления, MAX_SCAN_ROWS)
+      store.py                 # SqlAlchemyDatasetStore (явный каскад удаления)
       ranking.py               # свои чистые функции: cosine + буст точного имени (независимость)
       service.py               # LocalDatasetService — локальная реализация фасада
+                               #   (store инъектируется; MAX_SCAN_ROWS)
     memory/                    # обособленный модуль памяти (per-user + global, этап D)
       api.py                   # граница модуля: MemoryStore (Protocol-порт), Memory,
                                #   MemoryScope (USER|GLOBAL), MemoryNotFoundError
       models.py                # MemoryRow — таблица memories, собственность модуля
       store.py                 # SqlAlchemyMemoryStore (upsert по (owner, key), LIKE-поиск)
     cron/                      # обособленный модуль крон-задач (этап F)
-      api.py                   # граница модуля: CronStore/CronWaker (Protocol-порты), CronJob,
-                               #   ошибки, compute_next_fire/count_missed (croniter + zoneinfo)
+      api.py                   # граница модуля: CronStore/CronWaker/Scheduler (Protocol-порты),
+                               #   CronJob, ошибки, compute_next_fire/count_missed
+                               #   (croniter + zoneinfo) — публичный контракт для
+                               #   альтернативных движков планирования
       models.py                # CronJobRow — таблица cron_jobs, собственность модуля
       store.py                 # SqlAlchemyCronStore (CRUD + due-выборка + CAS-аренда)
-      scheduler.py             # CronScheduler (asyncio-цикл: claim → wake → complete_fire,
-                               #   coalesce пропущенных, разброс и лимит догонялки)
+      scheduler.py             # CronScheduler (реализация порта Scheduler: asyncio-цикл
+                               #   claim → wake → complete_fire, coalesce пропущенных,
+                               #   разброс и лимит догонялки)
       waker.py                 # ManagerCronWaker — адаптер порта на ConversationManager
+    search/                    # обособленный модуль веб-поиска (порт провайдера)
+      api.py                   # граница модуля: SearchProvider (Protocol), SearchResult,
+                               #   SearchResponse, SearchError — транспорт-нейтральные DTO
+      serper.py                # SerperSearchProvider — дефолтная реализация (serper.dev)
     net/                       # исполнение внешних вызовов (core-сторона, вне модуля)
       guard.py                 # SsrfGuard: resolve хоста (resolver инъектируется) → ipaddress-проверки;
                                #   allowed_prefixes для собственного base URL (пропуск до resolve)
@@ -127,12 +141,14 @@ core/                          # библиотека octoforge-core — дом�
     # дальше: skills/dynamic/ (Jinja-движок)
   tests/                       # test_agent_loop, test_conversation_runner, test_cron_store,
                                # test_cron_scheduler, test_data_skills,
-                               # test_datasets, test_dataset_validation, test_db_repositories,
-                               # test_embeddings, test_external_call, test_http_request_skill,
-                               # test_instruction_skills, test_instructions_local,
+                               # test_datasets, test_datasets_store_port, test_dataset_validation,
+                               # test_db_repositories, test_embeddings, test_external_call,
+                               # test_http_request_skill, test_instruction_skills,
+                               # test_instructions_local, test_instructions_store_port,
                                # test_memory, test_memory_skills,
-                               # test_openai_client, test_openai_stream, test_router,
-                               # test_skills_registry, test_ssrf_guard, test_tasks
+                               # test_openai_client, test_openai_stream, test_prompts,
+                               # test_router, test_serper_provider, test_skills_registry,
+                               # test_ssrf_guard, test_tasks, test_web_search_skill
 web/                           # приложение octoforge-web — FastAPI-обёртка
   pyproject.toml               # deps: octoforge-core, fastapi, uvicorn, pydantic-settings
   src/octoforge_web/
@@ -143,7 +159,10 @@ web/                           # приложение octoforge-web — FastAPI-
                                #   OF_EMBEDDING_*, OF_INSTRUCTIONS_TOP_K,
                                #   OF_EXTERNAL_CALL_AUTH_WHITELIST, OF_DATASETS_QUERY_*,
                                #   OF_MEMORY_SEARCH_*, OF_MAX_PROCESSES, OF_ROUTER_TIMEOUT_SECONDS,
-                               #   OF_SELF_BASE_URL, OF_CRON_*, OF_TELEGRAM_*, OF_SERPER_TOKEN)
+                               #   OF_SELF_BASE_URL, OF_CRON_*, OF_TELEGRAM_*, OF_SERPER_TOKEN,
+                               #   OF_SYSTEM_PROMPT_SOURCE / OF_ROUTER_PROMPT_SOURCE)
+    prompts.py                 # FilePromptProvider — промпты из файлов (file:), fallback
+                               #   на StaticPromptProvider; перечитывает файл на каждый get()
     deps.py                    # провайдеры зависимостей из app.state + заголовок X-User-Id
     api/
       dialog.py                # messages/cancel/events(SSE) по (user_id, channel)
@@ -164,7 +183,8 @@ web/                           # приложение octoforge-web — FastAPI-
     static/index.html          # чат-UI: SSE-стрим, шаги скилов, маркеры процессов,
                                #   кнопка «Стоп», поле имени (= user_id)
   tests/                       # test_dialog_api.py, test_cron_api.py, test_sse.py, test_config.py,
-                               # test_seed.py, test_telegram_models.py, test_telegram_bridge.py,
+                               # test_seed.py, test_prompts.py, test_modularity.py,
+                               # test_telegram_models.py, test_telegram_bridge.py,
                                # test_telegram_poller.py, test_telegram_client.py,
                                # test_telegram_standalone.py, test_telegram_markdown.py
 ```
@@ -269,19 +289,28 @@ web/                           # приложение octoforge-web — FastAPI-
 CANCEL/PROMOTE). Пустой пакет — passthrough (актор трактует как `[START_NEW]`).
 `ProcessInfo` — снимок активного процесса (id, title, place: FOREGROUND|BACKGROUND).
 
-Первая реализация — `LLMRouter(llm, timeout_seconds)`: пустой снимок → passthrough без
-вызова LLM; иначе one-shot `complete()` с tool `route(ops)` (компактный системный
-промпт со списком процессов, лимитом и правилами: при активном форграунде дефолт —
-inject, start_new только для очевидно несвязанного вопроса; сообщение пользователя —
-отдельным user-сообщением) под `asyncio.wait_for`. Нет tool_call, ошибка или таймаут →
-фолбэк: есть форграунд → `[INJECT]`, иначе пусто. Невалидные операции (неизвестный
-action, лишний/отсутствующий target, target не из снимка) отбрасываются; пакет с
-INJECT теряет все START_NEW (детерминированный guardrail против увода вопроса в фон);
-валидный остаток — решение (может стать пустым).
+Первая реализация — `LLMRouter(llm, timeout_seconds, prompts)`: пустой снимок → passthrough без
+вызова LLM; иначе one-shot `complete()` с tool `route(ops)` (системный промпт-шаблон приходит
+из `PromptProvider` — `ROUTER_PROMPT_NAME`, плейсхолдеры `{limit}`/`{processes}`; со списком
+процессов и правилами: при активном форграунде дефолт — inject, start_new только для очевидно
+несвязанного вопроса; сообщение пользователя — отдельным user-сообщением) под `asyncio.wait_for`.
+Нет tool_call, ошибка или таймаут → фолбэк: есть форграунд → `[INJECT]`, иначе пусто.
+Невалидные операции (неизвестный action, лишний/отсутствующий target, target не из снимка)
+отбрасываются; пакет с INJECT теряет все START_NEW (детерминированный guardrail против увода
+вопроса в фон); валидный остаток — решение (может стать пустым).
 
 ### Системный промпт (`agent/prompts.py`)
 
-`DEFAULT_SYSTEM_PROMPT`: отвечать «сначала суть, потом детали» (прерывание полезно),
+Промпты ядра поставляются через порт `PromptProvider` (`get(name) -> str`; имена —
+`SYSTEM_PROMPT_NAME`/`ROUTER_PROMPT_NAME`). Дефолт — `StaticPromptProvider` поверх вшитых
+констант; web-слой оборачивает его в `FilePromptProvider` (`web/prompts.py`): имена с
+настроенным `file:`-источником (`OF_SYSTEM_PROMPT_SOURCE`/`OF_ROUTER_PROMPT_SOURCE`)
+читаются из файла на каждый `get()` (правка файла действует без рестарта), нечитаемый файл
+или ненастроенное имя — fallback на вшитый дефолт (warning в лог). Ядро env не читает.
+`RunnerConfig` держит провайдер (а не строку): системный промпт подставляется в ветку
+процесса при старте с суффиксом текущей даты UTC (`_with_current_date`).
+
+Текст вшитого `DEFAULT_SYSTEM_PROMPT`: отвечать «сначала суть, потом детали» (прерывание полезно),
 «в фоне» → `task_spawn` и продолжить диалог, при system-уведомлении о задаче — коротко
 сообщить результат, для HTTP — `http_request`, статусы задач — `task_list`; перед
 нетривиальной задачей — `instructions_search` (знания/сценарии/тулы/датасеты), вызов найденных
@@ -356,6 +385,12 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 `task_spawner: TaskSpawner | None` — None вне актора, `task_spawn` тогда отказывает).
 Аргументы валидирует сам скил (`SkillArgumentsError`).
 
+Скил `web_search` зависит от порта `SearchProvider` (модуль `search/`: транспорт-нейтральные
+DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от конкретного поисковика:
+дефолт — `SerperSearchProvider` (serper.dev, регистрируется при `OF_SERPER_TOKEN`),
+инсталлятор подставляет свой провайдер (Bing/Brave/Tavily) в composition root. Форматирование
+выдачи, клэмп `num_results` (1..10) и срез вывода — ответственность скилла.
+
 ### Динамические скилы (план, после появления БД)
 
 `skills/dynamic/engine.py`: `SandboxedEnvironment(enable_async=True, undefined=StrictUndefined)`,
@@ -384,14 +419,20 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 
 - **Модуль `instructions/`** — самодостаточный: хранит, ищет и ранжирует записи трёх типов.
   Граница — `api.py` (Protocol `InstructionService`: `search`/`save`/`get_by_name`, DTO
-  JSON-совместимые под будущую HTTP-границу). Локальная реализация `LocalInstructionService`:
-  таблица `instructions` (собственность модуля), эмбеддинг `title + "\n" + content` через порт
-  `EmbeddingClient` (два бэкенда: OpenAI-совместимый `llm/embeddings.py` и локальный
-  sentence-transformers `llm/local_embeddings.py`; выбор — `OF_EMBEDDING_BACKEND`), ранжирование —
-  brute-force cosine + буст точного `title` (`ranking.py`, чистые функции; полная формула
-  70/30 + MMR — позже подменой модуля) + опциональный реранк шортлиста кросс-энкодером
-  (`OF_RERANKER_MODEL`; двухстадийная схема как в b2e: cosine-шортлист `rerank_candidates` →
-  cross-encoder → top-k). `search` инкрементирует `usage_count` возвращённых хитов.
+  JSON-совместимые под будущую HTTP-границу; **порт хранилища `InstructionStore`** — CRUD +
+  `list_with_embeddings` — и runtime-checkable capability `InstructionVectorSearch` для
+  сторов с поиском на своей стороне, напр. pgvector). Локальная реализация
+  `LocalInstructionService` получает стор конструктором (дефолт —
+  `SqlAlchemyInstructionStore`, таблица `instructions` — собственность модуля), эмбеддинг
+  `title + "\n" + content` через порт `EmbeddingClient` (два бэкенда: OpenAI-совместимый
+  `llm/embeddings.py` и локальный sentence-transformers `llm/local_embeddings.py`; выбор —
+  `OF_EMBEDDING_BACKEND`), ранжирование — brute-force cosine + буст точного `title`
+  (`ranking.py`, чистые функции; полная формула 70/30 + MMR — позже подменой модуля) +
+  опциональный реранк шортлиста кросс-энкодером (`OF_RERANKER_MODEL`; двухстадийная схема
+  как в b2e: cosine-шортлист `rerank_candidates` → cross-encoder → top-k). Если стор
+  реализует `InstructionVectorSearch`, сервис делегирует ему выбор кандидатов
+  (`search_by_vector`) вместо полного скана таблицы; буст и реранк остаются на сервисе.
+  `search` инкрементирует `usage_count` возвращённых хитов.
   Сидирование `seed_if_empty` (generic weather tool + два скила-примера) — в lifespan;
   запускается при `embeddings_configured()` (local-бэкенд или заданный ключ); падение
   сидирования не роняет старт — warning в лог, приложение работает без сидов.
@@ -418,12 +459,15 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 
 - **Модуль `datasets/`** — обособленный, зеркалит `instructions/`: граница `api.py`
   (Protocol `DatasetService`: `create_dataset`/`get_dataset`/`add_record`/`query_records`/
-  `delete_dataset`/`search`, DTO JSON-совместимые под будущую HTTP-границу). Локальная
-  реализация `LocalDatasetService`: таблицы `datasets` + `dataset_records` (собственность
-  модуля), эмбеддинг дескриптора `name + "\n" + description + "\n" + usage_notes` через
-  общий порт `EmbeddingClient` (`llm/embeddings.py`, перенесён туда из `instructions/`),
-  ранжирование — brute-force cosine + буст точного имени (свой `ranking.py`, от
-  instructions не зависит).
+  `delete_dataset`/`search`, DTO JSON-совместимые под будущую HTTP-границу; **порт хранилища
+  `DatasetStore`** — дескрипторы/записи/`list_with_embeddings` — и runtime-checkable
+  capability `DatasetVectorSearch` для сторов с поиском на своей стороне). Локальная
+  реализация `LocalDatasetService` получает стор конструктором (дефолт —
+  `SqlAlchemyDatasetStore`, таблицы `datasets` + `dataset_records` — собственность модуля),
+  эмбеддинг дескриптора `name + "\n" + description + "\n" + usage_notes` через общий порт
+  `EmbeddingClient` (`llm/embeddings.py`, перенесён туда из `instructions/`), ранжирование —
+  brute-force cosine + буст точного имени (свой `ranking.py`, от instructions не зависит);
+  vector-capable стор получает `search_by_vector(owner, embedding, k)` вместо полного скана.
 - **Схема датасета** — JSON `{"fields": [{"name", "type", "required?"}]}`; типы
   `string|integer|number|boolean|date|datetime` (`validation.py`: bool не считается
   integer/number, date/datetime — ISO-строки; лишние поля записи разрешены). Валидация
@@ -479,20 +523,25 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 
 - **Модуль `cron/`** — обособленный, зеркалит `datasets/` и `memory/`: граница `api.py`
   (Protocol `CronStore` — CRUD, due-выборка `list_due`, CAS-аренда `claim`/`release_claim`/
-  `complete_fire`; Protocol `CronWaker`; DTO `CronJob`; ошибки `CronJobNotFoundError`/
+  `complete_fire`; Protocol `CronWaker`; Protocol `Scheduler` — порт движка планирования;
+  DTO `CronJob`; ошибки `CronJobNotFoundError`/
   `CronScheduleError`; чистые функции расписания `compute_next_fire`/`count_missed` на
   croniter + zoneinfo — новая зависимость `croniter`; без py.typed → локальный
   `ignore_missing_imports` с комментарием в `core/pyproject.toml`). Локальная реализация
   `SqlAlchemyCronStore`: таблица `cron_jobs` (собственность модуля). Расписание считается
   croniter'ом по IANA-таймзоне задачи; хранение и сравнения — aware UTC.
-- **Планировщик** (`cron/scheduler.py`): `CronScheduler` — asyncio-задача в lifespan,
-  `owner` = uuid инстанса, knobs из Settings через `CronSchedulerConfig`. Тик (метод
-  `tick(now)` тестируем без сна): due-выборка (enabled, `next_fire_at <= now`, аренда
-  свободна или протухла по lease TTL, ORDER BY `next_fire_at`, LIMIT replay_limit) →
-  CAS `claim` одним UPDATE (проигравший гонку пропускает) → wake (prompt + суффикс про
-  пропущенные прогоны при coalesce) → `complete_fire` с пересчётом `next_fire_at` от
-  момента выстрела; исключение из waker → `release_claim`, задача остаётся due. Между
-  выстрелами тика — разброс 0.5 с (константа `REPLAY_STAGGER_SECONDS`).
+  `CronStore.list_due`/`claim`/`release_claim`/`complete_fire` + `compute_next_fire`/
+  `count_missed` — публичный контракт для альтернативных движков (Celery beat, APScheduler,
+  OS cron): инсталлятор либо подменяет `Scheduler` в корне, либо не стартует наш и драйвит
+  store + математику расписаний из своего раннера.
+- **Планировщик** (`cron/scheduler.py`): `CronScheduler` — реализация порта `Scheduler`,
+  asyncio-задача в lifespan, `owner` = uuid инстанса, knobs из Settings через
+  `CronSchedulerConfig`. Тик (метод `tick(now)` тестируем без сна): due-выборка (enabled,
+  `next_fire_at <= now`, аренда свободна или протухла по lease TTL, ORDER BY `next_fire_at`,
+  LIMIT replay_limit) → CAS `claim` одним UPDATE (проигравший гонку пропускает) → wake
+  (prompt + суффикс про пропущенные прогоны при coalesce) → `complete_fire` с пересчётом
+  `next_fire_at` от момента выстрела; исключение из waker → `release_claim`, задача остаётся
+  due. Между выстрелами тика — разброс 0.5 с (константа `REPLAY_STAGGER_SECONDS`).
 - **Выстрел в акторе**: `ConversationManager.wake` → get-or-create runner →
   `ConversationRunner.wake(title, prompt, cron_job_id)` — общий со `spawn_task` приватный
   хелпер, но `Task.input += {"cron_job_id"}`; переполнение лимита процессов → системная
@@ -722,9 +771,29 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - `core/tests/test_memory_skills.py` — `memory_store`/`memory_search`/`memory_delete` на
   реальном сторе `:memory:` (scope-парсинг и default, ошибки аргументов, формат ответов,
   not-found тексты, изоляция и кросс-поверхностная видимость через SkillContext)
+- `core/tests/test_instructions_store_port.py`, `core/tests/test_datasets_store_port.py` —
+  подмена store-портов (P1 модульности): in-memory `InstructionStore`/`DatasetStore`
+  инъектируются в немодифицированные сервисы (save/search/get/delete без SQL), vector-capable
+  fake получает `search_by_vector` (делегирование, owner в сигнатуре, буст поверх кандидатов)
+- `core/tests/test_prompts.py` — `StaticPromptProvider`: вшитые дефолты, кастомный маппинг,
+  KeyError на неизвестное имя; `test_router.py` += роутерный промпт из провайдера
+- `core/tests/test_web_search_skill.py` — скил над fake-`SearchProvider` (подмена P3):
+  форматирование answer box и позиций, клэмп num_results до провайдера, «no results»,
+  SearchError → текст ошибки, срез длинного вывода
+- `core/tests/test_serper_provider.py` — `SerperSearchProvider` на мокнутом httpx: заголовок
+  ключа и тело запроса, парсинг answerBox/organic (cap по num), HTTP-ошибка и сетевой сбой
+  → `SearchError`
 - `web/tests/test_config.py` — Settings: дефолты OF_EMBEDDING_*/top-k/whitelist/лимитов
   data_query и memory_search, max_processes и router_timeout_seconds (дефолты и env),
-  self_base_url и OF_CRON_* (дефолты и env), парсинг JSON-whitelist и лимитов из env
+  self_base_url и OF_CRON_* (дефолты и env), парсинг JSON-whitelist и лимитов из env,
+  OF_*_PROMPT_SOURCE (file:-источники, неизвестная схема → ValueError)
+- `web/tests/test_prompts.py` — `FilePromptProvider`: чтение из файла, перечитывание на
+  каждый get(), fallback на StaticPromptProvider (нет файла/файл нечитаем + warning),
+  KeyError на неизвестное имя
+- `web/tests/test_modularity.py` — приёмочный сценарий модульности: минимальный сторонний
+  composition root (без `main.runtime()`): системный+роутерный промпты из файлов,
+  fake-`SearchProvider`, in-memory `InstructionStore` — диалог прогоняется целиком
+  (промпты доезжают до LLM, скилы выполняются над подменёнными компонентами)
 - `web/tests/test_dialog_api.py` — get-or-create диалога, изоляция двух user_id, 400 без
   `X-User-Id`, messages/cancel/events (SSE через генератор), health, UI
 - `web/tests/test_cron_api.py` — create (201 + поля, next_fire_at в будущем, default UTC),

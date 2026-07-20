@@ -39,9 +39,10 @@ class CronSchedulerConfig:
 class CronScheduler:
     """Polling scheduler with lease-based exactly-once firing.
 
-    `owner` is a unique id of this scheduler instance (or test); it lands in
-    `claimed_by` so a dead owner's lease can expire (`lease_ttl_seconds`) and
-    be reclaimed by a live one.
+    Implements the `Scheduler` port from `cron/api.py`. `owner` is a unique
+    id of this scheduler instance (or test); it lands in `claimed_by` so a
+    dead owner's lease can expire (`lease_ttl_seconds`) and be reclaimed by
+    a live one.
     """
 
     def __init__(

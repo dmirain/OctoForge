@@ -26,19 +26,22 @@ from octoforge_core import (
     create_session_factory,
     init_db,
 )
-from octoforge_core.agent.prompts import DEFAULT_SYSTEM_PROMPT
+from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
 from octoforge_core.agent.router import LLMRouter
 from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.config import EmbeddingBackend
-from octoforge_core.cron.api import CronStore
+from octoforge_core.cron.api import CronStore, Scheduler
 from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.cron.waker import ManagerCronWaker
+from octoforge_core.datasets.api import DatasetService
 from octoforge_core.datasets.service import LocalDatasetService
+from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.seed import migrate_cron_tools_to_native, seed_if_empty
+from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.openai import OpenAICompatibleClient
@@ -47,6 +50,7 @@ from octoforge_core.memory.api import MemoryStore
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.search.serper import SerperSearchProvider
 from octoforge_core.skills.basic.cron_jobs import (
     CronCreateSkill,
     CronDeleteSkill,
@@ -74,6 +78,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.config import Settings
+from octoforge_web.prompts import FilePromptProvider
 from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_web.telegram.poller import TelegramBridgeRegistry, TelegramPoller
@@ -129,12 +134,12 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             embedder = _build_embedder(settings, embed_http)
             reranker = _build_reranker(settings)
             instructions = LocalInstructionService(
-                session_factory,
+                SqlAlchemyInstructionStore(session_factory),
                 embedder,
                 reranker=reranker,
                 rerank_candidates=settings.reranker_candidates,
             )
-            datasets = LocalDatasetService(session_factory, embedder)
+            datasets = LocalDatasetService(SqlAlchemyDatasetStore(session_factory), embedder)
             await _seed_instructions(instructions, settings)
             # The app's own base URL is allowlisted so tool records can
             # target our loopback HTTP API (cron jobs) past the SSRF guard.
@@ -149,7 +154,12 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             _register_core_skills(registry, outbound_http, guard, task_store, cron_store)
             if settings.serper_token:
                 registry.register(
-                    WebSearchSkill(http_client=outbound_http, api_key=settings.serper_token),
+                    WebSearchSkill(
+                        provider=SerperSearchProvider(
+                            http_client=outbound_http,
+                            api_key=settings.serper_token,
+                        )
+                    ),
                     SkillOrigin.BASIC,
                 )
             _register_instruction_skills(
@@ -163,13 +173,18 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 registry=registry,
                 max_iterations=settings.agent_max_iterations,
             )
+            prompt_provider: PromptProvider = FilePromptProvider(
+                files=settings.to_prompt_files(),
+                fallback=StaticPromptProvider(),
+            )
             manager = ConversationManager(
                 config=RunnerConfig(
                     loop=loop,
-                    system_prompt=DEFAULT_SYSTEM_PROMPT,
+                    prompts=prompt_provider,
                     router=LLMRouter(
                         llm_client,
                         timeout_seconds=settings.router_timeout_seconds,
+                        prompts=prompt_provider,
                     ),
                     max_processes=settings.max_processes,
                 ),
@@ -312,7 +327,7 @@ def _start_cron_scheduler(
     settings: Settings,
 ) -> asyncio.Task[None]:
     """Build the cron scheduler of this instance and start its poll loop."""
-    scheduler = CronScheduler(
+    scheduler: Scheduler = CronScheduler(
         store=store,
         waker=ManagerCronWaker(manager),
         owner=uuid.uuid4().hex,
@@ -399,7 +414,7 @@ def _register_core_skills(
 def _register_instruction_skills(
     registry: SkillRegistry,
     instructions: InstructionService,
-    datasets: LocalDatasetService,
+    datasets: DatasetService,
     executor: ExternalCallExecutor,
     settings: Settings,
 ) -> None:
@@ -418,7 +433,7 @@ def _register_instruction_skills(
 
 def _register_dataset_skills(
     registry: SkillRegistry,
-    datasets: LocalDatasetService,
+    datasets: DatasetService,
     settings: Settings,
 ) -> None:
     """Register the dataset record skills."""

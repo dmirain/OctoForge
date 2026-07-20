@@ -23,6 +23,14 @@
 connection refused на `127.0.0.1:8000`; сид-тулы крон-API удаляются миграцией
 `migrate_cron_tools_to_native` при старте).
 
+Сам движок планирования тоже за портом: `Scheduler` (`cron/api.py`,
+`run_forever()`; `CronScheduler` — реализация по умолчанию). Альтернативные
+движки (Celery beat, APScheduler, OS cron) подключаются двумя путями: подмена
+`Scheduler` в composition root, либо наш планировщик не стартует вовсе, а внешний
+раннер драйвит публичный контракт выстрелов — `CronStore.list_due`/`claim`/
+`release_claim`/`complete_fire` + математика расписаний `compute_next_fire`/
+`count_missed` (объявлены публичными в `cron/api.py`).
+
 - **cron_jobs**: `id`, `user_id`, `channel`, `title`, `schedule` (cron), `timezone` (IANA,
   default UTC), `prompt`, `enabled`, `next_fire_at`, `last_fire_at`, `claimed_by`,
   `claimed_at`, `created_at`. Все `*_at` — UTC; таймзона — для вычисления расписания

@@ -1,19 +1,26 @@
 """Public boundary of the datasets module.
 
 Everything the rest of the system (skills, executors) may know about datasets
-lives here: the `DatasetService` protocol, the JSON-serializable DTOs and the
-module errors.
+lives here: the `DatasetService` protocol, the `DatasetStore` storage port,
+the JSON-serializable DTOs and the module errors.
 
-The protocol is deliberately transport-shaped: DTOs contain only
+The protocols are deliberately transport-shaped: DTOs contain only
 JSON-compatible fields (datetimes serialize as ISO 8601 at a wire boundary),
 so a future HTTP implementation of `DatasetService` is the planned "extract
 to a dedicated service" path — call sites will not change.
+
+The store port exists so an installer can swap only the persistence/vector
+layer (e.g. pgvector or an external vector DB) without rewriting the service
+orchestration (embedding, boosting, validation). Stores able to run the
+vector search on their own side additionally implement the runtime-checkable
+`DatasetVectorSearch` capability; the service detects it with isinstance and
+stops pulling all of the owner's descriptors through `list_with_embeddings`.
 """
 
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
 class FieldType(StrEnum):
@@ -102,6 +109,91 @@ class DatasetHit:
 
     dataset: Dataset
     score: float
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddedDataset:
+    """A dataset descriptor together with its stored embedding (search input/output)."""
+
+    dataset: Dataset
+    embedding: tuple[float, ...]
+
+
+class DatasetStore(Protocol):
+    """Storage port of the datasets module: descriptors, records, embeddings.
+
+    Implementation shipped with the core: `SqlAlchemyDatasetStore`
+    (SQL, in-process). An installer substitutes its own (pgvector, an
+    external vector DB) in the composition root without touching the service.
+    `list_with_embeddings` is the brute-force path ("small data, rank in
+    process"); stores that outgrow it should also implement
+    `DatasetVectorSearch`. Owner isolation is the store's duty: every method
+    is scoped by `owner_user_id` (or by a descriptor id resolved under one).
+    """
+
+    async def create(  # noqa: PLR0913 — flat row fields, mirroring the SQL rows
+        self,
+        owner_user_id: str,
+        name: str,
+        description: str,
+        schema: DatasetSchema,
+        usage_notes: str,
+        retention: str,
+        embedding: tuple[float, ...],
+    ) -> Dataset:
+        """Insert the descriptor; raise `DatasetExistsError` on (owner, name) races."""
+        ...
+
+    async def get(self, owner_user_id: str, name: str) -> Dataset | None:
+        """Return the descriptor of this owner by name, or None."""
+        ...
+
+    async def add_record(
+        self,
+        dataset_id: str,
+        owner_user_id: str,
+        payload: dict[str, Any],
+    ) -> DatasetRecord:
+        """Append a record row to the dataset."""
+        ...
+
+    async def delete(self, owner_user_id: str, name: str) -> int | None:
+        """Delete the descriptor with its records; return the record count or None."""
+        ...
+
+    async def list_with_embeddings(self, owner_user_id: str) -> list[EmbeddedDataset]:
+        """Return every descriptor of this owner with its embedding (search input)."""
+        ...
+
+    async def query_candidates(
+        self,
+        dataset_id: str,
+        date_from: datetime | None,
+        date_to: datetime | None,
+        scan_limit: int,
+    ) -> list[DatasetRecord]:
+        """Return records in the created_at range, newest first, capped at scan_limit."""
+        ...
+
+
+@runtime_checkable
+class DatasetVectorSearch(Protocol):
+    """Optional DatasetStore capability: vector search on the storage side.
+
+    A store implementing this (e.g. pgvector) receives the query embedding
+    and returns the owner's closest descriptors itself, so the service never
+    pulls the whole table into the process. The service still applies its own
+    exact-name boost over the returned candidates.
+    """
+
+    async def search_by_vector(
+        self,
+        owner_user_id: str,
+        query_embedding: tuple[float, ...],
+        limit: int,
+    ) -> list[EmbeddedDataset]:
+        """Return up to `limit` descriptors of this owner closest to the embedding."""
+        ...
 
 
 class DatasetService(Protocol):

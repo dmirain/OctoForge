@@ -5,22 +5,13 @@ self-contained and must not import from the instructions module.
 """
 
 import math
-from dataclasses import dataclass
 
-from octoforge_core.datasets.api import Dataset, DatasetHit
+from octoforge_core.datasets.api import DatasetHit, EmbeddedDataset
 
 # Cosine scores lie in [-1, 1], so adding 2.0 puts an exact-name hit strictly
 # above any non-exact hit regardless of vector similarity.
 EXACT_NAME_BOOST = 2.0
 ZERO_NORM_SIMILARITY = 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class EmbeddedDataset:
-    """A dataset together with its stored embedding (module-internal)."""
-
-    dataset: Dataset
-    embedding: tuple[float, ...]
 
 
 def cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:

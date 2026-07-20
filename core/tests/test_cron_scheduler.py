@@ -10,6 +10,7 @@ from octoforge_core.cron import scheduler as scheduler_module
 from octoforge_core.cron.api import (
     CronJob,
     CronScheduleError,
+    Scheduler,
     compute_next_fire,
     count_missed,
 )
@@ -307,3 +308,31 @@ def test_count_missed_is_capped() -> None:
 def test_count_missed_rejects_invalid_input() -> None:
     with pytest.raises(CronScheduleError):
         count_missed("bogus", "UTC", CREATED_AT, NOW)
+
+
+class ManualScheduler:
+    """Alternative Scheduler engine: counts the run_forever invocations."""
+
+    def __init__(self) -> None:
+        self.runs = 0
+
+    async def run_forever(self) -> None:
+        self.runs += 1
+
+
+async def test_cron_scheduler_implements_the_scheduler_port(
+    store: SqlAlchemyCronStore,
+    waker: RecordingWaker,
+) -> None:
+    scheduler: Scheduler = make_scheduler(store, waker)
+
+    assert isinstance(scheduler, Scheduler)
+
+
+async def test_scheduler_port_accepts_alternative_engines() -> None:
+    engine = ManualScheduler()
+    scheduler: Scheduler = engine
+
+    await scheduler.run_forever()
+
+    assert engine.runs == 1

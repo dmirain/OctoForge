@@ -2,18 +2,26 @@
 
 Everything the rest of the system (agent loop, skills, executors) may know
 about instructions lives here: the `InstructionService` protocol, the
-JSON-serializable DTOs and the module errors.
+`InstructionStore` storage port, the JSON-serializable DTOs and the module
+errors.
 
-The protocol is deliberately transport-shaped: DTOs contain only
+The protocols are deliberately transport-shaped: DTOs contain only
 JSON-compatible fields (datetimes serialize as ISO 8601 at a wire boundary),
 so a future HTTP implementation of `InstructionService` is the planned
 "extract to a dedicated service" path — call sites will not change.
+
+The store port exists so an installer can swap only the persistence/vector
+layer (e.g. pgvector or an external vector DB) without rewriting the service
+orchestration (embedding, boosting, reranking). Stores able to run the
+vector search on their own side additionally implement the runtime-checkable
+`InstructionVectorSearch` capability; the service detects it with isinstance
+and stops pulling the whole table through `list_with_embeddings`.
 """
 
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 class InstructionType(StrEnum):
@@ -56,6 +64,72 @@ class SearchHit:
 
     instruction: Instruction
     score: float
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddedInstruction:
+    """An instruction together with its stored embedding (search input/output)."""
+
+    instruction: Instruction
+    embedding: tuple[float, ...]
+
+
+class InstructionStore(Protocol):
+    """Storage port of the instructions module: records plus their embeddings.
+
+    Implementation shipped with the core: `SqlAlchemyInstructionStore`
+    (SQL, in-process). An installer substitutes its own (pgvector, an
+    external vector DB) in the composition root without touching the service.
+    `list_with_embeddings` is the brute-force path ("small data, rank in
+    process"); stores that outgrow it should also implement
+    `InstructionVectorSearch`.
+    """
+
+    async def upsert(
+        self,
+        kind: InstructionType,
+        title: str,
+        content: str,
+        tags: tuple[str, ...],
+        embedding: tuple[float, ...],
+    ) -> Instruction:
+        """Create the record or replace content/tags/embedding, bumping the version."""
+        ...
+
+    async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
+        """Return the record by title (oldest first when types collide), or None."""
+        ...
+
+    async def list_with_embeddings(self) -> list[EmbeddedInstruction]:
+        """Return every record with its embedding (brute-force search input)."""
+        ...
+
+    async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
+        """Increment usage_count of the given records (search hits proved useful)."""
+        ...
+
+    async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
+        """Delete the record identified by (kind, title); return True when removed."""
+        ...
+
+
+@runtime_checkable
+class InstructionVectorSearch(Protocol):
+    """Optional InstructionStore capability: vector search on the storage side.
+
+    A store implementing this (e.g. pgvector) receives the query embedding
+    and returns the closest records itself, so the service never pulls the
+    whole table into the process. The service still applies its own exact
+    -title boost and reranker over the returned candidates.
+    """
+
+    async def search_by_vector(
+        self,
+        query_embedding: tuple[float, ...],
+        limit: int,
+    ) -> list[EmbeddedInstruction]:
+        """Return up to `limit` records closest to the query embedding, best first."""
+        ...
 
 
 class InstructionService(Protocol):

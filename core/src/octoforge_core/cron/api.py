@@ -2,18 +2,24 @@
 
 Everything the rest of the system (web API, scheduler, composition root) may
 know about cron jobs lives here: the `CronStore` protocol, the `CronWaker`
-port, the JSON-serializable DTO, the module errors and the schedule math
-(`compute_next_fire`, `count_missed`).
+port, the `Scheduler` engine port, the JSON-serializable DTO, the module
+errors and the schedule math (`compute_next_fire`, `count_missed`).
 
 The protocols are deliberately transport-shaped: the DTO contains only
 JSON-compatible fields (datetimes serialize as ISO 8601 at a wire boundary),
 so a future HTTP implementation of `CronStore` is the planned "extract to a
 dedicated service" path — call sites will not change.
+
+Alternative scheduling engines (Celery beat, APScheduler, OS cron) plug in
+two ways: implement the `Scheduler` port and start it instead of
+`CronScheduler`, or don't start ours and drive the public firing contract
+from the outside: `CronStore.list_due`/`claim`/`release_claim`/
+`complete_fire` plus `compute_next_fire`/`count_missed`.
 """
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
@@ -137,6 +143,20 @@ class CronWaker(Protocol):
         cron_job_id: str,
     ) -> None:
         """Start the job's background process in the user's dialog."""
+        ...
+
+
+@runtime_checkable
+class Scheduler(Protocol):
+    """Port of the cron firing engine: the loop that fires due jobs.
+
+    Implementation shipped with the core: `CronScheduler` (asyncio polling
+    with CAS leases). An installer either substitutes its own engine here or
+    drives `CronStore` + the schedule math from an external runner directly.
+    """
+
+    async def run_forever(self) -> None:
+        """Fire due jobs forever; cancellation is the stop signal."""
         ...
 
 

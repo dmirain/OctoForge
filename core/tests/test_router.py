@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 
+from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import (
     ROUTE_TOOL_NAME,
     LLMRouter,
@@ -22,6 +23,7 @@ MESSAGE = "what about the budget?"
 MAX_PROCESSES = 5
 TIMEOUT_SECONDS = 0.05
 SLOW_LLM_DELAY_SECONDS = 60.0
+CUSTOM_ROUTER_PROMPT = "CUSTOM ROUTER: limit {limit}; processes:\n{processes}"
 
 
 def foreground() -> ProcessInfo:
@@ -97,7 +99,11 @@ class SlowLLM:
 
 
 def make_router(llm: ScriptedLLM | SlowLLM) -> LLMRouter:
-    return LLMRouter(llm=llm, timeout_seconds=TIMEOUT_SECONDS)
+    return LLMRouter(
+        llm=llm,
+        timeout_seconds=TIMEOUT_SECONDS,
+        prompts=StaticPromptProvider(),
+    )
 
 
 async def test_empty_snapshot_passes_through_without_llm_call() -> None:
@@ -273,6 +279,21 @@ async def test_prompt_prefers_inject_and_forbids_combining() -> None:
     system = llm.last_messages[0]
     assert "inject is the default" in system.content
     assert "Never combine inject and start_new" in system.content
+
+
+async def test_router_prompt_comes_from_the_prompt_provider() -> None:
+    llm = ScriptedLLM(reply=route_reply([]))
+    router = LLMRouter(
+        llm=llm,
+        timeout_seconds=TIMEOUT_SECONDS,
+        prompts=StaticPromptProvider({ROUTER_PROMPT_NAME: CUSTOM_ROUTER_PROMPT}),
+    )
+
+    await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    system = llm.last_messages[0]
+    assert system.content.startswith("CUSTOM ROUTER: limit 5")
+    assert FG_ID in system.content
 
 
 async def test_llm_timeout_falls_back() -> None:

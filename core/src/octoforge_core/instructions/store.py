@@ -1,7 +1,10 @@
-"""SQLAlchemy storage of the instructions module (module-internal).
+"""SQLAlchemy storage of the instructions module.
 
 Follows the `db/repositories.py` style: sessions come from an injected
 `async_sessionmaker`, ORM rows are mapped to facade DTOs at the boundary.
+Implements the `InstructionStore` port from `instructions/api.py`; the
+vector-search capability (`InstructionVectorSearch`) is deliberately not
+implemented — this store ranks brute-force in the process.
 """
 
 import uuid
@@ -11,15 +14,14 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.instructions.api import Instruction, InstructionType
+from octoforge_core.instructions.api import EmbeddedInstruction, Instruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
-from octoforge_core.instructions.ranking import EmbeddedInstruction
 from octoforge_core.time import utc_now
 
 FIRST_VERSION = 1
 
 
-class InstructionStore:
+class SqlAlchemyInstructionStore:
     """SQL persistence for instruction records and their embeddings."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:

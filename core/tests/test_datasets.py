@@ -21,6 +21,7 @@ from octoforge_core.datasets.api import (
     FieldType,
 )
 from octoforge_core.datasets.service import LocalDatasetService
+from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.datasets.validation import parse_schema
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.llm.embeddings import EmbeddingClient
@@ -70,10 +71,18 @@ class StubEmbedder:
 ServiceFactory = Callable[[async_sessionmaker[AsyncSession], EmbeddingClient], DatasetService]
 
 
+def build_local_service(
+    session_factory: async_sessionmaker[AsyncSession],
+    embedder: EmbeddingClient,
+) -> DatasetService:
+    """Assemble the default local implementation over the SQL store."""
+    return LocalDatasetService(SqlAlchemyDatasetStore(session_factory), embedder)
+
+
 @pytest.fixture
 def service_factory() -> ServiceFactory:
     """The implementation under test; swap to run the suite over another one."""
-    return LocalDatasetService
+    return build_local_service
 
 
 @pytest.fixture

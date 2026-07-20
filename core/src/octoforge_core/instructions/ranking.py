@@ -6,22 +6,13 @@ module without touching the service.
 """
 
 import math
-from dataclasses import dataclass
 
-from octoforge_core.instructions.api import Instruction, SearchHit
+from octoforge_core.instructions.api import EmbeddedInstruction, SearchHit
 
 # Cosine scores lie in [-1, 1], so adding 2.0 puts an exact-title hit strictly
 # above any non-exact hit regardless of vector similarity.
 EXACT_TITLE_BOOST = 2.0
 ZERO_NORM_SIMILARITY = 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class EmbeddedInstruction:
-    """An instruction together with its stored embedding (module-internal)."""
-
-    instruction: Instruction
-    embedding: tuple[float, ...]
 
 
 def cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:

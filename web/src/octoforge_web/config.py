@@ -1,6 +1,9 @@
 """Application settings."""
 
+from pathlib import Path
+
 from octoforge_core import EmbeddingConfig, LLMConfig
+from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, SYSTEM_PROMPT_NAME
 from octoforge_core.config import DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddingBackend
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES
 from octoforge_core.net.external import ExternalCallAuth
@@ -29,6 +32,7 @@ DEFAULT_CRON_REPLAY_LIMIT = 5
 DEFAULT_RERANKER_MODEL = ""
 DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30.0
 DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS = 1.5
+FILE_SCHEME_PREFIX = "file:"
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -72,6 +76,8 @@ class Settings(BaseSettings):
     telegram_poll_timeout_seconds: float = DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
     telegram_edit_throttle_seconds: float = DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
     serper_token: str = ""
+    system_prompt_source: str = ""
+    router_prompt_source: str = ""
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""
@@ -109,3 +115,27 @@ class Settings(BaseSettings):
             )
             for entry in self.external_call_auth_whitelist
         )
+
+    def to_prompt_files(self) -> dict[str, Path]:
+        """Map prompt names to their override files (`file:` scheme, empty = default).
+
+        Raises ValueError on an unsupported scheme: a mistyped source must
+        fail at startup, not silently serve the built-in prompt.
+        """
+        files: dict[str, Path] = {}
+        sources = (
+            (SYSTEM_PROMPT_NAME, self.system_prompt_source),
+            (ROUTER_PROMPT_NAME, self.router_prompt_source),
+        )
+        for name, source in sources:
+            if source:
+                files[name] = _parse_prompt_source(source)
+        return files
+
+
+def _parse_prompt_source(source: str) -> Path:
+    if not source.startswith(FILE_SCHEME_PREFIX):
+        raise ValueError(
+            f"unsupported prompt source {source!r}: only '{FILE_SCHEME_PREFIX}' is supported"
+        )
+    return Path(source.removeprefix(FILE_SCHEME_PREFIX))
