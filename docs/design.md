@@ -281,9 +281,13 @@ web/                           # приложение octoforge-web — FastAPI-
   молча глотается. В `core/` есть логгеры модулей (`runner`, `cron/scheduler`).
 - `ConversationManager` — реестр runner'ов по dialog_id (создание под lock'ом),
   get-or-create диалога по (user_id, channel); конструктор принимает `RunnerConfig`
-  (loop, system_prompt, router, max_processes) + репозитории. Канал для ядра —
+  (loop, prompts, router, max_processes, task_outcome_listener) + репозитории. Канал для ядра —
   непрозрачная строка; конкретные значения (`"web"`, будущий `"telegram"`) объявляют
   адаптеры в composition root.
+- **Компакция нарратива (дизайн, не реализовано)**: ветка процесса сегодня — копия всего
+  нарратива; целевая многоуровневая модель (архив `messages` + периодические саммари с
+  разметкой тем + горячий хвост) и компонент `ContextCompactor` — в
+  [context.md](context.md).
 
 ### Роутер сообщений (`agent/router.py`)
 
