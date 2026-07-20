@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "sqlalchemy[asyncio]>=2",
+    "alembic>=1.13",
     "aiosqlite>=0.19",
     "croniter>=6,<7",
     "sentence-transformers>=3",
@@ -27,11 +28,19 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-octoforge_core = ["py.typed"]
+octoforge_core = [
+    "py.typed",
+    "db/migrations/*.py",
+    "db/migrations/*.mako",
+    "db/migrations/versions/*.py",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Alembic migration scripts use the dynamic `op`/`sa` API and generated
+# boilerplate; they are not held to the library's lint/type standards.
+extend-exclude = ["src/octoforge_core/db/migrations"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "C90", "PL", "RUF"]
@@ -46,6 +55,8 @@ max-statements = 50
 strict = true
 mypy_path = "src"
 packages = ["octoforge_core"]
+# Alembic migration scripts are excluded from strict typing (dynamic op API).
+exclude = ["src/octoforge_core/db/migrations/"]
 
 # croniter ships no py.typed marker (as of the 6.x line); imports are untyped
 # and all call results are bound to annotated variables at the call sites.

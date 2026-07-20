@@ -21,6 +21,7 @@ from octoforge_core import (
     SkillOrigin,
     SkillRegistry,
     SqlAlchemyTaskStore,
+    bootstrap_schema,
     create_engine,
     create_session_factory,
     init_db,
@@ -67,6 +68,7 @@ from octoforge_core.skills.basic.task_list import TaskListSkill
 from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
 from octoforge_core.skills.basic.web_search import WebSearchSkill
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
@@ -103,7 +105,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     surfaces (the Telegram-only runner) use it directly.
     """
     engine = create_engine(settings.database_url)
-    await init_db(engine)
+    await _bootstrap_schema(engine)
     session_factory = create_session_factory(engine)
     dialogs = DialogRepository(session_factory)
     messages = MessageRepository(session_factory)
@@ -210,6 +212,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(cron_router)
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
+
+
+async def _bootstrap_schema(engine: AsyncEngine) -> None:
+    """Migrate the schema to head; fall back to create_all if Alembic fails.
+
+    A fresh or already-managed database is migrated to head. If migrations
+    cannot run at all (misconfiguration, unexpected engine), the app still
+    starts on a create_all schema rather than failing outright.
+    """
+    try:
+        await bootstrap_schema(engine)
+    except Exception:  # any migration failure must not block startup
+        logger.warning("Alembic migration failed; falling back to create_all", exc_info=True)
+        await init_db(engine)
 
 
 async def _seed_instructions(instructions: InstructionService, settings: Settings) -> None:

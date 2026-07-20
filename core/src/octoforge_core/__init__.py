@@ -19,7 +19,12 @@ from octoforge_core.agent.events import (
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.runner import ConversationEvent, ConversationManager, ConversationRunner
 from octoforge_core.config import EmbeddingConfig, LLMConfig
-from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.engine import (
+    bootstrap_schema,
+    create_engine,
+    create_session_factory,
+    init_db,
+)
 from octoforge_core.db.errors import DialogNotFoundError
 from octoforge_core.db.repositories import DialogRepository, MessageRepository, SqlAlchemyTaskStore
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
@@ -78,6 +83,7 @@ __all__ = [
     "ToolCallCompleted",
     "ToolCallFailed",
     "ToolCallRequested",
+    "bootstrap_schema",
     "create_engine",
     "create_session_factory",
     "init_db",
