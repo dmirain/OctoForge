@@ -28,6 +28,7 @@ RESUME_NAME = "cron_resume"
 NO_JOBS_MESSAGE = "no cron jobs"
 JOB_NOT_FOUND_MESSAGE = "error: cron job not found"
 DELETED_MESSAGE = "deleted cron job {job_id}"
+DUPLICATE_MESSAGE = "already exists: cron job {job_id}"
 
 TITLE_PARAM: dict[str, Any] = {
     "type": "string",
@@ -35,7 +36,10 @@ TITLE_PARAM: dict[str, Any] = {
 }
 SCHEDULE_PARAM: dict[str, Any] = {
     "type": "string",
-    "description": "Cron expression, e.g. '0 9 * * *' for daily at 09:00",
+    "description": (
+        "Cron expression, e.g. '0 9 * * *' for daily at 09:00; for a one-shot reminder "
+        "include the date fields, e.g. '30 15 21 7 *' for July 21 at 15:30"
+    ),
 }
 PROMPT_PARAM: dict[str, Any] = {
     "type": "string",
@@ -44,6 +48,13 @@ PROMPT_PARAM: dict[str, Any] = {
 TIMEZONE_PARAM: dict[str, Any] = {
     "type": "string",
     "description": 'IANA timezone, e.g. "Europe/Moscow"; use "UTC" if unknown',
+}
+ONE_SHOT_PARAM: dict[str, Any] = {
+    "type": "boolean",
+    "description": (
+        "true for a one-time reminder: the job fires once and is deleted after "
+        "the first successful run; default false (recurring)"
+    ),
 }
 JOB_ID_PARAM: dict[str, Any] = {
     "type": "string",
@@ -57,6 +68,7 @@ CREATE_SCHEMA: dict[str, Any] = {
         "schedule": SCHEDULE_PARAM,
         "prompt": PROMPT_PARAM,
         "timezone": TIMEZONE_PARAM,
+        "one_shot": ONE_SHOT_PARAM,
     },
     "required": ["title", "schedule", "prompt", "timezone"],
 }
@@ -78,7 +90,10 @@ class CronCreateSkill:
     def spec(self) -> SkillSpec:
         return SkillSpec(
             name=CREATE_NAME,
-            description="Create a recurring cron job that wakes the agent with a prompt.",
+            description=(
+                "Create a cron job that wakes the agent with a prompt: recurring on a "
+                "schedule, or one-time with one_shot=true (deleted after it fires)."
+            ),
             parameters_schema=CREATE_SCHEMA,
         )
 
@@ -87,10 +102,14 @@ class CronCreateSkill:
         schedule = str(arguments["schedule"])
         prompt = str(arguments["prompt"])
         timezone = str(arguments["timezone"])
+        one_shot = arguments.get("one_shot") is True
         try:
             next_fire_at = compute_next_fire(schedule, timezone, utc_now())
         except CronScheduleError as exc:
             return f"error: {exc}"
+        duplicate = await self._find_duplicate(context.user_id, title, schedule, prompt, one_shot)
+        if duplicate is not None:
+            return DUPLICATE_MESSAGE.format(job_id=duplicate.id) + "\n" + _format_job(duplicate)
         job = CronJob(
             id=uuid.uuid4().hex,
             user_id=context.user_id,
@@ -105,9 +124,32 @@ class CronCreateSkill:
             claimed_by=None,
             claimed_at=None,
             created_at=utc_now(),
+            one_shot=one_shot,
+            last_status=None,
+            last_error=None,
+            retry_count=0,
         )
         stored = await self._store.create(job)
         return f"created cron job {stored.id}\n" + _format_job(stored)
+
+    async def _find_duplicate(
+        self,
+        user_id: str,
+        title: str,
+        schedule: str,
+        prompt: str,
+        one_shot: bool,
+    ) -> CronJob | None:
+        """Return the identical existing job, if any (idempotence guard)."""
+        for job in await self._store.list_for_user(user_id):
+            if (
+                job.title == title
+                and job.schedule == schedule
+                and job.prompt == prompt
+                and job.one_shot == one_shot
+            ):
+                return job
+        return None
 
 
 class CronListSkill:
@@ -215,6 +257,14 @@ def _format_job(job: CronJob) -> str:
         f"{job.id} [{state}] {job.title!r} — {job.schedule} ({job.timezone}), "
         f"next fire at {job.next_fire_at.isoformat()}"
     )
+    if job.one_shot:
+        line += ", one-shot"
     if job.last_fire_at is not None:
         line += f", last fire at {job.last_fire_at.isoformat()}"
+    if job.last_status is not None:
+        line += f", last run: {job.last_status.value}"
+        if job.last_error:
+            line += f" ({job.last_error})"
+    if job.retry_count > 0:
+        line += f", retry #{job.retry_count}"
     return line

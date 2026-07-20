@@ -31,6 +31,7 @@ from octoforge_core.agent.router import LLMRouter
 from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.config import EmbeddingBackend
 from octoforge_core.cron.api import CronStore, Scheduler
+from octoforge_core.cron.reporter import CronOutcomeReporter
 from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.cron.waker import ManagerCronWaker
@@ -187,6 +188,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         prompts=prompt_provider,
                     ),
                     max_processes=settings.max_processes,
+                    task_outcome_listener=CronOutcomeReporter(
+                        cron_store,
+                        retry_limit=settings.cron_retry_limit,
+                        backoff_base_seconds=settings.cron_retry_backoff_seconds,
+                    ),
                 ),
                 dialogs=dialogs,
                 messages=messages,

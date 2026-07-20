@@ -9,6 +9,7 @@ import pytest
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.tasks.models import TaskStatus
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 USER_A = "alice"
@@ -17,6 +18,7 @@ CHANNEL = "web"
 OWNER_A = "scheduler-a"
 OWNER_B = "scheduler-b"
 MISSING_JOB_ID = "no-such-job"
+RETRY_TWO = 2
 
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 CREATED_AT = NOW - timedelta(days=10)
@@ -40,6 +42,10 @@ BASE_JOB = CronJob(
     claimed_by=None,
     claimed_at=None,
     created_at=CREATED_AT,
+    one_shot=False,
+    last_status=None,
+    last_error=None,
+    retry_count=0,
 )
 
 
@@ -200,3 +206,33 @@ async def test_complete_fire_bumps_fire_times_and_drops_the_lease(
     assert fired.next_fire_at == FUTURE_AT
     assert fired.claimed_by is None
     assert fired.claimed_at is None
+
+
+async def test_record_fire_result_with_retry_reschedules_and_grows_the_streak(
+    store: SqlAlchemyCronStore,
+) -> None:
+    await store.create(BASE_JOB)
+    retry_at = NOW + timedelta(minutes=1)
+
+    await store.record_fire_result(BASE_JOB.id, TaskStatus.FAILED, "boom", retry_at)
+    await store.record_fire_result(BASE_JOB.id, TaskStatus.FAILED, "boom2", retry_at)
+
+    updated = await store.get(BASE_JOB.id)
+    assert updated.last_status is TaskStatus.FAILED
+    assert updated.last_error == "boom2"
+    assert updated.next_fire_at == retry_at
+    assert updated.retry_count == RETRY_TWO
+
+
+async def test_record_fire_result_without_retry_keeps_the_slot_and_resets_the_streak(
+    store: SqlAlchemyCronStore,
+) -> None:
+    await store.create(make_job(retry_count=RETRY_TWO))
+
+    await store.record_fire_result(BASE_JOB.id, TaskStatus.DONE, None, None)
+
+    updated = await store.get(BASE_JOB.id)
+    assert updated.last_status is TaskStatus.DONE
+    assert updated.last_error is None
+    assert updated.next_fire_at == DUE_AT  # the schedule slot is untouched
+    assert updated.retry_count == 0

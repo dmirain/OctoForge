@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
@@ -114,6 +114,14 @@ class _Process:
     pump: asyncio.Task[None] | None = None
 
 
+class TaskOutcomeListener(Protocol):
+    """Port reporting the terminal status of a task-backed process (e.g. cron)."""
+
+    async def report_outcome(self, task: Task, status: TaskStatus) -> None:
+        """React to a finished task; reporting must never break the dialog."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerConfig:
     """Behavior parameters shared by the conversation runners of one manager."""
@@ -122,6 +130,7 @@ class RunnerConfig:
     prompts: PromptProvider
     router: MessageRouter
     max_processes: int
+    task_outcome_listener: TaskOutcomeListener | None = None
 
 
 class ConversationRunner:
@@ -140,6 +149,7 @@ class ConversationRunner:
         self._prompts = config.prompts
         self._router = config.router
         self._max_processes = config.max_processes
+        self._task_outcome_listener = config.task_outcome_listener
         self._messages = messages
         self._tasks = tasks
         self._narrative = history
@@ -487,13 +497,31 @@ class ConversationRunner:
             await self._persist(terminal.message)
             self._narrative.append(terminal.message)
             await self._resolve_task(process, result=terminal.message.content)
-            return TaskStatus.DONE
-        if isinstance(terminal, Failed):
+            status = TaskStatus.DONE
+        elif isinstance(terminal, Failed):
             await self._fail_task(process, terminal.error)
-            return TaskStatus.FAILED
-        await self._cancel_task(process)
-        await self._salvage_interrupted_turn(process)
-        return TaskStatus.CANCELLED
+            status = TaskStatus.FAILED
+        else:
+            await self._cancel_task(process)
+            await self._salvage_interrupted_turn(process)
+            status = TaskStatus.CANCELLED
+        await self._report_outcome(process, status)
+        return status
+
+    async def _report_outcome(self, process: _Process, status: TaskStatus) -> None:
+        """Tell the outcome listener about a finished cron-tagged task, if any."""
+        listener = self._task_outcome_listener
+        if listener is None or process.task_id is None:
+            return
+        task = await self._tasks.get(process.task_id)
+        if "cron_job_id" not in task.input:
+            return
+        try:
+            await listener.report_outcome(task, status)
+        except Exception:  # outcome reporting must not break the dialog
+            logger.exception(
+                "task outcome report failed: dialog=%s task=%s", self._dialog.id, task.id
+            )
 
     async def _resolve_task(self, process: _Process, result: str) -> None:
         if process.task_id is None:

@@ -1,16 +1,22 @@
-# Крон-задачи (периодические задания)
+# Крон-задачи (периодические задания и разовые напоминания)
 
-> **Статус: реализовано (этап F).** Агент управляет задачами нативными скилами
-> `cron_create`/`cron_list`/`cron_delete`/`cron_pause`/`cron_resume` (поверх `CronStore`,
-> без HTTP); раньше — через `external_call` по сид-тулам крон-API, см. историю ниже.
+> **Статус: реализовано (этап F + итерация надёжности).** Агент управляет задачами
+> нативными скилами `cron_create`/`cron_list`/`cron_delete`/`cron_pause`/`cron_resume`
+> (поверх `CronStore`, без HTTP). Выстрел возвращает исход процесса в стор:
+> статус/ошибка последнего прогона, ретрай с backoff'ом при фейле, one-shot
+> напоминания с авто-удалением, идемпотентное создание (дедуп).
 
 ## Сценарий
 
-«Готовь каждое утро отчёт» → агент вызывает скил `cron_create` (сид-сценарий
-`schedule_a_recurring_report` подсказывает cron-выражение и таймзону) → запись в
-`cron_jobs` → планировщик в срок будит диалог (in-process wake) → фоновый процесс актора
-(этап E), помеченный `cron_job_id` в `Task.input` → отчёт приходит уведомлением
-о завершении.
+- «Готовь каждое утро отчёт» → агент вызывает `cron_create` (сид-сценарий
+  `schedule_a_recurring_report` подсказывает cron-выражение и таймзону) → запись в
+  `cron_jobs` → планировщик в срок будит диалог (in-process wake) → фоновый процесс
+  актора (этап E), помеченный `cron_job_id` в `Task.input` → отчёт приходит
+  уведомлением о завершении, а исход процесса записывается в задачу
+  (`last_status`/`last_error`).
+- «Напомни через час про встречу» → агент строит датированное cron-выражение
+  (`minute hour day month *`, ближайшее будущее вхождение) и создаёт задачу с
+  `one_shot=true` → выстрел → при успешном исходе задача удаляется сама.
 
 ## Крон-сервис
 
@@ -18,10 +24,7 @@
 процесс возможен без смены механизмов — порты `CronStore`/`CronWaker` транспортной
 формы): таблица `cron_jobs`, цикл планировщика, HTTP API для внешних клиентов. Для
 агента — нативные базовые скилы `cron_*` (`skills/basic/cron_jobs.py`), работающие на
-любой поверхности, включая standalone Telegram-раннер без HTTP-слушателя (раньше агент
-вызывал собственное API через `external_call` — на standalone это падало с
-connection refused на `127.0.0.1:8000`; сид-тулы крон-API удаляются миграцией
-`migrate_cron_tools_to_native` при старте).
+любой поверхности, включая standalone Telegram-раннер без HTTP-слушателя.
 
 Сам движок планирования тоже за портом: `Scheduler` (`cron/api.py`,
 `run_forever()`; `CronScheduler` — реализация по умолчанию). Альтернативные
@@ -29,73 +32,122 @@ connection refused на `127.0.0.1:8000`; сид-тулы крон-API удал�
 `Scheduler` в composition root, либо наш планировщик не стартует вовсе, а внешний
 раннер драйвит публичный контракт выстрелов — `CronStore.list_due`/`claim`/
 `release_claim`/`complete_fire` + математика расписаний `compute_next_fire`/
-`count_missed` (объявлены публичными в `cron/api.py`).
+`count_missed` (объявлены публичными в `cron/api.py`). Исходы процессов возвращаются
+через `record_fire_result` (зовёт диалоговая сторона, не движок).
 
-- **cron_jobs**: `id`, `user_id`, `channel`, `title`, `schedule` (cron), `timezone` (IANA,
-  default UTC), `prompt`, `enabled`, `next_fire_at`, `last_fire_at`, `claimed_by`,
-  `claimed_at`, `created_at`. Все `*_at` — UTC; таймзона — для вычисления расписания
-  («утро» — локальное утро юзера). Индексы: `user_id`; `(enabled, next_fire_at)` для
-  due-выборки. (`claimed_at` — добавлено к исходному списку колонок: нужно для TTL аренды.)
-- **API** (скоуп по `X-User-Id`): `POST /jobs`, `GET /jobs`, `DELETE /jobs/{id}`,
-  `POST /jobs/{id}/pause|resume`. Параметры — только query string (исторически: первичным
-  вызывающим был агент через `external_call`, который не умеет тела запросов; теперь API
-  — для внешних клиентов, агент ходит через скилы). Служебная авторизация —
-  whitelist-запись в composition root; служебные токены — позже, с аутентификацией.
+- **cron_jobs**: `id`, `user_id`, `channel`, `title`, `schedule` (cron), `timezone`
+  (IANA, default UTC), `prompt`, `enabled`, `next_fire_at`, `last_fire_at`,
+  `claimed_by`, `claimed_at`, `created_at`, а также `one_shot` (разовая задача),
+  `last_status` (исход последнего прогона: TaskStatus), `last_error` (текст ошибки,
+  до 500 символов), `retry_count` (текущая серия ретраев). Все `*_at` — UTC;
+  таймзона — для вычисления расписания («утро» — локальное утро юзера). Индексы:
+  `user_id`; `(enabled, next_fire_at)` для due-выборки.
+- **API** (скоуп по `X-User-Id`): `POST /jobs` (+= `one_shot`), `GET /jobs`,
+  `DELETE /jobs/{id}`, `POST /jobs/{id}/pause|resume`. Ответ включает `one_shot`,
+  `last_status`, `last_error`, `retry_count`. Параметры — только query string.
+  Служебная авторизация — whitelist-запись в composition root; служебные токены —
+  позже, с аутентификацией.
 
-## Выстрел
+## Выстрел и исход
 
-Планировщик (`CronScheduler`, asyncio-цикл с периодом `OF_CRON_POLL_INTERVAL_SECONDS`)
-выбирает due-задачи, захватывает их CAS'ом и будит диалог. Standalone: in-process
-ярлык — `ManagerCronWaker` → `ConversationManager.wake` → фоновый процесс в диалоге
-(см. [process-model.md](process-model.md)) с `prompt` задачи → завершение → уведомление
-пользователю. Distributed: HTTP `POST {core}/dialogs/{key}/wake` со служебным токеном —
-отложено до аутентификации; вызов через LB, хэш-ключ → инстанс-владелец
-(см. [scaling.md](scaling.md)).
-Выстрел подчиняется лимиту процессов; переполнение → системная заметка в диалоге
-(отложенное уведомление о невозможности запуска, `CRON_LIMIT_NOTE_TEMPLATE`).
+1. **Планировщик** (`CronScheduler`, asyncio-цикл с периодом
+   `OF_CRON_POLL_INTERVAL_SECONDS`): due-выборка → CAS-claim → wake
+   (`ManagerCronWaker` → `ConversationManager.wake` → фоновый процесс в диалоге,
+   `Task.input += {"cron_job_id"}`) → `complete_fire` (фиксирует `last_fire_at`,
+   пересчитывает `next_fire_at` по расписанию от момента выстрела). Выстрел
+   подчиняется лимиту процессов; переполнение → системная заметка в диалоге
+   (`CRON_LIMIT_NOTE_TEMPLATE`).
+2. **Исход процесса**: актор финализирует прогон (`ConversationRunner._finalize` →
+   DONE/FAILED/CANCELLED). Если у задачи есть `cron_job_id` в `input`, актор
+   репортит исход через порт `TaskOutcomeListener` (`agent/runner.py` — generic,
+   про cron не знает; ошибки репортёра ловятся и логируются, диалог не страдает).
+3. **Политика** (`CronOutcomeReporter`, `cron/reporter.py`; адаптер порта на
+   `CronStore`):
+   - **DONE** → `record_fire_result(status, retry_at=None)`: `last_status=done`,
+     серия ретраев сброшена; задача живёт по расписанию.
+   - **DONE + one_shot** → задача удаляется (`delete_for_user`): разовое
+     напоминание сработало и исчезло.
+   - **FAILED, серия < `OF_CRON_RETRY_LIMIT`** → `record_fire_result(status, error,
+     retry_at = now + OF_CRON_RETRY_BACKOFF_SECONDS * 2**retry_count)`:
+     экспоненциальная пауза (при дефолтах 3 и 60 с — 1 мин, 2 мин, 4 мин),
+     `retry_count += 1`. Ретрай-выстрел идёт обычным путём (due → claim → wake)
+     с тем же prompt; суффикс про пропущенные прогоны его не задевает
+     (retry_at — не слот расписания).
+   - **FAILED, лимит исчерпан** → фиксация фейла без ретрая: задача продолжает
+     жить по расписанию со свежим бюджетом ретраев (`retry_count` сброшен).
+   - **CANCELLED** → фиксация без ретрая (пользователь отменил сам).
+   - задача удалена между выстрелом и исходом → `CronJobNotFoundError` ловится,
+     debug-лог.
+4. `record_fire_result` — один атомарный UPDATE: всегда перезаписывает
+   `last_status`/`last_error`; `retry_at` задан → `next_fire_at=retry_at` и
+   инкремент серии; иначе серия сбрасывается, слот расписания не трогается.
+5. **Уведомления**: каждый фейленный прогон по-прежнему приходит в диалог
+   системной заметкой + репорт-прогоном (прозрачно: пользователь видит и фейл,
+   и последующий успех ретрая). Наблюдаемость со стороны задач: `cron_list`
+   показывает `last run: <status> (<error>)` и `retry #N`, то же — в HTTP API.
+
+## Идемпотентность создания
+
+`cron_create` перед вставкой ищет у пользователя идентичную задачу — совпадение
+`(title, schedule, prompt, one_shot)` — и вместо дубля отвечает
+`already exists: cron job {id}` с описанием существующей. Повторный вызов скилла
+(LLM иногда дублирует tool-вызовы) безопасен. Dedup на уровне петли для всех
+тулов — отдельный пункт бэклога ([plan.md](plan.md)).
 
 ## Надёжность
 
-- Exactly-once: CAS-захват due-задач одним UPDATE (`claimed_by` + `claimed_at`, lease
-  TTL `OF_CRON_LEASE_TTL_SECONDS`; протухшая аренда перехватывается живым инстансом).
-- Пропущенные выстрелы: coalesce до одного с пометкой в prompt («[N scheduled runs were
-  missed and coalesced into this one.]»; N — слоты расписания в (last_fire_at|created_at,
-  now] минус текущий, cap 100).
-- Догонялка (openclaw-review п.5): разброс `REPLAY_STAGGER_SECONDS` (0.5 с) между
-  выстрелами тика + лимит реплея на тик (`OF_CRON_REPLAY_LIMIT`, default 5) — остаток
-  дожидается следующих тиков.
-- `next_fire_at` пересчитывается после каждого выстрела **от момента выстрела** (не
-  накапливает дрейф и не порождает серию после простоя); `resume` тоже пересчитывает от
-  now — мгновенной догонялки после паузы нет.
-- Ошибка доставки wake (исключение из `CronWaker`) → аренда снимается (`release_claim`),
-  задача остаётся due и повторяется на следующем тике.
+- Exactly-once: CAS-захват due-задач одним UPDATE (`claimed_by` + `claimed_at`,
+  lease TTL `OF_CRON_LEASE_TTL_SECONDS`; протухшая аренда перехватывается живым
+  инстансом).
+- Пропущенные выстрелы: coalesce до одного с пометкой в prompt («[N scheduled runs
+  were missed and coalesced into this one.]»; N — слоты расписания в
+  (last_fire_at|created_at, now] минус текущий, cap 100).
+- Догонялка: разброс `REPLAY_STAGGER_SECONDS` (0.5 с) между выстрелами тика +
+  лимит реплея на тик (`OF_CRON_REPLAY_LIMIT`, default 5).
+- `next_fire_at` пересчитывается после каждого выстрела **от момента выстрела**;
+  `resume` тоже пересчитывает от now — мгновенной догонялки после паузы нет.
+- Ошибка доставки wake (исключение из `CronWaker`) → аренда снимается
+  (`release_claim`), задача остаётся due и повторяется на следующем тике —
+  транспортный фейл отличен от фейла процесса (тот идёт через outcome-цепочку).
+- Миграции: колонки outcome/one-shot приезжают Alembic-ревизией
+  `2b8f4c1a9e07`; `bootstrap_schema` коммитит транзакцию миграций явно
+  (раньше неявный откат при закрытии соединения терял version-запись и ALTER'ы).
 
-## Принятые решения при реализации
+## Принятые решения
 
+- **Push, а не poll исхода**: актор репортит исход в момент финализации через
+  generic-порт `TaskOutcomeListener`; cron-политика — в адаптере
+  `CronOutcomeReporter`. Планировщик не опрашивает TaskStore и не меняется вообще;
+  ядро диалога не импортирует cron (порт объявлен в `agent/runner.py`).
+- **One-shot через cron-выражение**, а не отдельная колонка `fire_at`: агент сам
+  строит датированное выражение (`minute hour day month *`), `compute_next_fire`
+  уже считает слот; флаг `one_shot` лишь включает удаление после успеха. Проваленный
+  one-shot ретраится как обычно; после исчерпания ретраев остаётся в списке с
+  `last_status=failed`.
+- **Дедуп по тройке + флаг** (`title, schedule, prompt, one_shot`) на уровне скилла:
+  задач у пользователя мало, фильтр в памяти по `list_for_user`; новых методов
+  стора не понадобилось.
 - **Нативные скилы вместо своего HTTP API** — агент управляет задачами скилами
-  `cron_*` над `CronStore`: одинаково работает на всех поверхностях (включая standalone
-  без HTTP-слушателя); HTTP API остаётся для внешних клиентов.
-- **Query-param API** — у `external_call` нет тела запроса (зафиксировано выше).
-- **In-process wake в standalone** — HTTP wake endpoint и служебные токены отложены до
-  аутентификации.
-- **Колонка `claimed_at`** — TTL аренды (добавлена к исходной схеме).
+  `cron_*` над `CronStore` на всех поверхностях; HTTP API остаётся для внешних
+  клиентов.
+- **Query-param API** — у `external_call` нет тела запроса.
+- **In-process wake в standalone** — HTTP wake endpoint и служебные токены отложены
+  до аутентификации.
 - **Миграция сидов** `migrate_cron_tools_to_native(service)` — удаляет HTTP-сид-тулы
-  (`cron_create_job` и др., через новый `InstructionService.delete`) и обновляет
-  скил-сценарий `schedule_a_recurring_report` на нативные скилы; идемпотентна.
-  Механизм allowlist-авторизации `external_call` (`{user_id}` в заголовке, SSRF-prefixes)
-  остаётся для прочих внутренних тулов.
+  и обновляет скил-сценарий `schedule_a_recurring_report` (сравнение контента →
+  существующие БД получают текст про one-shot при рестарте); идемпотентна.
 - **Конфиг**: `OF_SELF_BASE_URL`, `OF_CRON_POLL_INTERVAL_SECONDS`,
-  `OF_CRON_LEASE_TTL_SECONDS`, `OF_CRON_REPLAY_LIMIT`.
+  `OF_CRON_LEASE_TTL_SECONDS`, `OF_CRON_REPLAY_LIMIT`, `OF_CRON_RETRY_LIMIT` (3),
+  `OF_CRON_RETRY_BACKOFF_SECONDS` (60).
 
-## Известные доработки
+## Известные ограничения
 
-- **Путаница крон/фон в промпте** — агент не всегда различает фоновую задачу
-  (`task_spawn`) и крон-задачу; граница в системном промпте описана размыто
-  (`agent/prompts.py:49` против `:71-74`). Нужны явные правила и примеры.
-- **Нет ретрая и статуса фейла выстрела** — планировщик считает выстрел состоявшимся
-  в момент спавна процесса; итог процесса (например, «iteration limit») до `CronStore`
-  не доходит. Уведомление о фейле в диалог уже приходит системной заметкой — сохранить.
-- **Нет идемпотентности `cron_create`** — повторный вызов с теми же аргументами создаёт
-  дубль задачи (unique-констрейнта и dedup нет).
-
-Подробности и остальной бэклог — [plan.md](plan.md) «Бэклог доработок».
+- **Dedup только на уровне скилла**: повторный вызов `cron_create` безопасен, но
+  LLM может дважды позвать и другие мутации — общий dedup tool-вызовов в петле
+  остаётся в бэклоге.
+- **Шум ретраев**: каждая фейленная попытка уведомляет диалог (до 4 уведомлений на
+  инцидент при дефолтном лимите). Осознанная прозрачность, не подавляем.
+- **Поздний исход перезаписывает ранний**: если ретрай уже выстрелил, а исход
+  предыдущей попытки пришёл позже, `last_status` отражает последний пришедший —
+  семантика «последнее известное», без разбирательства гонок.
+- Остальной бэклог — [plan.md](plan.md) «Бэклог доработок».

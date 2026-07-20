@@ -26,6 +26,7 @@ class CronJobCreateParams(BaseModel):
     schedule: str = Field(min_length=MIN_QUERY_PARAM_LENGTH)
     prompt: str = Field(min_length=MIN_QUERY_PARAM_LENGTH)
     timezone: str = Field(default="UTC", min_length=MIN_QUERY_PARAM_LENGTH)
+    one_shot: bool = False
 
 
 class CronJobResponse(BaseModel):
@@ -42,3 +43,7 @@ class CronJobResponse(BaseModel):
     next_fire_at: datetime
     last_fire_at: datetime | None
     created_at: datetime
+    one_shot: bool
+    last_status: str | None
+    last_error: str | None
+    retry_count: int

@@ -14,7 +14,9 @@ Alternative scheduling engines (Celery beat, APScheduler, OS cron) plug in
 two ways: implement the `Scheduler` port and start it instead of
 `CronScheduler`, or don't start ours and drive the public firing contract
 from the outside: `CronStore.list_due`/`claim`/`release_claim`/
-`complete_fire` plus `compute_next_fire`/`count_missed`.
+`complete_fire` plus `compute_next_fire`/`count_missed`. Process outcomes
+flow back through `record_fire_result` (called by the dialog side via the
+`CronOutcomeReporter` adapter, not by the engine).
 """
 
 from dataclasses import dataclass
@@ -23,6 +25,8 @@ from typing import Protocol, runtime_checkable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
+
+from octoforge_core.tasks.models import TaskStatus
 
 MISSED_COUNT_DEFAULT_CAP = 100
 
@@ -43,6 +47,10 @@ class CronJob:
     boundary). `schedule`/`timezone` define the wall-clock cadence ("morning"
     means the user's local morning); all `*_at` fields are aware UTC.
     `claimed_by`/`claimed_at` form the scheduler lease (exactly-once firing).
+    `one_shot` marks a single-fire reminder: the job is deleted after the
+    first successful outcome. `last_status`/`last_error` are the outcome of
+    the most recent fired process; `retry_count` is the running retry streak
+    (reset on success or exhaustion).
     """
 
     id: str
@@ -58,6 +66,10 @@ class CronJob:
     claimed_by: str | None
     claimed_at: datetime | None
     created_at: datetime
+    one_shot: bool
+    last_status: TaskStatus | None
+    last_error: str | None
+    retry_count: int
 
 
 class CronStore(Protocol):
@@ -128,6 +140,22 @@ class CronStore(Protocol):
 
     async def complete_fire(self, job_id: str, fired_at: datetime, next_fire_at: datetime) -> None:
         """Record a successful fire: bump last/next fire times and drop the lease."""
+        ...
+
+    async def record_fire_result(
+        self,
+        job_id: str,
+        status: TaskStatus,
+        error: str | None,
+        retry_at: datetime | None,
+    ) -> None:
+        """Record the outcome of the fired process (reported by the dialog side).
+
+        Always overwrites `last_status`/`last_error`. When `retry_at` is set
+        the job is rescheduled to it and the retry streak grows; otherwise the
+        streak resets (success, exhaustion or cancellation — the next schedule
+        slot computed by `complete_fire` stays).
+        """
         ...
 
 

@@ -55,6 +55,10 @@ async def create_job(
         claimed_by=None,
         claimed_at=None,
         created_at=utc_now(),
+        one_shot=params.one_shot,
+        last_status=None,
+        last_error=None,
+        retry_count=0,
     )
     return _to_response(await store.create(job))
 
@@ -120,4 +124,8 @@ def _to_response(job: CronJob) -> CronJobResponse:
         next_fire_at=job.next_fire_at,
         last_fire_at=job.last_fire_at,
         created_at=job.created_at,
+        one_shot=job.one_shot,
+        last_status=None if job.last_status is None else job.last_status.value,
+        last_error=job.last_error,
+        retry_count=job.retry_count,
     )

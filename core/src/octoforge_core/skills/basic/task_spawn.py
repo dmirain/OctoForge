@@ -7,8 +7,9 @@ from octoforge_core.skills.errors import SkillArgumentsError
 
 SKILL_NAME = "task_spawn"
 SKILL_DESCRIPTION = (
-    "Spawn a background task that will be solved asynchronously. "
-    "Use it when the user asks to do something in the background or later."
+    "Spawn a background task that will be solved asynchronously right now. "
+    "Use it when the user asks to do work in the background (the result comes once, "
+    "when it is ready). NOT for reminders or anything on a schedule — use cron_create."
 )
 PARAMETERS_SCHEMA: dict[str, Any] = {
     "type": "object",

@@ -33,6 +33,7 @@ from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
     RunnerConfig,
+    TaskOutcomeListener,
 )
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
@@ -283,6 +284,7 @@ class ManagerOptions:
     router: FakeRouter | None = None
     store: TaskStore | None = None
     max_processes: int = MAX_PROCESSES
+    listener: TaskOutcomeListener | None = None
 
 
 def make_manager(
@@ -298,6 +300,7 @@ def make_manager(
         prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: PROMPT}),
         router=resolved.router if resolved.router is not None else FakeRouter(),
         max_processes=resolved.max_processes,
+        task_outcome_listener=resolved.listener,
     )
     return ConversationManager(
         config=config,
@@ -960,3 +963,80 @@ async def test_process_slot_released_when_finalize_fails(
     assert "spawned" in result
     assert "process limit" not in result
     await collect_completions(queue, 1)
+
+
+class RecordingOutcomeListener:
+    """TaskOutcomeListener stub recording (task, status) pairs; can be told to fail."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.calls: list[tuple[Task, TaskStatus]] = []
+        self.fail = fail
+
+    async def report_outcome(self, task: Task, status: TaskStatus) -> None:
+        if self.fail:
+            raise RuntimeError("listener boom")
+        self.calls.append((task, status))
+
+
+async def test_cron_task_outcome_is_reported_to_the_listener(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
+    listener = RecordingOutcomeListener()
+    manager = make_manager(
+        llm,
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(listener=listener),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    await collect_completions(queue, 2)
+
+    (reported,) = listener.calls
+    task, status = reported
+    assert status is TaskStatus.DONE
+    assert task.input["cron_job_id"] == CRON_JOB_ID
+
+
+async def test_plain_task_outcome_is_not_reported(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[reply("main answer")], background=[reply(TASK_RESULT)])
+    listener = RecordingOutcomeListener()
+    manager = make_manager(
+        llm,
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(listener=listener),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
+    await collect_completions(queue, 1)
+
+    assert listener.calls == []  # no cron_job_id in the task input
+
+
+async def test_listener_failure_does_not_break_finalize(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        llm,
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(store=store, listener=RecordingOutcomeListener(fail=True)),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    await collect_completions(queue, 2)
+
+    (task,) = await store.list(runner.dialog_id)
+    assert task.status is TaskStatus.DONE  # finalize completed despite the listener

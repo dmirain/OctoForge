@@ -69,7 +69,18 @@ def test_create_job_returns_the_created_job(client: TestClient) -> None:
     assert body["prompt"] == "prepare the report"
     assert body["enabled"] is True
     assert body["last_fire_at"] is None
+    assert body["one_shot"] is False
+    assert body["last_status"] is None
+    assert body["last_error"] is None
+    assert body["retry_count"] == 0
     assert datetime.fromisoformat(body["next_fire_at"]) > datetime.now(UTC)
+
+
+def test_create_job_with_one_shot_flag(client: TestClient) -> None:
+    response = create_job(client, one_shot="true")
+
+    assert response.status_code == HTTPStatus.CREATED
+    assert response.json()["one_shot"] is True
 
 
 def test_create_job_defaults_the_timezone_to_utc(client: TestClient) -> None:

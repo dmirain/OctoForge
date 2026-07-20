@@ -57,8 +57,9 @@ core/                          # библиотека octoforge-core — дом�
                                #   memory_store / memory_search / memory_delete, крон, web_search)
                                #   и ROUTER_SYSTEM_PROMPT; имена SYSTEM/ROUTER_PROMPT_NAME
       runner.py                # ConversationRunner (актор: нарратив + процессы fg/bg, bound
-                               #   TaskSpawner, wake для крон-выстрелов), ConversationManager,
-                               #   RunnerConfig, ConversationEvent
+                               #   TaskSpawner, wake для крон-выстрелов, порт
+                               #   TaskOutcomeListener для исходов cron-задач),
+                               #   ConversationManager, RunnerConfig, ConversationEvent
     skills/
       base.py                  # Skill (Protocol), SkillSpec, SkillOrigin (BASIC|DYNAMIC),
                                #   SkillContext (+ опциональный task_spawner)
@@ -122,10 +123,13 @@ core/                          # библиотека octoforge-core — дом�
                                #   (croniter + zoneinfo) — публичный контракт для
                                #   альтернативных движков планирования
       models.py                # CronJobRow — таблица cron_jobs, собственность модуля
-      store.py                 # SqlAlchemyCronStore (CRUD + due-выборка + CAS-аренда)
+      store.py                 # SqlAlchemyCronStore (CRUD + due-выборка + CAS-аренда
+                               #   + record_fire_result)
       scheduler.py             # CronScheduler (реализация порта Scheduler: asyncio-цикл
                                #   claim → wake → complete_fire, coalesce пропущенных,
                                #   разброс и лимит догонялки)
+      reporter.py              # CronOutcomeReporter — исход процесса в стор: ретрай
+                               #   с backoff'ом, удаление one-shot, сброс серии
       waker.py                 # ManagerCronWaker — адаптер порта на ConversationManager
     search/                    # обособленный модуль веб-поиска (порт провайдера)
       api.py                   # граница модуля: SearchProvider (Protocol), SearchResult,
@@ -311,15 +315,18 @@ CANCEL/PROMOTE). Пустой пакет — passthrough (актор тракт�
 процесса при старте с суффиксом текущей даты UTC (`_with_current_date`).
 
 Текст вшитого `DEFAULT_SYSTEM_PROMPT`: отвечать «сначала суть, потом детали» (прерывание полезно),
-«в фоне» → `task_spawn` и продолжить диалог, при system-уведомлении о задаче — коротко
+работа «в фоне прямо сейчас» (результат один раз, когда готов) → `task_spawn` и продолжить
+диалог, при system-уведомлении о задаче — коротко
 сообщить результат, для HTTP — `http_request`, статусы задач — `task_list`; перед
 нетривиальной задачей — `instructions_search` (знания/сценарии/тулы/датасеты), вызов найденных
 тулов — через `external_call`, после нового многошагового сценария — сохранить его
 через `instruction_save`; трекинг структурированных данных (еда, вес, привычки) —
 датасеты: искать через `instructions_search`, писать через `data_put` (создавая датасет
 со схемой при отсутствии), читать/строить отчёты через `data_query`, удалять через `data_forget`;
-просьбы «по расписанию/периодически/напоминай» — скил `cron_create` (cron-выражение
-составить самому, таймзону уточнить или взять UTC), управление — `cron_list`/`cron_pause`/
+просьбы «по расписанию/периодически/напоминай» (включая разовые «через час») — скил
+`cron_create` (cron-выражение составить самому, таймзону уточнить или взять UTC; разовые —
+`one_shot=true` с датированным выражением, задача удалится сама после срабатывания;
+явная граница с `task_spawn`: напоминания — только крон), управление — `cron_list`/`cron_pause`/
 `cron_resume`/`cron_delete`, подтвердив создание пользователю; факты из веба — скил
 `web_search`; разметка ответов — простая (`**bold**` для акцентов и заголовков, списки
 дефисом, код в fenced-блоках, таблицы избегать) — рендерится и в web, и в Telegram.
@@ -523,8 +530,9 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
 
 - **Модуль `cron/`** — обособленный, зеркалит `datasets/` и `memory/`: граница `api.py`
   (Protocol `CronStore` — CRUD, due-выборка `list_due`, CAS-аренда `claim`/`release_claim`/
-  `complete_fire`; Protocol `CronWaker`; Protocol `Scheduler` — порт движка планирования;
-  DTO `CronJob`; ошибки `CronJobNotFoundError`/
+  `complete_fire`, исход `record_fire_result`; Protocol `CronWaker`; Protocol `Scheduler`
+  — порт движка планирования; DTO `CronJob` (+ `one_shot`, `last_status`, `last_error`,
+  `retry_count`); ошибки `CronJobNotFoundError`/
   `CronScheduleError`; чистые функции расписания `compute_next_fire`/`count_missed` на
   croniter + zoneinfo — новая зависимость `croniter`; без py.typed → локальный
   `ignore_missing_imports` с комментарием в `core/pyproject.toml`). Локальная реализация
@@ -542,6 +550,22 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   (prompt + суффикс про пропущенные прогоны при coalesce) → `complete_fire` с пересчётом
   `next_fire_at` от момента выстрела; исключение из waker → `release_claim`, задача остаётся
   due. Между выстрелами тика — разброс 0.5 с (константа `REPLAY_STAGGER_SECONDS`).
+- **Исход выстрела** (`cron/reporter.py` + хук в акторе): актор репортит терминальный
+  статус задачи с `cron_job_id` через порт `TaskOutcomeListener` (`agent/runner.py`,
+  generic; ошибки репортёра ловятся — диалог не страдает). Адаптер `CronOutcomeReporter`
+  применяет политику: DONE → сброс серии ретраев (+ удаление one-shot задачи), FAILED →
+  ретрай с экспоненциальным backoff'ом (`OF_CRON_RETRY_LIMIT`=3,
+  `OF_CRON_RETRY_BACKOFF_SECONDS`=60 → 1/2/4 мин) через `record_fire_result` (атомарный
+  UPDATE: `last_status`/`last_error` ≤ 500 символов, сдвиг `next_fire_at`, инкремент
+  `retry_count`), лимит исчерпан → фиксация фейла, задача живёт по расписанию; CANCELLED →
+  без ретрая. Колонки приезжают Alembic-ревизией `2b8f4c1a9e07`; `bootstrap_schema` теперь
+  явно коммитит транзакцию миграций (баг: неявный откат терял version-запись и ALTER'ы).
+- **One-shot напоминания**: флаг `one_shot` в `cron_jobs` и `cron_create` (и в HTTP
+  `POST /jobs`); расписание — датированное cron-выражение (`minute hour day month *`),
+  агент строит сам под ближайшее будущее вхождение; после первого DONE задача удаляется.
+- **Идемпотентность `cron_create`**: совпадение `(title, schedule, prompt, one_shot)` по
+  `list_for_user` → ответ `already exists` вместо дубля. `cron_list` и HTTP API показывают
+  `last run: <status> (<error>)` и `retry #N`.
 - **Выстрел в акторе**: `ConversationManager.wake` → get-or-create runner →
   `ConversationRunner.wake(title, prompt, cron_job_id)` — общий со `spawn_task` приватный
   хелпер, но `Task.input += {"cron_job_id"}`; переполнение лимита процессов → системная
@@ -744,13 +768,20 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - `core/tests/test_cron_store.py` — SQL-стор крона на `:memory:`: CRUD, изоляция юзеров
   (delete/set_enabled чужого → CronJobNotFoundError), list_due (enabled, окно, свежая и
   протухшая аренда, порядок, лимит), claim CAS (гонка, сдвинутый next_fire_at, перехват
-  протухшей аренды), release_claim, complete_fire
+  протухшей аренды), release_claim, complete_fire, record_fire_result (retry_at →
+  сдвиг next_fire_at + инкремент серии, без ретрая → сброс)
 - `core/tests/test_cron_scheduler.py` — реальный стор + записывающий fake-waker: выстрел
   due с пересчётом next_fire_at в будущее, будущая/disabled не стреляют, coalesce
   пропущенных с суффиксом, лимит реплея (остаток ждёт следующий тик), failed wake →
   release_claim, чужая свежая аренда → пропуск; compute_next_fire по таймзоне
   (Europe/Moscow 9:00 = 06:00 UTC), невалидные schedule/timezone → CronScheduleError,
-  count_missed (минус текущий выстрел, cap)
+  count_missed (минус текущий выстрел, cap); порт Scheduler (соответствие и подмена)
+- `core/tests/test_cron_reporter.py` — политика исходов: DONE сбрасывает серию ретраев,
+  DONE удаляет one-shot задачу, FAILED → backoff с инкрементом серии, лимит → без ретрая
+  + сброс, CANCELLED без ретрая, удалённая/непомеченная задача — тихо, обрезка ошибки
+  до 500
+- `core/tests/test_cron_skills.py` — скилы cron_*: create (one_shot-флаг, дедуп тройки
+  → «already exists»), list с `last run`/`retry #N`, delete/pause/resume, owner-изоляция
 - `core/tests/test_instruction_skills.py` — адаптеры `instructions_search`/`instruction_save`/
   `external_call` (валидация аргументов + happy path на фейках)
 - `core/tests/test_datasets.py` — контрактный набор фасада DatasetService на `:memory:`

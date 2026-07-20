@@ -14,6 +14,7 @@ from octoforge_core.skills.basic.cron_jobs import (
     CronPauseSkill,
     CronResumeSkill,
 )
+from octoforge_core.tasks.models import TaskStatus
 from octoforge_core.time import utc_now
 
 USER_ID = "alice"
@@ -26,6 +27,8 @@ MISSING_JOB_ID = "no-such-job"
 VALID_SCHEDULE = "0 9 * * *"
 VALID_TIMEZONE = "Europe/Moscow"
 CONTEXT = SkillContext(user_id=USER_ID, channel=CHANNEL, dialog_id=DIALOG_ID)
+EXPECTED_TWO_JOBS = 2
+RETRY_TWO = 2
 
 
 class FakeCronStore:
@@ -94,6 +97,15 @@ class FakeCronStore:
     async def complete_fire(self, job_id: str, fired_at: datetime, next_fire_at: datetime) -> None:
         raise NotImplementedError
 
+    async def record_fire_result(
+        self,
+        job_id: str,
+        status: TaskStatus,
+        error: str | None,
+        retry_at: datetime | None,
+    ) -> None:
+        raise NotImplementedError
+
 
 def make_job(**overrides: object) -> CronJob:
     """A valid job of USER_ID; fields overridable per test."""
@@ -111,12 +123,16 @@ def make_job(**overrides: object) -> CronJob:
         claimed_by=None,
         claimed_at=None,
         created_at=utc_now(),
+        one_shot=False,
+        last_status=None,
+        last_error=None,
+        retry_count=0,
     )
     return replace(base, **overrides)
 
 
-def create_arguments(**overrides: str) -> dict[str, str]:
-    arguments = {
+def create_arguments(**overrides: object) -> dict[str, object]:
+    arguments: dict[str, object] = {
         "title": "morning report",
         "schedule": VALID_SCHEDULE,
         "prompt": "good morning",
@@ -230,3 +246,52 @@ async def test_pause_and_resume_refuse_foreign_jobs(
     result = await skill_cls(store).execute({"job_id": JOB_ID}, CONTEXT)
 
     assert result == "error: cron job not found"
+
+
+async def test_create_is_idempotent_for_an_identical_job() -> None:
+    store = FakeCronStore()
+    skill = CronCreateSkill(store)
+
+    first = await skill.execute(create_arguments(), CONTEXT)
+    second = await skill.execute(create_arguments(), CONTEXT)
+
+    assert "created cron job" in first
+    assert "already exists" in second
+    assert len(store.jobs) == 1
+
+
+async def test_create_with_a_different_one_shot_is_not_a_duplicate() -> None:
+    store = FakeCronStore()
+    skill = CronCreateSkill(store)
+
+    await skill.execute(create_arguments(), CONTEXT)
+    result = await skill.execute(create_arguments(one_shot=True), CONTEXT)
+
+    assert "created cron job" in result
+    assert len(store.jobs) == EXPECTED_TWO_JOBS
+
+
+async def test_create_one_shot_marks_the_job() -> None:
+    store = FakeCronStore()
+
+    result = await CronCreateSkill(store).execute(create_arguments(one_shot=True), CONTEXT)
+
+    (job,) = store.jobs.values()
+    assert job.one_shot
+    assert "one-shot" in result
+
+
+async def test_list_shows_the_last_run_and_retry_streak() -> None:
+    store = FakeCronStore()
+    await store.create(
+        make_job(
+            last_status=TaskStatus.FAILED,
+            last_error="iteration limit reached",
+            retry_count=RETRY_TWO,
+        )
+    )
+
+    result = await CronListSkill(store).execute({}, CONTEXT)
+
+    assert "last run: failed (iteration limit reached)" in result
+    assert "retry #2" in result

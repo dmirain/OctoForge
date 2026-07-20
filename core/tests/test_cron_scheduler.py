@@ -54,6 +54,10 @@ BASE_JOB = CronJob(
     claimed_by=None,
     claimed_at=None,
     created_at=CREATED_AT,
+    one_shot=False,
+    last_status=None,
+    last_error=None,
+    retry_count=0,
 )
 
 

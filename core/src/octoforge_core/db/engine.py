@@ -43,10 +43,13 @@ async def bootstrap_schema(engine: AsyncEngine) -> None:
     A fresh database has every table created by the baseline migration; a
     database that predates Alembic (tables but no `alembic_version`) is stamped
     at head (its schema is assumed current); an already-managed database is
-    upgraded.
+    upgraded. The transaction is committed explicitly: Alembic leaves it open
+    (the caller owns the connection), and closing an async connection would
+    roll it back, losing the version row and ALTERs.
     """
     async with engine.connect() as connection:
         await connection.run_sync(_bootstrap_sync)
+        await connection.commit()
 
 
 def _bootstrap_sync(connection: Connection) -> None:

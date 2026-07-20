@@ -16,6 +16,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError, CronStore
 from octoforge_core.cron.models import CronJobRow
+from octoforge_core.tasks.models import TaskStatus
 
 
 class SqlAlchemyCronStore(CronStore):
@@ -41,6 +42,10 @@ class SqlAlchemyCronStore(CronStore):
                 claimed_by=job.claimed_by,
                 claimed_at=job.claimed_at,
                 created_at=job.created_at,
+                one_shot=job.one_shot,
+                last_status=None if job.last_status is None else job.last_status.value,
+                last_error=job.last_error,
+                retry_count=job.retry_count,
             )
             session.add(row)
             await session.commit()
@@ -156,6 +161,39 @@ class SqlAlchemyCronStore(CronStore):
             await session.execute(statement)
             await session.commit()
 
+    async def record_fire_result(
+        self,
+        job_id: str,
+        status: TaskStatus,
+        error: str | None,
+        retry_at: datetime | None,
+    ) -> None:
+        """Apply the fired process outcome and the retry decision in one UPDATE."""
+        async with self._session_factory() as session:
+            if retry_at is not None:
+                statement = (
+                    update(CronJobRow)
+                    .where(CronJobRow.id == job_id)
+                    .values(
+                        last_status=status.value,
+                        last_error=error,
+                        next_fire_at=retry_at,
+                        retry_count=CronJobRow.retry_count + 1,
+                    )
+                )
+            else:
+                statement = (
+                    update(CronJobRow)
+                    .where(CronJobRow.id == job_id)
+                    .values(
+                        last_status=status.value,
+                        last_error=error,
+                        retry_count=0,
+                    )
+                )
+            await session.execute(statement)
+            await session.commit()
+
 
 def _claimable_clause(stale_before: datetime) -> ColumnElement[bool]:
     return or_(
@@ -194,4 +232,8 @@ def _to_cron_job(row: CronJobRow) -> CronJob:
         claimed_by=row.claimed_by,
         claimed_at=row.claimed_at,
         created_at=row.created_at,
+        one_shot=row.one_shot,
+        last_status=None if row.last_status is None else TaskStatus(row.last_status),
+        last_error=row.last_error,
+        retry_count=row.retry_count,
     )
