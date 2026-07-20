@@ -18,6 +18,7 @@ from octoforge_core import (
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ProcessInfo, RouteDecision
 from octoforge_core.agent.runner import ConversationRunner, RunnerConfig
+from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
@@ -178,6 +179,7 @@ async def make_manager(
             prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: SYSTEM_PROMPT}),
             router=PassthroughRouter(),
             max_processes=MAX_PROCESSES,
+            compactor=NoopContextCompactor(),
         ),
         dialogs=DialogRepository(session_factory),
         messages=MessageRepository(session_factory),

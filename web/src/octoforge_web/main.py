@@ -30,6 +30,8 @@ from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
 from octoforge_core.agent.router import LLMRouter
 from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.config import EmbeddingBackend
+from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
+from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.api import CronStore, Scheduler
 from octoforge_core.cron.reporter import CronOutcomeReporter
 from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
@@ -63,6 +65,7 @@ from octoforge_core.skills.basic.data_forget import DataForgetSkill
 from octoforge_core.skills.basic.data_put import DataPutSkill
 from octoforge_core.skills.basic.data_query import DataQuerySkill
 from octoforge_core.skills.basic.external_call import ExternalCallSkill
+from octoforge_core.skills.basic.history_search import HistorySearchSkill
 from octoforge_core.skills.basic.http_request import HttpRequestSkill
 from octoforge_core.skills.basic.instruction_save import InstructionSaveSkill
 from octoforge_core.skills.basic.instructions_search import InstructionsSearchSkill
@@ -169,6 +172,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             _register_dataset_skills(registry, datasets, settings)
             memory = SqlAlchemyMemoryStore(session_factory)
             _register_memory_skills(registry, memory, settings)
+            summary_store = SqlAlchemySummaryStore(session_factory)
+            _register_history_skill(registry, summary_store, settings)
             loop = AgentLoop(
                 llm_client=llm_client,
                 registry=registry,
@@ -188,6 +193,15 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         prompts=prompt_provider,
                     ),
                     max_processes=settings.max_processes,
+                    compactor=LlmContextCompactor(
+                        store=summary_store,
+                        archive=summary_store,
+                        llm=llm_client,
+                        config=CompactorConfig(
+                            hot_max_chars=settings.context_hot_max_chars,
+                            compact_target_chars=settings.context_compact_target_chars,
+                        ),
+                    ),
                     task_outcome_listener=CronOutcomeReporter(
                         cron_store,
                         retry_limit=settings.cron_retry_limit,
@@ -471,6 +485,23 @@ def _register_memory_skills(
         SkillOrigin.BASIC,
     )
     registry.register(MemoryDeleteSkill(store=store), SkillOrigin.BASIC)
+
+
+def _register_history_skill(
+    registry: SkillRegistry,
+    store: SqlAlchemySummaryStore,
+    settings: Settings,
+) -> None:
+    """Register the archive search skill over the summary store's read ports."""
+    registry.register(
+        HistorySearchSkill(
+            archive=store,
+            summaries=store,
+            default_limit=settings.history_search_default_limit,
+            max_limit=settings.history_search_max_limit,
+        ),
+        SkillOrigin.BASIC,
+    )
 
 
 app = create_app()

@@ -68,7 +68,8 @@ core/                          # библиотека octoforge-core — дом�
                                # instructions_search.py, instruction_save.py, external_call.py,
                                # data_put.py, data_query.py, data_forget.py,
                                # memory_store.py, memory_search.py, memory_delete.py,
-                               # cron_jobs.py (cron_create/list/delete/pause/resume), web_search.py
+                               # cron_jobs.py (cron_create/list/delete/pause/resume), web_search.py,
+                               # history_search.py
     tasks/
       models.py                # Task, TaskKind (RUN), TaskStatus (PENDING|RUNNING|DONE|FAILED|CANCELLED)
       store.py                 # InMemoryTaskStore (реализация порта TaskStore, для тестов)
@@ -117,6 +118,14 @@ core/                          # библиотека octoforge-core — дом�
                                #   MemoryScope (USER|GLOBAL), MemoryNotFoundError
       models.py                # MemoryRow — таблица memories, собственность модуля
       store.py                 # SqlAlchemyMemoryStore (upsert по (owner, key), LIKE-поиск)
+    context/                   # обособленный модуль контекста: компакция нарратива + поиск по архиву
+      api.py                   # граница модуля: ContextCompactor/SummaryStore/MessageArchive
+                               #   (Protocol-порты), DialogueSummary/ArchivedMessage/ArchiveFilter
+      models.py                # SummaryRow — таблица dialog_summaries, собственность модуля
+      store.py                 # SqlAlchemySummaryStore (оба порта: саммари + read-only архив)
+      compactor.py             # LlmContextCompactor (темы + горячий хвост, фоновая компакция
+                               #   с guard'ом на диалог), NoopContextCompactor, CompactorConfig
+      prompts.py               # промпт суммаризации + разбор ответа (TOPICS/SUMMARY)
     cron/                      # обособленный модуль крон-задач (этап F)
       api.py                   # граница модуля: CronStore/CronWaker/Scheduler (Protocol-порты),
                                #   CronJob, ошибки, compute_next_fire/count_missed
@@ -284,10 +293,13 @@ web/                           # приложение octoforge-web — FastAPI-
   (loop, prompts, router, max_processes, task_outcome_listener) + репозитории. Канал для ядра —
   непрозрачная строка; конкретные значения (`"web"`, будущий `"telegram"`) объявляют
   адаптеры в composition root.
-- **Компакция нарратива (дизайн, не реализовано)**: ветка процесса сегодня — копия всего
-  нарратива; целевая многоуровневая модель (архив `messages` + периодические саммари с
-  разметкой тем + горячий хвост) и компонент `ContextCompactor` — в
-  [context.md](context.md).
+- **Компакция нарратива**: ветка процесса собирается компактором из
+  `RunnerConfig.compactor` (порт `ContextCompactor`): блок тем (все саммари
+  диалога одним system-сообщением) + горячий хвост (`seq > max(seq_to)`,
+  дословно); при переполнении хвоста (`OF_CONTEXT_HOT_MAX_CHARS`) стартует
+  фоновая компакция — старейшие сообщения хвоста одним LLM-вызовом в запись
+  `dialog_summaries` (guard «одна компакция на диалог», фейл = warning-лог).
+  Модуль `context/` + скил `history_search` — см. [context.md](context.md).
 
 ### Роутер сообщений (`agent/router.py`)
 

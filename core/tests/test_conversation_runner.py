@@ -35,6 +35,7 @@ from octoforge_core.agent.runner import (
     RunnerConfig,
     TaskOutcomeListener,
 )
+from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
@@ -300,6 +301,7 @@ def make_manager(
         prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: PROMPT}),
         router=resolved.router if resolved.router is not None else FakeRouter(),
         max_processes=resolved.max_processes,
+        compactor=NoopContextCompactor(),
         task_outcome_listener=resolved.listener,
     )
     return ConversationManager(

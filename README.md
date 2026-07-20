@@ -148,6 +148,7 @@ from octoforge_core import (
 from octoforge_core.agent.prompts import StaticPromptProvider
 from octoforge_core.agent.router import LLMRouter
 from octoforge_core.agent.runner import RunnerConfig
+from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.llm.openai import OpenAICompatibleClient
 
 BASE_URL = "https://api.openai.com/v1"
@@ -170,6 +171,7 @@ async def main() -> None:
                     prompts=prompts,
                     router=LLMRouter(llm, timeout_seconds=10.0, prompts=prompts),
                     max_processes=5,
+                    compactor=NoopContextCompactor(),  # без сжатия истории
                 ),
                 dialogs=DialogRepository(session_factory),
                 messages=MessageRepository(session_factory),

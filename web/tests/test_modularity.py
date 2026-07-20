@@ -23,6 +23,7 @@ from octoforge_core.agent.prompts import (
 )
 from octoforge_core.agent.router import ROUTE_TOOL_NAME, LLMRouter
 from octoforge_core.agent.runner import ConversationEvent, ConversationManager, RunnerConfig
+from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
@@ -236,6 +237,7 @@ def build_third_party_root(
             prompts=prompts,
             router=LLMRouter(llm, timeout_seconds=ROUTER_TIMEOUT_SECONDS, prompts=prompts),
             max_processes=MAX_PROCESSES,
+            compactor=NoopContextCompactor(),
         ),
         dialogs=DialogRepository(session_factory),
         messages=MessageRepository(session_factory),

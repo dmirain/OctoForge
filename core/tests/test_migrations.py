@@ -8,6 +8,7 @@ from alembic.runtime.migration import MigrationContext
 from sqlalchemy import Connection, inspect, text
 
 # Importing the models registers every table on Base.metadata for the drift check.
+import octoforge_core.context.models
 import octoforge_core.cron.models
 import octoforge_core.datasets.models
 import octoforge_core.db.models
@@ -32,6 +33,7 @@ EXPECTED_TABLES = frozenset(
         "datasets",
         "dataset_records",
         "memories",
+        "dialog_summaries",
     }
 )
 

@@ -84,7 +84,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "section titles, hyphen-based lists, and fenced code blocks for code. Avoid tables; "
     "when a table is unavoidable, render it inside a code block.\n"
     "13. When the user asks about current events or facts you do not know, look them up "
-    "with the web_search skill and answer from the results, citing the source links."
+    "with the web_search skill and answer from the results, citing the source links.\n"
+    "14. The start of your context holds compressed summaries of earlier topics of this "
+    "conversation; only the recent tail is verbatim. If the user refers to something "
+    "discussed earlier that is not covered by the summaries or the tail, look it up "
+    "with the history_search skill instead of asking the user to repeat it."
 )
 
 ROUTER_SYSTEM_PROMPT = (

@@ -26,6 +26,7 @@ from octoforge_core.agent.router import (
     RouteDecision,
     RouteOp,
 )
+from octoforge_core.context.api import ContextCompactor
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.ports import TaskStore
@@ -130,6 +131,7 @@ class RunnerConfig:
     prompts: PromptProvider
     router: MessageRouter
     max_processes: int
+    compactor: ContextCompactor
     task_outcome_listener: TaskOutcomeListener | None = None
 
 
@@ -150,6 +152,7 @@ class ConversationRunner:
         self._router = config.router
         self._max_processes = config.max_processes
         self._task_outcome_listener = config.task_outcome_listener
+        self._compactor = config.compactor
         self._messages = messages
         self._tasks = tasks
         self._narrative = history
@@ -182,6 +185,7 @@ class ConversationRunner:
             process.control.cancel()
         if self._actor_task is not None:
             self._actor_task.cancel()
+        await self._compactor.aclose()
 
     async def submit(self, content: str) -> None:
         """Submit a user message; the router decides how it maps to processes."""
@@ -348,7 +352,7 @@ class ConversationRunner:
         if self._exceeds_limit(cancelled):
             await self._reject_for_limit(message)
             return
-        self._start_new(title=message.content[:TITLE_MAX_LENGTH])
+        await self._start_new(title=message.content[:TITLE_MAX_LENGTH])
 
     async def _apply_promote(
         self,
@@ -377,9 +381,10 @@ class ConversationRunner:
         )
         await self._publish_system_note(note)
 
-    def _start_new(self, title: str, trail: ChatMessage | None = None) -> None:
-        """Start a foreground process over the current narrative, suspending the old one."""
+    async def _start_new(self, title: str, trail: ChatMessage | None = None) -> None:
+        """Start a foreground process over the compacted narrative, suspending the old one."""
         self._suspend_foreground()
+        narrative = await self._compactor.assemble(self._dialog, self._narrative)
         process = self._create_process(
             process_id=uuid.uuid4().hex,
             title=title,
@@ -389,20 +394,20 @@ class ConversationRunner:
                     role=MessageRole.SYSTEM,
                     content=_with_current_date(self._prompts.get(SYSTEM_PROMPT_NAME)),
                 ),
-                *self._narrative,
+                *narrative,
                 *([trail] if trail is not None else []),
             ],
         )
         self._foreground_id = process.id
 
-    def _start_report_run(self) -> None:
+    async def _start_report_run(self) -> None:
         """Start a foreground run reacting to the latest narrative note (fg is free).
 
         A trailing system note leaves some models without anything to answer
         to (they reason but emit no content), so the run ends with a user-role
         nudge asking for the report.
         """
-        self._start_new(
+        await self._start_new(
             title=REPORT_TITLE,
             trail=ChatMessage(role=MessageRole.USER, content=REPORT_NUDGE),
         )
@@ -571,7 +576,7 @@ class ConversationRunner:
         if foreground is not None:
             foreground.control.inject(note)
         else:
-            self._start_report_run()
+            await self._start_report_run()
 
     async def _persist(self, message: ChatMessage) -> None:
         await self._messages.append(self._dialog.id, message)
