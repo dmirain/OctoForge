@@ -2,9 +2,12 @@
 
 from pathlib import Path
 
+import httpx
 import pytest
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, SYSTEM_PROMPT_NAME
 from octoforge_core.config import EmbeddingBackend
+from octoforge_core.llm.http_reranker import HttpRerankerClient
+from octoforge_core.llm.reranker import CrossEncoderReranker
 
 from octoforge_web.config import (
     DEFAULT_CRON_LEASE_TTL_SECONDS,
@@ -26,6 +29,7 @@ from octoforge_web.config import (
     DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
     Settings,
 )
+from octoforge_web.main import _build_reranker
 
 CUSTOM_TOP_K = 7
 CUSTOM_DATASETS_DEFAULT_LIMIT = 25
@@ -256,3 +260,44 @@ def test_prompt_source_with_unsupported_scheme_fails_fast(
 
     with pytest.raises(ValueError, match="unsupported prompt source"):
         Settings().to_prompt_files()
+
+
+RERANKER_API_URL = "https://rerank.example/v1/rerank"
+
+
+def test_reranker_api_settings_parsed_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_RERANKER_API_KEY", "sf-test-key")
+    monkeypatch.setenv("OF_RERANKER_API_URL", RERANKER_API_URL)
+
+    settings = Settings()
+
+    assert settings.reranker_api_key == "sf-test-key"
+    assert settings.reranker_api_url == RERANKER_API_URL
+
+
+def test_build_reranker_selects_http_backend_with_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OF_RERANKER_MODEL", LOCAL_RERANKER_MODEL)
+    monkeypatch.setenv("OF_RERANKER_API_KEY", "sf-test-key")
+
+    reranker = _build_reranker(Settings(), httpx.AsyncClient())
+
+    assert isinstance(reranker, HttpRerankerClient)
+
+
+def test_build_reranker_falls_back_to_local_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OF_RERANKER_MODEL", LOCAL_RERANKER_MODEL)
+    monkeypatch.delenv("OF_RERANKER_API_KEY", raising=False)
+
+    reranker = _build_reranker(Settings(), httpx.AsyncClient())
+
+    assert isinstance(reranker, CrossEncoderReranker)
+
+
+def test_build_reranker_disabled_without_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OF_RERANKER_MODEL", raising=False)
+
+    assert _build_reranker(Settings(), httpx.AsyncClient()) is None

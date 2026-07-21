@@ -37,6 +37,8 @@ DEFAULT_CRON_REPLAY_LIMIT = 5
 DEFAULT_CRON_RETRY_LIMIT = 3
 DEFAULT_CRON_RETRY_BACKOFF_SECONDS = 60.0
 DEFAULT_RERANKER_MODEL = ""
+DEFAULT_RERANKER_API_URL = "https://api.siliconflow.cn/v1/rerank"
+DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
 DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30.0
 DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS = 1.5
 FILE_SCHEME_PREFIX = "file:"
@@ -65,6 +67,9 @@ class Settings(BaseSettings):
     embedding_batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE
     reranker_model: str = DEFAULT_RERANKER_MODEL
     reranker_candidates: int = DEFAULT_RERANK_CANDIDATES
+    reranker_api_key: str = ""
+    reranker_api_url: str = DEFAULT_RERANKER_API_URL
+    reranker_timeout_seconds: float = DEFAULT_RERANKER_TIMEOUT_SECONDS
     instructions_top_k: int = DEFAULT_INSTRUCTIONS_TOP_K
     external_call_auth_whitelist: list[ExternalCallAuthSettings] = Field(default_factory=list)
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS

@@ -51,6 +51,7 @@ from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.registry import CORE_SYSTEM_SKILLS, sync_system_registry
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
+from octoforge_core.llm.http_reranker import HttpRerankerClient, HttpRerankerConfig
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient, RerankerConfig
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
@@ -122,7 +123,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             instructions = build_instruction_service(
                 SqlAlchemyInstructionStore(session_factory),
                 embedder,
-                reranker=_build_reranker(settings),
+                reranker=_build_reranker(settings, outbound_http),
                 rerank_candidates=settings.reranker_candidates,
             )
             datasets = build_dataset_service(SqlAlchemyDatasetStore(session_factory), embedder)
@@ -307,10 +308,20 @@ def _build_embedder(settings: Settings, http_client: httpx.AsyncClient) -> Embed
     )
 
 
-def _build_reranker(settings: Settings) -> RerankerClient | None:
-    """Build the optional cross-encoder reranker (empty model = disabled)."""
+def _build_reranker(settings: Settings, http_client: httpx.AsyncClient) -> RerankerClient | None:
+    """Build the optional reranker: HTTP backend when an API key is set, else local."""
     if not settings.reranker_model:
         return None
+    if settings.reranker_api_key:
+        return HttpRerankerClient(
+            http_client=http_client,
+            config=HttpRerankerConfig(
+                model=settings.reranker_model,
+                api_key=settings.reranker_api_key,
+                api_url=settings.reranker_api_url,
+                timeout_seconds=settings.reranker_timeout_seconds,
+            ),
+        )
     return CrossEncoderReranker(RerankerConfig(model=settings.reranker_model))
 
 

@@ -94,6 +94,7 @@ core/                          # библиотека octoforge-core — дом�
       local_embeddings.py      # локальный бэкенд эмбеддингов: sentence-transformers bi-encoder
                                #   (как в b2e), L2-нормализация, вычисление в asyncio.to_thread
       reranker.py              # RerankerClient (Protocol-порт) + кросс-энкодер (MPS при наличии)
+      http_reranker.py         # HTTP-бэкенд реранка: SiliconFlow-совместимый POST /rerank
     instructions/              # обособленный модуль инструкций (только хранение/поиск/ранг)
       api.py                   # граница модуля: InstructionService (Protocol), Instruction,
                                #   InstructionType, SearchHit, InstructionNotFoundError,
@@ -479,7 +480,11 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `OF_EMBEDDING_BACKEND`), ранжирование — brute-force cosine + буст точного `title`
   (`ranking.py`, чистые функции; полная формула 70/30 + MMR — позже подменой модуля) +
   опциональный реранк шортлиста кросс-энкодером (`OF_RERANKER_MODEL`; двухстадийная схема
-  как в b2e: cosine-шортлист `rerank_candidates` → cross-encoder → top-k). Если стор
+  как в b2e: cosine-шортлист `rerank_candidates` → cross-encoder → top-k). Бэкенд реранка
+  выбирается в composition root: с `OF_RERANKER_API_KEY` — HTTP-клиент
+  (`llm/http_reranker.py`, SiliconFlow-совместимый POST /rerank: группировка пар по запросу,
+  скоры маппятся обратно по индексу документа), без ключа — локальный кросс-энкодер
+  (`llm/reranker.py`, тяжёлый на CPU). Если стор
   реализует `InstructionVectorSearch`, сервис делегирует ему выбор кандидатов
   (`search_by_vector`) вместо полного скана таблицы; буст и реранк остаются на сервисе.
   `search` инкрементирует `usage_count` возвращённых хитов.
