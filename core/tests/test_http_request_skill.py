@@ -8,13 +8,13 @@ import pytest
 
 from octoforge_core.net.errors import SsrfBlockedError
 from octoforge_core.net.guard import SsrfGuard
-from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.basic.http_request import (
+from octoforge_core.net.tools import (
     MAX_RESPONSE_CHARS,
-    SKILL_NAME,
+    REQUEST_NAME,
     TRUNCATED_SUFFIX,
     HttpRequestSkill,
 )
+from octoforge_core.skills.base import SkillContext
 from octoforge_core.skills.errors import SkillArgumentsError
 
 TARGET_URL = "https://api.example.com/data"
@@ -48,7 +48,7 @@ def test_spec_advertised_to_llm() -> None:
 
     spec = skill.spec
 
-    assert spec.name == SKILL_NAME
+    assert spec.name == REQUEST_NAME
     assert spec.parameters_schema["required"] == ["method", "url"]
 
 

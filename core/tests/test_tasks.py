@@ -3,12 +3,16 @@
 import pytest
 
 from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.basic.task_list import NO_TASKS_MESSAGE, TaskListSkill
-from octoforge_core.skills.basic.task_spawn import NO_SPAWNER_MESSAGE, TaskSpawnSkill
 from octoforge_core.skills.errors import SkillArgumentsError
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.tasks.tools import (
+    NO_SPAWNER_MESSAGE,
+    NO_TASKS_MESSAGE,
+    TaskListSkill,
+    TaskSpawnSkill,
+)
 
 CTX = SkillContext(user_id="user-1", channel="web", dialog_id="dlg-1")
 OTHER_CTX = SkillContext(user_id="user-2", channel="web", dialog_id="dlg-2")

@@ -27,7 +27,7 @@ from octoforge_core.agent.loop import (
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallBroken, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
-from octoforge_core.skills.base import SkillContext, SkillOrigin, SkillSpec
+from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
 
 SKILL_NAME = "fake_skill"
@@ -267,7 +267,7 @@ class GatedSkill:
 
 def make_registry(skill: object) -> SkillRegistry:
     registry = SkillRegistry()
-    registry.register(skill, SkillOrigin.BASIC)
+    registry.register(skill)
     return registry
 
 
@@ -439,8 +439,8 @@ async def test_eager_calls_run_concurrently_history_keeps_call_order() -> None:
         final_reply(),
     )
     registry = SkillRegistry()
-    registry.register(NamedSkill(SLOW_NAME, delay=PAUSE_SECONDS), SkillOrigin.BASIC)
-    registry.register(NamedSkill(FAST_NAME, delay=0.0), SkillOrigin.BASIC)
+    registry.register(NamedSkill(SLOW_NAME, delay=PAUSE_SECONDS))
+    registry.register(NamedSkill(FAST_NAME, delay=0.0))
     loop = AgentLoop(llm_client=llm, registry=registry, max_iterations=3)
     history = [user_message()]
 

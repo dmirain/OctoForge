@@ -37,7 +37,12 @@ from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
-from octoforge_core.instructions.api import EmbeddedInstruction, Instruction, InstructionType
+from octoforge_core.instructions.api import (
+    EmbeddedInstruction,
+    Instruction,
+    InstructionDraft,
+    InstructionType,
+)
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
@@ -74,7 +79,7 @@ ALL_BASIC_SKILLS = {
     "cron_pause",
     "cron_resume",
     "web_search",
-    "instructions_search",
+    "skills_search",
     "instruction_save",
     "external_call",
     "data_put",
@@ -117,29 +122,23 @@ class InMemoryInstructionStore:
         self.records: dict[tuple[str, str], Instruction] = {}
         self.embeddings: dict[str, tuple[float, ...]] = {}
 
-    async def upsert(
-        self,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...],
-        embedding: tuple[float, ...],
-    ) -> Instruction:
+    async def upsert(self, draft: InstructionDraft) -> Instruction:
         now = utc_now()
         record = Instruction(
             id=f"mem-{len(self.records)}",
-            type=kind,
-            title=title,
-            content=content,
-            tags=tags,
+            type=draft.kind,
+            title=draft.title,
+            content=draft.content,
+            tags=draft.tags,
             version=FIRST_VERSION,
             usage_count=0,
             success_count=0,
             created_at=now,
             updated_at=now,
+            system=draft.system,
         )
-        self.records[(kind.value, title)] = record
-        self.embeddings[record.id] = embedding
+        self.records[(draft.kind.value, draft.title)] = record
+        self.embeddings[record.id] = draft.embedding
         return record
 
     async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
@@ -159,6 +158,9 @@ class InMemoryInstructionStore:
 
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
         return self.records.pop((kind.value, title), None) is not None
+
+    async def list_system(self) -> list[Instruction]:
+        return [record for record in self.records.values() if record.system]
 
 
 class FakeSearchProvider:
@@ -291,7 +293,7 @@ async def test_skills_run_over_substituted_ports(
 
     search_output = await registry.get("web_search").execute({"query": SEARCH_QUERY}, CONTEXT)
     assert FAKE_ANSWER in search_output
-    search_hits = await registry.get("instructions_search").execute({"query": SAVED_TITLE}, CONTEXT)
+    search_hits = await registry.get("skills_search").execute({"query": SAVED_TITLE}, CONTEXT)
     assert SAVED_TITLE in search_hits
 
 

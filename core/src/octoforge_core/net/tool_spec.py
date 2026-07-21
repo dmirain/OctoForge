@@ -1,6 +1,6 @@
-"""Parsing of tool instruction records into executable specs.
+"""Parsing of endpoint instruction records into executable specs.
 
-A tool record's `content` is a JSON document, e.g.:
+An endpoint record's `content` is a JSON document, e.g.:
 
     {"method": "GET",
      "url_template": "https://wttr.in/{city}?format=j2",
@@ -32,7 +32,7 @@ class ToolParamSpec:
 
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
-    """Executable view of a tool instruction record.
+    """Executable view of an endpoint instruction record.
 
     `auth` is informational only: internal authorization is injected by the
     executor from the composition-root whitelist, never from the record.
@@ -45,7 +45,7 @@ class ToolSpec:
 
 
 def parse_tool_spec(content: str) -> ToolSpec:
-    """Parse and validate a tool record's JSON content."""
+    """Parse and validate an endpoint record's JSON content."""
     data = _load_json(content)
     method = _parse_method(data.get("method"))
     url_template = _parse_url_template(data.get("url_template"))

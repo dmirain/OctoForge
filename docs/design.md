@@ -59,25 +59,20 @@ core/                          # библиотека octoforge-core — дом�
       router.py                # MessageRouter (Protocol), RouteAction/RouteOp/RouteDecision,
                                #   ProcessInfo/ProcessPlace, LLMRouter (one-shot tool call, таймаут, фолбэк)
       prompts.py               # порты промптов: PromptProvider (Protocol) + StaticPromptProvider
-                               #   поверх вшитых DEFAULT_SYSTEM_PROMPT (answer-first, task_spawn,
-                               #   уведомления, instructions_search / external_call / instruction_save,
-                               #   data_put / data_query / data_forget,
-                               #   memory_store / memory_search / memory_delete, крон, web_search)
-                               #   и ROUTER_SYSTEM_PROMPT; имена SYSTEM/ROUTER_PROMPT_NAME
+                               #   поверх вшитых DEFAULT_SYSTEM_PROMPT (мета-правила: answer-first,
+                               #   skills_search на непокрытый интент, instruction_save, формат
+                               #   мессенджера) и ROUTER_SYSTEM_PROMPT (роутинг + searches
+                               #   пре-поиска); имена SYSTEM/ROUTER_PROMPT_NAME
       runner.py                # ConversationRunner (актор: нарратив + процессы fg/bg, bound
                                #   TaskSpawner, wake для крон-выстрелов, порт
                                #   TaskOutcomeListener для исходов cron-задач),
                                #   ConversationManager, RunnerConfig, ConversationEvent
-    skills/
-      base.py                  # Skill (Protocol), SkillSpec, SkillOrigin (BASIC|DYNAMIC),
-                               #   SkillContext (+ опциональный task_spawner)
+    skills/                    # фреймворк тулов; реализации — в доменных модулях:
+                               #   cron/tools.py, memory/tools.py, datasets/tools.py,
+                               #   context/tools.py, tasks/tools.py, search/tools.py,
+                               #   net/tools.py, instructions/tools.py
+      base.py                  # Skill (Protocol), SkillSpec, SkillContext (+ опциональный task_spawner)
       registry.py, errors.py   # реестр + ошибки
-      basic/                   # http_request.py, task_spawn.py, task_list.py,
-                               # instructions_search.py, instruction_save.py, external_call.py,
-                               # data_put.py, data_query.py, data_forget.py,
-                               # memory_store.py, memory_search.py, memory_delete.py,
-                               # cron_jobs.py (cron_create/list/delete/pause/resume), web_search.py,
-                               # history_search.py
     tasks/
       models.py                # Task, TaskKind (RUN), TaskStatus (PENDING|RUNNING|DONE|FAILED|CANCELLED)
       store.py                 # InMemoryTaskStore (реализация порта TaskStore, для тестов)
@@ -109,7 +104,10 @@ core/                          # библиотека octoforge-core — дом�
       ranking.py               # чистые функции: cosine + буст точного title + реранк-мерж
       local.py                 # LocalInstructionService — локальная реализация фасада
                                #   (store инъектируется; vector-capable store → search_by_vector)
-      seed.py                  # SEED_INSTRUCTIONS + seed_if_empty (generic http tool + скилы-примеры)
+      registry.py              # SystemSkill + CORE_SYSTEM_SKILLS (8 системных сценариев)
+                               #   + sync_system_registry (синк системной части стора при старте)
+      presearch.py             # InstructionPresearch — пре-поиск скилов по searches роутера
+      tools.py                 # skills_search (полные сценарии в выдаче) + instruction_save
     datasets/                  # обособленный модуль датасетов (per-user трекеры, этап C)
       api.py                   # граница модуля: DatasetService (Protocol), Dataset, DatasetRecord,
                                #   DatasetSchema/FieldType, DatasetHit, ошибки модуля,
@@ -206,7 +204,7 @@ web/                           # приложение octoforge-web — FastAPI-
     static/index.html          # чат-UI: SSE-стрим, шаги скилов, маркеры процессов,
                                #   кнопка «Стоп», поле имени (= user_id)
   tests/                       # test_dialog_api.py, test_cron_api.py, test_sse.py, test_config.py,
-                               # test_seed.py, test_prompts.py, test_modularity.py,
+                               # test_system_skills.py, test_prompts.py, test_modularity.py,
                                # test_telegram_models.py, test_telegram_bridge.py,
                                # test_telegram_poller.py, test_telegram_client.py,
                                # test_telegram_standalone.py, test_telegram_markdown.py
@@ -360,22 +358,16 @@ CANCEL/PROMOTE). Пустой пакет — passthrough (актор тракт�
 `RunnerConfig` держит провайдер (а не строку): системный промпт подставляется в ветку
 процесса при старте с суффиксом текущей даты UTC (`_with_current_date`).
 
-Текст вшитого `DEFAULT_SYSTEM_PROMPT`: отвечать «сначала суть, потом детали» (прерывание полезно),
-работа «в фоне прямо сейчас» (результат один раз, когда готов) → `task_spawn` и продолжить
-диалог, при system-уведомлении о задаче — коротко
-сообщить результат, для HTTP — `http_request`, статусы задач — `task_list`; перед
-нетривиальной задачей — `instructions_search` (знания/сценарии/тулы/датасеты), вызов найденных
-тулов — через `external_call`, после нового многошагового сценария — сохранить его
-через `instruction_save`; трекинг структурированных данных (еда, вес, привычки) —
-датасеты: искать через `instructions_search`, писать через `data_put` (создавая датасет
-со схемой при отсутствии), читать/строить отчёты через `data_query`, удалять через `data_forget`;
-просьбы «по расписанию/периодически/напоминай» (включая разовые «через час») — скил
-`cron_create` (cron-выражение составить самому, таймзону уточнить или взять UTC; разовые —
-`one_shot=true` с датированным выражением, задача удалится сама после срабатывания;
-явная граница с `task_spawn`: напоминания — только крон), управление — `cron_list`/`cron_pause`/
-`cron_resume`/`cron_delete`, подтвердив создание пользователю; факты из веба — скил
-`web_search`; разметка ответов — простая (`**bold**` для акцентов и заголовков, списки
-дефисом, код в fenced-блоках, таблицы избегать) — рендерится и в web, и в Telegram.
+Текст вшитого `DEFAULT_SYSTEM_PROMPT` — только мета-правила: отвечать «сначала суть,
+потом детали» (прерывание полезно); не импровизировать применение тулов — следовать
+сценариям из контекста, а на непокрытый интент сначала вызвать `skills_search`; при
+system-уведомлении о фоновой задаче — коротко сообщить результат; после нового
+многошагового сценария — сохранить его через `instruction_save`; разметка ответов —
+простая (`**bold**` для акцентов и заголовков, списки дефисом, код в fenced-блоках,
+таблицы избегать) — рендерится и в web, и в Telegram. Пер-туловая методика
+(крон, фон, память, датасеты, история, веб, внешние вызовы) живёт в системных
+сценариях реестра (`instructions/registry.py`, см. [instructions.md](instructions.md))
+и попадает в контекст поиском (`skills_search`) и пре-поиском роутера.
 
 ### Стриминг LLM (`llm/openai.py`)
 
@@ -420,20 +412,22 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 
 ## Скилы
 
-> **Модель уточнена**: скилы стали одним из типов инструкций в общем хранилище (знание/скил/тул)
-> с векторным поиском — см. [instructions.md](instructions.md). Типизация BASIC/DYNAMIC отменена;
-> раздел ниже описывает состояние на момент реализации.
+> **Модель v3** ([instructions.md](instructions.md)): встроенные функции кода — тулы
+> (кодовые имена `Skill`/`SkillSpec` пока сохраняются), «скил» — сценарий в сторе
+> инструкций, «инструкция типа tool» — эндпоинт. Раздел ниже — про фреймворк тулов.
 
-Скил — единица, которую агент вызывает через LLM tool calling. Два типа:
-
-- **Базовые (`SkillOrigin.BASIC`)** — код проекта (`octoforge_core/skills/basic/`): `http_request`,
-  `task_spawn`, `task_list`, `instructions_search`, `instruction_save`, `external_call`,
-  `data_put`, `data_query`, `data_forget`, `memory_store`, `memory_search`, `memory_delete`,
-  `cron_create`, `cron_list`, `cron_delete`, `cron_pause`, `cron_resume`, `web_search`.
-  Подключаются в composition root. Имена скилов — с подчёркиваниями, не с точками:
-  точки в function-name несовместимы с OpenAI tool-calling (зафиксированное решение).
-- **Динамические (`SkillOrigin.DYNAMIC`)** — Jinja-шаблоны из БД (появятся с БД). Реестр един:
-  `SkillRegistry` хранит скилы обоих типов под уникальными именами.
+Скил — единица, которую агент вызывает через LLM tool calling (в терминологии модели
+v3 — тул; переименование кода отложено). Реализации живут в доменных модулях
+(`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`,
+`tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`):
+`http_request`, `task_spawn`, `task_list`, `skills_search`, `instruction_save`,
+`external_call`, `data_put`, `data_query`, `data_forget`, `memory_store`,
+`memory_search`, `memory_delete`, `cron_create`, `cron_list`, `cron_delete`,
+`cron_pause`, `cron_resume`, `web_search`, `history_search`.
+Подключаются в composition root. Имена скилов — с подчёркиваниями, не с точками:
+точки в function-name несовместимы с OpenAI tool-calling (зафиксированное решение).
+`SkillOrigin` упразднён: `SkillRegistry` хранит скилы под уникальными именами
+без деления на типы.
 
 Абстракция (`skills/base.py`): `SkillSpec` (name, description, parameters_schema — JSON Schema);
 `Skill` (Protocol): `spec` + `async execute(arguments, context) -> str`;
@@ -489,9 +483,12 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   реализует `InstructionVectorSearch`, сервис делегирует ему выбор кандидатов
   (`search_by_vector`) вместо полного скана таблицы; буст и реранк остаются на сервисе.
   `search` инкрементирует `usage_count` возвращённых хитов.
-  Сидирование `seed_if_empty` (generic weather tool + два скила-примера) — в lifespan;
-  запускается при `embeddings_configured()` (local-бэкенд или заданный ключ); падение
-  сидирования не роняет старт — warning в лог, приложение работает без сидов.
+  Системная часть стора — декларативный реестр (`CORE_SYSTEM_SKILLS` core + прикладные
+  пакеты установщика, у web — `WEB_SYSTEM_SKILLS` с погодным примером): синк
+  `sync_system_registry` в lifespan upsert'ит записи как `system=true` (усыновляя
+  легаси-записи) и удаляет системные записи, исчезнувшие из реестра; пользовательские
+  записи (`system=false`) не трогает. Запускается при `embeddings_configured()`
+  (local-бэкенд или заданный ключ); падение синка не роняет старт — warning в лог.
 - **Исполнение — вне модуля** (`net/`): `ExternalCallExecutor` читает tool-запись через
   `get_by_name`, парсит `ToolSpec` (JSON: method, url_template, params_schema, auth),
   валидирует параметры по схеме (required присутствуют, неизвестные запрещены), рендерит
@@ -505,9 +502,10 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `ExternalCallExecutor` и в скиле `http_request` (там тоже `follow_redirects=False` —
   поведение не изменилось, httpx и раньше не следовал редиректам по умолчанию). Известное
   ограничение TOCTOU/DNS-rebinding задокументировано в docstring гварда.
-- **Рантайм-скилы** — тонкие адаптеры: `instructions_search(query, k?)` (k по умолчанию —
-  `OF_INSTRUCTIONS_TOP_K`), `instruction_save(type, title, content, tags?)`,
-  `external_call(name, params?)`.
+- **Рантайм-скилы** — тонкие адаптеры (`instructions/tools.py`): `skills_search(query, k?)`
+  (k по умолчанию — `OF_INSTRUCTIONS_TOP_K`; ответ — полные сценарии, без сниппетов),
+  `instruction_save(type, title, content, tags?)` (системные записи защищены:
+  `SystemInstructionError`), `external_call(name, params?)` (`net/tools.py`).
 
 ## Датасеты пользовательских данных (этап C)
 
@@ -538,7 +536,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `data_query(dataset, equals?, date_from?, date_to?, limit?)` (date-only = весь день
   UTC; лимиты `OF_DATASETS_QUERY_DEFAULT_LIMIT`/`OF_DATASETS_QUERY_MAX_LIMIT`),
   `data_forget(dataset)` (явный каскад DELETE записей, ответ — счётчик).
-- **Дескрипторы в `instructions_search`**: скилу передан `DatasetService` (опциональный
+- **Дескрипторы в `skills_search`**: скилу передан `DatasetService` (опциональный
   параметр конструктора), хиты обоих фасадов сливаются по убыванию score; датасеты
   форматируются как `[dataset] <name>` со сниппетом description + списком полей.
 
@@ -628,7 +626,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   темплейт `{user_id}` (подстановка из `SkillContext.user_id`; вызов без user_id → без
   заголовка); скил `external_call` передаёт `context.user_id`. В whitelist composition
   root программно добавляется запись `(self_base_url, "X-User-Id", "{user_id}")`.
-- **Нативные скилы** (`skills/basic/cron_jobs.py`): `cron_create`/`cron_list`/
+- **Нативные скилы** (`cron/tools.py`): `cron_create`/`cron_list`/
   `cron_delete`/`cron_pause`/`cron_resume` над `CronStore` — семантика HTTP-эндпоинтов
   (owner-скоуп, resume пересчитывает `next_fire_at` от now), но без loopback-вызовов:
   работают и в standalone Telegram-раннере. Регистрируются в composition root на всех
@@ -637,11 +635,10 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   query string): `POST /jobs` (201; валидация schedule через croniter и timezone через
   zoneinfo → 422 с detail; `next_fire_at` от now), `GET /jobs`, `DELETE /jobs/{id}`
   (204; чужая/нет → 404), `POST /jobs/{id}/pause|resume`. Остаётся для внешних клиентов.
-- **Сид**: `migrate_cron_tools_to_native(service)` — удаляет HTTP-сид-тулы крона
-  (`cron_create_job` и др.) через `InstructionService.delete` и обновляет скил-сценарий
-  `schedule_a_recurring_report` на нативные скилы; идемпотентна, вызов в lifespan под
-  тем же условием рабочих эмбеддингов.
-- **Промпт**: правило 11 — см. «Системный промпт».
+- **Системный реестр**: HTTP-сид-тулы крона удалены синком `sync_system_registry`
+  (их нет в реестре — системные записи вне реестра стираются); нативный сценарий
+  крона — системный скил `cron_jobs` в `CORE_SYSTEM_SKILLS`.
+- **Промпт**: пер-туловые правила вынесены в системные сценарии — см. «Системный промпт».
 
 ## Telegram-адаптер (этап G)
 
@@ -836,7 +833,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   до 500
 - `core/tests/test_cron_skills.py` — скилы cron_*: create (one_shot-флаг, дедуп тройки
   → «already exists»), list с `last run`/`retry #N`, delete/pause/resume, owner-изоляция
-- `core/tests/test_instruction_skills.py` — адаптеры `instructions_search`/`instruction_save`/
+- `core/tests/test_instruction_skills.py` — адаптеры `skills_search`/`instruction_save`/
   `external_call` (валидация аргументов + happy path на фейках)
 - `core/tests/test_datasets.py` — контрактный набор фасада DatasetService на `:memory:`
   (create/get, дубликат имени, одно имя у разных owner'ов, изоляция, query: equals с
@@ -847,7 +844,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - `core/tests/test_data_skills.py` — `data_put` (создание со schema+description, отказ без
   них, запись в существующий, нарушения схемы текстом), `data_query` (JSON-строки, фильтры,
   лимиты, date-only границы, not-found текстом), `data_forget` (счётчик, not-found),
-  `instructions_search` с datasets (merged-выдача с `[dataset]`)
+  `skills_search` с datasets (merged-выдача с `[dataset]`)
 - `core/tests/test_memory.py` — контрактный набор порта MemoryStore на `:memory:` (put
   create/upsert с сохранением id и бампом updated_at, get, изоляция owner'ов, глобальный
   скоуп виден всем, повторный put глобального ключа без дублей, delete, search: подстрока

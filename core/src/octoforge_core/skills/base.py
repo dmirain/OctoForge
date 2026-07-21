@@ -1,17 +1,9 @@
-"""Skill abstraction shared by basic and dynamic skills."""
+"""Skill abstraction shared by all code tools."""
 
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Any, Protocol
 
 from octoforge_core.tasks.spawner import TaskSpawner
-
-
-class SkillOrigin(StrEnum):
-    """Where a skill implementation comes from."""
-
-    BASIC = "basic"
-    DYNAMIC = "dynamic"
 
 
 @dataclass(frozen=True, slots=True)

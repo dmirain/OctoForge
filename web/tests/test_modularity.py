@@ -48,6 +48,7 @@ from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
     Instruction,
+    InstructionDraft,
     InstructionService,
     InstructionType,
 )
@@ -85,6 +86,7 @@ WAIT_TIMEOUT_SECONDS = 2.0
 POLL_SECONDS = 0.01
 FIRST_CALL = 1
 SECOND_CALL = 2
+ROUTER_CALLS_TWO = 2
 FIRST_VERSION = 1
 
 
@@ -102,29 +104,23 @@ class InMemoryInstructionStore:
         self.records: dict[tuple[str, str], Instruction] = {}
         self.embeddings: dict[str, tuple[float, ...]] = {}
 
-    async def upsert(
-        self,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...],
-        embedding: tuple[float, ...],
-    ) -> Instruction:
+    async def upsert(self, draft: InstructionDraft) -> Instruction:
         now = utc_now()
         record = Instruction(
             id=f"mem-{len(self.records)}",
-            type=kind,
-            title=title,
-            content=content,
-            tags=tags,
+            type=draft.kind,
+            title=draft.title,
+            content=draft.content,
+            tags=draft.tags,
             version=FIRST_VERSION,
             usage_count=0,
             success_count=0,
             created_at=now,
             updated_at=now,
+            system=draft.system,
         )
-        self.records[(kind.value, title)] = record
-        self.embeddings[record.id] = embedding
+        self.records[(draft.kind.value, draft.title)] = record
+        self.embeddings[record.id] = draft.embedding
         return record
 
     async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
@@ -144,6 +140,9 @@ class InMemoryInstructionStore:
 
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
         return self.records.pop((kind.value, title), None) is not None
+
+    async def list_system(self) -> list[Instruction]:
+        return [record for record in self.records.values() if record.system]
 
 
 class FakeSearchProvider:
@@ -168,7 +167,7 @@ class RootLLM:
     complete() serves the router (always inject); stream() drives the dialog:
     the first call waits on a gate (so the second user message meets an active
     process and exercises the router), then asks for web_search, then for
-    instructions_search, then finishes with the final reply.
+    skills_search, then finishes with the final reply.
     """
 
     def __init__(self) -> None:
@@ -206,7 +205,7 @@ class RootLLM:
             yield StreamFinished(message=_tool_call("call-search", "web_search", SEARCH_QUERY))
         elif call_number == SECOND_CALL:
             yield StreamFinished(
-                message=_tool_call("call-instructions", "instructions_search", SAVED_TITLE)
+                message=_tool_call("call-instructions", "skills_search", SAVED_TITLE)
             )
         else:
             yield LlmTextDelta(text=FINAL_REPLY)
@@ -353,7 +352,8 @@ async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     await runner.submit(FIRST_QUESTION)
     await wait_until(lambda: len(root.llm.stream_requests) == 1)
     await runner.submit(SECOND_QUESTION)
-    await wait_until(lambda: len(root.llm.complete_requests) == 1)
+    # the router runs on every message (pre-search): first question, then second
+    await wait_until(lambda: len(root.llm.complete_requests) == ROUTER_CALLS_TWO)
     root.llm.first_stream_gate.set()
     events = await collect_until_terminal(queue)
 
@@ -361,10 +361,13 @@ async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     first_system = root.llm.stream_requests[0][0]
     assert first_system.role is MessageRole.SYSTEM
     assert first_system.content.startswith(CUSTOM_SYSTEM_PROMPT)
-    # the router prompt came from the installer's file too
-    router_system = root.llm.complete_requests[0][0]
+    # the router prompt came from the installer's file too (first message = pre-search)
+    first_router_system, first_router_user = root.llm.complete_requests[0]
+    assert "CUSTOM ROUTER PROMPT FROM FILE" in first_router_system.content
+    assert first_router_user == ChatMessage(role=MessageRole.USER, content=FIRST_QUESTION)
+    # the second router call lists the first question's process in its system message
+    router_system = root.llm.complete_requests[1][0]
     assert router_system.role is MessageRole.SYSTEM
-    assert "CUSTOM ROUTER PROMPT FROM FILE" in router_system.content
     assert FIRST_QUESTION in router_system.content
     # the skills ran over the substituted provider and instruction store
     outputs = tool_outputs(events)

@@ -1,4 +1,4 @@
-"""Basic skills managing the caller's cron jobs directly, without the HTTP API.
+"""Tools managing the caller's cron jobs directly, without the HTTP API.
 
 These replace the seeded HTTP tool records (`cron_create_job` etc.) that made
 the agent call our own loopback API through `external_call`: the skills work

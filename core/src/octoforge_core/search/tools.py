@@ -1,4 +1,4 @@
-"""Basic skill that searches the web through an injected SearchProvider."""
+"""Tool that searches the web through an injected SearchProvider."""
 
 from typing import Any
 

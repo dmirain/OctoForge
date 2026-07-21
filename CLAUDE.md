@@ -46,20 +46,20 @@ The dialog is an actor, not a request/response handler:
 
 ### Skills
 
-`Skill` / `SkillSpec` / `SkillContext` / `SkillRegistry`, kinds `BASIC | DYNAMIC`. Basic skills live in `core/src/octoforge_core/skills/basic/` and are registered in the composition root. Notable ones: `http_request`, `external_call` (over DB tool-records, behind the `SsrfGuard`), `instructions_search` / `instruction_save`, `data_put` / `data_query` / `data_forget`, `memory_store` / `memory_search` / `memory_delete`, `cron_create` / `cron_list` / `cron_delete` / `cron_pause` / `cron_resume`, `web_search` (serper.dev, only when `OF_SERPER_TOKEN` is set).
+`Skill` / `SkillSpec` / `SkillContext` / `SkillRegistry` (no origin kinds — `SkillOrigin` was removed). The `skills/` package is framework only; tool implementations live in their domain modules (`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`, `tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`) and are registered in the composition root. Notable ones: `http_request`, `external_call` (over DB endpoint-records, behind the `SsrfGuard`), `skills_search` / `instruction_save`, `data_put` / `data_query` / `data_forget`, `memory_store` / `memory_search` / `memory_delete`, `cron_create` / `cron_list` / `cron_delete` / `cron_pause` / `cron_resume`, `web_search` (serper.dev, only when `OF_SERPER_TOKEN` is set).
 
 ### Self-contained domain modules
 
 Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQL-backed implementation:
 
-- `instructions/` — knowledge/skills/tools in the `instructions` table; cosine ranking + exact-title boost + optional cross-encoder rerank of the shortlist; seeded on startup.
-- `datasets/` — user data (`datasets` / `dataset_records`), JSON-schema validation, owner isolation at the SQL level; descriptors also feed `instructions_search`.
+- `instructions/` — knowledge/skill/endpoint records in the `instructions` table; cosine ranking + exact-title boost + optional cross-encoder rerank of the shortlist. The system-owned slice (`system` flag) is a declarative registry (`CORE_SYSTEM_SKILLS` in core, `WEB_SYSTEM_SKILLS` in web) synced at startup; agent-facing save/delete refuse system records.
+- `datasets/` — user data (`datasets` / `dataset_records`), JSON-schema validation, owner isolation at the SQL level; descriptors also feed `skills_search`.
 - `memory/` — key/value memories, `user_id` NULL = global scope, LIKE search over "own + global".
 - `cron/` — `CronScheduler` asyncio loop with CAS lease (`lease_ttl`), coalescing missed fires; a fire calls `ConversationManager.wake` → a background process. See `docs/cron.md`.
 
 ### Embeddings / reranker (optional but needed for instructions & datasets)
 
-`EmbeddingClient` port has two backends chosen by `OF_EMBEDDING_BACKEND`: local sentence-transformers (`llm/local_embeddings.py`) or an OpenAI-compatible HTTP endpoint (`llm/embeddings.py`). Optional cross-encoder `RerankerClient` (`llm/reranker.py`). Without a working backend the app still starts (seeding is skipped), but instruction/dataset search & save are unavailable.
+`EmbeddingClient` port has two backends chosen by `OF_EMBEDDING_BACKEND`: local sentence-transformers (`llm/local_embeddings.py`) or an OpenAI-compatible HTTP endpoint (`llm/embeddings.py`). Optional cross-encoder `RerankerClient` (`llm/reranker.py`). Without a working backend the app still starts (the registry sync is skipped), but instruction/dataset search & save are unavailable.
 
 ### Telegram surface
 

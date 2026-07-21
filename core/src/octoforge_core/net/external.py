@@ -1,9 +1,9 @@
-"""Executor of external calls described by tool instruction records.
+"""Executor of external calls described by endpoint instruction records.
 
-Core-side execution: the instructions module only stores/searches/ranks tool
-records; this executor reads them through the `InstructionService` facade,
-validates and renders the URL, applies the SSRF guard and the composition-root
-auth whitelist, and performs the HTTP request.
+Core-side execution: the instructions module only stores/searches/ranks
+endpoint records; this executor reads them through the `InstructionService`
+facade, validates and renders the URL, applies the SSRF guard and the
+composition-root auth whitelist, and performs the HTTP request.
 """
 
 from dataclasses import dataclass
@@ -45,7 +45,7 @@ class ExternalCallResult:
 
 
 class ExternalCallExecutor:
-    """Executes tool records fetched through the instructions facade."""
+    """Executes endpoint records fetched through the instructions facade."""
 
     def __init__(
         self,
@@ -67,8 +67,8 @@ class ExternalCallExecutor:
         params: dict[str, str],
         user_id: str | None = None,
     ) -> ExternalCallResult:
-        """Run the tool call `name` with validated params and return status + body."""
-        instruction = await self._service.get_by_name(name, InstructionType.TOOL)
+        """Run the endpoint call `name` with validated params and return status + body."""
+        instruction = await self._service.get_by_name(name, InstructionType.ENDPOINT)
         spec = parse_tool_spec(instruction.content)
         validated = _validate_params(spec, params)
         url = _render_url(spec, validated)

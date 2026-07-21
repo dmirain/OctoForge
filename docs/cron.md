@@ -23,7 +23,7 @@
 Подсистема приложения (обособленный модуль `octoforge_core/cron/`; вынос в отдельный
 процесс возможен без смены механизмов — порты `CronStore`/`CronWaker` транспортной
 формы): таблица `cron_jobs`, цикл планировщика, HTTP API для внешних клиентов. Для
-агента — нативные базовые скилы `cron_*` (`skills/basic/cron_jobs.py`), работающие на
+агента — нативные базовые скилы `cron_*` (`cron/tools.py`), работающие на
 любой поверхности, включая standalone Telegram-раннер без HTTP-слушателя.
 
 Сам движок планирования тоже за портом: `Scheduler` (`cron/api.py`,
@@ -135,9 +135,9 @@
 - **Query-param API** — у `external_call` нет тела запроса.
 - **In-process wake в standalone** — HTTP wake endpoint и служебные токены отложены
   до аутентификации.
-- **Миграция сидов** `migrate_cron_tools_to_native(service)` — удаляет HTTP-сид-тулы
-  и обновляет скил-сценарий `schedule_a_recurring_report` (сравнение контента →
-  существующие БД получают текст про one-shot при рестарте); идемпотентна.
+- **Миграция сидов** — упразднена вместе с `seed.py`: HTTP-сид-тулы крона стирает
+  синк системного реестра (`sync_system_registry`), а сценарий живёт в системном
+  скиле `cron_jobs` (`CORE_SYSTEM_SKILLS`).
 - **Конфиг**: `OF_SELF_BASE_URL`, `OF_CRON_POLL_INTERVAL_SECONDS`,
   `OF_CRON_LEASE_TTL_SECONDS`, `OF_CRON_REPLAY_LIMIT`, `OF_CRON_RETRY_LIMIT` (3),
   `OF_CRON_RETRY_BACKOFF_SECONDS` (60).

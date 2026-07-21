@@ -28,6 +28,7 @@ from octoforge_core import (
     build_external_executor,
     build_instruction_service,
     build_llm_client,
+    build_presearch,
     build_router,
     build_runner_config,
     build_skill_registry,
@@ -47,7 +48,7 @@ from octoforge_core.cron.waker import ManagerCronWaker
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
-from octoforge_core.instructions.seed import migrate_cron_tools_to_native, seed_if_empty
+from octoforge_core.instructions.registry import CORE_SYSTEM_SKILLS, sync_system_registry
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
@@ -65,6 +66,7 @@ from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
+from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
 from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_web.telegram.poller import TelegramBridgeRegistry, TelegramPoller
@@ -124,7 +126,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 rerank_candidates=settings.reranker_candidates,
             )
             datasets = build_dataset_service(SqlAlchemyDatasetStore(session_factory), embedder)
-            await _seed_instructions(instructions, settings)
+            await _sync_system_skills(instructions, settings)
             # The app's own base URL is allowlisted so tool records can
             # target our loopback HTTP API (cron jobs) past the SSRF guard.
             guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
@@ -187,6 +189,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                             retry_limit=settings.cron_retry_limit,
                             backoff_base_seconds=settings.cron_retry_backoff_seconds,
                         ),
+                        presearch=build_presearch(instructions),
                     ),
                 ),
                 dialogs=dialogs,
@@ -271,23 +274,22 @@ async def _bootstrap_schema(engine: AsyncEngine) -> None:
         await init_db(engine)
 
 
-async def _seed_instructions(instructions: InstructionService, settings: Settings) -> None:
-    """Seed the baseline records and migrate cron tools when embeddings work.
+async def _sync_system_skills(instructions: InstructionService, settings: Settings) -> None:
+    """Sync the declarative system registry into the store when embeddings work.
 
-    Seeding needs working embeddings; when no usable backend is configured it
-    is skipped so the app still starts (embeddings stay optional until the
-    first instructions_search/save call). A failing embeddings backend or
-    database must not take the app down: log a warning and start without the
-    baseline records (seeding retries on the next restart).
+    The sync needs working embeddings (every upsert recomputes one); when no
+    usable backend is configured it is skipped so the app still starts
+    (embeddings stay optional until the first skills_search/save call). A
+    failing embeddings backend or database must not take the app down: log a
+    warning and start without the sync (it retries on the next restart).
     """
     if not settings.embeddings_configured():
         return
     try:
-        await seed_if_empty(instructions)
-        await migrate_cron_tools_to_native(instructions)
+        await sync_system_registry(instructions, CORE_SYSTEM_SKILLS + WEB_SYSTEM_SKILLS)
     except (httpx.HTTPError, LLMResponseError, SQLAlchemyError):
         logger.warning(
-            "Instruction seeding failed; starting without baseline records",
+            "System skill registry sync failed; starting without it",
             exc_info=True,
         )
 

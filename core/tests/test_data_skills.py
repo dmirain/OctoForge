@@ -1,4 +1,4 @@
-"""Tests for the dataset runtime skills and the merged instructions_search."""
+"""Tests for the dataset runtime skills and the merged skills_search."""
 
 import json
 from collections.abc import AsyncIterator
@@ -20,20 +20,18 @@ from octoforge_core.datasets.api import (
 )
 from octoforge_core.datasets.service import LocalDatasetService
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
+from octoforge_core.datasets.tools import DataForgetSkill, DataPutSkill, DataQuerySkill
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
     Instruction,
     InstructionType,
     SearchHit,
 )
-from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.basic.data_forget import DataForgetSkill
-from octoforge_core.skills.basic.data_put import DataPutSkill
-from octoforge_core.skills.basic.data_query import DataQuerySkill
-from octoforge_core.skills.basic.instructions_search import (
+from octoforge_core.instructions.tools import (
     NO_HITS_MESSAGE,
-    InstructionsSearchSkill,
+    SkillsSearchSkill,
 )
+from octoforge_core.skills.base import SkillContext
 from octoforge_core.skills.errors import SkillArgumentsError
 from octoforge_core.time import utc_now
 
@@ -378,7 +376,7 @@ async def test_forget_invalid_arguments_rejected(
         await skill.execute(arguments, CTX)
 
 
-# --- instructions_search with datasets --------------------------------------
+# --- skills_search with datasets --------------------------------------
 
 HIT = SearchHit(
     instruction=Instruction(
@@ -492,7 +490,7 @@ class FakeDatasetService:
 
 async def test_search_merges_and_orders_dataset_hits() -> None:
     datasets = FakeDatasetService(hits=[DATASET_HIT])
-    skill = InstructionsSearchSkill(
+    skill = SkillsSearchSkill(
         service=FakeInstructionService(hits=[HIT]),
         default_k=DEFAULT_K,
         datasets=datasets,
@@ -510,7 +508,7 @@ async def test_search_merges_and_orders_dataset_hits() -> None:
 
 async def test_search_dataset_hits_only() -> None:
     datasets = FakeDatasetService(hits=[DATASET_HIT])
-    skill = InstructionsSearchSkill(
+    skill = SkillsSearchSkill(
         service=FakeInstructionService(),
         default_k=DEFAULT_K,
         datasets=datasets,
@@ -522,6 +520,6 @@ async def test_search_dataset_hits_only() -> None:
 
 
 async def test_search_without_datasets_service_unchanged() -> None:
-    skill = InstructionsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
+    skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     assert await skill.execute({"query": "nothing"}, CTX) == NO_HITS_MESSAGE

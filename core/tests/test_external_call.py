@@ -23,8 +23,8 @@ from octoforge_core.net.external import (
 )
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tool_spec import parse_tool_spec
+from octoforge_core.net.tools import ExternalCallSkill
 from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.basic.external_call import ExternalCallSkill
 
 PUBLIC_IP = "93.184.216.34"
 PRIVATE_IP = "10.0.0.1"
@@ -78,7 +78,7 @@ class FakeInstructionService:
             raise InstructionNotFoundError(name)
         return Instruction(
             id=f"id-{name}",
-            type=InstructionType.TOOL,
+            type=InstructionType.ENDPOINT,
             title=name,
             content=self._records[name],
             tags=(),

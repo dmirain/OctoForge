@@ -14,49 +14,47 @@ import httpx
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.prompts import PromptProvider
 from octoforge_core.agent.router import LLMRouter, MessageRouter
-from octoforge_core.agent.runner import ConversationManager, RunnerConfig, TaskOutcomeListener
+from octoforge_core.agent.runner import (
+    ConversationManager,
+    PresearchPort,
+    RunnerConfig,
+    TaskOutcomeListener,
+)
 from octoforge_core.config import LLMConfig
 from octoforge_core.context.api import ContextCompactor, MessageArchive, SummaryStore
 from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
+from octoforge_core.context.tools import HistorySearchSkill
 from octoforge_core.cron.api import CronStore, CronWaker, Scheduler
 from octoforge_core.cron.reporter import CronOutcomeReporter
 from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
-from octoforge_core.datasets.api import DatasetService, DatasetStore
-from octoforge_core.datasets.service import LocalDatasetService
-from octoforge_core.db.repositories import DialogRepository, MessageRepository
-from octoforge_core.instructions.api import InstructionService, InstructionStore
-from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES, LocalInstructionService
-from octoforge_core.llm.embeddings import EmbeddingClient
-from octoforge_core.llm.openai import OpenAICompatibleClient
-from octoforge_core.llm.reranker import RerankerClient
-from octoforge_core.memory.api import MemoryStore
-from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
-from octoforge_core.net.guard import SsrfGuard
-from octoforge_core.ports import LLMClient, TaskStore
-from octoforge_core.search.api import SearchProvider
-from octoforge_core.skills.base import SkillOrigin
-from octoforge_core.skills.basic.cron_jobs import (
+from octoforge_core.cron.tools import (
     CronCreateSkill,
     CronDeleteSkill,
     CronListSkill,
     CronPauseSkill,
     CronResumeSkill,
 )
-from octoforge_core.skills.basic.data_forget import DataForgetSkill
-from octoforge_core.skills.basic.data_put import DataPutSkill
-from octoforge_core.skills.basic.data_query import DataQuerySkill
-from octoforge_core.skills.basic.external_call import ExternalCallSkill
-from octoforge_core.skills.basic.history_search import HistorySearchSkill
-from octoforge_core.skills.basic.http_request import HttpRequestSkill
-from octoforge_core.skills.basic.instruction_save import InstructionSaveSkill
-from octoforge_core.skills.basic.instructions_search import InstructionsSearchSkill
-from octoforge_core.skills.basic.memory_delete import MemoryDeleteSkill
-from octoforge_core.skills.basic.memory_search import MemorySearchSkill
-from octoforge_core.skills.basic.memory_store import MemoryStoreSkill
-from octoforge_core.skills.basic.task_list import TaskListSkill
-from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
-from octoforge_core.skills.basic.web_search import WebSearchSkill
+from octoforge_core.datasets.api import DatasetService, DatasetStore
+from octoforge_core.datasets.service import LocalDatasetService
+from octoforge_core.datasets.tools import DataForgetSkill, DataPutSkill, DataQuerySkill
+from octoforge_core.db.repositories import DialogRepository, MessageRepository
+from octoforge_core.instructions.api import InstructionService, InstructionStore
+from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES, LocalInstructionService
+from octoforge_core.instructions.presearch import InstructionPresearch
+from octoforge_core.instructions.tools import InstructionSaveSkill, SkillsSearchSkill
+from octoforge_core.llm.embeddings import EmbeddingClient
+from octoforge_core.llm.openai import OpenAICompatibleClient
+from octoforge_core.llm.reranker import RerankerClient
+from octoforge_core.memory.api import MemoryStore
+from octoforge_core.memory.tools import MemoryDeleteSkill, MemorySearchSkill, MemoryStoreSkill
+from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
+from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.net.tools import ExternalCallSkill, HttpRequestSkill
+from octoforge_core.ports import LLMClient, TaskStore
+from octoforge_core.search.api import SearchProvider
+from octoforge_core.search.tools import WebSearchSkill
 from octoforge_core.skills.registry import SkillRegistry
+from octoforge_core.tasks.tools import TaskListSkill, TaskSpawnSkill
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,10 +97,11 @@ class SkillServices:
 
 @dataclass(frozen=True, slots=True)
 class RunnerOptions:
-    """Tuning knobs of the conversation runners (one process limit, one listener)."""
+    """Tuning knobs of the conversation runners (limit, listener, presearch)."""
 
     max_processes: int
     task_outcome_listener: TaskOutcomeListener | None = None
+    presearch: PresearchPort | None = None
 
 
 def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMClient:
@@ -153,7 +152,7 @@ def build_skill_registry(
     services: SkillServices,
     limits: SkillLimits,
 ) -> SkillRegistry:
-    """Build the registry with the full set of basic skills.
+    """Build the registry with the full set of code tools.
 
     All skills are wired to the given ports; the web_search skill is
     registered only when a search provider is supplied.
@@ -161,10 +160,7 @@ def build_skill_registry(
     registry = SkillRegistry()
     _register_core_skills(registry, outbound_http, guard, stores.tasks, stores.cron)
     if services.search_provider is not None:
-        registry.register(
-            WebSearchSkill(provider=services.search_provider),
-            SkillOrigin.BASIC,
-        )
+        registry.register(WebSearchSkill(provider=services.search_provider))
     _register_instruction_skills(registry, services, limits)
     _register_dataset_skills(registry, services.datasets, limits)
     _register_memory_skills(registry, stores.memory, limits)
@@ -208,6 +204,11 @@ def build_router(
     return LLMRouter(llm, timeout_seconds=timeout_seconds, prompts=prompts)
 
 
+def build_presearch(instructions: InstructionService) -> PresearchPort:
+    """Build the default skill presearch over the instructions facade."""
+    return InstructionPresearch(instructions)
+
+
 def build_cron_outcome_reporter(
     store: CronStore,
     *,
@@ -237,6 +238,7 @@ def build_runner_config(
         max_processes=options.max_processes,
         compactor=compactor,
         task_outcome_listener=options.task_outcome_listener,
+        presearch=options.presearch,
     )
 
 
@@ -269,17 +271,14 @@ def _register_core_skills(
     cron_store: CronStore,
 ) -> None:
     """Register the HTTP, background-task and cron skills."""
-    registry.register(
-        HttpRequestSkill(http_client=outbound_http, guard=guard),
-        SkillOrigin.BASIC,
-    )
-    registry.register(TaskSpawnSkill(), SkillOrigin.BASIC)
-    registry.register(TaskListSkill(store=task_store), SkillOrigin.BASIC)
-    registry.register(CronCreateSkill(store=cron_store), SkillOrigin.BASIC)
-    registry.register(CronListSkill(store=cron_store), SkillOrigin.BASIC)
-    registry.register(CronDeleteSkill(store=cron_store), SkillOrigin.BASIC)
-    registry.register(CronPauseSkill(store=cron_store), SkillOrigin.BASIC)
-    registry.register(CronResumeSkill(store=cron_store), SkillOrigin.BASIC)
+    registry.register(HttpRequestSkill(http_client=outbound_http, guard=guard))
+    registry.register(TaskSpawnSkill())
+    registry.register(TaskListSkill(store=task_store))
+    registry.register(CronCreateSkill(store=cron_store))
+    registry.register(CronListSkill(store=cron_store))
+    registry.register(CronDeleteSkill(store=cron_store))
+    registry.register(CronPauseSkill(store=cron_store))
+    registry.register(CronResumeSkill(store=cron_store))
 
 
 def _register_instruction_skills(
@@ -289,15 +288,14 @@ def _register_instruction_skills(
 ) -> None:
     """Register the instructions discovery/save and external-call skills."""
     registry.register(
-        InstructionsSearchSkill(
+        SkillsSearchSkill(
             service=services.instructions,
             default_k=limits.instructions_top_k,
             datasets=services.datasets,
-        ),
-        SkillOrigin.BASIC,
+        )
     )
-    registry.register(InstructionSaveSkill(service=services.instructions), SkillOrigin.BASIC)
-    registry.register(ExternalCallSkill(executor=services.executor), SkillOrigin.BASIC)
+    registry.register(InstructionSaveSkill(service=services.instructions))
+    registry.register(ExternalCallSkill(executor=services.executor))
 
 
 def _register_dataset_skills(
@@ -306,16 +304,15 @@ def _register_dataset_skills(
     limits: SkillLimits,
 ) -> None:
     """Register the dataset record skills."""
-    registry.register(DataPutSkill(service=datasets), SkillOrigin.BASIC)
+    registry.register(DataPutSkill(service=datasets))
     registry.register(
         DataQuerySkill(
             service=datasets,
             default_limit=limits.datasets_query_default_limit,
             max_limit=limits.datasets_query_max_limit,
-        ),
-        SkillOrigin.BASIC,
+        )
     )
-    registry.register(DataForgetSkill(service=datasets), SkillOrigin.BASIC)
+    registry.register(DataForgetSkill(service=datasets))
 
 
 def _register_memory_skills(
@@ -324,16 +321,15 @@ def _register_memory_skills(
     limits: SkillLimits,
 ) -> None:
     """Register the memory skills over the shared memory store."""
-    registry.register(MemoryStoreSkill(store=store), SkillOrigin.BASIC)
+    registry.register(MemoryStoreSkill(store=store))
     registry.register(
         MemorySearchSkill(
             store=store,
             default_limit=limits.memory_search_default_limit,
             max_limit=limits.memory_search_max_limit,
-        ),
-        SkillOrigin.BASIC,
+        )
     )
-    registry.register(MemoryDeleteSkill(store=store), SkillOrigin.BASIC)
+    registry.register(MemoryDeleteSkill(store=store))
 
 
 def _register_history_skill(
@@ -349,6 +345,5 @@ def _register_history_skill(
             summaries=summaries,
             default_limit=limits.history_search_default_limit,
             max_limit=limits.history_search_max_limit,
-        ),
-        SkillOrigin.BASIC,
+        )
     )

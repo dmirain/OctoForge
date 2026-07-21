@@ -1,4 +1,4 @@
-"""Basic skill searching the full message archive of the current dialog."""
+"""Tool searching the full message archive of the current dialog."""
 
 from datetime import UTC, datetime, timedelta
 from typing import Any

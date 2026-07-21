@@ -49,7 +49,7 @@ OctoForge строится вокруг другой идеи:
                         /                                 \
          LLMClient (OpenAI-совм., SSE)         SkillRegistry — базовые скилы:
                                                http_request, task_spawn/list, cron_*,
-                                               instructions_search/save, external_call,
+                                               skills_search, instruction_save, external_call,
                                                data_*, memory_*, web_search
                                          |
     instructions · datasets · memory · cron · tasks — SQL-модули ядра (SQLite)
@@ -201,7 +201,7 @@ asyncio.run(main())
 Замечания к примеру:
 
 - С пустым `SkillRegistry` агент отвечает только текстом. Скилы регистрируются по одному
-  (`registry.register(HttpRequestSkill(...), SkillOrigin.BASIC)` и т.д.) — полный набор
+  (`registry.register(HttpRequestSkill(...))` и т.д.) — полный набор
   смотрите в `runtime()`; эмбеддинги нужны только скилам инструкций и датасетов.
 - Диалог переживает рестарт: нарратив перечитывается из БД при
   `get_or_create_runner` (процессы — в памяти и не переживают).
@@ -224,4 +224,6 @@ make check  # ruff (lint + format) → mypy --strict → pytest для обои�
 - [docs/process-model.md](docs/process-model.md), [docs/cron.md](docs/cron.md),
   [docs/instructions.md](docs/instructions.md), [docs/data-store.md](docs/data-store.md),
   [docs/dialogs.md](docs/dialogs.md) — углублённые темы.
+- [docs/prompt-caching.md](docs/prompt-caching.md) — как работает KV-cache префикса у LLM-провайдеров
+  и как строить контекст для максимального попадания в кеш.
 - [AGENTS.md](AGENTS.md) — конвенции кода и правила workflow.

@@ -6,14 +6,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
-from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.basic.cron_jobs import (
+from octoforge_core.cron.tools import (
     CronCreateSkill,
     CronDeleteSkill,
     CronListSkill,
     CronPauseSkill,
     CronResumeSkill,
 )
+from octoforge_core.skills.base import SkillContext
 from octoforge_core.tasks.models import TaskStatus
 from octoforge_core.time import utc_now
 

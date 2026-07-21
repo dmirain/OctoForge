@@ -13,21 +13,19 @@ from octoforge_core.instructions.api import (
     InstructionType,
     SearchHit,
 )
-from octoforge_core.net.external import ExternalCallExecutor
-from octoforge_core.net.guard import SsrfGuard
-from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.basic.external_call import SKILL_NAME as EXTERNAL_CALL_NAME
-from octoforge_core.skills.basic.external_call import ExternalCallSkill
-from octoforge_core.skills.basic.instruction_save import SKILL_NAME as SAVE_NAME
-from octoforge_core.skills.basic.instruction_save import InstructionSaveSkill
-from octoforge_core.skills.basic.instructions_search import (
+from octoforge_core.instructions.tools import (
     MAX_K,
     NO_HITS_MESSAGE,
-    InstructionsSearchSkill,
+    SAVE_NAME,
+    SEARCH_NAME,
+    InstructionSaveSkill,
+    SkillsSearchSkill,
 )
-from octoforge_core.skills.basic.instructions_search import (
-    SKILL_NAME as SEARCH_NAME,
-)
+from octoforge_core.net.external import ExternalCallExecutor
+from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.net.tools import CALL_NAME as EXTERNAL_CALL_NAME
+from octoforge_core.net.tools import ExternalCallSkill
+from octoforge_core.skills.base import SkillContext
 from octoforge_core.skills.errors import SkillArgumentsError
 
 CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
@@ -41,7 +39,7 @@ CREATED_AT = datetime(2026, 1, 1, tzinfo=UTC)
 HIT = SearchHit(
     instruction=Instruction(
         id="id-1",
-        type=InstructionType.TOOL,
+        type=InstructionType.ENDPOINT,
         title=TOOL_NAME,
         content='{"method": "GET", "url_template": "https://wttr.in/{city}?format=j2"}',
         tags=("http", "weather"),
@@ -140,7 +138,7 @@ class _ToolServingService(FakeInstructionService):
             raise InstructionNotFoundError(name)
         return Instruction(
             id=f"id-{name}",
-            type=InstructionType.TOOL,
+            type=InstructionType.ENDPOINT,
             title=name,
             content=self._records[name],
             tags=(),
@@ -152,11 +150,11 @@ class _ToolServingService(FakeInstructionService):
         )
 
 
-# --- instructions_search ---------------------------------------------------
+# --- skills_search ---------------------------------------------------
 
 
 def test_search_skill_spec() -> None:
-    skill = InstructionsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
+    skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     assert skill.spec.name == SEARCH_NAME
     assert skill.spec.parameters_schema["required"] == ["query"]
@@ -164,21 +162,47 @@ def test_search_skill_spec() -> None:
 
 async def test_search_skill_formats_hits() -> None:
     service = FakeInstructionService(hits=[HIT])
-    skill = InstructionsSearchSkill(service=service, default_k=DEFAULT_K)
+    skill = SkillsSearchSkill(service=service, default_k=DEFAULT_K)
 
     output = await skill.execute({"query": "weather"}, CTX)
 
     assert service.search_calls == [("weather", DEFAULT_K)]
-    assert "[tool]" in output
+    assert "[endpoint]" in output
     assert TOOL_NAME in output
     assert "http, weather" in output
     assert "0.875" in output
-    assert "url_template" in output  # content snippet
+    assert "url_template" in output  # full content
+
+
+async def test_search_skill_returns_full_content_without_truncation() -> None:
+    long_content = "line one\n" + ("x" * 400) + "\nline tail"
+    hit = SearchHit(
+        instruction=Instruction(
+            id="id-long",
+            type=InstructionType.SKILL,
+            title="long scenario",
+            content=long_content,
+            tags=(),
+            version=1,
+            usage_count=0,
+            success_count=0,
+            created_at=CREATED_AT,
+            updated_at=CREATED_AT,
+        ),
+        score=0.5,
+    )
+    skill = SkillsSearchSkill(service=FakeInstructionService(hits=[hit]), default_k=DEFAULT_K)
+
+    output = await skill.execute({"query": "scenario"}, CTX)
+
+    assert "x" * 400 in output  # beyond the old 300-char snippet cap
+    assert "line one" in output
+    assert "line tail" in output
 
 
 async def test_search_skill_explicit_k_overrides_default() -> None:
     service = FakeInstructionService()
-    skill = InstructionsSearchSkill(service=service, default_k=DEFAULT_K)
+    skill = SkillsSearchSkill(service=service, default_k=DEFAULT_K)
 
     await skill.execute({"query": "q", "k": CUSTOM_K}, CTX)
     await skill.execute({"query": "q", "k": MAX_K}, CTX)
@@ -187,7 +211,7 @@ async def test_search_skill_explicit_k_overrides_default() -> None:
 
 
 async def test_search_skill_no_hits_message() -> None:
-    skill = InstructionsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
+    skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     assert await skill.execute({"query": "nothing"}, CTX) == NO_HITS_MESSAGE
 
@@ -206,7 +230,7 @@ async def test_search_skill_no_hits_message() -> None:
     ],
 )
 async def test_search_skill_invalid_arguments_rejected(arguments: dict[str, object]) -> None:
-    skill = InstructionsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
+    skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     with pytest.raises(SkillArgumentsError):
         await skill.execute(arguments, CTX)

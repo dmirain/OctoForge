@@ -11,6 +11,7 @@ import pytest
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
     Instruction,
+    InstructionDraft,
     InstructionNotFoundError,
     InstructionType,
 )
@@ -52,31 +53,25 @@ class InMemoryInstructionStore:
         self.embeddings: dict[str, tuple[float, ...]] = {}
         self.list_calls = 0
 
-    async def upsert(
-        self,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...],
-        embedding: tuple[float, ...],
-    ) -> Instruction:
-        key = (kind.value, title)
+    async def upsert(self, draft: InstructionDraft) -> Instruction:
+        key = (draft.kind.value, draft.title)
         existing = self.records.get(key)
         now = utc_now()
         record = Instruction(
             id=existing.id if existing is not None else f"mem-{len(self.records)}",
-            type=kind,
-            title=title,
-            content=content,
-            tags=tags,
+            type=draft.kind,
+            title=draft.title,
+            content=draft.content,
+            tags=draft.tags,
             version=existing.version + 1 if existing is not None else FIRST_VERSION,
             usage_count=existing.usage_count if existing is not None else 0,
             success_count=existing.success_count if existing is not None else 0,
             created_at=existing.created_at if existing is not None else now,
             updated_at=now,
+            system=draft.system,
         )
         self.records[key] = record
-        self.embeddings[record.id] = embedding
+        self.embeddings[record.id] = draft.embedding
         return record
 
     async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
@@ -114,6 +109,12 @@ class InMemoryInstructionStore:
 
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
         return self.records.pop((kind.value, title), None) is not None
+
+    async def list_system(self) -> list[Instruction]:
+        return sorted(
+            (record for record in self.records.values() if record.system),
+            key=lambda record: (record.created_at, record.id),
+        )
 
 
 class VectorSearchStore(InMemoryInstructionStore):

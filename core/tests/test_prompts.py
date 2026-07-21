@@ -32,3 +32,21 @@ def test_static_provider_raises_for_an_unknown_name() -> None:
 
     with pytest.raises(KeyError):
         provider.get(UNKNOWN_NAME)
+
+
+def test_system_prompt_holds_meta_rules_only() -> None:
+    assert "skills_search" in DEFAULT_SYSTEM_PROMPT
+    assert "instruction_save" in DEFAULT_SYSTEM_PROMPT
+    assert "finished background task" in DEFAULT_SYSTEM_PROMPT
+    assert "limited markup" in DEFAULT_SYSTEM_PROMPT
+    # per-tool rules moved into the system skill scenarios
+    assert "cron_create" not in DEFAULT_SYSTEM_PROMPT
+    assert "memory_store" not in DEFAULT_SYSTEM_PROMPT
+    assert "http_request" not in DEFAULT_SYSTEM_PROMPT
+    assert "task_spawn" not in DEFAULT_SYSTEM_PROMPT
+
+
+def test_router_prompt_documents_the_searches_block() -> None:
+    assert "searches" in ROUTER_SYSTEM_PROMPT
+    assert "'create a reminder'" in ROUTER_SYSTEM_PROMPT
+    assert "pure chit-chat" in ROUTER_SYSTEM_PROMPT

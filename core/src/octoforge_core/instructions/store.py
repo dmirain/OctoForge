@@ -14,7 +14,12 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.instructions.api import EmbeddedInstruction, Instruction, InstructionType
+from octoforge_core.instructions.api import (
+    EmbeddedInstruction,
+    Instruction,
+    InstructionDraft,
+    InstructionType,
+)
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.time import utc_now
 
@@ -27,33 +32,28 @@ class SqlAlchemyInstructionStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def upsert(
-        self,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...],
-        embedding: tuple[float, ...],
-    ) -> Instruction:
+    async def upsert(self, draft: InstructionDraft) -> Instruction:
         """Create the record or replace content/tags/embedding, bumping the version."""
         async with self._session_factory() as session:
-            row = await self._find_row(session, kind, title)
+            row = await self._find_row(session, draft.kind, draft.title)
             if row is None:
                 row = InstructionRow(
                     id=uuid.uuid4().hex,
-                    type=kind.value,
-                    title=title,
-                    content=content,
-                    embedding=list(embedding),
-                    tags=list(tags),
+                    type=draft.kind.value,
+                    title=draft.title,
+                    content=draft.content,
+                    embedding=list(draft.embedding),
+                    tags=list(draft.tags),
                     version=FIRST_VERSION,
+                    system=draft.system,
                 )
                 session.add(row)
             else:
-                row.content = content
-                row.embedding = list(embedding)
-                row.tags = list(tags)
+                row.content = draft.content
+                row.embedding = list(draft.embedding)
+                row.tags = list(draft.tags)
                 row.version += 1
+                row.system = draft.system
                 row.updated_at = utc_now()
             await session.commit()
             return _to_instruction(row)
@@ -79,6 +79,17 @@ class SqlAlchemyInstructionStore:
                 )
                 for row in rows
             ]
+
+    async def list_system(self) -> list[Instruction]:
+        """Return every system (registry-owned) record, oldest first."""
+        async with self._session_factory() as session:
+            statement = (
+                select(InstructionRow)
+                .where(InstructionRow.system.is_(True))
+                .order_by(InstructionRow.created_at, InstructionRow.id)
+            )
+            rows = (await session.scalars(statement)).all()
+            return [_to_instruction(row) for row in rows]
 
     async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
         """Increment usage_count of the given records (search hits proved useful)."""
@@ -131,4 +142,5 @@ def _to_instruction(row: InstructionRow) -> Instruction:
         success_count=row.success_count,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        system=row.system,
     )

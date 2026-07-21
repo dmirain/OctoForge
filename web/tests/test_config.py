@@ -82,7 +82,7 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     ):
         monkeypatch.delenv(variable, raising=False)
 
-    settings = Settings()
+    settings = Settings(_env_file=None)  # defaults must not read the developer's .env
 
     assert settings.embedding_base_url == DEFAULT_EMBEDDING_BASE_URL
     assert settings.embedding_api_key == ""

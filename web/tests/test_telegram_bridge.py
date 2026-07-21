@@ -24,7 +24,7 @@ from octoforge_core.domain import ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.ports import LLMClient
-from octoforge_core.skills.base import SkillContext, SkillOrigin
+from octoforge_core.skills.base import SkillContext
 from octoforge_core.tasks.store import InMemoryTaskStore
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -312,7 +312,7 @@ async def test_tool_call_renders_status_line_before_the_answer(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     registry = SkillRegistry()
-    registry.register(EchoSkill(), SkillOrigin.BASIC)
+    registry.register(EchoSkill())
     client = FakeTelegramClient()
     manager = await make_manager(
         ScriptedLLM([tool_call_reply(), reply()]), session_factory, registry

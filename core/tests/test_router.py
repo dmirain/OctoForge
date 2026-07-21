@@ -34,11 +34,14 @@ def background() -> ProcessInfo:
     return ProcessInfo(id=BG_ID, title="background work", place=ProcessPlace.BACKGROUND)
 
 
-def route_reply(ops: list[dict[str, object]]) -> ChatMessage:
+def route_reply(ops: list[dict[str, object]], searches: object = None) -> ChatMessage:
+    arguments: dict[str, object] = {"ops": ops}
+    if searches is not None:
+        arguments["searches"] = searches
     return ChatMessage(
         role=MessageRole.ASSISTANT,
         content="",
-        tool_calls=(ToolCall(id="call-1", name=ROUTE_TOOL_NAME, arguments={"ops": ops}),),
+        tool_calls=(ToolCall(id="call-1", name=ROUTE_TOOL_NAME, arguments=arguments),),
     )
 
 
@@ -106,14 +109,62 @@ def make_router(llm: ScriptedLLM | SlowLLM) -> LLMRouter:
     )
 
 
-async def test_empty_snapshot_passes_through_without_llm_call() -> None:
+async def test_empty_snapshot_still_calls_the_llm_for_presearch() -> None:
     llm = ScriptedLLM(reply=plain_reply())
     router = make_router(llm)
 
     decision = await router.route((), MESSAGE, MAX_PROCESSES)
 
     assert decision.ops == ()
-    assert llm.complete_calls == 0
+    assert decision.searches == ()
+    assert llm.complete_calls == 1  # pre-search runs on the first message too
+
+
+async def test_searches_are_parsed_from_the_route_tool_call() -> None:
+    llm = ScriptedLLM(reply=route_reply([], searches=["create a reminder", "weather lookup"]))
+    router = make_router(llm)
+
+    decision = await router.route((), MESSAGE, MAX_PROCESSES)
+
+    assert decision.searches == ("create a reminder", "weather lookup")
+
+
+async def test_searches_drop_garbage_and_blank_entries() -> None:
+    llm = ScriptedLLM(
+        reply=route_reply([], searches=["  ", 42, None, "valid query", {"not": "a string"}])
+    )
+    router = make_router(llm)
+
+    decision = await router.route((), MESSAGE, MAX_PROCESSES)
+
+    assert decision.searches == ("valid query",)
+
+
+async def test_searches_are_capped_at_three() -> None:
+    llm = ScriptedLLM(reply=route_reply([], searches=["q1", "q2", "q3", "q4", "q5"]))
+    router = make_router(llm)
+
+    decision = await router.route((), MESSAGE, MAX_PROCESSES)
+
+    assert decision.searches == ("q1", "q2", "q3")
+
+
+async def test_missing_searches_default_to_empty() -> None:
+    llm = ScriptedLLM(reply=route_reply([{"action": "start_new", "target_id": None}]))
+    router = make_router(llm)
+
+    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.searches == ()
+
+
+async def test_fallback_decision_has_no_searches() -> None:
+    llm = ScriptedLLM(error=RuntimeError("llm down"))
+    router = make_router(llm)
+
+    decision = await router.route((), MESSAGE, MAX_PROCESSES)
+
+    assert decision.searches == ()
 
 
 async def test_ops_are_parsed_from_the_route_tool_call() -> None:

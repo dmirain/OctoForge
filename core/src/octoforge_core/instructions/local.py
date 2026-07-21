@@ -11,11 +11,13 @@ cross-encoder (the b2e two-stage pattern).
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
     Instruction,
+    InstructionDraft,
     InstructionNotFoundError,
     InstructionStore,
     InstructionType,
     InstructionVectorSearch,
     SearchHit,
+    SystemInstructionError,
 )
 from octoforge_core.instructions.ranking import rank, rerank
 from octoforge_core.llm.embeddings import EmbeddingClient
@@ -65,9 +67,22 @@ class LocalInstructionService:
         content: str,
         tags: tuple[str, ...] = (),
     ) -> Instruction:
-        """Embed title + content and upsert the record (version bump on replace)."""
-        (embedding,) = await self._embedder.embed((_embedded_text(title, content),))
-        return await self._store.upsert(kind, title, content, tags, embedding)
+        """Embed title + content and upsert the record (version bump on replace).
+
+        Agent-facing: refuses to overwrite a system (registry-owned) record.
+        """
+        await self._ensure_not_system(kind, title)
+        return await self._upsert(kind, title, content, tags, system=False)
+
+    async def save_system(
+        self,
+        kind: InstructionType,
+        title: str,
+        content: str,
+        tags: tuple[str, ...] = (),
+    ) -> Instruction:
+        """Upsert a system record; a (kind, title) match is adopted as system."""
+        return await self._upsert(kind, title, content, tags, system=True)
 
     async def get_by_name(self, name: str, kind: InstructionType | None = None) -> Instruction:
         """Return the record by title, optionally narrowed by type."""
@@ -76,10 +91,50 @@ class LocalInstructionService:
             raise InstructionNotFoundError(name)
         return instruction
 
+    async def list_system(self) -> list[Instruction]:
+        """Return every system (registry-owned) record."""
+        return await self._store.list_system()
+
     async def delete(self, name: str, kind: InstructionType) -> None:
-        """Delete the record; raise InstructionNotFoundError when absent."""
+        """Delete the record; raise InstructionNotFoundError when absent.
+
+        Agent-facing: refuses to delete a system (registry-owned) record.
+        """
+        existing = await self._store.get_by_title(name, kind)
+        if existing is None:
+            raise InstructionNotFoundError(name)
+        if existing.system:
+            raise SystemInstructionError(name)
+        await self._store.delete_by_title(name, kind)
+
+    async def delete_system(self, name: str, kind: InstructionType) -> None:
+        """Delete a record regardless of the system flag (registry sync only)."""
         if not await self._store.delete_by_title(name, kind):
             raise InstructionNotFoundError(name)
+
+    async def _upsert(
+        self,
+        kind: InstructionType,
+        title: str,
+        content: str,
+        tags: tuple[str, ...],
+        system: bool,
+    ) -> Instruction:
+        (embedding,) = await self._embedder.embed((_embedded_text(title, content),))
+        draft = InstructionDraft(
+            kind=kind,
+            title=title,
+            content=content,
+            tags=tags,
+            embedding=embedding,
+            system=system,
+        )
+        return await self._store.upsert(draft)
+
+    async def _ensure_not_system(self, kind: InstructionType, title: str) -> None:
+        existing = await self._store.get_by_title(title, kind)
+        if existing is not None and existing.system:
+            raise SystemInstructionError(title)
 
     def _shortlist_size(self, k: int) -> int:
         return max(k, self._rerank_candidates) if self._reranker is not None else k

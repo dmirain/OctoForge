@@ -29,21 +29,27 @@ class InstructionType(StrEnum):
 
     KNOWLEDGE = "knowledge"
     SKILL = "skill"
-    TOOL = "tool"
+    ENDPOINT = "endpoint"
 
 
 class InstructionNotFoundError(Exception):
     """Raised when no instruction matches the requested name."""
 
 
+class SystemInstructionError(Exception):
+    """Raised when an agent-facing write targets a system (registry-owned) record."""
+
+
 @dataclass(frozen=True, slots=True)
 class Instruction:
-    """One instruction record (knowledge, skill scenario or tool description).
+    """One instruction record (knowledge, skill scenario or endpoint description).
 
     JSON-friendly: str/int/float fields, a tuple of str tags, an StrEnum type
     (serializes as its value) and UTC datetimes (ISO 8601 at a wire boundary).
     The embedding is intentionally not part of the DTO: it is a local
-    implementation detail of the search engine.
+    implementation detail of the search engine. `system` marks records owned
+    by the declarative system registry: they are upserted/deleted by the
+    startup sync only, never by agent-facing save/delete.
     """
 
     id: str
@@ -56,6 +62,7 @@ class Instruction:
     success_count: int
     created_at: datetime
     updated_at: datetime
+    system: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +81,18 @@ class EmbeddedInstruction:
     embedding: tuple[float, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class InstructionDraft:
+    """Upsert input of the store: record fields, the embedding and the ownership flag."""
+
+    kind: InstructionType
+    title: str
+    content: str
+    tags: tuple[str, ...]
+    embedding: tuple[float, ...]
+    system: bool = False
+
+
 class InstructionStore(Protocol):
     """Storage port of the instructions module: records plus their embeddings.
 
@@ -85,15 +104,12 @@ class InstructionStore(Protocol):
     `InstructionVectorSearch`.
     """
 
-    async def upsert(
-        self,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...],
-        embedding: tuple[float, ...],
-    ) -> Instruction:
-        """Create the record or replace content/tags/embedding, bumping the version."""
+    async def upsert(self, draft: InstructionDraft) -> Instruction:
+        """Create the record or replace content/tags/embedding, bumping the version.
+
+        The update path also rewrites the `system` flag (registry adoption);
+        the agent-facing protection of system records lives in the service.
+        """
         ...
 
     async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
@@ -102,6 +118,10 @@ class InstructionStore(Protocol):
 
     async def list_with_embeddings(self) -> list[EmbeddedInstruction]:
         """Return every record with its embedding (brute-force search input)."""
+        ...
+
+    async def list_system(self) -> list[Instruction]:
+        """Return every system (registry-owned) record, oldest first."""
         ...
 
     async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
@@ -159,6 +179,7 @@ class InstructionService(Protocol):
 
         Upsert: an existing record gets its content/tags replaced, its version
         bumped and its embedding recomputed; usage/success counters survive.
+        Raises `SystemInstructionError` when the existing record is system.
         """
         ...
 
@@ -172,6 +193,33 @@ class InstructionService(Protocol):
 
     async def delete(self, name: str, kind: InstructionType) -> None:
         """Delete the instruction identified by (kind, title).
+
+        Raises `InstructionNotFoundError` when nothing matches and
+        `SystemInstructionError` when the record is system.
+        """
+        ...
+
+    async def save_system(
+        self,
+        kind: InstructionType,
+        title: str,
+        content: str,
+        tags: tuple[str, ...] = (),
+    ) -> Instruction:
+        """Create or replace a system (registry-owned) record.
+
+        Management surface for the composition root's system-registry sync,
+        not for agent-facing tools: a (kind, title) match is adopted — its
+        content/tags/embedding are replaced and the record becomes system.
+        """
+        ...
+
+    async def list_system(self) -> list[Instruction]:
+        """Return every system (registry-owned) record."""
+        ...
+
+    async def delete_system(self, name: str, kind: InstructionType) -> None:
+        """Delete a record regardless of the system flag (registry sync only).
 
         Raises `InstructionNotFoundError` when nothing matches.
         """

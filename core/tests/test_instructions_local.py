@@ -17,16 +17,9 @@ from octoforge_core.instructions.api import (
     InstructionNotFoundError,
     InstructionService,
     InstructionType,
+    SystemInstructionError,
 )
 from octoforge_core.instructions.local import LocalInstructionService
-from octoforge_core.instructions.seed import (
-    SEED_CRON_HTTP_TOOL_TITLES,
-    SEED_CRON_SCENARIO_CONTENT,
-    SEED_CRON_SCENARIO_TITLE,
-    SEED_INSTRUCTIONS,
-    migrate_cron_tools_to_native,
-    seed_if_empty,
-)
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient
 
@@ -194,7 +187,7 @@ async def test_get_by_name_narrowed_type_missing_raises(
     await service.save(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
 
     with pytest.raises(InstructionNotFoundError):
-        await service.get_by_name(TITLE_ALPHA, InstructionType.TOOL)
+        await service.get_by_name(TITLE_ALPHA, InstructionType.ENDPOINT)
 
 
 async def test_search_empty_store_returns_nothing(
@@ -279,41 +272,6 @@ async def test_search_bumps_usage_of_returned_hits_only(
     assert (await service.get_by_name(TITLE_BETA)).usage_count == USAGE_NEVER
 
 
-def fill_seed_vectors(embedder: StubEmbedder) -> None:
-    for seed in SEED_INSTRUCTIONS:
-        register_vector(embedder, seed.title, seed.content, V_RIGHT)
-
-
-async def test_seed_if_empty_seeds_baseline_records(
-    service: InstructionService,
-    embedder: StubEmbedder,
-) -> None:
-    fill_seed_vectors(embedder)
-
-    await seed_if_empty(service)
-
-    for seed in SEED_INSTRUCTIONS:
-        stored = await service.get_by_name(seed.title, seed.kind)
-        assert stored.content == seed.content
-        assert stored.tags == seed.tags
-        assert stored.version == VERSION_CREATED
-
-
-async def test_seed_if_empty_is_a_no_op_the_second_time(
-    service: InstructionService,
-    embedder: StubEmbedder,
-) -> None:
-    fill_seed_vectors(embedder)
-
-    await seed_if_empty(service)
-    await seed_if_empty(service)
-
-    # a repeated seed would have re-saved and bumped versions
-    for seed in SEED_INSTRUCTIONS:
-        stored = await service.get_by_name(seed.title, seed.kind)
-        assert stored.version == VERSION_CREATED
-
-
 class LenientEmbedder:
     """EmbeddingClient stub returning the same vector for every text."""
 
@@ -345,37 +303,103 @@ async def test_delete_raises_for_a_missing_record(
     service = make_lenient_service(session_factory)
 
     with pytest.raises(InstructionNotFoundError):
-        await service.delete(TITLE_ALPHA, InstructionType.TOOL)
+        await service.delete(TITLE_ALPHA, InstructionType.ENDPOINT)
 
 
-async def test_migrate_cron_tools_removes_legacy_http_tool_records(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    service = make_lenient_service(session_factory)
-    for title in SEED_CRON_HTTP_TOOL_TITLES:
-        await service.save(InstructionType.TOOL, title, "legacy http tool", ("cron",))
-    await service.save(
-        InstructionType.SKILL, SEED_CRON_SCENARIO_TITLE, "legacy scenario", ("cron",)
-    )
-
-    await migrate_cron_tools_to_native(service)
-
-    for title in SEED_CRON_HTTP_TOOL_TITLES:
-        with pytest.raises(InstructionNotFoundError):
-            await service.get_by_name(title, InstructionType.TOOL)
-    scenario = await service.get_by_name(SEED_CRON_SCENARIO_TITLE, InstructionType.SKILL)
-    assert scenario.content == SEED_CRON_SCENARIO_CONTENT
-    assert "cron_create" in scenario.content
+# --- system flag, protection and adoption (model v3) -------------------------
 
 
-async def test_migrate_cron_tools_is_idempotent(
+async def test_save_creates_user_record_by_default(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
 
-    await migrate_cron_tools_to_native(service)
-    await migrate_cron_tools_to_native(service)
+    saved = await service.save(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
 
-    # a repeated migration would have re-saved and bumped the version
-    scenario = await service.get_by_name(SEED_CRON_SCENARIO_TITLE, InstructionType.SKILL)
-    assert scenario.version == VERSION_CREATED
+    assert saved.system is False
+    assert await service.list_system() == []
+
+
+async def test_save_system_marks_the_record(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+
+    saved = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+
+    assert saved.system is True
+    assert saved.tags == ("core",)
+    listed = await service.list_system()
+    assert [record.title for record in listed] == [TITLE_ALPHA]
+    assert (await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL)).system is True
+
+
+async def test_save_refuses_to_overwrite_a_system_record(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+    await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+
+    with pytest.raises(SystemInstructionError):
+        await service.save(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B)
+    # a same-titled record of another type is untouched by the protection
+    await service.save(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
+
+
+async def test_delete_refuses_a_system_record(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+    await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+
+    with pytest.raises(SystemInstructionError):
+        await service.delete(TITLE_ALPHA, InstructionType.SKILL)
+    assert (await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL)).system is True
+
+
+async def test_delete_system_removes_the_record(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+    await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+
+    await service.delete_system(TITLE_ALPHA, InstructionType.SKILL)
+
+    with pytest.raises(InstructionNotFoundError):
+        await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL)
+
+
+async def test_delete_system_raises_for_a_missing_record(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+
+    with pytest.raises(InstructionNotFoundError):
+        await service.delete_system(TITLE_ALPHA, InstructionType.KNOWLEDGE)
+
+
+async def test_save_system_adopts_a_legacy_user_record(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+    legacy = await service.save(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("legacy",))
+
+    adopted = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B, ("core",))
+
+    assert adopted.id == legacy.id
+    assert adopted.system is True
+    assert adopted.content == CONTENT_B
+    assert adopted.tags == ("core",)
+    assert adopted.version == VERSION_REPLACED
+    assert (await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL)).system is True
+
+
+async def test_store_reads_endpoint_records(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+
+    await service.save(InstructionType.ENDPOINT, TITLE_ALPHA, CONTENT_A)
+
+    stored = await service.get_by_name(TITLE_ALPHA, InstructionType.ENDPOINT)
+    assert stored.type is InstructionType.ENDPOINT

@@ -1,8 +1,8 @@
 """Tests for the web_search skill over a fake SearchProvider (port substitution)."""
 
 from octoforge_core.search.api import SearchError, SearchResponse, SearchResult
+from octoforge_core.search.tools import WebSearchSkill
 from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.basic.web_search import WebSearchSkill
 
 CONTEXT = SkillContext(user_id="alice", channel="telegram", dialog_id="dialog-1")
 MAX_OUTPUT_WITH_SUFFIX = 4000 + 20

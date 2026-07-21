@@ -115,3 +115,43 @@ async def test_bootstrap_upgrades_stale_legacy_database(tmp_path: Path) -> None:
         await engine.dispose()
     assert {"one_shot", "last_status", "last_error", "retry_count"} <= columns
     assert head != _BASELINE_REVISION
+
+
+def _insert_legacy_tool_instruction(connection: Connection) -> None:
+    """Insert a baseline-schema instruction row of the pre-rename type 'tool'."""
+    connection.execute(
+        text(
+            "INSERT INTO instructions "
+            "(id, type, title, content, embedding, tags, version, usage_count, success_count,"
+            " created_at, updated_at) VALUES "
+            "('legacy-1', 'tool', 'legacy_tool', '{}', '[]', '[]', 1, 0, 0,"
+            " '2026-01-01 00:00:00+00:00', '2026-01-01 00:00:00+00:00')"
+        )
+    )
+
+
+def _instruction_row(connection: Connection) -> tuple[str, int]:
+    row = connection.execute(
+        text("SELECT type, system FROM instructions WHERE id = 'legacy-1'")
+    ).one()
+    return str(row[0]), int(row[1])
+
+
+def _instruction_columns(connection: Connection) -> set[str]:
+    return {column["name"] for column in inspect(connection).get_columns("instructions")}
+
+
+async def test_bootstrap_renames_tool_type_and_adds_system_flag(tmp_path: Path) -> None:
+    engine = create_engine(_database_url(tmp_path))
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(_legacy_baseline_schema)
+            await connection.run_sync(_insert_legacy_tool_instruction)
+        await bootstrap_schema(engine)  # stamp at baseline, then apply later migrations
+        async with engine.connect() as connection:
+            row = await connection.run_sync(_instruction_row)
+            columns = await connection.run_sync(_instruction_columns)
+    finally:
+        await engine.dispose()
+    assert row == ("endpoint", 0)
+    assert "system" in columns

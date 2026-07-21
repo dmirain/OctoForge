@@ -23,6 +23,7 @@ from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
     ConversationRunner,
+    PresearchPort,
     RunnerConfig,
     TaskOutcomeListener,
 )
@@ -40,6 +41,7 @@ from octoforge_core.composition import (
     build_external_executor,
     build_instruction_service,
     build_llm_client,
+    build_presearch,
     build_router,
     build_runner_config,
     build_skill_registry,
@@ -68,7 +70,7 @@ from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.memory.api import MemoryStore
 from octoforge_core.ports import LLMClient, TaskStore
 from octoforge_core.search.api import SearchProvider
-from octoforge_core.skills.base import Skill, SkillContext, SkillOrigin, SkillSpec
+from octoforge_core.skills.base import Skill, SkillContext, SkillSpec
 from octoforge_core.skills.errors import (
     DuplicateSkillError,
     SkillArgumentsError,
@@ -115,6 +117,7 @@ __all__ = [
     "MessageRepository",
     "MessageRole",
     "MessageRouter",
+    "PresearchPort",
     "ProcessCompleted",
     "ProcessResumed",
     "ProcessSuspended",
@@ -129,7 +132,6 @@ __all__ = [
     "SkillContext",
     "SkillLimits",
     "SkillNotFoundError",
-    "SkillOrigin",
     "SkillRegistry",
     "SkillServices",
     "SkillSpec",
@@ -157,6 +159,7 @@ __all__ = [
     "build_external_executor",
     "build_instruction_service",
     "build_llm_client",
+    "build_presearch",
     "build_router",
     "build_runner_config",
     "build_skill_registry",
