@@ -29,7 +29,12 @@ class MessageRow(Base):
     """One message of a dialog, ordered by seq within the dialog."""
 
     __tablename__ = "messages"
-    __table_args__ = (UniqueConstraint("dialog_id", "seq"),)
+    __table_args__ = (
+        UniqueConstraint("dialog_id", "seq"),
+        UniqueConstraint(
+            "dialog_id", "client_message_id", name="uq_messages_dialog_client_message"
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
     dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), index=True)
@@ -38,6 +43,7 @@ class MessageRow(Base):
     content: Mapped[str] = mapped_column(String)
     tool_calls: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     tool_call_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    client_message_id: Mapped[str | None] = mapped_column(String, nullable=True)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)

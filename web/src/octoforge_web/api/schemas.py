@@ -11,6 +11,7 @@ class PostMessageRequest(BaseModel):
     """Incoming user message."""
 
     content: str
+    client_message_id: str | None = None
 
 
 class AckResponse(BaseModel):

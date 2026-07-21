@@ -31,9 +31,13 @@ async def post_message(
     channel: ChannelDep,
     manager: ManagerDep,
 ) -> AckResponse:
-    """Submit a user message; injected mid-run or starts a new run."""
+    """Submit a user message; injected mid-run or starts a new run.
+
+    `client_message_id` is an idempotency key: a retry with an
+    already-recorded key is accepted but skipped (no double run).
+    """
     runner = await manager.get_or_create_runner(user_id, channel)
-    await runner.submit(request.content)
+    await runner.submit(request.content, client_message_id=request.client_message_id)
     return AckResponse(status=STATUS_ACCEPTED)
 
 

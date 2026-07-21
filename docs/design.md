@@ -793,8 +793,13 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 
 - все эндпоинты диалога требуют заголовок `X-User-Id` (доверенная строка до появления
   аутентификации); отсутствующий/пустой → 400
-- `POST /api/dialog/messages` `{content}` → 202 `{status: "accepted"}` — сообщение уходит
-  роутеру: новый процесс, инъекция в форграунд, отмена или promote — по его решению
+- `POST /api/dialog/messages` `{content, client_message_id?}` → 202 `{status: "accepted"}` —
+  сообщение уходит роутеру: новый процесс, инъекция в форграунд, отмена или promote — по его
+  решению. `client_message_id` — ключ идемпотентности: повтор с уже записанным ключом
+  принимается, но пропускается (skip-if-seen в акторе + unique `(dialog_id,
+  client_message_id)` на `messages`, миграция `8a1f3d5c2e97`); ретраи доставки не задваивают
+  прогон. Telegram-адаптер использует `update_id` как ключ (Telegram шлёт update повторно,
+  пока не получит 200)
 - `POST /api/dialog/cancel` → 202 — мягкая отмена форграунд-процесса (явная просьба)
 - `GET /api/dialog/events` — SSE-подписка на события диалога (`iteration_started`,
   `text_delta`, `assistant_message`, `tool_call_*`, `finished`, `cancelled`, `failed`,

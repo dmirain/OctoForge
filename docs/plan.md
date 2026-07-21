@@ -389,7 +389,14 @@ distributed-профиль (scaling.md этап 2); секреты-заглуш�
   (Active Task verbatim / Decisions / Pending).
 - **Стоимость:** ~2–3 дня. Зависит от п. 1–2 (нужны класс ошибки и usage).
 
-### 4. Идемпотентный submit по client_message_id
+### 4. Идемпотентный submit по client_message_id ✅
+
+> **Сделано** (2026-07-21): `submit(content, client_message_id=None)`, колонка
+> `messages.client_message_id` + unique `(dialog_id, client_message_id)`
+> (миграция `8a1f3d5c2e97`, NULL'ы сосуществуют), skip-if-seen в акторе
+> (повтор — ни персиста, ни роутинга), `POST /api/dialog/messages` принимает
+> ключ, Telegram-адаптер шлёт `update_id` как ключ. См. [design.md](design.md)
+> «API».
 
 - **Что.** Опциональное поле `client_message_id` в `POST /api/dialog/messages` и
   `ConversationRunner.submit()`; колонка на `messages`, unique-index

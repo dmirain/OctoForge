@@ -84,12 +84,16 @@ class TelegramBridge:
         queue = runner.subscribe()  # subscribe before the run starts, events are not replayed
         self._forwarder = asyncio.create_task(self._forward(runner, queue))
 
-    async def handle_text(self, content: str) -> None:
-        """Submit user text into the dialog, starting the forwarder on first contact."""
+    async def handle_text(self, content: str, client_message_id: str | None = None) -> None:
+        """Submit user text into the dialog, starting the forwarder on first contact.
+
+        `client_message_id` (Telegram update_id) deduplicates delivery
+        retries: Telegram re-sends an update until it gets a 200.
+        """
         runner = await self._ensure_runner()
         await self.start()
         await self._client.send_chat_action(self._chat_id, CHAT_ACTION_TYPING)
-        await runner.submit(content)
+        await runner.submit(content, client_message_id=client_message_id)
 
     async def cancel(self) -> None:
         """Cancel the current run of the dialog."""

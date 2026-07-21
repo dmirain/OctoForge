@@ -62,6 +62,7 @@ IDLE_BATCH_SECONDS = 0.05
 REPLY = "pong"
 FIRST_UPDATE_ID = 41
 SECOND_UPDATE_ID = 42
+EXPECTED_TWO_REPLIES = 2
 EXPECTED_GREETING_COUNT = 2
 EXPECTED_CALLS_AFTER_DRAIN = 2
 MIN_CALLS_AFTER_RECOVERY = 3
@@ -252,6 +253,28 @@ async def test_text_message_reaches_the_dialog_and_renders_the_reply(
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+
+
+async def test_redelivered_update_is_not_answered_twice(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # Telegram re-sends an update until it gets a 200; update_id is the
+    # idempotency key, so the redelivery must not produce a second run.
+    replies = [
+        ChatMessage(role=MessageRole.ASSISTANT, content=REPLY),
+        ChatMessage(role=MessageRole.ASSISTANT, content=REPLY),
+    ]
+    manager = await make_manager(replies, session_factory)
+    client = FakeTelegramClient()
+    poller = make_poller(client, manager.get_or_create_runner)
+
+    await poller.dispatch(make_update(FIRST_UPDATE_ID, text="ping"))
+    await wait_until(lambda: len(client.sent) == 1)
+    await poller.dispatch(make_update(FIRST_UPDATE_ID, text="ping"))  # redelivery
+    await poller.dispatch(make_update(SECOND_UPDATE_ID, text="ping"))
+    await wait_until(lambda: len(client.sent) == EXPECTED_TWO_REPLIES)
+
+    assert len(client.sent) == EXPECTED_TWO_REPLIES
 
 
 async def test_cancel_command_is_accepted(

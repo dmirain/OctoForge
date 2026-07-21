@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
@@ -37,6 +38,8 @@ SECOND_SEQ = 2
 THIRD_SEQ = 3
 PROMPT_TOKENS = 321
 COMPLETION_TOKENS = 12
+CLIENT_MESSAGE_ID = "client-key-1"
+EXPECTED_UNKEYED_PLUS_ONE = 3
 CREATED_EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
 TOOL_CALL = ToolCall(id="call-1", name="http_request", arguments={"url": "https://example.com"})
 
@@ -182,6 +185,34 @@ async def test_message_usage_round_trip(
     assert rows[0].completion_tokens == COMPLETION_TOKENS
     assert rows[1].prompt_tokens is None
     assert rows[1].completion_tokens is None
+
+
+async def test_client_message_id_dedup_round_trip(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    assert not await messages.find_by_client_id(dialog.id, CLIENT_MESSAGE_ID)
+    await messages.append(
+        dialog.id,
+        ChatMessage(role=MessageRole.USER, content="hi"),
+        client_message_id=CLIENT_MESSAGE_ID,
+    )
+    assert await messages.find_by_client_id(dialog.id, CLIENT_MESSAGE_ID)
+
+    with pytest.raises(IntegrityError):  # the unique constraint is the backstop
+        await messages.append(
+            dialog.id,
+            ChatMessage(role=MessageRole.USER, content="hi again"),
+            client_message_id=CLIENT_MESSAGE_ID,
+        )
+
+    # unkeyed messages coexist freely (NULLs are distinct in SQLite)
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="no key"))
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="no key 2"))
+    assert len(await messages.list(dialog.id)) == EXPECTED_UNKEYED_PLUS_ONE
 
 
 async def test_message_tool_calls_round_trip(

@@ -60,6 +60,9 @@ PARTIAL = "partial"
 PROMPT_TOKENS = 321
 COMPLETION_TOKENS = 12
 RETRIED_CALLS = 2
+FIRST_CLIENT_KEY = "upd-1"
+SECOND_CLIENT_KEY = "upd-2"
+SECOND_REPLY = "world"
 BLOCKING_SKILL = "blocking"
 TASK_SPAWN_CALL = "task_spawn"
 CALL_ID = "call-1"
@@ -519,6 +522,30 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
     assert assistant.role == MessageRole.ASSISTANT.value
     assert assistant.prompt_tokens == PROMPT_TOKENS
     assert assistant.completion_tokens == COMPLETION_TOKENS
+
+
+async def test_duplicate_client_message_id_is_skipped(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    router = FakeRouter()
+    llm = ScriptedLLM([reply(), reply(SECOND_REPLY)])
+    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(router=router))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi", client_message_id=FIRST_CLIENT_KEY)
+    await collect_until(queue, is_completed)
+    await runner.submit("hi", client_message_id=FIRST_CLIENT_KEY)  # delivery retry
+    await runner.submit("again", client_message_id=SECOND_CLIENT_KEY)
+    await collect_until(queue, is_completed)
+
+    assert len(router.calls) == RETRIED_CALLS  # the duplicate never reached the router
+    assert runner.history() == [
+        ChatMessage(role=MessageRole.USER, content="hi"),
+        reply(),
+        ChatMessage(role=MessageRole.USER, content="again"),
+        reply(SECOND_REPLY),
+    ]
 
 
 async def test_context_overflow_compacts_and_retries_once(

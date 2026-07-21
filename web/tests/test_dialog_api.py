@@ -55,6 +55,10 @@ USER_A = "alice"
 USER_B = "bob"
 CHANNEL = "web"
 SECRET_A = "alice secret question"
+FIRST_CLIENT_KEY = "client-key-1"
+SECOND_CLIENT_KEY = "client-key-2"
+EXPECTED_HISTORY_LEN = 4
+POLL_SECONDS = 0.01
 EXPECTED_TWO_DIALOGS = 2
 USER_ID_HEADER = "X-User-Id"
 
@@ -206,6 +210,47 @@ async def test_dialog_is_get_or_created_per_user(
     assert len(dialogs) == EXPECTED_TWO_DIALOGS
     assert {row.user_id for row in dialogs} == {USER_A, USER_B}
     assert all(row.channel == CHANNEL for row in dialogs)
+
+
+async def test_post_message_deduplicates_client_message_id(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = await make_manager([reply(), reply()], session_factory)
+    runner = await manager.get_or_create_runner(USER_A, CHANNEL)
+    queue = runner.subscribe()
+
+    await post_message_endpoint(
+        PostMessageRequest(content="one", client_message_id=FIRST_CLIENT_KEY),
+        USER_A,
+        CHANNEL,
+        manager,
+    )
+    await collect_until_terminal(queue)
+    await post_message_endpoint(  # a client retry with the same key
+        PostMessageRequest(content="one", client_message_id=FIRST_CLIENT_KEY),
+        USER_A,
+        CHANNEL,
+        manager,
+    )
+    await post_message_endpoint(
+        PostMessageRequest(content="two", client_message_id=SECOND_CLIENT_KEY),
+        USER_A,
+        CHANNEL,
+        manager,
+    )
+    await collect_until_terminal(queue)
+
+    async def _history_complete() -> None:  # finalize persists after the terminal event
+        while len(runner.history()) < EXPECTED_HISTORY_LEN:
+            await asyncio.sleep(POLL_SECONDS)
+
+    await asyncio.wait_for(_history_complete(), timeout=EVENTS_TIMEOUT_SECONDS)
+    assert runner.history() == [
+        ChatMessage(role=MessageRole.USER, content="one"),
+        reply(),
+        ChatMessage(role=MessageRole.USER, content="two"),
+        reply(),
+    ]
 
 
 async def test_users_are_isolated(session_factory: async_sessionmaker[AsyncSession]) -> None:

@@ -122,7 +122,7 @@ class TelegramPoller:
         if message.text == COMMAND_CANCEL:
             await bridge.cancel()
             return
-        await bridge.handle_text(message.text)
+        await bridge.handle_text(message.text, client_message_id=str(update.update_id))
 
     async def _dispatch_safely(self, update: TelegramUpdate) -> None:
         try:

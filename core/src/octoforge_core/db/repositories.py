@@ -62,13 +62,19 @@ class MessageRepository:
         self._session_factory = session_factory
 
     async def append(
-        self, dialog_id: str, message: ChatMessage, usage: Usage | None = None
+        self,
+        dialog_id: str,
+        message: ChatMessage,
+        usage: Usage | None = None,
+        client_message_id: str | None = None,
     ) -> None:
         """Append a message assigning it the next seq within the dialog.
 
         The seq is computed inside the INSERT statement, so concurrent writers
         (the actor and the process pumps) cannot assign the same seq. `usage`
         (provider token accounting) is stored only on assistant messages.
+        `client_message_id` is the idempotency key of client submits; the
+        unique (dialog_id, client_message_id) constraint rejects duplicates.
         """
         async with self._session_factory() as session:
             next_seq = (
@@ -85,6 +91,7 @@ class MessageRepository:
                     content=message.content,
                     tool_calls=_tool_calls_to_json(message.tool_calls),
                     tool_call_id=message.tool_call_id,
+                    client_message_id=client_message_id,
                     prompt_tokens=usage.prompt_tokens if usage is not None else None,
                     completion_tokens=usage.completion_tokens if usage is not None else None,
                 )
@@ -93,6 +100,19 @@ class MessageRepository:
             if dialog is not None:
                 dialog.updated_at = utc_now()
             await session.commit()
+
+    async def find_by_client_id(self, dialog_id: str, client_message_id: str) -> bool:
+        """Return True when a message with this idempotency key already exists."""
+        async with self._session_factory() as session:
+            value = await session.scalar(
+                select(MessageRow.id)
+                .where(
+                    MessageRow.dialog_id == dialog_id,
+                    MessageRow.client_message_id == client_message_id,
+                )
+                .limit(1)
+            )
+            return value is not None
 
     async def list(self, dialog_id: str) -> list[ChatMessage]:
         """Return the dialog messages ordered by seq."""

@@ -89,6 +89,7 @@ class _Submit:
 
     message: ChatMessage
     recorded: bool = False
+    client_message_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,9 +207,18 @@ class ConversationRunner:
             self._actor_task.cancel()
         await self._compactor.aclose()
 
-    async def submit(self, content: str) -> None:
-        """Submit a user message; the router decides how it maps to processes."""
-        await self._inbox.put(_Submit(ChatMessage(role=MessageRole.USER, content=content)))
+    async def submit(self, content: str, client_message_id: str | None = None) -> None:
+        """Submit a user message; the router decides how it maps to processes.
+
+        `client_message_id` is an idempotency key: a repeat with an
+        already-recorded key is skipped (delivery retries are normal).
+        """
+        await self._inbox.put(
+            _Submit(
+                ChatMessage(role=MessageRole.USER, content=content),
+                client_message_id=client_message_id,
+            )
+        )
 
     async def cancel(self) -> None:
         """Cancel the foreground process, if any (explicit user request)."""
@@ -312,10 +322,23 @@ class ConversationRunner:
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
         if not command.recorded:
-            await self._persist(message)
+            if await self._is_duplicate(command.client_message_id):
+                logger.info(
+                    "duplicate submit skipped: dialog=%s key=%s",
+                    self._dialog.id,
+                    command.client_message_id,
+                )
+                return
+            await self._persist(message, client_message_id=command.client_message_id)
             self._narrative.append(message)
         decision = await self._router.route(self._snapshot(), message.content, self._max_processes)
         await self._apply_decision(message, decision)
+
+    async def _is_duplicate(self, client_message_id: str | None) -> bool:
+        """Whether a submit with this idempotency key was already recorded."""
+        if client_message_id is None:
+            return False
+        return await self._messages.find_by_client_id(self._dialog.id, client_message_id)
 
     def _handle_cancel(self) -> None:
         foreground = self._foreground()
@@ -670,8 +693,15 @@ class ConversationRunner:
         else:
             await self._start_report_run()
 
-    async def _persist(self, message: ChatMessage, usage: Usage | None = None) -> None:
-        await self._messages.append(self._dialog.id, message, usage=usage)
+    async def _persist(
+        self,
+        message: ChatMessage,
+        usage: Usage | None = None,
+        client_message_id: str | None = None,
+    ) -> None:
+        await self._messages.append(
+            self._dialog.id, message, usage=usage, client_message_id=client_message_id
+        )
 
     def _broadcast(self, event: LoopEvent) -> None:
         self._seq += 1
