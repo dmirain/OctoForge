@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_core.db.errors import DialogNotFoundError
 from octoforge_core.db.models import DialogRow, MessageRow, TaskRow
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
+from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.time import utc_now
@@ -60,11 +61,14 @@ class MessageRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def append(self, dialog_id: str, message: ChatMessage) -> None:
+    async def append(
+        self, dialog_id: str, message: ChatMessage, usage: Usage | None = None
+    ) -> None:
         """Append a message assigning it the next seq within the dialog.
 
         The seq is computed inside the INSERT statement, so concurrent writers
-        (the actor and the process pumps) cannot assign the same seq.
+        (the actor and the process pumps) cannot assign the same seq. `usage`
+        (provider token accounting) is stored only on assistant messages.
         """
         async with self._session_factory() as session:
             next_seq = (
@@ -81,6 +85,8 @@ class MessageRepository:
                     content=message.content,
                     tool_calls=_tool_calls_to_json(message.tool_calls),
                     tool_call_id=message.tool_call_id,
+                    prompt_tokens=usage.prompt_tokens if usage is not None else None,
+                    completion_tokens=usage.completion_tokens if usage is not None else None,
                 )
             )
             dialog = await session.get(DialogRow, dialog_id)

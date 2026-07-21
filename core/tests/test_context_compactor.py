@@ -24,6 +24,7 @@ from octoforge_core.db.engine import create_engine, create_session_factory, init
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent
+from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.skills.base import SkillSpec
 from octoforge_core.time import utc_now
 
@@ -104,9 +105,11 @@ class SummarizingLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         self.requests.append(list(messages))
-        return ChatMessage(role=MessageRole.ASSISTANT, content=self._replies.pop(0))
+        return Completion(
+            message=ChatMessage(role=MessageRole.ASSISTANT, content=self._replies.pop(0))
+        )
 
     def stream(
         self,
@@ -128,7 +131,7 @@ class GatedSummarizingLLM(SummarizingLLM):
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         self.calls += 1
         await self.release.wait()
         return await super().complete(messages, tools)
@@ -141,7 +144,7 @@ class FailingLLM(SummarizingLLM):
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise RuntimeError("llm down")
 
 
@@ -410,6 +413,130 @@ async def test_repeated_compactions_cover_disjoint_ranges(
     await compactor.assemble(dialog, history)  # tail of 2 fits now: no third run
     await asyncio.sleep(0)
     assert len(llm.requests) == TWO_CALLS
+
+
+# --- token-based trigger -------------------------------------------------------
+
+MODEL_CONTEXT_TOKENS = 1000
+CONTEXT_BUFFER_TOKENS = 100
+OVERFLOW_PROMPT_TOKENS = 950
+SMALL_PROMPT_TOKENS = 100
+USAGE_COMPLETION_TOKENS = 5
+
+
+def make_token_compactor(
+    store: SqlAlchemySummaryStore,
+    llm: SummarizingLLM,
+    model_context_tokens: int = MODEL_CONTEXT_TOKENS,
+) -> LlmContextCompactor:
+    return LlmContextCompactor(
+        store=store,
+        archive=store,
+        llm=llm,
+        config=CompactorConfig(
+            hot_max_chars=100000,  # the chars heuristic stays out of the way
+            compact_target_chars=50000,
+            model_context_tokens=model_context_tokens,
+            context_buffer_tokens=CONTEXT_BUFFER_TOKENS,
+        ),
+    )
+
+
+async def append_assistant_with_usage(
+    session_factory: async_sessionmaker[AsyncSession],
+    dialog_id: str,
+    prompt_tokens: int,
+) -> ChatMessage:
+    message = ChatMessage(role=MessageRole.ASSISTANT, content="answer")
+    await MessageRepository(session_factory).append(
+        dialog_id,
+        message,
+        usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=USAGE_COMPLETION_TOKENS),
+    )
+    return message
+
+
+async def test_token_overflow_triggers_compaction_without_char_overflow(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    llm = SummarizingLLM([SUMMARY_REPLY])
+    compactor = make_token_compactor(store, llm)
+    history = await append_history(session_factory, dialog.id, ["hello"])
+    history.append(
+        await append_assistant_with_usage(session_factory, dialog.id, OVERFLOW_PROMPT_TOKENS)
+    )
+
+    await compactor.assemble(dialog, history)
+
+    await wait_for_condition(lambda: len(llm.requests) == 1)
+    assert await _wait_for_summaries(store, dialog.id, count=1)
+
+
+async def test_token_trigger_stays_quiet_below_threshold(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    llm = SummarizingLLM([SUMMARY_REPLY])
+    compactor = make_token_compactor(store, llm)
+    history = await append_history(session_factory, dialog.id, ["hello"])
+    history.append(
+        await append_assistant_with_usage(session_factory, dialog.id, SMALL_PROMPT_TOKENS)
+    )
+
+    await compactor.assemble(dialog, history)
+    await asyncio.sleep(0)
+
+    assert llm.requests == []
+
+
+async def test_token_trigger_falls_back_to_chars_without_usage(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    llm = SummarizingLLM([SUMMARY_REPLY])
+    compactor = make_token_compactor(store, llm)
+    history = await append_history(session_factory, dialog.id, ["hello"])
+
+    await compactor.assemble(dialog, history)  # no usage in the archive: no trigger
+    await asyncio.sleep(0)
+
+    assert llm.requests == []
+
+
+async def test_token_trigger_disabled_with_zero_context(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    llm = SummarizingLLM([SUMMARY_REPLY])
+    compactor = make_token_compactor(store, llm, model_context_tokens=0)
+    history = await append_history(session_factory, dialog.id, ["hello"])
+    history.append(
+        await append_assistant_with_usage(session_factory, dialog.id, OVERFLOW_PROMPT_TOKENS)
+    )
+
+    await compactor.assemble(dialog, history)
+    await asyncio.sleep(0)
+
+    assert llm.requests == []
+
+
+async def test_latest_prompt_tokens_reads_the_newest_assistant_usage(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    assert await store.latest_prompt_tokens(dialog.id) is None
+
+    await append_assistant_with_usage(session_factory, dialog.id, SMALL_PROMPT_TOKENS)
+    await append_history(session_factory, dialog.id, ["user text"])
+    await append_assistant_with_usage(session_factory, dialog.id, OVERFLOW_PROMPT_TOKENS)
+
+    assert await store.latest_prompt_tokens(dialog.id) == OVERFLOW_PROMPT_TOKENS
 
 
 async def test_aclose_cancels_a_pending_compaction(

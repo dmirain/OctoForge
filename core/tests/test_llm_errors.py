@@ -10,6 +10,7 @@ from octoforge_core import (
     AuthError,
     ChatMessage,
     ClientError,
+    Completion,
     ContextOverflowError,
     LLMConfig,
     LLMResponseError,
@@ -153,11 +154,11 @@ class ScriptedFailureLLM:
 
     async def complete(
         self, messages: list[ChatMessage], tools: list[SkillSpec] | None = None
-    ) -> ChatMessage:
+    ) -> Completion:
         failure = self._next_failure()
         if failure is not None:
             raise failure
-        return ChatMessage(role=MessageRole.ASSISTANT, content="ok")
+        return Completion(message=ChatMessage(role=MessageRole.ASSISTANT, content="ok"))
 
     async def stream(
         self, messages: list[ChatMessage], tools: list[SkillSpec] | None = None
@@ -198,7 +199,7 @@ async def test_complete_retries_transient_failure() -> None:
 
     reply = await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
 
-    assert reply.content == "ok"
+    assert reply.message.content == "ok"
     assert inner.calls == RETRIED_CALLS
     assert len(sleeper.delays) == 1
     assert 0 <= sleeper.delays[0] <= MAX_DELAY_SECONDS

@@ -5,6 +5,7 @@ from typing import Protocol
 
 from octoforge_core.domain import ChatMessage
 from octoforge_core.llm.events import StreamEvent
+from octoforge_core.llm.usage import Completion
 from octoforge_core.skills.base import SkillSpec
 from octoforge_core.tasks.models import Task
 
@@ -16,8 +17,8 @@ class LLMClient(Protocol):
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
-        """Return the assistant reply for the given conversation."""
+    ) -> Completion:
+        """Return the assistant reply and its usage for the given conversation."""
         ...
 
     def stream(

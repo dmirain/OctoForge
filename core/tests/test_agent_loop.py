@@ -27,6 +27,7 @@ from octoforge_core.agent.loop import (
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallBroken, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Completion
 from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
 
@@ -59,9 +60,9 @@ class ScriptedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         self.requests.append(list(messages))
-        return self._replies.pop(0)
+        return Completion(message=self._replies.pop(0))
 
     async def stream(
         self,
@@ -85,8 +86,10 @@ class ChunkedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
-        return ChatMessage(role=MessageRole.ASSISTANT, content="".join(self._parts))
+    ) -> Completion:
+        return Completion(
+            message=ChatMessage(role=MessageRole.ASSISTANT, content="".join(self._parts))
+        )
 
     async def stream(
         self,
@@ -164,8 +167,8 @@ class EagerLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
-        return self._reply
+    ) -> Completion:
+        return Completion(message=self._reply)
 
     async def stream(
         self,
@@ -191,8 +194,8 @@ class StallingLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
-        return final_reply()
+    ) -> Completion:
+        return Completion(message=final_reply())
 
     async def stream(
         self,
@@ -215,8 +218,8 @@ class SlowLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
-        return self._reply
+    ) -> Completion:
+        return Completion(message=self._reply)
 
     async def stream(
         self,

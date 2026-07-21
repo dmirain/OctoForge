@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from octoforge_core.domain import ChatMessage, ToolCall
+from octoforge_core.llm.usage import Usage
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,9 +42,10 @@ class ToolCallBroken:
 
 @dataclass(frozen=True, slots=True)
 class StreamFinished:
-    """Terminal event carrying the complete assistant message."""
+    """Terminal event carrying the complete assistant message and its usage."""
 
     message: ChatMessage
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True, slots=True)

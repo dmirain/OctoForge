@@ -136,7 +136,7 @@ class LLMRouter:
         also carries the skill pre-search queries for the new process.
         """
         try:
-            reply = await asyncio.wait_for(
+            completion = await asyncio.wait_for(
                 self._llm.complete(
                     self._build_messages(processes, message, max_processes),
                     tools=[ROUTE_TOOL_SPEC],
@@ -145,6 +145,7 @@ class LLMRouter:
             )
         except Exception:  # router failures must not break the dialog
             return _fallback(processes)
+        reply = completion.message
         call = next((c for c in reply.tool_calls if c.name == ROUTE_TOOL_NAME), None)
         if call is None:
             return _fallback(processes)

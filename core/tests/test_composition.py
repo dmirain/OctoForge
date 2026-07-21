@@ -45,6 +45,7 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Completion
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
@@ -186,7 +187,7 @@ class ScriptedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(

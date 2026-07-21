@@ -80,6 +80,7 @@ from octoforge_core.llm.errors import (
 )
 from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
+from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.memory.api import MemoryStore
 from octoforge_core.ports import LLMClient, TaskStore
 from octoforge_core.search.api import SearchProvider
@@ -101,6 +102,7 @@ __all__ = [
     "Cancelled",
     "ChatMessage",
     "ClientError",
+    "Completion",
     "ContextCompactor",
     "ContextOverflowError",
     "ConversationEvent",
@@ -173,6 +175,7 @@ __all__ = [
     "ToolCallFailed",
     "ToolCallRequested",
     "TransportError",
+    "Usage",
     "bootstrap_schema",
     "build_agent_loop",
     "build_compactor",

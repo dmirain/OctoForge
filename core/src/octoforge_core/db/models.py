@@ -38,6 +38,8 @@ class MessageRow(Base):
     content: Mapped[str] = mapped_column(String)
     tool_calls: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     tool_call_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
 
 

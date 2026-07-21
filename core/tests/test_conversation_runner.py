@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.events import (
@@ -38,10 +39,12 @@ from octoforge_core.agent.runner import (
 )
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.models import MessageRow
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient, TaskStore
 from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
@@ -52,6 +55,8 @@ from octoforge_core.tasks.tools import TaskSpawnSkill
 PROMPT = "test system prompt"
 REPLY = "hello"
 PARTIAL = "partial"
+PROMPT_TOKENS = 321
+COMPLETION_TOKENS = 12
 BLOCKING_SKILL = "blocking"
 TASK_SPAWN_CALL = "task_spawn"
 CALL_ID = "call-1"
@@ -127,9 +132,9 @@ class ScriptedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         self.requests.append(list(messages))
-        return self._replies.pop(0)
+        return Completion(message=self._replies.pop(0))
 
     async def stream(
         self,
@@ -143,6 +148,25 @@ class ScriptedLLM:
         yield StreamFinished(message=reply)
 
 
+class UsageLLM(ScriptedLLM):
+    """ScriptedLLM attaching provider usage to the stream finish."""
+
+    def __init__(self, replies: list[ChatMessage], usage: Usage) -> None:
+        super().__init__(replies)
+        self._usage = usage
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[SkillSpec] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.requests.append(list(messages))
+        reply = self._replies.pop(0)
+        if reply.content:
+            yield LlmTextDelta(text=reply.content)
+        yield StreamFinished(message=reply, usage=self._usage)
+
+
 class GatedLLM:
     """LLMClient stub pausing its second reply until released."""
 
@@ -154,7 +178,7 @@ class GatedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(
@@ -193,7 +217,7 @@ class BranchLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(
@@ -224,7 +248,7 @@ class StallingLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(
@@ -417,6 +441,32 @@ async def test_submit_streams_events_and_updates_narrative(
     ]
     dialog = await get_dialog(session_factory)
     assert await MessageRepository(session_factory).list(dialog.id) == runner.history()
+
+
+async def test_finished_usage_is_persisted_on_the_assistant_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    usage = Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS)
+    manager = make_manager(UsageLLM([reply()], usage), SkillRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    events = await collect_until(queue, is_completed)
+
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert finished[0].usage == usage
+    dialog = await get_dialog(session_factory)
+    async with session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(MessageRow).where(MessageRow.dialog_id == dialog.id).order_by(MessageRow.seq)
+            )
+        ).all()
+    assistant = rows[-1]
+    assert assistant.role == MessageRole.ASSISTANT.value
+    assert assistant.prompt_tokens == PROMPT_TOKENS
+    assert assistant.completion_tokens == COMPLETION_TOKENS
 
 
 async def test_new_question_suspends_foreground_and_starts_new_process(

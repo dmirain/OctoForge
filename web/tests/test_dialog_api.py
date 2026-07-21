@@ -28,6 +28,7 @@ from octoforge_core.db.engine import create_engine, create_session_factory, init
 from octoforge_core.db.models import DialogRow
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Completion
 from octoforge_core.tasks.store import InMemoryTaskStore
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -69,9 +70,9 @@ class ScriptedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         self.requests.append(list(messages))
-        return self._replies.pop(0)
+        return Completion(message=self._replies.pop(0))
 
     async def stream(
         self,

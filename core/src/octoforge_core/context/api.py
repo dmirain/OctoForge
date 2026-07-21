@@ -121,6 +121,14 @@ class MessageArchive(Protocol):
         """Return the dialog messages with `seq >` the given one, ordered by seq."""
         ...
 
+    async def latest_prompt_tokens(self, dialog_id: str) -> int | None:
+        """Return prompt_tokens of the newest assistant message that has usage.
+
+        None when no assistant message carries provider usage yet (the chars
+        heuristic stays the fallback trigger then).
+        """
+        ...
+
     async def search(
         self,
         dialog_id: str,

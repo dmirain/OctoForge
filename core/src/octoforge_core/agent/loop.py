@@ -27,6 +27,7 @@ from octoforge_core.llm.events import (
     ToolCallReady,
 )
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Usage
 from octoforge_core.ports import LLMClient
 from octoforge_core.skills.base import SkillContext
 from octoforge_core.skills.registry import SkillRegistry
@@ -45,11 +46,13 @@ class _IterationOutcome:
     message: ChatMessage | None = None
     interrupted: bool = False
     failed: bool = False
+    usage: Usage | None = None
 
     def observe(self, event: LoopEvent) -> None:
         if isinstance(event, AssistantMessage):
             self.message = event.message
             self.interrupted = event.interrupted
+            self.usage = event.usage
         elif isinstance(event, Failed):
             self.failed = True
 
@@ -62,6 +65,7 @@ class _AssistantStreamState:
     final_message: ChatMessage | None = None
     interrupted: bool = False
     timed_out: bool = False
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +230,7 @@ class AgentLoop:
                 yield Failed(error=EMPTY_STREAM_MESSAGE)
                 return
             if not outcome.message.tool_calls:
-                yield Finished(message=outcome.message)
+                yield Finished(message=outcome.message, usage=outcome.usage)
                 return
             async for event in self._stream_tool_calls(outcome.message, tracker, history):
                 yield event
@@ -269,9 +273,12 @@ class AgentLoop:
             if control.is_cancelled:
                 state.interrupted = True
                 return
-            loop_events, finished = self._handle_stream_event(event, state.content_parts, tracker)
+            loop_events, finished, usage = self._handle_stream_event(
+                event, state.content_parts, tracker
+            )
             if finished is not None:
                 state.final_message = finished
+                state.usage = usage
             for loop_event in loop_events:
                 yield loop_event
 
@@ -294,17 +301,18 @@ class AgentLoop:
             yield Failed(error=EMPTY_STREAM_MESSAGE)
             return
         history.append(state.final_message)
-        yield AssistantMessage(message=state.final_message)
+        yield AssistantMessage(message=state.final_message, usage=state.usage)
 
     def _handle_stream_event(
         self,
         event: StreamEvent,
         content_parts: list[str],
         tracker: _ToolRunTracker,
-    ) -> tuple[list[LoopEvent], ChatMessage | None]:
+    ) -> tuple[list[LoopEvent], ChatMessage | None, Usage | None]:
         """Translate one LLM stream event into loop events and a final message."""
         events: list[LoopEvent] = []
         final_message: ChatMessage | None = None
+        usage: Usage | None = None
         if isinstance(event, LlmTextDelta):
             content_parts.append(event.text)
             events.append(TextDelta(text=event.text))
@@ -315,6 +323,7 @@ class AgentLoop:
             tracker.mark_broken(event)
         elif isinstance(event, StreamFinished):
             final_message = event.message
+            usage = event.usage
         elif isinstance(event, LlmRetryScheduled):
             events.append(
                 RetryScheduled(
@@ -324,7 +333,7 @@ class AgentLoop:
                 )
             )
         events.extend(tracker.drain())
-        return events, final_message
+        return events, final_message, usage
 
     async def _interrupt_iteration(
         self,

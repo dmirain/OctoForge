@@ -20,6 +20,7 @@ from octoforge_core.llm.events import (
     ToolCallReady,
     ToolCallStarted,
 )
+from octoforge_core.llm.usage import Completion, Usage, parse_usage
 from octoforge_core.skills.base import SkillSpec
 
 CHAT_COMPLETIONS_PATH = "/chat/completions"
@@ -53,7 +54,7 @@ class OpenAICompatibleClient:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         """Call chat/completions (non-streaming) and return the reply."""
         try:
             response = await self._http.post(
@@ -65,7 +66,8 @@ class OpenAICompatibleClient:
         except httpx.HTTPError as exc:
             raise TransportError(str(exc) or type(exc).__name__) from exc
         _raise_for_status(response)
-        return self._parse_reply(response.json())
+        data = response.json()
+        return Completion(message=self._parse_reply(data), usage=parse_usage(data.get("usage")))
 
     async def stream(
         self,
@@ -95,7 +97,7 @@ class OpenAICompatibleClient:
                     yield event
         except httpx.HTTPError as exc:
             raise TransportError(str(exc) or type(exc).__name__) from exc
-        yield StreamFinished(message=accumulator.build_message())
+        yield StreamFinished(message=accumulator.build_message(), usage=accumulator.usage)
 
     def _build_payload(
         self,
@@ -110,6 +112,8 @@ class OpenAICompatibleClient:
             "messages": [self._serialize_message(message) for message in messages],
             "stream": stream,
         }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
         if tools:
             payload["tools"] = [self._serialize_tool(spec) for spec in tools]
         return payload
@@ -194,13 +198,30 @@ class _StreamAccumulator:
         self._content_parts: list[str] = []
         self._tool_calls: dict[int, _ToolCallSlot] = {}
         self._open_index: int | None = None
+        self._usage: Usage | None = None
+
+    @property
+    def usage(self) -> Usage | None:
+        """Token usage reported by the provider, when it sent any."""
+        return self._usage
 
     def feed(self, data: str) -> list[StreamEvent]:
         """Consume one SSE data payload and emit stream events."""
         try:
             chunk = json.loads(data)
-            delta = chunk["choices"][0].get("delta") or {}
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        except json.JSONDecodeError as exc:
+            raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
+        if not isinstance(chunk, dict):
+            raise LLMResponseError(PARSE_ERROR_MESSAGE)
+        usage = parse_usage(chunk.get("usage"))
+        if usage is not None:
+            self._usage = usage
+        choices = chunk.get("choices") or []
+        if not choices:
+            return []  # usage-only final chunk (stream_options.include_usage)
+        try:
+            delta = choices[0].get("delta") or {}
+        except (IndexError, AttributeError, TypeError) as exc:
             raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
         events: list[StreamEvent] = []
         content = delta.get("content")

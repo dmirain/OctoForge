@@ -331,7 +331,14 @@ distributed-профиль (scaling.md этап 2); секреты-заглуш�
 - **Стоимость:** ~1–2 дня (таксономия ~150 строк + декоратор ~80 строк + тесты).
   Основа для п. 2 (класс `context_overflow`) и будущего `FallbackLLMClient`.
 
-### 2. Usage capture → токенный триггер компакции
+### 2. Usage capture → токенный триггер компакции ✅
+
+> **Сделано** (2026-07-21): `stream_options.include_usage`, DTO `Usage` в
+> `StreamFinished` и `Completion` из `complete()` (порт изменился, фейки обновлены),
+> колонки `prompt_tokens`/`completion_tokens` на `messages` (миграция `4c7e2b9a1f63`),
+> второй триггер компактора `prompt_tokens ≥ OF_MODEL_CONTEXT_TOKENS −
+> OF_CONTEXT_BUFFER_TOKENS` (0 = выключен; символьная эвристика — фолбэк).
+> См. [context.md](context.md) и [design.md](design.md) «Usage capture».
 
 - **Что.** Просим usage у провайдера (`stream_options={"include_usage": true}` в
   `llm/openai.py`), DTO `Usage` (input/output/cached) добавляется в `StreamFinished`

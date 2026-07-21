@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from octoforge_core.domain import ChatMessage, ToolCall
+from octoforge_core.llm.usage import Usage
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +26,7 @@ class AssistantMessage:
 
     message: ChatMessage
     interrupted: bool = False
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +57,7 @@ class Finished:
     """The loop produced the final answer."""
 
     message: ChatMessage
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True, slots=True)

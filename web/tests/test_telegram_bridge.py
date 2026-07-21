@@ -23,6 +23,7 @@ from octoforge_core.db.engine import create_engine, create_session_factory, init
 from octoforge_core.domain import ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
 from octoforge_core.skills.base import SkillContext
 from octoforge_core.tasks.store import InMemoryTaskStore
@@ -97,7 +98,7 @@ class ScriptedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(
@@ -121,7 +122,7 @@ class ChunkedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(
@@ -146,7 +147,7 @@ class StallingLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(
@@ -166,7 +167,7 @@ class FailingLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(

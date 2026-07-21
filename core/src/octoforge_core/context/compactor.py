@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_HOT_MAX_CHARS = 12000
 DEFAULT_COMPACT_TARGET_CHARS = 6000
+DEFAULT_MODEL_CONTEXT_TOKENS = 0  # 0 = token trigger disabled
+DEFAULT_CONTEXT_BUFFER_TOKENS = 2000
 TOPICS_BLOCK_HEADER = (
     "Compressed summaries of earlier topics of this conversation "
     "(the verbatim recent history follows):"
@@ -47,10 +49,17 @@ NO_TOPICS = "-"
 
 @dataclass(frozen=True, slots=True)
 class CompactorConfig:
-    """Limits of the hot-tail policy, in characters (a ~4:1 proxy of tokens)."""
+    """Limits of the hot-tail policy.
+
+    Chars are a ~4:1 proxy of tokens. When `model_context_tokens` is set
+    and the provider reports usage, the token trigger (last run's
+    prompt_tokens >= model_context - buffer) complements the chars heuristic.
+    """
 
     hot_max_chars: int = DEFAULT_HOT_MAX_CHARS
     compact_target_chars: int = DEFAULT_COMPACT_TARGET_CHARS
+    model_context_tokens: int = DEFAULT_MODEL_CONTEXT_TOKENS
+    context_buffer_tokens: int = DEFAULT_CONTEXT_BUFFER_TOKENS
 
 
 class NoopContextCompactor(ContextCompactor):
@@ -85,12 +94,22 @@ class LlmContextCompactor(ContextCompactor):
         max_seq_to = await self._store.max_seq_to(dialog.id)
         tail_count = await self._archive.count_after(dialog.id, max_seq_to)
         tail = _tail_of(history, tail_count)
-        if _chars(tail) > self._config.hot_max_chars:
+        if _chars(tail) > self._config.hot_max_chars or await self._token_overflow(dialog):
             self._trigger_compact(dialog)
         summaries = await self._store.list_for_dialog(dialog.id)
         if not summaries:
             return tail
         return [_topics_block(summaries), *tail]
+
+    async def _token_overflow(self, dialog: Dialog) -> bool:
+        """Whether the last run's prompt approached the model's context window."""
+        if self._config.model_context_tokens <= 0:
+            return False
+        prompt_tokens = await self._archive.latest_prompt_tokens(dialog.id)
+        if prompt_tokens is None:
+            return False
+        threshold = self._config.model_context_tokens - self._config.context_buffer_tokens
+        return prompt_tokens >= threshold
 
     async def aclose(self) -> None:
         """Cancel pending compactions (the owning runner is stopping)."""
@@ -129,13 +148,13 @@ class LlmContextCompactor(ContextCompactor):
         await self._store.create(summary)
 
     async def _summarize(self, dialog: Dialog, segment: list[ArchivedMessage]) -> DialogueSummary:
-        reply = await self._llm.complete(
+        completion = await self._llm.complete(
             [
                 ChatMessage(role=MessageRole.SYSTEM, content=SUMMARY_SYSTEM_PROMPT),
                 ChatMessage(role=MessageRole.USER, content=format_segment(segment)),
             ]
         )
-        topics, content = parse_summary_reply(reply.content)
+        topics, content = parse_summary_reply(completion.message.content)
         return DialogueSummary(
             id=uuid.uuid4().hex,
             dialog_id=dialog.id,

@@ -16,6 +16,7 @@ from octoforge_core.db.repositories import (
     SqlAlchemyTaskStore,
 )
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
+from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 
@@ -34,6 +35,8 @@ OWN_TASK_COUNT = 2
 FIRST_SEQ = 1
 SECOND_SEQ = 2
 THIRD_SEQ = 3
+PROMPT_TOKENS = 321
+COMPLETION_TOKENS = 12
 CREATED_EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
 TOOL_CALL = ToolCall(id="call-1", name="http_request", arguments={"url": "https://example.com"})
 
@@ -153,6 +156,32 @@ async def test_messages_get_monotonic_seq_and_order(
         ).all()
     assert [row.seq for row in rows] == [FIRST_SEQ, SECOND_SEQ, THIRD_SEQ]
     assert all(row.created_at.tzinfo == UTC for row in rows)
+
+
+async def test_message_usage_round_trip(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    await messages.append(
+        dialog.id,
+        ChatMessage(role=MessageRole.ASSISTANT, content="answer"),
+        usage=Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS),
+    )
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="plain"))
+
+    async with session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(MessageRow).where(MessageRow.dialog_id == dialog.id).order_by(MessageRow.seq)
+            )
+        ).all()
+    assert rows[0].prompt_tokens == PROMPT_TOKENS
+    assert rows[0].completion_tokens == COMPLETION_TOKENS
+    assert rows[1].prompt_tokens is None
+    assert rows[1].completion_tokens is None
 
 
 async def test_message_tool_calls_round_trip(

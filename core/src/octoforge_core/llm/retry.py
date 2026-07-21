@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from octoforge_core.domain import ChatMessage
 from octoforge_core.llm.errors import LLMError, RateLimitError
 from octoforge_core.llm.events import RetryScheduled, StreamEvent
+from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
 from octoforge_core.skills.base import SkillSpec
 
@@ -45,7 +46,7 @@ class RetryingLLMClient:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         """Call complete(), retrying transient failures silently (log only)."""
         attempt = 0
         while True:

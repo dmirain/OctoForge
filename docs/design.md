@@ -400,6 +400,18 @@ backoff с full-jitter, задержка не ниже `Retry-After`, ретра
 Telegram (статус-строка «повтор N через X сек») показывают ретрай вместо молчания.
 Исчерпание попыток — исходная ошибка (раннер вещает `Failed`, как и раньше).
 
+### Usage capture (`llm/usage.py`)
+
+Клиент просит учёт токенов у провайдера (`stream_options.include_usage` при
+стриминге; usage-only финальный чанк без `choices` парсится, стрим не ломается).
+DTO `Usage` (prompt/completion/cached токены) приезжает в `StreamFinished`, а
+`complete()` возвращает DTO `Completion(message, usage)` — порт изменился, фейки
+обновлены. Петля пробрасывает usage в события `AssistantMessage`/`Finished`;
+раннер персистит токены на assistant-сообщении (колонки
+`prompt_tokens`/`completion_tokens`, миграция `4c7e2b9a1f63`). Потребители:
+токенный триггер компакции ([context.md](context.md), `OF_MODEL_CONTEXT_TOKENS`/
+`OF_CONTEXT_BUFFER_TOKENS`) и фундамент per-user учёта стоимости.
+
 ## Фоновые задачи
 
 Задача — это фоновый процесс актора, подкреплённый записью в `TaskStore`

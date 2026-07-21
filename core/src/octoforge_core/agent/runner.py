@@ -29,6 +29,7 @@ from octoforge_core.agent.router import (
 from octoforge_core.context.api import ContextCompactor
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
+from octoforge_core.llm.usage import Usage
 from octoforge_core.ports import TaskStore
 from octoforge_core.skills.base import SkillContext
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
@@ -539,7 +540,7 @@ class ConversationRunner:
     async def _finalize(self, process: _Process, terminal: LoopEvent) -> TaskStatus:
         """Fold the run outcome into the narrative and the task store."""
         if isinstance(terminal, Finished):
-            await self._persist(terminal.message)
+            await self._persist(terminal.message, usage=terminal.usage)
             self._narrative.append(terminal.message)
             await self._resolve_task(process, result=terminal.message.content)
             status = TaskStatus.DONE
@@ -618,8 +619,8 @@ class ConversationRunner:
         else:
             await self._start_report_run()
 
-    async def _persist(self, message: ChatMessage) -> None:
-        await self._messages.append(self._dialog.id, message)
+    async def _persist(self, message: ChatMessage, usage: Usage | None = None) -> None:
+        await self._messages.append(self._dialog.id, message, usage=usage)
 
     def _broadcast(self, event: LoopEvent) -> None:
         self._seq += 1

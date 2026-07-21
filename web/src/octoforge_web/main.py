@@ -181,6 +181,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         config=CompactorConfig(
                             hot_max_chars=settings.context_hot_max_chars,
                             compact_target_chars=settings.context_compact_target_chars,
+                            model_context_tokens=settings.model_context_tokens,
+                            context_buffer_tokens=settings.context_buffer_tokens,
                         ),
                     ),
                     options=RunnerOptions(

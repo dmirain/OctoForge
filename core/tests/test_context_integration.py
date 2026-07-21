@@ -25,6 +25,7 @@ from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Completion
 from octoforge_core.skills.base import SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
 from octoforge_core.tasks.store import InMemoryTaskStore
@@ -82,9 +83,11 @@ class DialogLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         self.complete_requests.append(list(messages))
-        return ChatMessage(role=MessageRole.ASSISTANT, content=self._complete_replies.pop(0))
+        return Completion(
+            message=ChatMessage(role=MessageRole.ASSISTANT, content=self._complete_replies.pop(0))
+        )
 
     async def stream(
         self,

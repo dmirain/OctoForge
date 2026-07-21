@@ -54,6 +54,7 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Completion
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
@@ -179,18 +180,20 @@ class RootLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         self.complete_requests.append(list(messages))
-        return ChatMessage(
-            role=MessageRole.ASSISTANT,
-            content="",
-            tool_calls=(
-                ToolCall(
-                    id="route-1",
-                    name=ROUTE_TOOL_NAME,
-                    arguments={"ops": [{"action": "inject", "target_id": None}]},
+        return Completion(
+            message=ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content="",
+                tool_calls=(
+                    ToolCall(
+                        id="route-1",
+                        name=ROUTE_TOOL_NAME,
+                        arguments={"ops": [{"action": "inject", "target_id": None}]},
+                    ),
                 ),
-            ),
+            )
         )
 
     async def stream(

@@ -22,6 +22,7 @@ from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.llm.usage import Completion
 from octoforge_core.tasks.store import InMemoryTaskStore
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -110,7 +111,7 @@ class ScriptedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         raise NotImplementedError
 
     async def stream(

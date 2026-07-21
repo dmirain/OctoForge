@@ -14,6 +14,7 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent
+from octoforge_core.llm.usage import Completion
 from octoforge_core.skills.base import SkillSpec
 
 FG_ID = "p-fg"
@@ -63,14 +64,14 @@ class ScriptedLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         self.complete_calls += 1
         self.last_messages = list(messages)
         self.last_tools = tools
         if self._error is not None:
             raise self._error
         assert self._reply is not None
-        return self._reply
+        return Completion(message=self._reply)
 
     async def stream(
         self,
@@ -88,7 +89,7 @@ class SlowLLM:
         self,
         messages: list[ChatMessage],
         tools: list[SkillSpec] | None = None,
-    ) -> ChatMessage:
+    ) -> Completion:
         await asyncio.sleep(SLOW_LLM_DELAY_SECONDS)
         raise AssertionError("should have been cancelled by the router timeout")
 

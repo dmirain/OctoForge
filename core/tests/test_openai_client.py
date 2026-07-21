@@ -13,6 +13,7 @@ from octoforge_core import (
     MessageRole,
     ProviderInternalError,
     ToolCall,
+    Usage,
 )
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.skills.base import SkillSpec
@@ -24,6 +25,9 @@ REPLY_CONTENT = "hello there"
 TOOL_NAME = "http_request"
 TOOL_DESCRIPTION = "does http"
 CALL_ID = "call-42"
+PROMPT_TOKENS = 321
+COMPLETION_TOKENS = 12
+CACHED_TOKENS = 300
 
 
 def make_config() -> LLMConfig:
@@ -47,9 +51,10 @@ async def test_complete_sends_request_and_returns_reply() -> None:
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
         client = OpenAICompatibleClient(http_client=http, config=make_config())
-        reply = await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
+        completion = await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
 
-    assert reply == ChatMessage(role=MessageRole.ASSISTANT, content=REPLY_CONTENT)
+    assert completion.message == ChatMessage(role=MessageRole.ASSISTANT, content=REPLY_CONTENT)
+    assert completion.usage is None
 
     request = captured[0]
     assert request.url.path == "/v1/chat/completions"
@@ -57,6 +62,33 @@ async def test_complete_sends_request_and_returns_reply() -> None:
     body = json.loads(request.content)
     assert body["model"] == MODEL
     assert body["messages"] == [{"role": "user", "content": "hi"}]
+    assert "stream_options" not in body
+
+
+async def test_complete_parses_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            HTTPStatus.OK,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": REPLY_CONTENT}}],
+                "usage": {
+                    "prompt_tokens": PROMPT_TOKENS,
+                    "completion_tokens": COMPLETION_TOKENS,
+                    "prompt_tokens_details": {"cached_tokens": CACHED_TOKENS},
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
+        client = OpenAICompatibleClient(http_client=http, config=make_config())
+        completion = await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
+
+    assert completion.usage == Usage(
+        prompt_tokens=PROMPT_TOKENS,
+        completion_tokens=COMPLETION_TOKENS,
+        cached_tokens=CACHED_TOKENS,
+    )
 
 
 async def test_complete_raises_on_http_error() -> None:
@@ -142,10 +174,10 @@ async def test_tool_calls_parsed_from_reply() -> None:
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
         client = OpenAICompatibleClient(http_client=http, config=make_config())
-        reply = await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
+        completion = await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
 
-    assert reply.content == ""
-    assert reply.tool_calls == (
+    assert completion.message.content == ""
+    assert completion.message.tool_calls == (
         ToolCall(id=CALL_ID, name=TOOL_NAME, arguments={"method": "GET", "url": "https://x"}),
     )
 

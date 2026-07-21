@@ -6,7 +6,7 @@ from http import HTTPStatus
 
 import httpx
 
-from octoforge_core import ChatMessage, LLMConfig, MessageRole, ToolCall
+from octoforge_core import ChatMessage, LLMConfig, MessageRole, ToolCall, Usage
 from octoforge_core.llm.events import (
     StreamEvent,
     StreamFinished,
@@ -26,6 +26,9 @@ SECOND_CALL_ID = "call-8"
 TOOL_NAME = "http_request"
 SECOND_TOOL_NAME = "web_search"
 STOP_AFTER_EVENTS = 2
+PROMPT_TOKENS = 1234
+COMPLETION_TOKENS = 42
+CACHED_TOKENS = 1000
 USER_MESSAGE = ChatMessage(role=MessageRole.USER, content="hi")
 
 
@@ -215,3 +218,55 @@ async def test_stream_broken_arguments_emit_broken_and_keep_message() -> None:
     final = events[-1]
     assert isinstance(final, StreamFinished)
     assert final.message.tool_calls == (ToolCall(id=CALL_ID, name=TOOL_NAME, arguments={}),)
+
+
+def usage_chunk(prompt: int, completion: int, cached: int | None = None) -> dict[str, object]:
+    usage: dict[str, object] = {"prompt_tokens": prompt, "completion_tokens": completion}
+    if cached is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    return {"choices": [], "usage": usage}
+
+
+async def test_stream_captures_usage_from_usage_only_chunk() -> None:
+    client = make_client(
+        [content_chunk("hi"), usage_chunk(PROMPT_TOKENS, COMPLETION_TOKENS, CACHED_TOKENS)]
+    )
+
+    events = await collect(client.stream([USER_MESSAGE]))
+
+    final = events[-1]
+    assert isinstance(final, StreamFinished)
+    assert final.usage == Usage(
+        prompt_tokens=PROMPT_TOKENS,
+        completion_tokens=COMPLETION_TOKENS,
+        cached_tokens=CACHED_TOKENS,
+    )
+
+
+async def test_stream_without_usage_chunk_finishes_with_none_usage() -> None:
+    client = make_client([content_chunk("hi")])
+
+    events = await collect(client.stream([USER_MESSAGE]))
+
+    final = events[-1]
+    assert isinstance(final, StreamFinished)
+    assert final.usage is None
+
+
+async def test_stream_requests_usage_via_stream_options() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text=sse_body([content_chunk("ok")]))
+
+    transport = httpx.MockTransport(handler)
+    client = OpenAICompatibleClient(
+        http_client=httpx.AsyncClient(transport=transport, base_url=BASE_URL),
+        config=make_config(),
+    )
+
+    await collect(client.stream([USER_MESSAGE]))
+
+    payload = json.loads(captured[0].content)
+    assert payload["stream_options"] == {"include_usage": True}
