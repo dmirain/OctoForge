@@ -70,6 +70,15 @@ class Failed:
 
 
 @dataclass(frozen=True, slots=True)
+class RetryScheduled:
+    """The LLM client is retrying a transiently failed call."""
+
+    attempt: int
+    delay_seconds: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessSuspended:
     """Actor marker: the foreground process moved to the background."""
 
@@ -104,6 +113,7 @@ LoopEvent = (
     | Finished
     | Cancelled
     | Failed
+    | RetryScheduled
     | ProcessSuspended
     | ProcessResumed
     | ProcessCompleted

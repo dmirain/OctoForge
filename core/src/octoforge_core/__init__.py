@@ -11,6 +11,7 @@ from octoforge_core.agent.events import (
     ProcessCompleted,
     ProcessResumed,
     ProcessSuspended,
+    RetryScheduled,
     TextDelta,
     ToolCallCompleted,
     ToolCallFailed,
@@ -66,7 +67,19 @@ from octoforge_core.instructions.api import (
     InstructionVectorSearch,
 )
 from octoforge_core.llm.embeddings import EmbeddingClient
+from octoforge_core.llm.errors import (
+    AuthError,
+    ClientError,
+    ContextOverflowError,
+    ErrorKind,
+    LLMError,
+    ProviderInternalError,
+    QuotaError,
+    RateLimitError,
+    TransportError,
+)
 from octoforge_core.llm.reranker import RerankerClient
+from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.memory.api import MemoryStore
 from octoforge_core.ports import LLMClient, TaskStore
 from octoforge_core.search.api import SearchProvider
@@ -84,9 +97,12 @@ from octoforge_core.time import utc_now
 __all__ = [
     "AgentLoop",
     "AssistantMessage",
+    "AuthError",
     "Cancelled",
     "ChatMessage",
+    "ClientError",
     "ContextCompactor",
+    "ContextOverflowError",
     "ConversationEvent",
     "ConversationManager",
     "ConversationRunner",
@@ -101,6 +117,7 @@ __all__ = [
     "DuplicateSkillError",
     "EmbeddingClient",
     "EmbeddingConfig",
+    "ErrorKind",
     "Failed",
     "Finished",
     "InstructionService",
@@ -109,6 +126,7 @@ __all__ = [
     "IterationStarted",
     "LLMClient",
     "LLMConfig",
+    "LLMError",
     "LLMResponseError",
     "LoopControl",
     "LoopEvent",
@@ -122,7 +140,12 @@ __all__ = [
     "ProcessResumed",
     "ProcessSuspended",
     "PromptProvider",
+    "ProviderInternalError",
+    "QuotaError",
+    "RateLimitError",
     "RerankerClient",
+    "RetryScheduled",
+    "RetryingLLMClient",
     "RunnerConfig",
     "RunnerOptions",
     "Scheduler",
@@ -149,6 +172,7 @@ __all__ = [
     "ToolCallCompleted",
     "ToolCallFailed",
     "ToolCallRequested",
+    "TransportError",
     "bootstrap_schema",
     "build_agent_loop",
     "build_compactor",

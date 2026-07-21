@@ -46,4 +46,15 @@ class StreamFinished:
     message: ChatMessage
 
 
-StreamEvent = TextDelta | ToolCallStarted | ToolCallReady | ToolCallBroken | StreamFinished
+@dataclass(frozen=True, slots=True)
+class RetryScheduled:
+    """The client is about to retry a transiently failed call."""
+
+    attempt: int
+    delay_seconds: float
+    reason: str
+
+
+StreamEvent = (
+    TextDelta | ToolCallStarted | ToolCallReady | ToolCallBroken | StreamFinished | RetryScheduled
+)

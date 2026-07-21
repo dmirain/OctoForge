@@ -30,6 +30,9 @@ DEFAULT_CONTEXT_COMPACT_TARGET_CHARS = 6000
 DEFAULT_MAX_PROCESSES = 5
 DEFAULT_ROUTER_TIMEOUT_SECONDS = 10.0
 DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
+DEFAULT_LLM_MAX_RETRIES = 3
+DEFAULT_LLM_RETRY_BASE_SECONDS = 1.0
+DEFAULT_LLM_RETRY_MAX_SECONDS = 30.0
 DEFAULT_SELF_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CRON_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_CRON_LEASE_TTL_SECONDS = 60.0
@@ -85,6 +88,9 @@ class Settings(BaseSettings):
     max_processes: int = DEFAULT_MAX_PROCESSES
     router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
     llm_stream_idle_timeout_seconds: float = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS
+    llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
+    llm_retry_base_seconds: float = DEFAULT_LLM_RETRY_BASE_SECONDS
+    llm_retry_max_seconds: float = DEFAULT_LLM_RETRY_MAX_SECONDS
     self_base_url: str = DEFAULT_SELF_BASE_URL
     cron_poll_interval_seconds: float = DEFAULT_CRON_POLL_INTERVAL_SECONDS
     cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
@@ -104,6 +110,9 @@ class Settings(BaseSettings):
             base_url=self.llm_base_url,
             api_key=self.llm_api_key,
             model=self.llm_model,
+            max_retries=self.llm_max_retries,
+            retry_base_seconds=self.llm_retry_base_seconds,
+            retry_max_seconds=self.llm_retry_max_seconds,
         )
 
     def to_embedding_config(self) -> EmbeddingConfig:

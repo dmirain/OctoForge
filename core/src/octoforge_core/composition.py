@@ -45,6 +45,7 @@ from octoforge_core.instructions.tools import InstructionSaveSkill, SkillsSearch
 from octoforge_core.llm.embeddings import EmbeddingClient
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.reranker import RerankerClient
+from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.memory.api import MemoryStore
 from octoforge_core.memory.tools import MemoryDeleteSkill, MemorySearchSkill, MemoryStoreSkill
 from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
@@ -105,8 +106,13 @@ class RunnerOptions:
 
 
 def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMClient:
-    """Build the default LLM client (OpenAI-compatible HTTP)."""
-    return OpenAICompatibleClient(http_client=http_client, config=config)
+    """Build the default LLM client (OpenAI-compatible HTTP with retries)."""
+    return RetryingLLMClient(
+        OpenAICompatibleClient(http_client=http_client, config=config),
+        max_retries=config.max_retries,
+        base_seconds=config.retry_base_seconds,
+        max_seconds=config.retry_max_seconds,
+    )
 
 
 def build_instruction_service(

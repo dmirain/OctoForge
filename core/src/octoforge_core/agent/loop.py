@@ -12,12 +12,14 @@ from octoforge_core.agent.events import (
     Finished,
     IterationStarted,
     LoopEvent,
+    RetryScheduled,
     TextDelta,
     ToolCallCompleted,
     ToolCallFailed,
     ToolCallRequested,
 )
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
+from octoforge_core.llm.events import RetryScheduled as LlmRetryScheduled
 from octoforge_core.llm.events import (
     StreamEvent,
     StreamFinished,
@@ -313,6 +315,14 @@ class AgentLoop:
             tracker.mark_broken(event)
         elif isinstance(event, StreamFinished):
             final_message = event.message
+        elif isinstance(event, LlmRetryScheduled):
+            events.append(
+                RetryScheduled(
+                    attempt=event.attempt,
+                    delay_seconds=event.delay_seconds,
+                    reason=event.reason,
+                )
+            )
         events.extend(tracker.drain())
         return events, final_message
 

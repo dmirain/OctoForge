@@ -380,6 +380,26 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 с пустыми аргументами — стрим не падает). В конце — `StreamFinished(message)`, источник
 истины для истории. `aclose()` на генераторе обрывает HTTP-соединение — основа отмены.
 
+### Ошибки LLM и ретраи (`llm/errors.py`, `llm/retry.py`)
+
+Голый `raise_for_status()` заменён типизированной таксономией: классификация по
+HTTP-статусу и телу ошибки (`error.code`/`error.type` OpenAI-пayload'а) —
+`RateLimitError` (с `retry_after` из заголовка Retry-After), `AuthError`, `QuotaError`,
+`ContextOverflowError`, `ProviderInternalError`, `TransportError` (httpx-ошибки
+транспорта), `ClientError` (прочие 4xx). Транзиентные классы — rate_limit,
+provider_internal, transport; остальные фатальны.
+
+Поверх порта `LLMClient` — декоратор `RetryingLLMClient` (оборачивает любую
+реализацию, навешивается только в composition root, `build_llm_client`): экспоненциальный
+backoff с full-jitter, задержка не ниже `Retry-After`, ретраятся только транзиентные
+классы, лимит — в `LLMConfig` (`OF_LLM_MAX_RETRIES`, `OF_LLM_RETRY_BASE_SECONDS`,
+`OF_LLM_RETRY_MAX_SECONDS`). `complete()` ретраится молча (warning-лог). `stream()`
+ретраится только если сбой случился ДО первого события стрима (после первой дельты
+повтор задвоил бы вывод); перед повтором в стрим отдаётся событие `RetryScheduled`,
+которое петля мапит в LoopEvent — web (SSE `retry_scheduled`, статус-строка в UI) и
+Telegram (статус-строка «повтор N через X сек») показывают ретрай вместо молчания.
+Исчерпание попыток — исходная ошибка (раннер вещает `Failed`, как и раньше).
+
 ## Фоновые задачи
 
 Задача — это фоновый процесс актора, подкреплённый записью в `TaskStore`

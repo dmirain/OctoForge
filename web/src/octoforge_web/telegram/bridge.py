@@ -15,6 +15,7 @@ from octoforge_core.agent.events import (
     LoopEvent,
     ProcessResumed,
     ProcessSuspended,
+    RetryScheduled,
     TextDelta,
     ToolCallFailed,
     ToolCallRequested,
@@ -40,6 +41,7 @@ SUSPENDED_LINE_TEMPLATE = "⏸️ «{title}» ушёл в фон"
 RESUMED_LINE_TEMPLATE = "▶️ «{title}» снова активен"
 CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
+RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
 PARSE_MODE_HTML = "HTML"
 
 
@@ -190,5 +192,9 @@ def _status_line(event: LoopEvent) -> str | None:
         return SUSPENDED_LINE_TEMPLATE.format(title=event.title)
     if isinstance(event, ProcessResumed):
         return RESUMED_LINE_TEMPLATE.format(title=event.title)
+    if isinstance(event, RetryScheduled):
+        return RETRY_LINE_TEMPLATE.format(
+            reason=event.reason, attempt=event.attempt, delay=event.delay_seconds
+        )
     # ProcessCompleted is not rendered: completions already arrive as report-run text.
     return None

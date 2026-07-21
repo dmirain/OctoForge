@@ -58,6 +58,9 @@ tool_calls, и на каждый пишется tool-ответ «cancelled» и
    (конец вызова = переход дельт на следующий index; последний закрывается на
    `finish`); `ToolCallBroken(index, call_id, name, error, raw)` — JSON не собрался.
    `StreamFinished(message)` остаётся источником истины для истории.
+   Отдельно: `RetryScheduled(attempt, delay_seconds, reason)` — клиентский
+   ретрай транзиентного сбоя (см. design.md «Ошибки LLM и ретраи»); петля
+   транслирует его в LoopEvent без влияния на историю.
 2. **Петля** (`agent/loop.py`): на `Ready` — немедленно `asyncio.create_task` +
    `ToolCallRequested`; результаты через `asyncio.Queue`, события по мере готовности;
    в конце шага — ожидание всех задач; **в историю tool-сообщения строго в порядке

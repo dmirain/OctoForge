@@ -6,7 +6,14 @@ from http import HTTPStatus
 import httpx
 import pytest
 
-from octoforge_core import ChatMessage, LLMConfig, LLMResponseError, MessageRole, ToolCall
+from octoforge_core import (
+    ChatMessage,
+    LLMConfig,
+    LLMResponseError,
+    MessageRole,
+    ProviderInternalError,
+    ToolCall,
+)
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.skills.base import SkillSpec
 
@@ -59,7 +66,7 @@ async def test_complete_raises_on_http_error() -> None:
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
         client = OpenAICompatibleClient(http_client=http, config=make_config())
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(ProviderInternalError):
             await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
 
 

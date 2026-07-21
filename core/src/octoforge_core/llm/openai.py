@@ -3,6 +3,7 @@
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from typing import Any
 
 import httpx
@@ -10,6 +11,7 @@ import httpx
 from octoforge_core.config import LLMConfig
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.errors import LLMResponseError
+from octoforge_core.llm.errors import TransportError, classify_http_error, parse_retry_after
 from octoforge_core.llm.events import (
     StreamEvent,
     StreamFinished,
@@ -28,6 +30,18 @@ SSE_DATA_PREFIX = "data:"
 SSE_DONE_MARKER = "[DONE]"
 
 
+def _raise_for_status(response: httpx.Response) -> None:
+    """Raise a typed LLMError for an error HTTP status."""
+    if response.status_code < HTTPStatus.BAD_REQUEST:
+        return
+    try:
+        body: object = response.json()
+    except ValueError:
+        body = None
+    retry_after = parse_retry_after(response.headers.get("retry-after"))
+    raise classify_http_error(response.status_code, body, retry_after)
+
+
 class OpenAICompatibleClient:
     """LLMClient implementation for OpenAI-compatible endpoints."""
 
@@ -41,13 +55,16 @@ class OpenAICompatibleClient:
         tools: list[SkillSpec] | None = None,
     ) -> ChatMessage:
         """Call chat/completions (non-streaming) and return the reply."""
-        response = await self._http.post(
-            CHAT_COMPLETIONS_PATH,
-            json=self._build_payload(messages, tools, stream=False),
-            headers={"Authorization": f"Bearer {self._config.api_key}"},
-            timeout=self._config.timeout_seconds,
-        )
-        response.raise_for_status()
+        try:
+            response = await self._http.post(
+                CHAT_COMPLETIONS_PATH,
+                json=self._build_payload(messages, tools, stream=False),
+                headers={"Authorization": f"Bearer {self._config.api_key}"},
+                timeout=self._config.timeout_seconds,
+            )
+        except httpx.HTTPError as exc:
+            raise TransportError(str(exc) or type(exc).__name__) from exc
+        _raise_for_status(response)
         return self._parse_reply(response.json())
 
     async def stream(
@@ -56,26 +73,29 @@ class OpenAICompatibleClient:
         tools: list[SkillSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Call chat/completions with streaming and yield events."""
-        async with self._http.stream(
-            "POST",
-            CHAT_COMPLETIONS_PATH,
-            json=self._build_payload(messages, tools, stream=True),
-            headers={"Authorization": f"Bearer {self._config.api_key}"},
-            timeout=self._config.timeout_seconds,
-        ) as response:
-            response.raise_for_status()
-            accumulator = _StreamAccumulator()
-            async for line in response.aiter_lines():
-                if not line.startswith(SSE_DATA_PREFIX):
-                    continue
-                data = line[len(SSE_DATA_PREFIX) :].strip()
-                if data == SSE_DONE_MARKER:
-                    break
-                for event in accumulator.feed(data):
+        try:
+            async with self._http.stream(
+                "POST",
+                CHAT_COMPLETIONS_PATH,
+                json=self._build_payload(messages, tools, stream=True),
+                headers={"Authorization": f"Bearer {self._config.api_key}"},
+                timeout=self._config.timeout_seconds,
+            ) as response:
+                _raise_for_status(response)
+                accumulator = _StreamAccumulator()
+                async for line in response.aiter_lines():
+                    if not line.startswith(SSE_DATA_PREFIX):
+                        continue
+                    data = line[len(SSE_DATA_PREFIX) :].strip()
+                    if data == SSE_DONE_MARKER:
+                        break
+                    for event in accumulator.feed(data):
+                        yield event
+                for event in accumulator.finish():
                     yield event
-            for event in accumulator.finish():
-                yield event
-            yield StreamFinished(message=accumulator.build_message())
+        except httpx.HTTPError as exc:
+            raise TransportError(str(exc) or type(exc).__name__) from exc
+        yield StreamFinished(message=accumulator.build_message())
 
     def _build_payload(
         self,

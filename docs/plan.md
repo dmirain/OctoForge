@@ -297,7 +297,13 @@ distributed-профиль (scaling.md этап 2); секреты-заглуш�
 > исполнения — в конце раздела. Каждый пункт: что делаем, зачем (какой сценарий
 > поломки или переплаты закрывает), как это решено у референсов, стоимость.
 
-### 1. Таксономия ошибок LLM + ретраи с классификатором и Retry-After
+### 1. Таксономия ошибок LLM + ретраи с классификатором и Retry-After ✅
+
+> **Сделано** (2026-07-21): `llm/errors.py` (таксономия + классификация из статуса/тела,
+> Retry-After), `RetryingLLMClient` в `build_llm_client` (backoff+jitter, стрим — до
+> первого события), событие `RetryScheduled` → LoopEvent → SSE/Telegram/UI, конфиг
+> `OF_LLM_MAX_RETRIES`/`OF_LLM_RETRY_BASE_SECONDS`/`OF_LLM_RETRY_MAX_SECONDS`.
+> См. [design.md](design.md) «Ошибки LLM и ретраи».
 
 - **Что.** Новый модуль `core/src/octoforge_core/llm/errors.py`: типизированная
   таксономия (`rate_limit(retry_after) | auth | quota | context_overflow |

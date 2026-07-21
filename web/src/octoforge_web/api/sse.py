@@ -14,6 +14,7 @@ from octoforge_core.agent.events import (
     ProcessCompleted,
     ProcessResumed,
     ProcessSuspended,
+    RetryScheduled,
     TextDelta,
     ToolCallCompleted,
     ToolCallFailed,
@@ -87,6 +88,13 @@ def _terminal_event_details(payload: LoopEvent) -> dict[str, Any] | None:
         return {"type": "cancelled"}
     if isinstance(payload, Failed):
         return {"type": "failed", "error": payload.error}
+    if isinstance(payload, RetryScheduled):
+        return {
+            "type": "retry_scheduled",
+            "attempt": payload.attempt,
+            "delay_seconds": payload.delay_seconds,
+            "reason": payload.reason,
+        }
     return None
 
 
