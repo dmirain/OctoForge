@@ -1,23 +1,32 @@
 """Summarization prompt of the context module and the reply parsing helpers."""
 
-from octoforge_core.context.api import ArchivedMessage
+from octoforge_core.context.api import ArchivedMessage, DialogueSummary
 
 TOPICS_PREFIX = "TOPICS:"
 SUMMARY_PREFIX = "SUMMARY:"
 MAX_TOPICS = 4
 SEGMENT_LINE_TEMPLATE = "[{seq}] {role}: {content}"
+NO_PREVIOUS_SUMMARY = "Previous summary: none."
 
 SUMMARY_SYSTEM_PROMPT = (
-    "You compress a segment of a conversation into a durable summary.\n"
+    "You maintain a durable summary of a conversation.\n"
+    "You receive the previous summary (possibly none) and a new conversation segment. "
+    "Produce the UPDATED summary: preserve what is still true, drop what is stale or "
+    "superseded, merge in the new facts.\n"
     "Reply in exactly this format:\n"
     f"{TOPICS_PREFIX} tag1, tag2\n"
     f"{SUMMARY_PREFIX}\n"
-    "<compressed text>\n"
+    "<updated summary>\n"
+    "Summary structure:\n"
+    "- Goal: what the user is trying to achieve.\n"
+    "- State: current state, what has been done.\n"
+    "- Next: open tasks and next steps.\n"
+    "- Decisions: key decisions, facts and agreements.\n"
     "Rules:\n"
     "1. Emit 1-4 topic tags: short, lowercase, normalized (singular, no punctuation).\n"
-    "2. The summary preserves facts, decisions, agreements, names, numbers and open "
-    "tasks; drop small talk and phrasing.\n"
-    "3. Write in the language of the segment."
+    "2. Keep exact identifiers: paths, commands, error texts, names, numbers, dates.\n"
+    "3. Drop small talk and phrasing; keep the summary compact.\n"
+    "4. Write in the language of the conversation."
 )
 
 
@@ -29,6 +38,20 @@ def format_segment(segment: list[ArchivedMessage]) -> str:
         )
         for message in segment
     )
+
+
+def format_merge_request(previous: list[DialogueSummary], segment: list[ArchivedMessage]) -> str:
+    """Render the rolling-merge request: previous summary + the new segment."""
+    parts: list[str] = []
+    if previous:
+        parts.append("Previous summary:")
+        parts.extend(f"- {summary.content}" for summary in previous)
+    else:
+        parts.append(NO_PREVIOUS_SUMMARY)
+    parts.append("")
+    parts.append("New segment:")
+    parts.append(format_segment(segment))
+    return "\n".join(parts)
 
 
 def parse_summary_reply(text: str) -> tuple[tuple[str, ...], str]:

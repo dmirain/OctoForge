@@ -412,6 +412,17 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
 токенный триггер компакции ([context.md](context.md), `OF_MODEL_CONTEXT_TOKENS`/
 `OF_CONTEXT_BUFFER_TOKENS`) и фундамент per-user учёта стоимости.
 
+### Реактивная компакция и rolling merge (`context/`)
+
+`ContextOverflowError` (класс из таксономии выше) не убивает прогон: раннер
+синхронно компактит нарратив через порт `ContextCompactor.compact_now`,
+пересобирает ветку процесса (голова и trail на месте, нарратив — заново через
+`assemble`) и повторяет прогон один раз; повторный overflow → честный `Failed`.
+Суммаризации сливаются rolling merge'ем: промпт получает предыдущее саммари и
+обновляет его (структура Goal/State/Next/Decisions, точные идентификаторы
+сохраняются), стор замещает записи диалога одной (`replace_for_dialog`) —
+размер блока тем константный. Подробности — [context.md](context.md).
+
 ## Фоновые задачи
 
 Задача — это фоновый процесс актора, подкреплённый записью в `TaskStore`

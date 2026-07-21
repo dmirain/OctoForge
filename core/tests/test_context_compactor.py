@@ -18,7 +18,11 @@ from octoforge_core.context.compactor import (
     NoopContextCompactor,
     select_compact_segment,
 )
-from octoforge_core.context.prompts import parse_summary_reply
+from octoforge_core.context.prompts import (
+    NO_PREVIOUS_SUMMARY,
+    format_merge_request,
+    parse_summary_reply,
+)
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
@@ -253,6 +257,25 @@ def test_parse_summary_reply_normalizes_and_caps_topics() -> None:
     assert topics == ("one", "two", "three", "four")
 
 
+def test_format_merge_request_renders_previous_summary_and_segment() -> None:
+    previous = [make_summary("dlg", seq_from=1, seq_to=2)]
+    segment = [archived(3, "hello"), archived(4, "world")]
+
+    request = format_merge_request(previous, segment)
+
+    assert "Previous summary:" in request
+    assert "we planned a trip" in request
+    assert "[3] user: hello" in request
+    assert "[4] user: world" in request
+
+
+def test_format_merge_request_marks_absent_previous_summary() -> None:
+    request = format_merge_request([], [archived(1, "hello")])
+
+    assert NO_PREVIOUS_SUMMARY in request
+    assert "[1] user: hello" in request
+
+
 # --- assemble -----------------------------------------------------------------
 
 
@@ -370,8 +393,19 @@ async def test_guard_runs_one_compaction_per_dialog_and_retriggers_after(
 
     await compactor.assemble(dialog, history)  # tail is still over: retrigger
     await wait_for_condition(lambda: llm.calls == TWO_CALLS)
-    summaries = await _wait_for_summaries(store, dialog.id, count=TWO_CALLS)
-    assert [(s.seq_from, s.seq_to) for s in summaries] == [(1, 2), (3, FOUR_MESSAGES)]
+    # rolling merge: the second run folds the new segment into the one summary
+    assert "Previous summary:" in llm.requests[1][1].content
+    assert "compressed facts" in llm.requests[1][1].content
+
+    async def _merged() -> bool:
+        summaries = await store.list_for_dialog(dialog.id)
+        return len(summaries) == 1 and summaries[0].seq_to == FOUR_MESSAGES
+
+    await wait_for_condition(_merged)
+    (merged,) = await store.list_for_dialog(dialog.id)
+    assert (merged.seq_from, merged.seq_to) == (1, FOUR_MESSAGES)
+    assert merged.topics == ("gamma",)
+    assert merged.content == "more facts"
 
 
 async def test_failed_compaction_logs_a_warning_and_the_dialog_lives(
@@ -393,7 +427,7 @@ async def test_failed_compaction_logs_a_warning_and_the_dialog_lives(
     assert await store.list_for_dialog(dialog.id) == []
 
 
-async def test_repeated_compactions_cover_disjoint_ranges(
+async def test_repeated_compactions_merge_into_one_rolling_summary(
     store: SqlAlchemySummaryStore,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -407,8 +441,14 @@ async def test_repeated_compactions_cover_disjoint_ranges(
     assert (summaries[0].seq_from, summaries[0].seq_to) == (1, 2)
 
     await compactor.assemble(dialog, history)
-    summaries = await _wait_for_summaries(store, dialog.id, count=TWO_CALLS)
-    assert [(s.seq_from, s.seq_to) for s in summaries] == [(1, 2), (3, FOUR_MESSAGES)]
+
+    async def _merged() -> bool:
+        summaries = await store.list_for_dialog(dialog.id)
+        return len(summaries) == 1 and summaries[0].seq_to == FOUR_MESSAGES
+
+    await wait_for_condition(_merged)
+    (merged,) = await store.list_for_dialog(dialog.id)
+    assert merged.seq_from == 1  # the merged record keeps the earliest covered seq
 
     await compactor.assemble(dialog, history)  # tail of 2 fits now: no third run
     await asyncio.sleep(0)
@@ -537,6 +577,23 @@ async def test_latest_prompt_tokens_reads_the_newest_assistant_usage(
     await append_assistant_with_usage(session_factory, dialog.id, OVERFLOW_PROMPT_TOKENS)
 
     assert await store.latest_prompt_tokens(dialog.id) == OVERFLOW_PROMPT_TOKENS
+
+
+async def test_compact_now_compacts_synchronously_and_reports_progress(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    llm = SummarizingLLM([SUMMARY_REPLY])
+    compactor = make_compactor(store, llm)  # high limits: no automatic trigger
+    await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
+
+    compacted = await compactor.compact_now(dialog)
+
+    assert compacted
+    summaries = await store.list_for_dialog(dialog.id)  # written before the return
+    assert len(summaries) == 1
+    assert await compactor.compact_now(dialog) is False  # nothing new to compact
 
 
 async def test_aclose_cancels_a_pending_compaction(

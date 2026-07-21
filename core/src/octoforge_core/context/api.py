@@ -72,6 +72,15 @@ class ContextCompactor(Protocol):
         """
         ...
 
+    async def compact_now(self, dialog: Dialog) -> bool:
+        """Compact synchronously (the reactive path after a context overflow).
+
+        Returns True when a new summary was written and re-assembling the
+        branch is worthwhile; False when there was nothing to compact (or the
+        implementation never compacts — the Noop default).
+        """
+        ...
+
     async def aclose(self) -> None:
         """Cancel pending background work (the owning runner is stopping)."""
         ...
@@ -86,6 +95,14 @@ class SummaryStore(Protocol):
 
     async def list_for_dialog(self, dialog_id: str) -> list[DialogueSummary]:
         """Return all summaries of the dialog, ordered by seq_from."""
+        ...
+
+    async def replace_for_dialog(self, dialog_id: str, summary: DialogueSummary) -> None:
+        """Replace all summaries of the dialog with the one (rolling merge).
+
+        The merged summary covers `[min(previous seq_from), new seq_to]`, so
+        `max_seq_to` keeps working and the topics block stays constant-size.
+        """
         ...
 
     async def max_seq_to(self, dialog_id: str) -> int:

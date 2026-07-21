@@ -7,7 +7,7 @@ implements both ports of the module: `SummaryStore` over the module-owned
 `messages` table (writing messages stays the actor's business).
 """
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.context.api import (
@@ -57,6 +57,23 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
                 .order_by(SummaryRow.seq_from)
             )
             return [_to_summary(row) for row in result.all()]
+
+    async def replace_for_dialog(self, dialog_id: str, summary: DialogueSummary) -> None:
+        """Replace all summaries of the dialog with the one (rolling merge)."""
+        async with self._session_factory() as session:
+            await session.execute(delete(SummaryRow).where(SummaryRow.dialog_id == dialog_id))
+            session.add(
+                SummaryRow(
+                    id=summary.id,
+                    dialog_id=summary.dialog_id,
+                    seq_from=summary.seq_from,
+                    seq_to=summary.seq_to,
+                    topics=list(summary.topics),
+                    content=summary.content,
+                    created_at=summary.created_at,
+                )
+            )
+            await session.commit()
 
     async def max_seq_to(self, dialog_id: str) -> int:
         """Return the highest covered seq; NO_COMPACTED_SEQ when nothing was compacted."""

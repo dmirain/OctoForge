@@ -29,6 +29,7 @@ from octoforge_core.agent.router import (
 from octoforge_core.context.api import ContextCompactor
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
+from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
 from octoforge_core.ports import TaskStore
 from octoforge_core.skills.base import SkillContext
@@ -114,6 +115,13 @@ class _Process:
     control: LoopControl
     branch: list[ChatMessage]
     pump: asyncio.Task[None] | None = None
+    # Branch layout for the reactive-compaction rebuild: the head (system
+    # prompt + presearch note) and the trail survive, the narrative between
+    # them is re-assembled after compaction. head_len=0 marks branches not
+    # built from the narrative (background tasks) — they are not rebuilt.
+    head_len: int = 0
+    trail: ChatMessage | None = None
+    overflow_retried: bool = False
 
 
 class TaskOutcomeListener(Protocol):
@@ -426,6 +434,8 @@ class ConversationRunner:
                 *([trail] if trail is not None else []),
             ],
         )
+        process.head_len = 1 + (1 if presearch_note is not None else 0)
+        process.trail = trail
         self._foreground_id = process.id
 
     async def _presearch_note(self, searches: tuple[str, ...]) -> ChatMessage | None:
@@ -504,6 +514,45 @@ class ConversationRunner:
             self._terminate_process(process, status)
 
     async def _stream_terminal(self, process: _Process) -> LoopEvent:
+        """Run the loop stream, compacting reactively once on a context overflow.
+
+        An overflow fails the run only when the process was already retried or
+        its branch is not narrative-built (background tasks): a retry with the
+        same oversized branch would just overflow again.
+        """
+        while True:
+            try:
+                return await self._stream_once(process)
+            except ContextOverflowError as exc:
+                if process.overflow_retried or process.head_len == 0:
+                    return self._fail_run(process, format_error(exc))
+                process.overflow_retried = True
+                logger.info(
+                    "context overflow, compacting reactively: dialog=%s process=%s",
+                    self._dialog.id,
+                    process.id,
+                )
+                if not await self._compactor.compact_now(self._dialog):
+                    return self._fail_run(process, format_error(exc))
+                await self._rebuild_branch(process)
+
+    async def _rebuild_branch(self, process: _Process) -> None:
+        """Re-assemble the narrative part of the branch after a compaction."""
+        narrative = await self._compactor.assemble(self._dialog, self._narrative)
+        process.branch[:] = [
+            *process.branch[: process.head_len],
+            *narrative,
+            *([process.trail] if process.trail is not None else []),
+        ]
+
+    def _fail_run(self, process: _Process, error: str) -> LoopEvent:
+        """Broadcast and return a Failed terminal for the process."""
+        terminal = Failed(error=error)
+        if self._foreground_id == process.id:
+            self._broadcast(terminal)
+        return terminal
+
+    async def _stream_once(self, process: _Process) -> LoopEvent:
         """Run the loop stream, broadcasting events only while it is the foreground."""
         context = SkillContext(
             user_id=self._dialog.user_id,
@@ -518,6 +567,8 @@ class ConversationRunner:
                     self._broadcast(event)
                 if isinstance(event, (Finished, Cancelled, Failed)):
                     terminal = event
+        except ContextOverflowError:
+            raise  # the reactive-compaction retry handles it one level up
         except Exception as exc:  # loop failures are broadcast, not raised
             logger.exception(
                 "process loop crashed: dialog=%s process=%s", self._dialog.id, process.id

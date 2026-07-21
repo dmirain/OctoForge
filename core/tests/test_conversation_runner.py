@@ -37,11 +37,13 @@ from octoforge_core.agent.runner import (
     RunnerConfig,
     TaskOutcomeListener,
 )
+from octoforge_core.context.api import ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.models import MessageRow
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
+from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
@@ -57,6 +59,7 @@ REPLY = "hello"
 PARTIAL = "partial"
 PROMPT_TOKENS = 321
 COMPLETION_TOKENS = 12
+RETRIED_CALLS = 2
 BLOCKING_SKILL = "blocking"
 TASK_SPAWN_CALL = "task_spawn"
 CALL_ID = "call-1"
@@ -165,6 +168,52 @@ class UsageLLM(ScriptedLLM):
         if reply.content:
             yield LlmTextDelta(text=reply.content)
         yield StreamFinished(message=reply, usage=self._usage)
+
+
+class FakeCompactor:
+    """ContextCompactor stub: passthrough assemble, programmable compact_now."""
+
+    def __init__(self, compact_result: bool = True) -> None:
+        self._compact_result = compact_result
+        self.compact_calls = 0
+
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
+        return list(history)
+
+    async def compact_now(self, dialog: Dialog) -> bool:
+        self.compact_calls += 1
+        return self._compact_result
+
+    async def aclose(self) -> None:
+        pass
+
+
+class OverflowLLM:
+    """LLMClient stub failing streams with ContextOverflowError, then answering."""
+
+    def __init__(self, overflows: int) -> None:
+        self._overflows = overflows
+        self.stream_calls = 0
+        self.requests: list[list[ChatMessage]] = []
+
+    async def complete(
+        self,
+        messages: list[ChatMessage],
+        tools: list[SkillSpec] | None = None,
+    ) -> Completion:
+        raise NotImplementedError
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[SkillSpec] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.stream_calls += 1
+        self.requests.append(list(messages))
+        if self.stream_calls <= self._overflows:
+            raise ContextOverflowError("prompt too big")
+        yield LlmTextDelta(text=REPLY)
+        yield StreamFinished(message=ChatMessage(role=MessageRole.ASSISTANT, content=REPLY))
 
 
 class GatedLLM:
@@ -324,6 +373,7 @@ class ManagerOptions:
     max_processes: int = MAX_PROCESSES
     listener: TaskOutcomeListener | None = None
     presearch: PresearchPort | None = None
+    compactor: ContextCompactor | None = None
 
 
 def make_manager(
@@ -339,7 +389,9 @@ def make_manager(
         prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: PROMPT}),
         router=resolved.router if resolved.router is not None else FakeRouter(),
         max_processes=resolved.max_processes,
-        compactor=NoopContextCompactor(),
+        compactor=(
+            resolved.compactor if resolved.compactor is not None else NoopContextCompactor()
+        ),
         task_outcome_listener=resolved.listener,
         presearch=resolved.presearch,
     )
@@ -467,6 +519,72 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
     assert assistant.role == MessageRole.ASSISTANT.value
     assert assistant.prompt_tokens == PROMPT_TOKENS
     assert assistant.completion_tokens == COMPLETION_TOKENS
+
+
+async def test_context_overflow_compacts_and_retries_once(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = OverflowLLM(overflows=1)
+    compactor = FakeCompactor()
+    manager = make_manager(
+        llm, SkillRegistry(), session_factory, ManagerOptions(compactor=compactor)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    events = await collect_until(queue, is_completed)
+
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert len(finished) == 1
+    assert finished[0].message.content == REPLY
+    assert compactor.compact_calls == 1
+    assert llm.stream_calls == RETRIED_CALLS
+    # the retried run got a rebuilt branch: system head + narrative
+    second_request = llm.requests[1]
+    assert second_request[0].role is MessageRole.SYSTEM
+    assert second_request[-1].content == "hi"
+    done = completions(events)
+    assert [(item.title, item.status) for item in done] == [("hi", TaskStatus.DONE.value)]
+
+
+async def test_second_context_overflow_fails_the_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = OverflowLLM(overflows=RETRIED_CALLS)
+    compactor = FakeCompactor()
+    manager = make_manager(
+        llm, SkillRegistry(), session_factory, ManagerOptions(compactor=compactor)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    events = await collect_until(queue, is_completed)
+
+    failed = [e.payload for e in events if isinstance(e.payload, Failed)]
+    assert len(failed) == 1
+    assert "ContextOverflowError" in failed[0].error
+    assert compactor.compact_calls == 1  # exactly one reactive compaction
+    assert llm.stream_calls == RETRIED_CALLS  # initial run + one retry
+    done = completions(events)
+    assert [(item.title, item.status) for item in done] == [("hi", TaskStatus.FAILED.value)]
+
+
+async def test_context_overflow_without_compaction_fails_immediately(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = OverflowLLM(overflows=1)  # NoopContextCompactor: compact_now -> False
+    manager = make_manager(llm, SkillRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    events = await collect_until(queue, is_completed)
+
+    failed = [e.payload for e in events if isinstance(e.payload, Failed)]
+    assert len(failed) == 1
+    assert llm.stream_calls == 1  # no retry without a compaction
 
 
 async def test_new_question_suspends_foreground_and_starts_new_process(

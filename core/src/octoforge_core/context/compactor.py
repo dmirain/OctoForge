@@ -1,13 +1,15 @@
 """Default ContextCompactor: hot-tail policy and background LLM summarization.
 
-Assemble returns `[topics block?] + hot tail`: one system message with every
-summary of the dialog (skipped when there are none), then the archive tail
+Assemble returns `[topics block?] + hot tail`: one system message with the
+dialog's rolling summary (skipped when there is none), then the archive tail
 with `seq > max(seq_to)` taken from the actor's narrative (its in-memory
 mirror). When the tail outgrows the configured limit, a background asyncio
-task compresses the oldest tail messages into a new summary — one LLM call,
-one store write; the fresh tail is never touched. Compaction is technical
-work, not an actor process: it stays invisible to the dialog, guarded to one
-run per dialog, and a failure is a logged warning, never a dialog error.
+task compresses the oldest tail messages, merging them into the single
+rolling summary — one LLM call, one store write; the fresh tail is never
+touched. Compaction is technical work, not an actor process: it stays
+invisible to the dialog, guarded to one run per dialog, and a failure is a
+logged warning, never a dialog error. `compact_now` runs the same merge
+synchronously — the reactive path after a provider context overflow.
 """
 
 import asyncio
@@ -26,7 +28,7 @@ from octoforge_core.context.api import (
 )
 from octoforge_core.context.prompts import (
     SUMMARY_SYSTEM_PROMPT,
-    format_segment,
+    format_merge_request,
     parse_summary_reply,
 )
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
@@ -68,6 +70,10 @@ class NoopContextCompactor(ContextCompactor):
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
         """Return the history unchanged."""
         return list(history)
+
+    async def compact_now(self, dialog: Dialog) -> bool:
+        """Never compacts: there is nothing to rebuild against."""
+        return False
 
     async def aclose(self) -> None:
         """Nothing to cancel."""
@@ -121,6 +127,20 @@ class LlmContextCompactor(ContextCompactor):
             with suppress(asyncio.CancelledError):
                 await task
 
+    async def compact_now(self, dialog: Dialog) -> bool:
+        """Compact synchronously; True when the covered range advanced.
+
+        An in-flight background compaction is awaited first: its result
+        counts, so a reactive call does not redo the same work.
+        """
+        before = await self._store.max_seq_to(dialog.id)
+        running = self._running.get(dialog.id)
+        if running is not None and not running.done():
+            with suppress(asyncio.CancelledError):
+                await running
+        await self._compact(dialog)
+        return await self._store.max_seq_to(dialog.id) > before
+
     def _trigger_compact(self, dialog: Dialog) -> None:
         """Start a background compaction unless one is already running (guard)."""
         running = self._running.get(dialog.id)
@@ -144,21 +164,28 @@ class LlmContextCompactor(ContextCompactor):
         segment = select_compact_segment(tail, self._config.compact_target_chars)
         if not segment:
             return
-        summary = await self._summarize(dialog, segment)
-        await self._store.create(summary)
+        previous = await self._store.list_for_dialog(dialog.id)
+        summary = await self._summarize(dialog, segment, previous)
+        await self._store.replace_for_dialog(dialog.id, summary)
 
-    async def _summarize(self, dialog: Dialog, segment: list[ArchivedMessage]) -> DialogueSummary:
+    async def _summarize(
+        self,
+        dialog: Dialog,
+        segment: list[ArchivedMessage],
+        previous: list[DialogueSummary],
+    ) -> DialogueSummary:
         completion = await self._llm.complete(
             [
                 ChatMessage(role=MessageRole.SYSTEM, content=SUMMARY_SYSTEM_PROMPT),
-                ChatMessage(role=MessageRole.USER, content=format_segment(segment)),
+                ChatMessage(role=MessageRole.USER, content=format_merge_request(previous, segment)),
             ]
         )
         topics, content = parse_summary_reply(completion.message.content)
+        seq_from = min([segment[0].seq, *(s.seq_from for s in previous)])
         return DialogueSummary(
             id=uuid.uuid4().hex,
             dialog_id=dialog.id,
-            seq_from=segment[0].seq,
+            seq_from=seq_from,
             seq_to=segment[-1].seq,
             topics=topics,
             content=content,
