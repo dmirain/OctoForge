@@ -42,6 +42,14 @@ core/                          # библиотека octoforge-core — дом�
     time.py                    # utc_now() — единая точка времени (UTC aware)
     errors.py                  # LLMResponseError
     ports.py                   # Protocol-порты: LLMClient, TaskStore
+    composition.py             # переиспользуемые builder'ы сборки (P5): build_llm_client,
+                               #   build_instruction_service, build_dataset_service,
+                               #   build_external_executor, build_skill_registry,
+                               #   build_agent_loop, build_compactor, build_router,
+                               #   build_cron_outcome_reporter, build_runner_config,
+                               #   build_conversation_manager, build_cron_scheduler;
+                               #   бандлы SkillLimits/SkillStores/SkillServices/RunnerOptions;
+                               #   только порты и конфиги, без fastapi и web-Settings
     agent/
       events.py                # LoopEvent: IterationStarted, TextDelta, AssistantMessage,
                                #   ToolCallRequested/Completed/Failed, Finished, Cancelled, Failed,
@@ -152,7 +160,8 @@ core/                          # библиотека octoforge-core — дом�
                                #   (+ темплейт {user_id} в значении заголовка), SSRF-гвард
       errors.py                # SsrfBlockedError, ToolSpecError, ExternalCallError
     # дальше: skills/dynamic/ (Jinja-движок)
-  tests/                       # test_agent_loop, test_conversation_runner, test_cron_store,
+  tests/                       # test_agent_loop, test_composition, test_conversation_runner,
+                               # test_cron_store,
                                # test_cron_scheduler, test_data_skills,
                                # test_datasets, test_datasets_store_port, test_dataset_validation,
                                # test_db_repositories, test_embeddings, test_external_call,
@@ -165,7 +174,8 @@ core/                          # библиотека octoforge-core — дом�
 web/                           # приложение octoforge-web — FastAPI-обёртка
   pyproject.toml               # deps: octoforge-core, fastapi, uvicorn, pydantic-settings
   src/octoforge_web/
-    main.py                    # app factory + composition root (DI: БД, LLM, эмбеддер, реестр,
+    main.py                    # app factory + composition root (DI поверх builder'ов
+                               #   octoforge_core.composition: БД, LLM, эмбеддер, реестр,
                                #   исполнитель external_call, LLMRouter, акторы, крон-планировщик,
                                #   telegram-адаптер; канал "web")
     config.py                  # Settings (env с префиксом OF_, включая OF_DATABASE_URL,
@@ -850,6 +860,10 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   подмена store-портов (P1 модульности): in-memory `InstructionStore`/`DatasetStore`
   инъектируются в немодифицированные сервисы (save/search/get/delete без SQL), vector-capable
   fake получает `search_by_vector` (делегирование, owner в сигнатуре, буст поверх кандидатов)
+- `core/tests/test_composition.py` — переиспользуемые builder'ы (P5 модульности): полный
+  набор базовых скилов из `build_skill_registry` (без `web_search` при `search_provider=None`),
+  подмена портов через builder'ы (fake `SearchProvider`, in-memory `InstructionStore`),
+  рабочий `build_conversation_manager` на SQLite `:memory:` с прогоном диалога
 - `core/tests/test_prompts.py` — `StaticPromptProvider`: вшитые дефолты, кастомный маппинг,
   KeyError на неизвестное имя; `test_router.py` += роутерный промпт из провайдера
 - `core/tests/test_web_search_skill.py` — скил над fake-`SearchProvider` (подмена P3):
@@ -866,7 +880,8 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   каждый get(), fallback на StaticPromptProvider (нет файла/файл нечитаем + warning),
   KeyError на неизвестное имя
 - `web/tests/test_modularity.py` — приёмочный сценарий модульности: минимальный сторонний
-  composition root (без `main.runtime()`): системный+роутерный промпты из файлов,
+  composition root (без `main.runtime()`), собранный из core-builder'ов
+  (`octoforge_core.composition`): системный+роутерный промпты из файлов,
   fake-`SearchProvider`, in-memory `InstructionStore` — диалог прогоняется целиком
   (промпты доезжают до LLM, скилы выполняются над подменёнными компонентами)
 - `web/tests/test_dialog_api.py` — get-or-create диалога, изоляция двух user_id, 400 без

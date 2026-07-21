@@ -1,6 +1,6 @@
 # Модульность и подменяемость ядра (аудит + дорожная карта)
 
-> **Статус: P1–P4 и P6 реализованы; P5 (переиспользуемый composition root) впереди.**
+> **Статус: P1–P6 реализованы.**
 > Цель — чтобы тот, кто ставит OctoForge в свою экосистему, мог подменить ключевые
 > компоненты **без переписывания ядра**: поиск/выдачу инструкций, cron, промпты ядра,
 > интеграцию с веб-поиском, память и другие выделенные швы. Связанные доки:
@@ -15,7 +15,8 @@
 
 - **Механизм расширения:** порты + собственный composition root. Инсталлятор пишет *свой*
   корень сборки, переиспользуя `octoforge-core` как библиотеку; ядро не редактируется.
-  Набор портов достроен (P1–P4 ниже); осталась декомпозиция самого корня (P5).
+  Набор портов достроен (P1–P4), сам корень разложен на переиспользуемые builder'ы (P5):
+  сторонний корень собирается из `octoforge_core.composition`, не копируя `runtime()`.
 - **Промпты:** переопределяются из внешнего источника (файл/конфиг) через `PromptProvider`;
   роутерный промпт вынесен за пределы `LLMRouter` (P2 сделано).
 - Каждый этап реализации = порт + дефолтная реализация + перенос wiring в корень + тесты +
@@ -128,29 +129,46 @@ Store-порты instructions/datasets повторяют этот паттер�
   APScheduler, OS cron).
 - Тесты: `test_cron_scheduler.py` += соответствие порту и подмена альтернативным движком.
 
+### P5 — Переиспользуемый composition root ✅
+
+**Что было.** `runtime()` (`main.py`) — монолитная сборка ~90 строк. При подходе «свой
+корень» инсталлятор вынужден копировать её целиком ради подмены одного компонента.
+
+**Что сделано.**
+- Новый модуль `core/.../composition.py` — переиспользуемые builder-функции без зависимости
+  от FastAPI / web-Settings / Telegram (только порты, конфиги, примитивы):
+  `build_llm_client`, `build_instruction_service`, `build_dataset_service`,
+  `build_external_executor`, `build_skill_registry`, `build_agent_loop`, `build_compactor`,
+  `build_router`, `build_cron_outcome_reporter`, `build_runner_config`,
+  `build_conversation_manager`, `build_cron_scheduler` (не создаёт asyncio-таск — старт
+  `run_forever()` на вызывающей стороне).
+- Лимиты скилов — frozen-dataclass `SkillLimits` (все поля обязательные); связанные порты
+  сгруппированы в бандлы `SkillStores` (tasks/cron/memory/archive/summaries) и
+  `SkillServices` (instructions/datasets/executor/search_provider), тюнинг раннера — в
+  `RunnerOptions` (max_processes + опциональный `TaskOutcomeListener`), чтобы не раздувать
+  сигнатуры (PLR0913 ≤ 5).
+- `_register_*`-хелперы переехали из `main.py` в `composition.py`; регистрация
+  `history_search` типизирована портами `MessageArchive`/`SummaryStore` (был конкретный
+  `SqlAlchemySummaryStore`). `web_search` регистрируется только при переданном
+  `search_provider`.
+- `runtime()` переписан вызовами builder'ов; в web осталась settings/транспорт-специфика:
+  engine + bootstrap схемы, httpx-клиенты, выбор бэкенда эмбеддингов/реранкера,
+  `FilePromptProvider`, SSRF-whitelist с `self_base_url`, serper-провайдер, сидинг, старт
+  telegram/cron-тасков, FastAPI. Поведение дефолтной сборки не изменилось (web и standalone
+  telegram — общий `runtime()`).
+- Публичный API ядра (`octoforge_core/__init__.py`) экспортирует builder'ы, бандлы и все
+  порты из таблицы выше (роутер, промпты, память, cron, эмбеддинги/реранкер,
+  instructions/datasets, поиск, контекст, TaskSpawner, RunnerConfig, TaskOutcomeListener).
+- Тесты: `core/tests/test_composition.py` (набор скилов, подмена портов через builder'ы,
+  менеджер на SQLite `:memory:`); `web/tests/test_modularity.py` переведён на сборку
+  стороннего корня из core-builder'ов.
+
 ### P6 — Косметика: конкретные аннотации в корне ✅
 
 `_register_instruction_skills`/`_register_dataset_skills` в `main.py` типизируют параметр
 портом `DatasetService` (было `LocalDatasetService`) — сделано заодно с P1, type-check при
-подмене `DatasetService` на HTTP-клиент больше не ломается.
-
-## Оставшиеся этапы
-
-### P5 — Переиспользуемый composition root
-
-**Проблема.** `runtime()` (`main.py`) — монолитная сборка ~90 строк. При подходе «свой
-корень» инсталлятор вынужден копировать её целиком ради подмены одного компонента.
-
-**Целевое решение.** Разложить сборку на переиспользуемые builder-функции с параметрами-
-портами: `build_skill_registry(...)`, `build_conversation_manager(...)`,
-`build_instruction_service(...)` и т.п. Существующие `_register_*`-хелперы поднять в
-переиспользуемый слой. `runtime()` остаётся дефолтной сборкой поверх builder'ов; сторонний
-корень собирает своё из тех же кирпичей. Слой без зависимости от FastAPI — в
-`octoforge-core`; web-специфика (Telegram/HTTP) — в `web/`. Публичный API ядра
-(`octoforge_core/__init__.py`) экспортирует все порты и builder'ы.
-
-**Файлы:** `main.py`, возможно новый `core/.../composition.py` или `web/.../assembly.py`,
-`octoforge_core/__init__.py`.
+подмене `DatasetService` на HTTP-клиент больше не ломается. С P5 хелперы живут в
+`composition.py` и типизированы портами целиком.
 
 ## Дополнительно (низкий приоритет)
 
@@ -168,7 +186,7 @@ Store-порты instructions/datasets повторяют этот паттер�
 2. ✅ **P2 — PromptProvider.**
 3. ✅ **P3 — SearchProvider.**
 4. ✅ **P4 — Scheduler-порт.**
-5. **P5 — Декомпозиция composition root** — следующий шаг (набор портов стабилизировался).
+5. ✅ **P5 — Декомпозиция composition root** (builder'ы в `octoforge_core.composition`).
 6. ✅ **P6 — Косметика аннотаций** (сделано заодно с P1).
 
 ## Верификация
@@ -181,12 +199,16 @@ Store-порты instructions/datasets повторяют этот паттер�
   подставленной вместо дефолтной: `test_instructions_store_port.py`,
   `test_datasets_store_port.py`, `test_web_search_skill.py` (fake-провайдер),
   `test_router.py` + `test_prompts.py` (кастомный провайдер промптов),
-  `test_cron_scheduler.py` (альтернативный движок).
+  `test_cron_scheduler.py` (альтернативный движок),
+  `test_composition.py` (builder'ы: набор скилов, подмена `SearchProvider`/
+  `InstructionStore` через `build_skill_registry`, менеджер на SQLite `:memory:`).
 - Единичные тесты из нужного проекта: `cd core && ../.venv/bin/pytest ...`,
   `cd web && ../.venv/bin/pytest ...`.
 - Приёмочный сценарий модульности — реализован: `web/tests/test_modularity.py` собирает
-  *минимальный сторонний composition root*, переопределяющий системный+роутерный промпт из
-  файла, с fake-`SearchProvider` и in-memory `InstructionStore`, и прогоняет через него
-  диалог (промпты доезжают до LLM, скилы выполняются над подменёнными компонентами).
+  *минимальный сторонний composition root* из core-builder'ов
+  (`octoforge_core.composition`), переопределяющий системный+роутерный промпт из файла,
+  с fake-`SearchProvider` и in-memory `InstructionStore`, и прогоняет через него диалог
+  (промпты доезжают до LLM, скилы выполняются над подменёнными компонентами) — подмена без
+  копирования `runtime()`.
 - E2E-дым: `make run` (chat UI на http://127.0.0.1:8000) и `make run-telegram` — дефолтная
   сборка не сломана.

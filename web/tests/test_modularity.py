@@ -1,11 +1,12 @@
 """Acceptance modularity scenario: a minimal third-party composition root.
 
-Builds a ConversationManager the way an installer would — with its own
-wiring, not `main.runtime()` — overriding the system and router prompts
-from files, substituting a fake SearchProvider and an in-memory
-InstructionStore, then runs a dialog through it. This is the acceptance
-check of the modularity roadmap (P1-P3): the seams are replaced without
-touching the core.
+Builds a ConversationManager the way an installer would — from the reusable
+core builders (`octoforge_core.composition`), not `main.runtime()` —
+overriding the system and router prompts from files, substituting a fake
+SearchProvider and an in-memory InstructionStore, then runs a dialog through
+it. This is the acceptance check of the modularity roadmap (P1-P3, P5): the
+seams are replaced without touching the core and without copying the default
+composition root.
 """
 
 import asyncio
@@ -13,29 +14,49 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 import pytest
 from octoforge_core.agent.events import Cancelled, Failed, Finished, ToolCallCompleted
-from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.prompts import (
     ROUTER_PROMPT_NAME,
     SYSTEM_PROMPT_NAME,
     StaticPromptProvider,
 )
-from octoforge_core.agent.router import ROUTE_TOOL_NAME, LLMRouter
-from octoforge_core.agent.runner import ConversationEvent, ConversationManager, RunnerConfig
+from octoforge_core.agent.router import ROUTE_TOOL_NAME
+from octoforge_core.agent.runner import ConversationEvent, ConversationManager
+from octoforge_core.composition import (
+    RunnerOptions,
+    SkillLimits,
+    SkillServices,
+    SkillStores,
+    build_agent_loop,
+    build_conversation_manager,
+    build_dataset_service,
+    build_external_executor,
+    build_instruction_service,
+    build_router,
+    build_runner_config,
+    build_skill_registry,
+)
 from octoforge_core.context.compactor import NoopContextCompactor
+from octoforge_core.context.store import SqlAlchemySummaryStore
+from octoforge_core.cron.store import SqlAlchemyCronStore
+from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
-from octoforge_core.instructions.api import EmbeddedInstruction, Instruction, InstructionType
-from octoforge_core.instructions.local import LocalInstructionService
+from octoforge_core.instructions.api import (
+    EmbeddedInstruction,
+    Instruction,
+    InstructionService,
+    InstructionType,
+)
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
+from octoforge_core.memory.store import SqlAlchemyMemoryStore
+from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
-from octoforge_core.skills.base import SkillOrigin, SkillSpec
-from octoforge_core.skills.basic.instructions_search import InstructionsSearchSkill
-from octoforge_core.skills.basic.web_search import WebSearchSkill
-from octoforge_core.skills.registry import SkillRegistry
+from octoforge_core.skills.base import SkillSpec
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.time import utc_now
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -58,6 +79,7 @@ CUSTOM_ROUTER_PROMPT = "CUSTOM ROUTER PROMPT FROM FILE (limit {limit}):\n{proces
 MAX_ITERATIONS = 5
 MAX_PROCESSES = 5
 DEFAULT_K = 5
+QUERY_LIMIT = 50
 ROUTER_TIMEOUT_SECONDS = 5.0
 WAIT_TIMEOUT_SECONDS = 2.0
 POLL_SECONDS = 0.01
@@ -207,14 +229,15 @@ class ThirdPartyRoot:
 
     manager: ConversationManager
     llm: RootLLM
-    instructions: LocalInstructionService
+    instructions: InstructionService
 
 
 def build_third_party_root(
     session_factory: async_sessionmaker[AsyncSession],
+    http_client: httpx.AsyncClient,
     prompt_dir: Path,
 ) -> ThirdPartyRoot:
-    """Assemble a ConversationManager from installer-owned parts (no main.py)."""
+    """Assemble a ConversationManager from the core builders (no main.py)."""
     system_file = prompt_dir / "system.txt"
     system_file.write_text(CUSTOM_SYSTEM_PROMPT, encoding="utf-8")
     router_file = prompt_dir / "router.txt"
@@ -223,21 +246,50 @@ def build_third_party_root(
         files={SYSTEM_PROMPT_NAME: system_file, ROUTER_PROMPT_NAME: router_file},
         fallback=StaticPromptProvider(),
     )
-    instructions = LocalInstructionService(InMemoryInstructionStore(), LenientEmbedder())
-    registry = SkillRegistry()
-    registry.register(WebSearchSkill(provider=FakeSearchProvider()), SkillOrigin.BASIC)
-    registry.register(
-        InstructionsSearchSkill(service=instructions, default_k=DEFAULT_K),
-        SkillOrigin.BASIC,
+    instructions = build_instruction_service(InMemoryInstructionStore(), LenientEmbedder())
+    summary_store = SqlAlchemySummaryStore(session_factory)
+    guard = SsrfGuard()
+    registry = build_skill_registry(
+        http_client,
+        guard,
+        stores=SkillStores(
+            tasks=InMemoryTaskStore(),
+            cron=SqlAlchemyCronStore(session_factory),
+            memory=SqlAlchemyMemoryStore(session_factory),
+            archive=summary_store,
+            summaries=summary_store,
+        ),
+        services=SkillServices(
+            instructions=instructions,
+            datasets=build_dataset_service(
+                SqlAlchemyDatasetStore(session_factory),
+                LenientEmbedder(),
+            ),
+            executor=build_external_executor(
+                service=instructions,
+                http_client=http_client,
+                guard=guard,
+            ),
+            search_provider=FakeSearchProvider(),
+        ),
+        limits=SkillLimits(
+            instructions_top_k=DEFAULT_K,
+            datasets_query_default_limit=QUERY_LIMIT,
+            datasets_query_max_limit=QUERY_LIMIT,
+            memory_search_default_limit=QUERY_LIMIT,
+            memory_search_max_limit=QUERY_LIMIT,
+            history_search_default_limit=QUERY_LIMIT,
+            history_search_max_limit=QUERY_LIMIT,
+        ),
     )
     llm = RootLLM()
-    manager = ConversationManager(
-        config=RunnerConfig(
-            loop=AgentLoop(llm_client=llm, registry=registry, max_iterations=MAX_ITERATIONS),
-            prompts=prompts,
-            router=LLMRouter(llm, timeout_seconds=ROUTER_TIMEOUT_SECONDS, prompts=prompts),
-            max_processes=MAX_PROCESSES,
-            compactor=NoopContextCompactor(),
+    manager = build_conversation_manager(
+        config=build_runner_config(
+            build_agent_loop(llm, registry, max_iterations=MAX_ITERATIONS),
+            prompts,
+            build_router(llm, prompts, timeout_seconds=ROUTER_TIMEOUT_SECONDS),
+            NoopContextCompactor(),
+            options=RunnerOptions(max_processes=MAX_PROCESSES),
         ),
         dialogs=DialogRepository(session_factory),
         messages=MessageRepository(session_factory),
@@ -252,6 +304,12 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     await init_db(engine)
     yield create_session_factory(engine)
     await engine.dispose()
+
+
+@pytest.fixture
+async def http_client() -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient() as client:
+        yield client
 
 
 async def wait_until(predicate: Callable[[], bool]) -> None:
@@ -284,9 +342,10 @@ def tool_outputs(events: list[ConversationEvent]) -> list[str]:
 
 async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     session_factory: async_sessionmaker[AsyncSession],
+    http_client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
-    root = build_third_party_root(session_factory, tmp_path)
+    root = build_third_party_root(session_factory, http_client, tmp_path)
     await root.instructions.save(InstructionType.SKILL, SAVED_TITLE, SAVED_CONTENT)
     runner = await root.manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()

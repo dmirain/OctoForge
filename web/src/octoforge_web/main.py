@@ -14,67 +14,49 @@ import httpx
 from fastapi import FastAPI, Response, status
 from fastapi.staticfiles import StaticFiles
 from octoforge_core import (
-    AgentLoop,
     ConversationManager,
     DialogRepository,
     MessageRepository,
-    SkillOrigin,
-    SkillRegistry,
     SqlAlchemyTaskStore,
     bootstrap_schema,
+    build_agent_loop,
+    build_compactor,
+    build_conversation_manager,
+    build_cron_outcome_reporter,
+    build_cron_scheduler,
+    build_dataset_service,
+    build_external_executor,
+    build_instruction_service,
+    build_llm_client,
+    build_router,
+    build_runner_config,
+    build_skill_registry,
     create_engine,
     create_session_factory,
     init_db,
 )
 from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
-from octoforge_core.agent.router import LLMRouter
-from octoforge_core.agent.runner import RunnerConfig
+from octoforge_core.composition import RunnerOptions, SkillLimits, SkillServices, SkillStores
 from octoforge_core.config import EmbeddingBackend
-from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
+from octoforge_core.context.compactor import CompactorConfig
 from octoforge_core.context.store import SqlAlchemySummaryStore
-from octoforge_core.cron.api import CronStore, Scheduler
-from octoforge_core.cron.reporter import CronOutcomeReporter
-from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
+from octoforge_core.cron.api import CronStore
+from octoforge_core.cron.scheduler import CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.cron.waker import ManagerCronWaker
-from octoforge_core.datasets.api import DatasetService
-from octoforge_core.datasets.service import LocalDatasetService
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
-from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.seed import migrate_cron_tools_to_native, seed_if_empty
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
-from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient, RerankerConfig
-from octoforge_core.memory.api import MemoryStore
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
-from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
+from octoforge_core.net.external import ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.serper import SerperSearchProvider
-from octoforge_core.skills.basic.cron_jobs import (
-    CronCreateSkill,
-    CronDeleteSkill,
-    CronListSkill,
-    CronPauseSkill,
-    CronResumeSkill,
-)
-from octoforge_core.skills.basic.data_forget import DataForgetSkill
-from octoforge_core.skills.basic.data_put import DataPutSkill
-from octoforge_core.skills.basic.data_query import DataQuerySkill
-from octoforge_core.skills.basic.external_call import ExternalCallSkill
-from octoforge_core.skills.basic.history_search import HistorySearchSkill
-from octoforge_core.skills.basic.http_request import HttpRequestSkill
-from octoforge_core.skills.basic.instruction_save import InstructionSaveSkill
-from octoforge_core.skills.basic.instructions_search import InstructionsSearchSkill
-from octoforge_core.skills.basic.memory_delete import MemoryDeleteSkill
-from octoforge_core.skills.basic.memory_search import MemorySearchSkill
-from octoforge_core.skills.basic.memory_store import MemoryStoreSkill
-from octoforge_core.skills.basic.task_list import TaskListSkill
-from octoforge_core.skills.basic.task_spawn import TaskSpawnSkill
-from octoforge_core.skills.basic.web_search import WebSearchSkill
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -116,7 +98,9 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     """Build all services and background tasks; no HTTP listener is involved.
 
     Shared composition root: the FastAPI lifespan wraps it, standalone
-    surfaces (the Telegram-only runner) use it directly.
+    surfaces (the Telegram-only runner) use it directly. The object graph is
+    assembled from the reusable builders of `octoforge_core.composition`;
+    only the settings/transport specifics live here.
     """
     engine = create_engine(settings.database_url)
     await _bootstrap_schema(engine)
@@ -131,70 +115,63 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             httpx.AsyncClient(base_url=settings.embedding_base_url) as embed_http,
             httpx.AsyncClient() as outbound_http,
         ):
-            llm_client = OpenAICompatibleClient(
-                http_client=llm_http,
-                config=settings.to_llm_config(),
-            )
+            llm_client = build_llm_client(llm_http, settings.to_llm_config())
             embedder = _build_embedder(settings, embed_http)
-            reranker = _build_reranker(settings)
-            instructions = LocalInstructionService(
+            instructions = build_instruction_service(
                 SqlAlchemyInstructionStore(session_factory),
                 embedder,
-                reranker=reranker,
+                reranker=_build_reranker(settings),
                 rerank_candidates=settings.reranker_candidates,
             )
-            datasets = LocalDatasetService(SqlAlchemyDatasetStore(session_factory), embedder)
+            datasets = build_dataset_service(SqlAlchemyDatasetStore(session_factory), embedder)
             await _seed_instructions(instructions, settings)
             # The app's own base URL is allowlisted so tool records can
             # target our loopback HTTP API (cron jobs) past the SSRF guard.
             guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
-            external_executor = ExternalCallExecutor(
-                service=instructions,
-                http_client=outbound_http,
-                guard=guard,
-                auth_whitelist=_external_call_whitelist(settings),
-            )
-            registry = SkillRegistry()
-            _register_core_skills(registry, outbound_http, guard, task_store, cron_store)
-            if settings.serper_token:
-                registry.register(
-                    WebSearchSkill(
-                        provider=SerperSearchProvider(
-                            http_client=outbound_http,
-                            api_key=settings.serper_token,
-                        )
-                    ),
-                    SkillOrigin.BASIC,
-                )
-            _register_instruction_skills(
-                registry, instructions, datasets, external_executor, settings
-            )
-            _register_dataset_skills(registry, datasets, settings)
             memory = SqlAlchemyMemoryStore(session_factory)
-            _register_memory_skills(registry, memory, settings)
             summary_store = SqlAlchemySummaryStore(session_factory)
-            _register_history_skill(registry, summary_store, settings)
-            loop = AgentLoop(
-                llm_client=llm_client,
-                registry=registry,
-                max_iterations=settings.agent_max_iterations,
-                stream_idle_timeout=settings.llm_stream_idle_timeout_seconds or None,
+            registry = build_skill_registry(
+                outbound_http,
+                guard,
+                stores=SkillStores(
+                    tasks=task_store,
+                    cron=cron_store,
+                    memory=memory,
+                    archive=summary_store,
+                    summaries=summary_store,
+                ),
+                services=SkillServices(
+                    instructions=instructions,
+                    datasets=datasets,
+                    executor=build_external_executor(
+                        service=instructions,
+                        http_client=outbound_http,
+                        guard=guard,
+                        auth_whitelist=_external_call_whitelist(settings),
+                    ),
+                    search_provider=_build_search_provider(settings, outbound_http),
+                ),
+                limits=_skill_limits(settings),
             )
             prompt_provider: PromptProvider = FilePromptProvider(
                 files=settings.to_prompt_files(),
                 fallback=StaticPromptProvider(),
             )
-            manager = ConversationManager(
-                config=RunnerConfig(
-                    loop=loop,
-                    prompts=prompt_provider,
-                    router=LLMRouter(
+            manager = build_conversation_manager(
+                config=build_runner_config(
+                    build_agent_loop(
                         llm_client,
-                        timeout_seconds=settings.router_timeout_seconds,
-                        prompts=prompt_provider,
+                        registry,
+                        max_iterations=settings.agent_max_iterations,
+                        stream_idle_timeout=settings.llm_stream_idle_timeout_seconds or None,
                     ),
-                    max_processes=settings.max_processes,
-                    compactor=LlmContextCompactor(
+                    prompt_provider,
+                    build_router(
+                        llm_client,
+                        prompt_provider,
+                        timeout_seconds=settings.router_timeout_seconds,
+                    ),
+                    build_compactor(
                         store=summary_store,
                         archive=summary_store,
                         llm=llm_client,
@@ -203,10 +180,13 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                             compact_target_chars=settings.context_compact_target_chars,
                         ),
                     ),
-                    task_outcome_listener=CronOutcomeReporter(
-                        cron_store,
-                        retry_limit=settings.cron_retry_limit,
-                        backoff_base_seconds=settings.cron_retry_backoff_seconds,
+                    options=RunnerOptions(
+                        max_processes=settings.max_processes,
+                        task_outcome_listener=build_cron_outcome_reporter(
+                            cron_store,
+                            retry_limit=settings.cron_retry_limit,
+                            backoff_base_seconds=settings.cron_retry_backoff_seconds,
+                        ),
                     ),
                 ),
                 dialogs=dialogs,
@@ -332,6 +312,29 @@ def _build_reranker(settings: Settings) -> RerankerClient | None:
     return CrossEncoderReranker(RerankerConfig(model=settings.reranker_model))
 
 
+def _build_search_provider(
+    settings: Settings,
+    outbound_http: httpx.AsyncClient,
+) -> SearchProvider | None:
+    """Build the default web-search provider when a serper token is configured."""
+    if not settings.serper_token:
+        return None
+    return SerperSearchProvider(http_client=outbound_http, api_key=settings.serper_token)
+
+
+def _skill_limits(settings: Settings) -> SkillLimits:
+    """Map the settings' skill limit fields to the core SkillLimits bundle."""
+    return SkillLimits(
+        instructions_top_k=settings.instructions_top_k,
+        datasets_query_default_limit=settings.datasets_query_default_limit,
+        datasets_query_max_limit=settings.datasets_query_max_limit,
+        memory_search_default_limit=settings.memory_search_default_limit,
+        memory_search_max_limit=settings.memory_search_max_limit,
+        history_search_default_limit=settings.history_search_default_limit,
+        history_search_max_limit=settings.history_search_max_limit,
+    )
+
+
 def _external_call_whitelist(settings: Settings) -> tuple[ExternalCallAuth, ...]:
     """Env-configured entries plus the app's own API with the per-user header."""
     self_entry = ExternalCallAuth(
@@ -348,9 +351,9 @@ def _start_cron_scheduler(
     settings: Settings,
 ) -> asyncio.Task[None]:
     """Build the cron scheduler of this instance and start its poll loop."""
-    scheduler: Scheduler = CronScheduler(
-        store=store,
-        waker=ManagerCronWaker(manager),
+    scheduler = build_cron_scheduler(
+        store,
+        ManagerCronWaker(manager),
         owner=uuid.uuid4().hex,
         config=CronSchedulerConfig(
             poll_interval_seconds=settings.cron_poll_interval_seconds,
@@ -409,100 +412,6 @@ async def _stop_background_tasks(
         with suppress(asyncio.CancelledError):
             await poller_task
         await registry.aclose()
-
-
-def _register_core_skills(
-    registry: SkillRegistry,
-    outbound_http: httpx.AsyncClient,
-    guard: SsrfGuard,
-    task_store: SqlAlchemyTaskStore,
-    cron_store: CronStore,
-) -> None:
-    """Register the HTTP, background-task and cron skills."""
-    registry.register(
-        HttpRequestSkill(http_client=outbound_http, guard=guard),
-        SkillOrigin.BASIC,
-    )
-    registry.register(TaskSpawnSkill(), SkillOrigin.BASIC)
-    registry.register(TaskListSkill(store=task_store), SkillOrigin.BASIC)
-    registry.register(CronCreateSkill(store=cron_store), SkillOrigin.BASIC)
-    registry.register(CronListSkill(store=cron_store), SkillOrigin.BASIC)
-    registry.register(CronDeleteSkill(store=cron_store), SkillOrigin.BASIC)
-    registry.register(CronPauseSkill(store=cron_store), SkillOrigin.BASIC)
-    registry.register(CronResumeSkill(store=cron_store), SkillOrigin.BASIC)
-
-
-def _register_instruction_skills(
-    registry: SkillRegistry,
-    instructions: InstructionService,
-    datasets: DatasetService,
-    executor: ExternalCallExecutor,
-    settings: Settings,
-) -> None:
-    """Register the instructions discovery/save and external-call skills."""
-    registry.register(
-        InstructionsSearchSkill(
-            service=instructions,
-            default_k=settings.instructions_top_k,
-            datasets=datasets,
-        ),
-        SkillOrigin.BASIC,
-    )
-    registry.register(InstructionSaveSkill(service=instructions), SkillOrigin.BASIC)
-    registry.register(ExternalCallSkill(executor=executor), SkillOrigin.BASIC)
-
-
-def _register_dataset_skills(
-    registry: SkillRegistry,
-    datasets: DatasetService,
-    settings: Settings,
-) -> None:
-    """Register the dataset record skills."""
-    registry.register(DataPutSkill(service=datasets), SkillOrigin.BASIC)
-    registry.register(
-        DataQuerySkill(
-            service=datasets,
-            default_limit=settings.datasets_query_default_limit,
-            max_limit=settings.datasets_query_max_limit,
-        ),
-        SkillOrigin.BASIC,
-    )
-    registry.register(DataForgetSkill(service=datasets), SkillOrigin.BASIC)
-
-
-def _register_memory_skills(
-    registry: SkillRegistry,
-    store: MemoryStore,
-    settings: Settings,
-) -> None:
-    """Register the memory skills over the shared memory store."""
-    registry.register(MemoryStoreSkill(store=store), SkillOrigin.BASIC)
-    registry.register(
-        MemorySearchSkill(
-            store=store,
-            default_limit=settings.memory_search_default_limit,
-            max_limit=settings.memory_search_max_limit,
-        ),
-        SkillOrigin.BASIC,
-    )
-    registry.register(MemoryDeleteSkill(store=store), SkillOrigin.BASIC)
-
-
-def _register_history_skill(
-    registry: SkillRegistry,
-    store: SqlAlchemySummaryStore,
-    settings: Settings,
-) -> None:
-    """Register the archive search skill over the summary store's read ports."""
-    registry.register(
-        HistorySearchSkill(
-            archive=store,
-            summaries=store,
-            default_limit=settings.history_search_default_limit,
-            max_limit=settings.history_search_max_limit,
-        ),
-        SkillOrigin.BASIC,
-    )
 
 
 app = create_app()
