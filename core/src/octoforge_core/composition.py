@@ -16,7 +16,6 @@ from octoforge_core.agent.prompts import PromptProvider
 from octoforge_core.agent.router import LLMRouter, MessageRouter
 from octoforge_core.agent.runner import (
     ConversationManager,
-    PresearchPort,
     RunnerConfig,
     TaskOutcomeListener,
 )
@@ -40,7 +39,6 @@ from octoforge_core.datasets.tools import DataForgetSkill, DataPutSkill, DataQue
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.instructions.api import InstructionService, InstructionStore
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES, LocalInstructionService
-from octoforge_core.instructions.presearch import InstructionPresearch
 from octoforge_core.instructions.tools import InstructionSaveSkill, SkillsSearchSkill
 from octoforge_core.llm.embeddings import EmbeddingClient
 from octoforge_core.llm.openai import OpenAICompatibleClient
@@ -98,11 +96,10 @@ class SkillServices:
 
 @dataclass(frozen=True, slots=True)
 class RunnerOptions:
-    """Tuning knobs of the conversation runners (limit, listener, presearch)."""
+    """Tuning knobs of the conversation runners (limit, listener)."""
 
     max_processes: int
     task_outcome_listener: TaskOutcomeListener | None = None
-    presearch: PresearchPort | None = None
 
 
 def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMClient:
@@ -210,11 +207,6 @@ def build_router(
     return LLMRouter(llm, timeout_seconds=timeout_seconds, prompts=prompts)
 
 
-def build_presearch(instructions: InstructionService) -> PresearchPort:
-    """Build the default skill presearch over the instructions facade."""
-    return InstructionPresearch(instructions)
-
-
 def build_cron_outcome_reporter(
     store: CronStore,
     *,
@@ -244,7 +236,6 @@ def build_runner_config(
         max_processes=options.max_processes,
         compactor=compactor,
         task_outcome_listener=options.task_outcome_listener,
-        presearch=options.presearch,
     )
 
 

@@ -129,9 +129,9 @@ class _Process:
     branch: list[ChatMessage]
     pump: asyncio.Task[None] | None = None
     # Branch layout for the reactive-compaction rebuild: the head (system
-    # prompt + presearch note) and the trail survive, the narrative between
-    # them is re-assembled after compaction. head_len=0 marks branches not
-    # built from the narrative (background tasks) — they are not rebuilt.
+    # prompt) and the trail survive, the narrative between them is re-assembled
+    # after compaction. head_len=0 marks branches not built from the narrative
+    # (background tasks) — they are not rebuilt.
     head_len: int = 0
     trail: ChatMessage | None = None
     overflow_retried: bool = False
@@ -145,14 +145,6 @@ class TaskOutcomeListener(Protocol):
         ...
 
 
-class PresearchPort(Protocol):
-    """Port running skill pre-searches for a new process (branch-only note)."""
-
-    async def run(self, queries: tuple[str, ...]) -> str | None:
-        """Return a system note with the relevant scenarios, or None when nothing found."""
-        ...
-
-
 @dataclass(frozen=True, slots=True)
 class RunnerConfig:
     """Behavior parameters shared by the conversation runners of one manager."""
@@ -163,7 +155,6 @@ class RunnerConfig:
     max_processes: int
     compactor: ContextCompactor
     task_outcome_listener: TaskOutcomeListener | None = None
-    presearch: PresearchPort | None = None
 
 
 class ConversationRunner:
@@ -183,7 +174,6 @@ class ConversationRunner:
         self._router = config.router
         self._max_processes = config.max_processes
         self._task_outcome_listener = config.task_outcome_listener
-        self._presearch = config.presearch
         self._compactor = config.compactor
         self._messages = messages
         self._tasks = tasks
@@ -387,9 +377,9 @@ class ConversationRunner:
                 if op.target_id is not None and self._cancel_process(op.target_id):
                     cancelled.add(op.target_id)
             elif op.action is RouteAction.INJECT:
-                await self._apply_inject(message, cancelled, decision.searches)
+                await self._apply_inject(message, cancelled)
             elif op.action is RouteAction.START_NEW:
-                await self._apply_start_new(message, cancelled, decision.searches)
+                await self._apply_start_new(message, cancelled)
             elif op.action is RouteAction.PROMOTE:
                 await self._apply_promote(message, op.target_id, cancelled)
 
@@ -397,24 +387,22 @@ class ConversationRunner:
         self,
         message: ChatMessage,
         cancelled: set[str],
-        searches: tuple[str, ...],
     ) -> None:
         foreground = self._foreground()
         if foreground is not None:
             foreground.control.inject(message)
             return
-        await self._apply_start_new(message, cancelled, searches)
+        await self._apply_start_new(message, cancelled)
 
     async def _apply_start_new(
         self,
         message: ChatMessage,
         cancelled: set[str],
-        searches: tuple[str, ...],
     ) -> None:
         if self._exceeds_limit(cancelled):
             await self._reject_for_limit(message)
             return
-        await self._start_new(title=message.content[:TITLE_MAX_LENGTH], searches=searches)
+        await self._start_new(title=message.content[:TITLE_MAX_LENGTH])
 
     async def _apply_promote(
         self,
@@ -447,20 +435,16 @@ class ConversationRunner:
         self,
         title: str,
         trail: ChatMessage | None = None,
-        searches: tuple[str, ...] = (),
     ) -> None:
         """Start a foreground process over the compacted narrative, suspending the old one."""
         self._suspend_foreground()
         narrative = await self._compactor.assemble(self._dialog, self._narrative)
-        presearch_note = await self._presearch_note(searches)
-        head_len = 1 + (1 if presearch_note is not None else 0)
         branch = [
             ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME)),
-            *([presearch_note] if presearch_note is not None else []),
             *narrative,
             *([trail] if trail is not None else []),
         ]
-        if len(branch) > head_len:
+        if len(branch) > 1:
             branch[-1] = _with_date_envelope(branch[-1])
         process = self._create_process(
             process_id=uuid.uuid4().hex,
@@ -468,22 +452,9 @@ class ConversationRunner:
             task_id=None,
             branch=branch,
         )
-        process.head_len = head_len
+        process.head_len = 1
         process.trail = trail
         self._foreground_id = process.id
-
-    async def _presearch_note(self, searches: tuple[str, ...]) -> ChatMessage | None:
-        """Resolve the router's pre-search queries into a branch-only system note."""
-        if self._presearch is None or not searches:
-            return None
-        try:
-            note = await self._presearch.run(searches)
-        except Exception:  # a presearch failure must not break the dialog
-            logger.exception("skill presearch failed: dialog=%s", self._dialog.id)
-            return None
-        if note is None:
-            return None
-        return ChatMessage(role=MessageRole.SYSTEM, content=note)
 
     async def _start_report_run(self) -> None:
         """Start a foreground run reacting to the latest narrative note (fg is free).

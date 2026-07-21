@@ -355,7 +355,7 @@ async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     await runner.submit(FIRST_QUESTION)
     await wait_until(lambda: len(root.llm.stream_requests) == 1)
     await runner.submit(SECOND_QUESTION)
-    # the router runs on every message (pre-search): first question, then second
+    # the router runs on every message: first question, then second
     await wait_until(lambda: len(root.llm.complete_requests) == ROUTER_CALLS_TWO)
     root.llm.first_stream_gate.set()
     events = await collect_until_terminal(queue)
@@ -364,7 +364,7 @@ async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     first_system = root.llm.stream_requests[0][0]
     assert first_system.role is MessageRole.SYSTEM
     assert first_system.content.startswith(CUSTOM_SYSTEM_PROMPT)
-    # the router prompt came from the installer's file too (first message = pre-search)
+    # the router prompt came from the installer's file too (first message routes too)
     first_router_system, first_router_user = root.llm.complete_requests[0]
     assert "CUSTOM ROUTER PROMPT FROM FILE" in first_router_system.content
     assert first_router_user == ChatMessage(role=MessageRole.USER, content=FIRST_QUESTION)

@@ -30,15 +30,9 @@ class RouteOp:
 
 @dataclass(frozen=True, slots=True)
 class RouteDecision:
-    """Ordered package of operations; an empty package is a passthrough.
-
-    `searches` are free-text skill pre-search queries about the message's
-    intent; the actor runs them and injects the found scenarios into the new
-    process branch.
-    """
+    """Ordered package of operations; an empty package is a passthrough."""
 
     ops: tuple[RouteOp, ...] = ()
-    searches: tuple[str, ...] = ()
 
 
 class ProcessPlace(StrEnum):
@@ -71,7 +65,6 @@ class MessageRouter(Protocol):
 
 
 ROUTE_TOOL_NAME = "route"
-MAX_SEARCHES = 3
 ROUTE_TOOL_SPEC = SkillSpec(
     name=ROUTE_TOOL_NAME,
     description="Route the user message to the dialog processes.",
@@ -95,15 +88,6 @@ ROUTE_TOOL_SPEC = SkillSpec(
                     },
                     "required": ["action", "target_id"],
                 },
-            },
-            "searches": {
-                "type": "array",
-                "description": (
-                    "Free-text skill search queries capturing the message's intents; "
-                    "empty for pure chit-chat."
-                ),
-                "items": {"type": "string"},
-                "maxItems": MAX_SEARCHES,
             },
         },
         "required": ["ops"],
@@ -130,11 +114,7 @@ class LLMRouter:
         message: str,
         max_processes: int,
     ) -> RouteDecision:
-        """Route the message; fall back to a deterministic decision on LLM trouble.
-
-        The LLM is called even with an empty process snapshot: the decision
-        also carries the skill pre-search queries for the new process.
-        """
+        """Route the message; fall back to a deterministic decision on LLM trouble."""
         try:
             completion = await asyncio.wait_for(
                 self._llm.complete(
@@ -156,10 +136,7 @@ class LLMRouter:
             for raw in (raw_ops if isinstance(raw_ops, list) else [])
             if (op := _parse_op(raw, known_ids)) is not None
         )
-        return RouteDecision(
-            ops=_resolve_conflicts(ops),
-            searches=_parse_searches(call.arguments.get("searches")),
-        )
+        return RouteDecision(ops=_resolve_conflicts(ops))
 
     def _build_messages(
         self,
@@ -191,14 +168,6 @@ def _resolve_conflicts(ops: tuple[RouteOp, ...]) -> tuple[RouteOp, ...]:
     if any(op.action is RouteAction.INJECT for op in ops):
         return tuple(op for op in ops if op.action is not RouteAction.START_NEW)
     return ops
-
-
-def _parse_searches(raw: object) -> tuple[str, ...]:
-    """Keep only non-empty string queries, capped at MAX_SEARCHES."""
-    if not isinstance(raw, list):
-        return ()
-    queries = tuple(item.strip() for item in raw if isinstance(item, str) and item.strip())
-    return queries[:MAX_SEARCHES]
 
 
 def _parse_op(raw: object, known_ids: set[str]) -> RouteOp | None:

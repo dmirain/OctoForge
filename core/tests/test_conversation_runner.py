@@ -33,7 +33,6 @@ from octoforge_core.agent.runner import (
     REPORT_NUDGE,
     ConversationEvent,
     ConversationManager,
-    PresearchPort,
     RunnerConfig,
     TaskOutcomeListener,
 )
@@ -111,20 +110,8 @@ class FakeRouter:
         self.calls.append((processes, message))
         return self.handler(processes, message)
 
-    def decide(self, *ops: RouteOp, searches: tuple[str, ...] = ()) -> None:
-        self.handler = lambda processes, message: RouteDecision(ops=ops, searches=searches)
-
-
-class FakePresearch:
-    """PresearchPort stub returning a scripted note and recording queries."""
-
-    def __init__(self, note: str | None = None) -> None:
-        self.note = note
-        self.calls: list[tuple[str, ...]] = []
-
-    async def run(self, queries: tuple[str, ...]) -> str | None:
-        self.calls.append(queries)
-        return self.note
+    def decide(self, *ops: RouteOp) -> None:
+        self.handler = lambda processes, message: RouteDecision(ops=ops)
 
 
 class ScriptedLLM:
@@ -375,7 +362,6 @@ class ManagerOptions:
     store: TaskStore | None = None
     max_processes: int = MAX_PROCESSES
     listener: TaskOutcomeListener | None = None
-    presearch: PresearchPort | None = None
     compactor: ContextCompactor | None = None
 
 
@@ -396,7 +382,6 @@ def make_manager(
             resolved.compactor if resolved.compactor is not None else NoopContextCompactor()
         ),
         task_outcome_listener=resolved.listener,
-        presearch=resolved.presearch,
     )
     return ConversationManager(
         config=config,
@@ -1278,104 +1263,3 @@ async def test_listener_failure_does_not_break_finalize(
 
     (task,) = await store.list(runner.dialog_id)
     assert task.status is TaskStatus.DONE  # finalize completed despite the listener
-
-
-# --- skill presearch (branch-only injection) ---------------------------------
-
-PRESEARCH_NOTE = "Relevant scenarios for this run (follow them):\n1. [skill] cron_jobs\n..."
-PRESEARCH_QUERY = "create a reminder"
-
-
-async def test_presearch_note_follows_the_system_prompt_in_the_branch(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    llm = ScriptedLLM([reply()])
-    router = FakeRouter()
-    router.decide(searches=(PRESEARCH_QUERY,))
-    presearch = FakePresearch(note=PRESEARCH_NOTE)
-    manager = make_manager(
-        llm,
-        SkillRegistry(),
-        session_factory,
-        ManagerOptions(router=router, presearch=presearch),
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("remind me tonight")
-    await collect_until(queue, is_completed)
-
-    assert presearch.calls == [(PRESEARCH_QUERY,)]
-    branch = llm.requests[0]
-    assert branch[0].role is MessageRole.SYSTEM
-    assert branch[0].content == PROMPT  # stable cacheable prefix: no volatile date
-    assert branch[1] == ChatMessage(role=MessageRole.SYSTEM, content=PRESEARCH_NOTE)
-    assert branch[2].role is MessageRole.USER
-    assert branch[2].content.endswith("remind me tonight")  # date envelope + message
-    # the note is branch-only: it is not persisted into the narrative
-    assert all(message.content != PRESEARCH_NOTE for message in runner.history())
-
-
-async def test_no_presearch_call_without_searches(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    llm = ScriptedLLM([reply()])
-    router = FakeRouter()
-    router.decide()  # searches=()
-    presearch = FakePresearch(note=PRESEARCH_NOTE)
-    manager = make_manager(
-        llm,
-        SkillRegistry(),
-        session_factory,
-        ManagerOptions(router=router, presearch=presearch),
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("hi")
-    await collect_until(queue, is_completed)
-
-    assert presearch.calls == []
-    branch = llm.requests[0]
-    assert branch[1].role is MessageRole.USER
-
-
-async def test_searches_without_presearch_port_are_ignored(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    llm = ScriptedLLM([reply()])
-    router = FakeRouter()
-    router.decide(searches=(PRESEARCH_QUERY,))
-    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(router=router))
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("remind me tonight")
-    await collect_until(queue, is_completed)
-
-    branch = llm.requests[0]
-    assert branch[1].role is MessageRole.USER
-
-
-async def test_presearch_none_result_inserts_no_note(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    llm = ScriptedLLM([reply()])
-    router = FakeRouter()
-    router.decide(searches=(PRESEARCH_QUERY,))
-    presearch = FakePresearch(note=None)
-    manager = make_manager(
-        llm,
-        SkillRegistry(),
-        session_factory,
-        ManagerOptions(router=router, presearch=presearch),
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("remind me tonight")
-    await collect_until(queue, is_completed)
-
-    assert presearch.calls == [(PRESEARCH_QUERY,)]
-    branch = llm.requests[0]
-    assert branch[1].role is MessageRole.USER

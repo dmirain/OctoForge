@@ -76,10 +76,5 @@ ROUTER_SYSTEM_PROMPT = (
     "6. 'Stop everything' -> one cancel op per active process, optionally followed "
     "by start_new.\n"
     "7. Respect the limit: active processes minus your cancel ops plus one must not "
-    "exceed the limit, otherwise do not emit start_new/promote.\n"
-    "Searches: for every user intent in the message, add one free-text search query "
-    "to the searches list, capturing the intent's essence rather than the raw wording "
-    "(e.g. 'remind me tonight to buy groceries' -> 'create a reminder'). A composite "
-    "message yields one query per intent. Use an empty list for pure chit-chat. "
-    "Maximum 3 queries."
+    "exceed the limit, otherwise do not emit start_new/promote."
 )

@@ -61,8 +61,8 @@ core/                          # библиотека octoforge-core — дом�
       prompts.py               # порты промптов: PromptProvider (Protocol) + StaticPromptProvider
                                #   поверх вшитых DEFAULT_SYSTEM_PROMPT (мета-правила: answer-first,
                                #   skills_search на непокрытый интент, instruction_save, формат
-                               #   мессенджера) и ROUTER_SYSTEM_PROMPT (роутинг + searches
-                               #   пре-поиска); имена SYSTEM/ROUTER_PROMPT_NAME
+                               #   мессенджера) и ROUTER_SYSTEM_PROMPT (роутинг процессов);
+                               #   имена SYSTEM/ROUTER_PROMPT_NAME
       runner.py                # ConversationRunner (актор: нарратив + процессы fg/bg, bound
                                #   TaskSpawner, wake для крон-выстрелов, порт
                                #   TaskOutcomeListener для исходов cron-задач),
@@ -107,7 +107,6 @@ core/                          # библиотека octoforge-core — дом�
                                #   (store инъектируется; vector-capable store → search_by_vector)
       registry.py              # SystemSkill + CORE_SYSTEM_SKILLS (8 системных сценариев)
                                #   + sync_system_registry (синк системной части стора при старте)
-      presearch.py             # InstructionPresearch — пре-поиск скилов по searches роутера
       tools.py                 # skills_search (полные сценарии в выдаче) + instruction_save
     datasets/                  # обособленный модуль датасетов (per-user трекеры, этап C)
       api.py                   # граница модуля: DatasetService (Protocol), Dataset, DatasetRecord,
@@ -372,7 +371,7 @@ system-уведомлении о фоновой задаче — коротко 
 таблицы избегать) — рендерится и в web, и в Telegram. Пер-туловая методика
 (крон, фон, память, датасеты, история, веб, внешние вызовы) живёт в системных
 сценариях реестра (`instructions/registry.py`, см. [instructions.md](instructions.md))
-и попадает в контекст поиском (`skills_search`) и пре-поиском роутера.
+и попадает в контекст поиском (`skills_search` на каждый непокрытый интент).
 
 ### Стриминг LLM (`llm/openai.py`)
 
