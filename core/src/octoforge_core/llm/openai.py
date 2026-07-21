@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -9,11 +10,19 @@ import httpx
 from octoforge_core.config import LLMConfig
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.errors import LLMResponseError
-from octoforge_core.llm.events import StreamEvent, StreamFinished, TextDelta
+from octoforge_core.llm.events import (
+    StreamEvent,
+    StreamFinished,
+    TextDelta,
+    ToolCallBroken,
+    ToolCallReady,
+    ToolCallStarted,
+)
 from octoforge_core.skills.base import SkillSpec
 
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 PARSE_ERROR_MESSAGE = "Unexpected LLM response payload"
+ARGUMENTS_NOT_OBJECT_MESSAGE = "tool call arguments are not a JSON object"
 FUNCTION_TOOL_TYPE = "function"
 SSE_DATA_PREFIX = "data:"
 SSE_DONE_MARKER = "[DONE]"
@@ -64,6 +73,8 @@ class OpenAICompatibleClient:
                     break
                 for event in accumulator.feed(data):
                     yield event
+            for event in accumulator.finish():
+                yield event
             yield StreamFinished(message=accumulator.build_message())
 
     def _build_payload(
@@ -138,48 +149,105 @@ class OpenAICompatibleClient:
             raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
 
 
+@dataclass(slots=True)
+class _ToolCallSlot:
+    """Mutable accumulation state of one streamed tool call."""
+
+    call_id: str = ""
+    name: str = ""
+    argument_parts: list[str] = field(default_factory=list)
+    arguments: dict[str, Any] = field(default_factory=dict)
+    started: bool = False
+    closed: bool = False
+
+
 class _StreamAccumulator:
-    """Accumulates streaming deltas into a complete assistant message."""
+    """Accumulates streaming deltas into a message, emitting tool-call events.
+
+    A slot closes when deltas move on to the next `index`; the last open slot
+    is closed by `finish()`. Closing emits `ToolCallReady` (arguments parsed)
+    or `ToolCallBroken` (unparseable arguments — the call keeps empty
+    arguments in the final message instead of failing the stream).
+    """
 
     def __init__(self) -> None:
         self._content_parts: list[str] = []
-        self._tool_calls: dict[int, dict[str, Any]] = {}
+        self._tool_calls: dict[int, _ToolCallSlot] = {}
+        self._open_index: int | None = None
 
-    def feed(self, data: str) -> list[TextDelta]:
-        """Consume one SSE data payload and emit text deltas."""
+    def feed(self, data: str) -> list[StreamEvent]:
+        """Consume one SSE data payload and emit stream events."""
         try:
             chunk = json.loads(data)
             delta = chunk["choices"][0].get("delta") or {}
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
-        events: list[TextDelta] = []
+        events: list[StreamEvent] = []
         content = delta.get("content")
         if content:
             self._content_parts.append(content)
             events.append(TextDelta(text=content))
         for raw_call in delta.get("tool_calls") or []:
-            self._feed_tool_call(raw_call)
+            events.extend(self._feed_tool_call(raw_call))
         return events
 
-    def _feed_tool_call(self, raw: dict[str, Any]) -> None:
+    def _feed_tool_call(self, raw: dict[str, Any]) -> list[StreamEvent]:
         index = raw.get("index", 0)
-        slot = self._tool_calls.setdefault(index, {"id": "", "name": "", "arguments": []})
+        events: list[StreamEvent] = []
+        if self._open_index is not None and index != self._open_index:
+            closed = self._close_slot(self._open_index)
+            if closed is not None:
+                events.append(closed)
+        slot = self._tool_calls.setdefault(index, _ToolCallSlot())
+        self._open_index = index
         if raw.get("id"):
-            slot["id"] = raw["id"]
+            slot.call_id = raw["id"]
         function = raw.get("function") or {}
         if function.get("name"):
-            slot["name"] += function["name"]
+            slot.name += function["name"]
         if function.get("arguments"):
-            slot["arguments"].append(function["arguments"])
+            slot.argument_parts.append(function["arguments"])
+        if not slot.started and slot.call_id and slot.name:
+            slot.started = True
+            events.append(ToolCallStarted(index=index, call_id=slot.call_id, name=slot.name))
+        return events
+
+    def finish(self) -> list[StreamEvent]:
+        """Close the last open slot, emitting its terminal tool-call event."""
+        if self._open_index is None:
+            return []
+        event = self._close_slot(self._open_index)
+        return [event] if event is not None else []
+
+    def _close_slot(self, index: int) -> ToolCallReady | ToolCallBroken | None:
+        slot = self._tool_calls.get(index)
+        if slot is None or slot.closed:
+            return None
+        slot.closed = True
+        raw = "".join(slot.argument_parts) or "{}"
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return ToolCallBroken(
+                index=index, call_id=slot.call_id, name=slot.name, error=str(exc), raw=raw
+            )
+        if not isinstance(parsed, dict):
+            return ToolCallBroken(
+                index=index,
+                call_id=slot.call_id,
+                name=slot.name,
+                error=ARGUMENTS_NOT_OBJECT_MESSAGE,
+                raw=raw,
+            )
+        slot.arguments = parsed
+        return ToolCallReady(call=ToolCall(id=slot.call_id, name=slot.name, arguments=parsed))
 
     def build_message(self) -> ChatMessage:
         """Assemble the final assistant message from accumulated deltas."""
+        for index in self._tool_calls:
+            self._close_slot(index)
         tool_calls = tuple(
-            ToolCall(
-                id=slot["id"],
-                name=slot["name"],
-                arguments=self._parse_slot_arguments(slot),
-            )
+            ToolCall(id=slot.call_id, name=slot.name, arguments=slot.arguments)
             for _, slot in sorted(self._tool_calls.items())
         )
         return ChatMessage(
@@ -187,14 +255,3 @@ class _StreamAccumulator:
             content="".join(self._content_parts),
             tool_calls=tool_calls,
         )
-
-    @staticmethod
-    def _parse_slot_arguments(slot: dict[str, Any]) -> dict[str, Any]:
-        raw = "".join(slot["arguments"]) or "{}"
-        try:
-            arguments = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
-        if not isinstance(arguments, dict):
-            raise LLMResponseError(PARSE_ERROR_MESSAGE)
-        return arguments

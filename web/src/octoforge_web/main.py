@@ -178,6 +178,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 llm_client=llm_client,
                 registry=registry,
                 max_iterations=settings.agent_max_iterations,
+                stream_idle_timeout=settings.llm_stream_idle_timeout_seconds or None,
             )
             prompt_provider: PromptProvider = FilePromptProvider(
                 files=settings.to_prompt_files(),
