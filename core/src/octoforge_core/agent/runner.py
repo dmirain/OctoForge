@@ -65,7 +65,7 @@ BACKGROUND_TASK_PROMPT = (
     "You are solving a background task. User message is the task. "
     "Produce the final answer as the result."
 )
-CURRENT_DATE_TEMPLATE = "\nCurrent date and time: {now} (UTC)."
+DATE_ENVELOPE_TEMPLATE = "[Current date and time: {now} (UTC)]\n{content}"
 CURRENT_DATE_FORMAT = "%Y-%m-%d %H:%M"
 
 
@@ -78,9 +78,21 @@ class ConversationEvent:
     payload: LoopEvent
 
 
-def _with_current_date(prompt: str) -> str:
-    """Append the current UTC date/time so the model stops guessing it."""
-    return prompt + CURRENT_DATE_TEMPLATE.format(now=utc_now().strftime(CURRENT_DATE_FORMAT))
+def _with_date_envelope(message: ChatMessage) -> ChatMessage:
+    """Stamp the current UTC date/time on a copy of the branch's last message.
+
+    The volatile timestamp rides the tail of the prompt (the narrative and the
+    store keep the clean copy), so the system prompt — the long cacheable
+    prefix — stays byte-stable across runs and processes.
+    """
+    return ChatMessage(
+        role=message.role,
+        content=DATE_ENVELOPE_TEMPLATE.format(
+            now=utc_now().strftime(CURRENT_DATE_FORMAT), content=message.content
+        ),
+        tool_calls=message.tool_calls,
+        tool_call_id=message.tool_call_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,10 +284,8 @@ class ConversationRunner:
             title=title,
             task_id=task.id,
             branch=[
-                ChatMessage(
-                    role=MessageRole.SYSTEM, content=_with_current_date(BACKGROUND_TASK_PROMPT)
-                ),
-                ChatMessage(role=MessageRole.USER, content=prompt),
+                ChatMessage(role=MessageRole.SYSTEM, content=BACKGROUND_TASK_PROMPT),
+                _with_date_envelope(ChatMessage(role=MessageRole.USER, content=prompt)),
             ],
         )
         return task
@@ -443,21 +453,22 @@ class ConversationRunner:
         self._suspend_foreground()
         narrative = await self._compactor.assemble(self._dialog, self._narrative)
         presearch_note = await self._presearch_note(searches)
+        head_len = 1 + (1 if presearch_note is not None else 0)
+        branch = [
+            ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME)),
+            *([presearch_note] if presearch_note is not None else []),
+            *narrative,
+            *([trail] if trail is not None else []),
+        ]
+        if len(branch) > head_len:
+            branch[-1] = _with_date_envelope(branch[-1])
         process = self._create_process(
             process_id=uuid.uuid4().hex,
             title=title,
             task_id=None,
-            branch=[
-                ChatMessage(
-                    role=MessageRole.SYSTEM,
-                    content=_with_current_date(self._prompts.get(SYSTEM_PROMPT_NAME)),
-                ),
-                *([presearch_note] if presearch_note is not None else []),
-                *narrative,
-                *([trail] if trail is not None else []),
-            ],
+            branch=branch,
         )
-        process.head_len = 1 + (1 if presearch_note is not None else 0)
+        process.head_len = head_len
         process.trail = trail
         self._foreground_id = process.id
 
@@ -567,6 +578,8 @@ class ConversationRunner:
             *narrative,
             *([process.trail] if process.trail is not None else []),
         ]
+        if len(process.branch) > process.head_len:
+            process.branch[-1] = _with_date_envelope(process.branch[-1])
 
     def _fail_run(self, process: _Process, error: str) -> LoopEvent:
         """Broadcast and return a Failed terminal for the process."""

@@ -524,6 +524,29 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
     assert assistant.completion_tokens == COMPLETION_TOKENS
 
 
+async def test_branch_keeps_system_prompt_stable_and_envelopes_last_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = ScriptedLLM([reply()])
+    manager = make_manager(llm, SkillRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    await collect_until(queue, is_completed)
+
+    branch = llm.requests[0]
+    assert branch[0] == ChatMessage(role=MessageRole.SYSTEM, content=PROMPT)  # no volatile date
+    assert branch[-1].role is MessageRole.USER
+    assert branch[-1].content.startswith("[Current date and time: ")
+    assert branch[-1].content.endswith("\nhi")
+    # the envelope is branch-only: the narrative and the store keep the clean copy
+    assert runner.history()[0] == ChatMessage(role=MessageRole.USER, content="hi")
+    dialog = await get_dialog(session_factory)
+    stored = await MessageRepository(session_factory).list(dialog.id)
+    assert stored[0] == ChatMessage(role=MessageRole.USER, content="hi")
+
+
 async def test_duplicate_client_message_id_is_skipped(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -570,7 +593,7 @@ async def test_context_overflow_compacts_and_retries_once(
     # the retried run got a rebuilt branch: system head + narrative
     second_request = llm.requests[1]
     assert second_request[0].role is MessageRole.SYSTEM
-    assert second_request[-1].content == "hi"
+    assert second_request[-1].content.endswith("\nhi")  # the date envelope wraps it
     done = completions(events)
     assert [(item.title, item.status) for item in done] == [("hi", TaskStatus.DONE.value)]
 
@@ -856,7 +879,8 @@ async def test_process_limit_starts_report_run_when_foreground_is_free(
     assert [item.message.content for item in finished] == ["report answer"]
     report_branch = llm.main_requests[-1]
     assert report_branch[-2].content == refusal.content
-    assert report_branch[-1] == ChatMessage(role=MessageRole.USER, content=REPORT_NUDGE)
+    assert report_branch[-1].role is MessageRole.USER
+    assert report_branch[-1].content.endswith(REPORT_NUDGE)  # date envelope + nudge
 
     llm.background_release.set()
     events = await collect_completions(queue, 2)
@@ -929,11 +953,12 @@ async def test_task_spawn_skill_runs_background_process_and_reports(
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
     assert [item.message.content for item in finished] == ["report answer"]
     report_request = llm.main_requests[-1]
-    assert report_request[-1] == ChatMessage(role=MessageRole.USER, content=REPORT_NUDGE)
+    assert report_request[-1].role is MessageRole.USER
+    assert report_request[-1].content.endswith(REPORT_NUDGE)  # date envelope + nudge
     background_request = llm.background_requests[0]
-    assert background_request[0].content.startswith(BACKGROUND_TASK_PROMPT)
-    assert "Current date and time" in background_request[0].content
-    assert background_request[1] == ChatMessage(role=MessageRole.USER, content=TASK_PROMPT)
+    assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
+    assert background_request[1].role is MessageRole.USER
+    assert background_request[1].content.endswith(TASK_PROMPT)  # date envelope + prompt
 
 
 async def test_task_done_notification_injected_into_busy_foreground(
@@ -1072,8 +1097,9 @@ async def test_wake_runs_cron_tagged_background_process(
     assert TASK_RESULT in notification.content
     assert runner.history()[-1] == reply("report answer")
     background_request = llm.background_requests[0]
-    assert background_request[0].content.startswith(BACKGROUND_TASK_PROMPT)
-    assert background_request[1] == ChatMessage(role=MessageRole.USER, content=CRON_PROMPT)
+    assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
+    assert background_request[1].role is MessageRole.USER
+    assert background_request[1].content.endswith(CRON_PROMPT)  # date envelope + prompt
 
 
 async def test_wake_over_the_process_limit_publishes_a_system_note(
@@ -1282,9 +1308,10 @@ async def test_presearch_note_follows_the_system_prompt_in_the_branch(
     assert presearch.calls == [(PRESEARCH_QUERY,)]
     branch = llm.requests[0]
     assert branch[0].role is MessageRole.SYSTEM
-    assert branch[0].content.startswith(PROMPT)
+    assert branch[0].content == PROMPT  # stable cacheable prefix: no volatile date
     assert branch[1] == ChatMessage(role=MessageRole.SYSTEM, content=PRESEARCH_NOTE)
-    assert branch[2] == ChatMessage(role=MessageRole.USER, content="remind me tonight")
+    assert branch[2].role is MessageRole.USER
+    assert branch[2].content.endswith("remind me tonight")  # date envelope + message
     # the note is branch-only: it is not persisted into the narrative
     assert all(message.content != PRESEARCH_NOTE for message in runner.history())
 

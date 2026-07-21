@@ -199,7 +199,7 @@ async def test_branch_after_restart_has_topics_block_and_fresh_tail(
     assert any("trip plans" in content and "travel" in content for content in contents)
     assert "recent one" in contents
     assert "recent two" in contents
-    assert "fresh question" in contents
+    assert any("fresh question" in content for content in contents)  # date-enveloped tail
     assert "old message one" not in contents  # compacted: never verbatim in the branch
     assert "old message two" not in contents
     assert llm.complete_requests == []  # below the limit: no compaction ran
@@ -243,6 +243,6 @@ async def test_long_dialog_compacts_and_the_next_branch_uses_the_block(
     assert "old message three" in contents  # the hot tail stays verbatim
     assert "fresh question one" in contents
     assert "answer one" in contents
-    assert "fresh question two" in contents
+    assert any("fresh question two" in content for content in contents)  # date-enveloped tail
     assert "old message one" not in contents
     assert "old message two" not in contents

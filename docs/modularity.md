@@ -85,7 +85,8 @@ Store-порты instructions/datasets повторяют этот паттер�
 - `LLMRouter` принимает провайдер конструктором и форматирует шаблон
   (`{limit}`/`{processes}`) на каждый вызов; `RunnerConfig.system_prompt: str` заменён на
   `prompts: PromptProvider` — раннер берёт системный промпт из провайдера при старте
-  процесса, суффикс текущей даты (`_with_current_date`) сохранён.
+  процесса (текущая дата позже переехала из промпта в конверт последнего сообщения
+  ветки — см. [prompt-caching.md](prompt-caching.md)).
 - Файловая реализация на web-слое: `FilePromptProvider` (`web/.../prompts.py`) читает
   источники `OF_SYSTEM_PROMPT_SOURCE`/`OF_ROUTER_PROMPT_SOURCE` (формат `file:/path`,
   парсинг — `Settings.to_prompt_files()`, неизвестная схема → ValueError при старте).
