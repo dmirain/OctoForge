@@ -41,6 +41,7 @@ PROMPT_TOKENS = 321
 COMPLETION_TOKENS = 12
 CLIENT_MESSAGE_ID = "client-key-1"
 EXPECTED_UNKEYED_PLUS_ONE = 3
+EXPECTED_STATS_MESSAGE_COUNT = 2
 CREATED_EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
 TOOL_CALL = ToolCall(id="call-1", name="http_request", arguments={"url": "https://example.com"})
 
@@ -136,6 +137,41 @@ async def test_list_user_ids_by_channel(
 
     assert sorted(web_users) == [USER_ID, OTHER_USER_ID]
     assert telegram_users == [USER_ID]
+
+
+async def test_list_by_channel_returns_full_dialogs(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = DialogRepository(session_factory)
+    first = await repo.get_or_create(USER_ID, CHANNEL)
+    second = await repo.get_or_create(OTHER_USER_ID, CHANNEL)
+    await repo.get_or_create(USER_ID, OTHER_CHANNEL)
+
+    dialogs = await repo.list_by_channel(CHANNEL)
+
+    assert {dialog.id for dialog in dialogs} == {first.id, second.id}
+    assert all(dialog.updated_at.tzinfo == UTC for dialog in dialogs)
+
+
+async def test_message_stats_by_channel(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    first = await dialogs.get_or_create(USER_ID, CHANNEL)
+    second = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
+    other_channel = await dialogs.get_or_create(USER_ID, OTHER_CHANNEL)
+    await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="one"))
+    await messages.append(first.id, ChatMessage(role=MessageRole.ASSISTANT, content="three"))
+    await messages.append(second.id, ChatMessage(role=MessageRole.USER, content="four"))
+    await messages.append(other_channel.id, ChatMessage(role=MessageRole.USER, content="ignored"))
+
+    stats = {entry.user_id: entry for entry in await messages.stats_by_channel(CHANNEL)}
+
+    assert stats[USER_ID].message_count == EXPECTED_STATS_MESSAGE_COUNT
+    assert stats[USER_ID].total_chars == len("one") + len("three")
+    assert stats[OTHER_USER_ID].message_count == 1
+    assert stats[OTHER_USER_ID].total_chars == len("four")
 
 
 async def test_messages_get_monotonic_seq_and_order(

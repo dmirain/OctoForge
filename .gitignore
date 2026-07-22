@@ -8,5 +8,7 @@ __pycache__/
 dist/
 .env
 octoforge.db
+telegram.db
+*.bak
 OctoForgeBotToken.txt
 logs/

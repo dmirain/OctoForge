@@ -1,6 +1,8 @@
 """Registry of skills available to the agent."""
 
-from octoforge_core.skills.base import Skill, SkillSpec
+from collections.abc import Callable
+
+from octoforge_core.skills.base import Skill, SkillContext, SkillSpec
 from octoforge_core.skills.errors import DuplicateSkillError, SkillNotFoundError
 
 
@@ -24,6 +26,19 @@ class SkillRegistry:
         except KeyError as exc:
             raise SkillNotFoundError(name) from exc
 
-    def specs(self) -> list[SkillSpec]:
-        """Return LLM-facing specs of all registered skills."""
-        return [skill.spec for skill in self._skills.values()]
+    def specs(self, context: SkillContext | None = None) -> list[SkillSpec]:
+        """Return LLM-facing specs of the skills visible in the given context.
+
+        A skill may opt into context-dependent visibility by defining a
+        `visible_to(context) -> bool` attribute (duck-typed opt-in: the Skill
+        protocol is unchanged and most skills stay visible always). Without a
+        context every skill is listed, exactly as before.
+        """
+        if context is None:
+            return [skill.spec for skill in self._skills.values()]
+        return [skill.spec for skill in self._skills.values() if _is_visible(skill, context)]
+
+
+def _is_visible(skill: Skill, context: SkillContext) -> bool:
+    visible_to: Callable[[SkillContext], bool] | None = getattr(skill, "visible_to", None)
+    return visible_to is None or visible_to(context)

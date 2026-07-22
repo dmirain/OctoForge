@@ -1,14 +1,15 @@
 """Application settings."""
 
 from pathlib import Path
+from typing import Annotated
 
 from octoforge_core import EmbeddingConfig, LLMConfig
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, SYSTEM_PROMPT_NAME
 from octoforge_core.config import DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddingBackend
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES
 from octoforge_core.net.external import ExternalCallAuth
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ENV_PREFIX = "OF_"
 ENV_FILE = ".env"
@@ -46,6 +47,7 @@ DEFAULT_RERANKER_API_URL = "https://api.siliconflow.cn/v1/rerank"
 DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
 DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30.0
 DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS = 1.5
+DEFAULT_TELEGRAM_DATABASE_URL = "sqlite+aiosqlite:///./telegram.db"
 FILE_SCHEME_PREFIX = "file:"
 
 
@@ -104,6 +106,8 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_poll_timeout_seconds: float = DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
     telegram_edit_throttle_seconds: float = DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
+    telegram_database_url: str = DEFAULT_TELEGRAM_DATABASE_URL
+    telegram_admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     serper_token: str = ""
     system_prompt_source: str = ""
     router_prompt_source: str = ""
@@ -134,6 +138,14 @@ class Settings(BaseSettings):
         only with an API key.
         """
         return self.embedding_backend == EmbeddingBackend.LOCAL or bool(self.embedding_api_key)
+
+    @field_validator("telegram_admin_ids", mode="before")
+    @classmethod
+    def _parse_admin_ids(cls, value: object) -> object:
+        """Accept a comma-separated string for the admin id list (`.env` friendly)."""
+        if isinstance(value, str):
+            return [int(part) for part in value.split(",") if part.strip()]
+        return value
 
     def to_external_call_auth_whitelist(self) -> tuple[ExternalCallAuth, ...]:
         """Build the executor's auth whitelist from the settings entries."""

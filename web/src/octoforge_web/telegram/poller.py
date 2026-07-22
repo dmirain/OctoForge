@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from collections.abc import Iterable
+from enum import StrEnum
 
 import httpx
 
@@ -11,6 +12,12 @@ from octoforge_web.telegram.client import (
     USER_ID_PREFIX,
     TelegramApiError,
     TelegramClient,
+)
+from octoforge_web.telegram.invites.api import (
+    InviteAlreadyClaimedError,
+    InviteNotFoundError,
+    InviteStatus,
+    InviteStore,
 )
 from octoforge_web.telegram.models import TelegramChatType, TelegramUpdate
 
@@ -22,11 +29,70 @@ GREETING_TEXT = (
     "Привет! Я OctoForge — напиши вопрос, и я постараюсь помочь. "
     "Команда /cancel прерывает текущий ответ."
 )
+WELCOME_TEXT = (
+    "Код принят, добро пожаловать! Я OctoForge — напиши вопрос, и я постараюсь помочь. "
+    "Команда /cancel прерывает текущий ответ."
+)
+ACCESS_DENIED_TEXT = (
+    "Нет доступа: обратитесь к администратору за инвайт-кодом и отправьте /start <код>."
+)
+INVITE_INVALID_TEXT = (
+    "Этот код недействителен или уже использован. Обратитесь к администратору за новым кодом."
+)
 TEXT_ONLY_NOTICE = "Пока понимаю только текстовые сообщения."
 GROUP_NOTICE = "Пока работаю только в личных чатах."
 DEFAULT_ERROR_BACKOFF_SECONDS = 5.0
 DRAIN_TIMEOUT_SECONDS = 0.0
 LAST_UPDATE_OFFSET = -1
+
+
+class MembershipDecision(StrEnum):
+    """Verdict of the membership gate for one incoming message."""
+
+    ALLOW = "allow"
+    ALLOW_WITH_WELCOME = "allow_with_welcome"
+    DENY_INVITE_INVALID = "deny_invite_invalid"
+    DENY_NO_ACCESS = "deny_no_access"
+
+
+class TelegramMembership:
+    """Invite gate: who may talk to the bot at all.
+
+    Admins (their numeric Telegram id in `admin_ids`) always pass. Anyone else
+    needs an invite: either an already claimed one (status CLAIMED) or a fresh
+    code passed as `/start <code>`, which is claimed atomically on entry.
+    """
+
+    def __init__(self, invite_store: InviteStore, admin_ids: Iterable[int]) -> None:
+        self._invites = invite_store
+        self._admin_ids = frozenset(admin_ids)
+
+    async def check(self, user_id: str, text: str) -> MembershipDecision:
+        """Decide whether the user may proceed; claims `/start <code>` invites."""
+        numeric_id = chat_id_from_user_id(user_id)
+        if numeric_id is not None and numeric_id in self._admin_ids:
+            return MembershipDecision.ALLOW
+        code = _start_code(text)
+        if code is not None:
+            return await self._claim(code, user_id)
+        invite = await self._invites.get_by_user(user_id)
+        if invite is not None and invite.status is InviteStatus.CLAIMED:
+            return MembershipDecision.ALLOW
+        return MembershipDecision.DENY_NO_ACCESS
+
+    async def _claim(self, code: str, user_id: str) -> MembershipDecision:
+        try:
+            await self._invites.claim(code, user_id)
+        except (InviteAlreadyClaimedError, InviteNotFoundError):
+            return MembershipDecision.DENY_INVITE_INVALID
+        return MembershipDecision.ALLOW_WITH_WELCOME
+
+
+def _start_code(text: str) -> str | None:
+    """Extract the invite code from `/start <code>` (None for a bare /start)."""
+    if not text.startswith(COMMAND_START + " "):
+        return None
+    return text[len(COMMAND_START) :].strip() or None
 
 
 class TelegramBridgeRegistry:
@@ -80,11 +146,13 @@ class TelegramPoller:
         registry: TelegramBridgeRegistry,
         poll_timeout_seconds: float,
         error_backoff_seconds: float = DEFAULT_ERROR_BACKOFF_SECONDS,
+        membership: TelegramMembership | None = None,
     ) -> None:
         self._client = client
         self._registry = registry
         self._poll_timeout_seconds = poll_timeout_seconds
         self._error_backoff_seconds = error_backoff_seconds
+        self._membership = membership
         self._offset: int | None = None
 
     async def run_forever(self) -> None:
@@ -113,16 +181,34 @@ class TelegramPoller:
         if message.text is None:
             await self._client.send_message(chat_id, TEXT_ONLY_NOTICE)
             return
-        if message.text == COMMAND_START:
-            await self._client.send_message(chat_id, GREETING_TEXT)
+        user_id = f"{USER_ID_PREFIX}{message.from_user.id}"
+        if not await self._check_membership(user_id, chat_id, message.text):
             return
-        bridge = self._registry.get_or_create(
-            user_id=f"{USER_ID_PREFIX}{message.from_user.id}", chat_id=chat_id
-        )
+        if message.text == COMMAND_START or _start_code(message.text) is not None:
+            if message.text == COMMAND_START:
+                await self._client.send_message(chat_id, GREETING_TEXT)
+            return  # a successful claim was already welcomed by the gate
+        bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
         if message.text == COMMAND_CANCEL:
             await bridge.cancel()
             return
         await bridge.handle_text(message.text, client_message_id=str(update.update_id))
+
+    async def _check_membership(self, user_id: str, chat_id: int, text: str) -> bool:
+        """Apply the invite gate (no gate configured = everyone passes)."""
+        if self._membership is None:
+            return True
+        decision = await self._membership.check(user_id, text)
+        if decision is MembershipDecision.ALLOW:
+            return True
+        if decision is MembershipDecision.ALLOW_WITH_WELCOME:
+            await self._client.send_message(chat_id, WELCOME_TEXT)
+            return True
+        if decision is MembershipDecision.DENY_INVITE_INVALID:
+            await self._client.send_message(chat_id, INVITE_INVALID_TEXT)
+            return False
+        await self._client.send_message(chat_id, ACCESS_DENIED_TEXT)
+        return False
 
     async def _dispatch_safely(self, update: TelegramUpdate) -> None:
         try:

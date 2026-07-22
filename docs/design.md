@@ -760,7 +760,27 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   (`DialogRepository.list_user_ids_by_channel`) — иначе крон-выстрелы и уведомления задач
   после рестарта ушли бы в пустоту (подписчиков нет); chat_id выводится из `tg:<id>`.
 - **Конфиг**: `OF_TELEGRAM_BOT_TOKEN` (пусто = адаптер выключен),
-  `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` (30), `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` (1.5).
+  `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` (30), `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` (1.5),
+  `OF_TELEGRAM_ADMIN_IDS` (CSV telegram user id админов), `OF_TELEGRAM_DATABASE_URL`
+  (отдельная SQLite-база инвайтов, по умолчанию `./telegram.db`).
+- **Инвайты и гейт членства** (`telegram/invites/`, реализация
+  [telegram-invites-plan.md](telegram-invites-plan.md)): доступ по приглашениям,
+  целиком в web-слое — своя SQLite-база, свой `Base`, без Alembic и без касания core.
+  Гейт `TelegramMembership` в поллере: админы (`OF_TELEGRAM_ADMIN_IDS`) проходят
+  всегда; `/start <код>` атомарно клеймит код (CAS в `InviteStore.claim`);
+  обладатель CLAIMED-инвайта проходит; остальным — вежливый отказ без создания
+  бриджа. Гейт (и админский тул) активируется только при непустом списке админов —
+  иначе поверхность открыта, как раньше.
+- **Админский тул** (`telegram/admin.py`): скилл `admin_manage` (действия
+  `list_users`/`generate_invite`/`revoke_invite`/`restore_invite`) регистрируется
+  только при включённом Telegram и непустых админах. Отзыв обратим: инвайт
+  переводится в REVOKED (поллер блокирует новые сообщения), крон-задачи пользователя
+  выключаются (не удаляются) с запоминанием id в записи инвайта — `restore_invite`
+  включает обратно ровно их, не трогая паузы, поставленные самим пользователем;
+  уже запущенные процессы добиваются естественно. Тул скрыт от не-админов на уровне
+  списка тулов: общий duck-typed хук `visible_to(context)` в
+  `SkillRegistry.specs(context)` (core про инвайтов/админов не знает — хук общий),
+  плюс проверка допуска первой строкой `execute()`.
 - **Standalone-режим** (`telegram/__main__.py`): `python -m octoforge_web.telegram` поднимает
   только адаптер и крон-планировщик на общем composition root'е (`runtime()` в `main.py`,
   вынесен из FastAPI-lifespan) — FastAPI-приложение не создаётся, порт не слушается, только

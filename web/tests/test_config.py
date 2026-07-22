@@ -301,3 +301,19 @@ def test_build_reranker_disabled_without_model(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("OF_RERANKER_MODEL", raising=False)
 
     assert _build_reranker(Settings(), httpx.AsyncClient()) is None
+
+
+def test_telegram_admin_ids_parsed_from_csv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_TELEGRAM_ADMIN_IDS", "123456, 789012")
+
+    settings = Settings()
+
+    assert settings.telegram_admin_ids == [123456, 789012]
+
+
+def test_telegram_admin_ids_default_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OF_TELEGRAM_ADMIN_IDS", raising=False)
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.telegram_admin_ids == []

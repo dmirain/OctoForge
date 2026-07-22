@@ -29,7 +29,7 @@ from octoforge_core.llm.events import (
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Usage
 from octoforge_core.ports import LLMClient
-from octoforge_core.skills.base import SkillContext
+from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
 
 MAX_ITERATIONS_MESSAGE = "Agent loop reached the iteration limit"
@@ -210,6 +210,7 @@ class AgentLoop:
         control: LoopControl,
         context: SkillContext,
     ) -> AsyncIterator[LoopEvent]:
+        specs = self._registry.specs(context)
         for index in range(self._max_iterations):
             yield IterationStarted(index=index)
             history.extend(control.drain())
@@ -218,7 +219,7 @@ class AgentLoop:
                 return
             outcome = _IterationOutcome()
             tracker = _ToolRunTracker(self._registry, context)
-            async for event in self._stream_assistant(history, control, tracker):
+            async for event in self._stream_assistant(history, control, tracker, specs):
                 outcome.observe(event)
                 yield event
             if outcome.failed:
@@ -241,9 +242,10 @@ class AgentLoop:
         history: list[ChatMessage],
         control: LoopControl,
         tracker: _ToolRunTracker,
+        specs: list[SkillSpec],
     ) -> AsyncIterator[LoopEvent]:
         """Stream one LLM call, spawning eager tool runs as calls become ready."""
-        stream = self._llm.stream(history, tools=self._registry.specs())
+        stream = self._llm.stream(history, tools=specs)
         state = _AssistantStreamState()
         try:
             async for event in self._pump_stream(stream, control, tracker, state):

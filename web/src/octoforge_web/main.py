@@ -68,9 +68,16 @@ from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
 from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
+from octoforge_web.telegram.admin import AdminAccess, AdminManageSkill
 from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
-from octoforge_web.telegram.poller import TelegramBridgeRegistry, TelegramPoller
+from octoforge_web.telegram.invites.models import InviteBase
+from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
+from octoforge_web.telegram.poller import (
+    TelegramBridgeRegistry,
+    TelegramMembership,
+    TelegramPoller,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 APP_TITLE = "OctoForge"
@@ -112,6 +119,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     messages = MessageRepository(session_factory)
     task_store = SqlAlchemyTaskStore(session_factory)
     cron_store = SqlAlchemyCronStore(session_factory)
+    invites = await _build_invite_store(settings)
     try:
         async with (
             httpx.AsyncClient(base_url=settings.llm_base_url) as llm_http,
@@ -156,6 +164,21 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 ),
                 limits=_skill_limits(settings),
             )
+            if invites is not None and settings.telegram_admin_ids:
+                registry.register(
+                    AdminManageSkill(
+                        invites[0],
+                        cron_store,
+                        messages,
+                        dialogs,
+                        AdminAccess(
+                            admin_ids=frozenset(settings.telegram_admin_ids),
+                            telegram=TelegramBotClient(
+                                http_client=outbound_http, token=settings.telegram_bot_token
+                            ),
+                        ),
+                    )
+                )
             prompt_provider: PromptProvider = FilePromptProvider(
                 files=settings.to_prompt_files(),
                 fallback=StaticPromptProvider(),
@@ -200,7 +223,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             )
             scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
             telegram = _start_telegram(
-                settings, manager.get_or_create_runner, dialogs, outbound_http
+                settings,
+                manager.get_or_create_runner,
+                dialogs,
+                outbound_http,
+                invites,
             )
             try:
                 yield Runtime(
@@ -215,6 +242,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 await manager.stop_all()
     finally:
         await engine.dispose()
+        if invites is not None:
+            await invites[1].dispose()
 
 
 def _configure_logging() -> None:
@@ -379,13 +408,35 @@ def _start_cron_scheduler(
     return asyncio.create_task(scheduler.run_forever())
 
 
+async def _build_invite_store(
+    settings: Settings,
+) -> tuple[SqlAlchemyInviteStore, AsyncEngine] | None:
+    """Build the invite store on its own database when Telegram is enabled.
+
+    The invites schema is bootstrapped with a plain create_all: one small
+    isolated table on its own Base/engine, no Alembic chain of its own.
+    """
+    if not settings.telegram_bot_token:
+        return None
+    engine = create_engine(settings.telegram_database_url)
+    async with engine.begin() as connection:
+        await connection.run_sync(InviteBase.metadata.create_all)
+    return SqlAlchemyInviteStore(create_session_factory(engine)), engine
+
+
 def _start_telegram(
     settings: Settings,
     runner_provider: RunnerProvider,
     dialogs: DialogRepository,
     http_client: httpx.AsyncClient,
+    invites: tuple[SqlAlchemyInviteStore, AsyncEngine] | None = None,
 ) -> tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None:
-    """Start the Telegram long-poll adapter when a bot token is configured."""
+    """Start the Telegram long-poll adapter when a bot token is configured.
+
+    The membership gate activates only with admin ids configured: without
+    admins there is nobody to issue invites, and gating would lock every
+    existing user out (legacy open behavior is kept instead).
+    """
     if not settings.telegram_bot_token:
         return None
     client = TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token)
@@ -394,10 +445,14 @@ def _start_telegram(
         client=client,
         edit_throttle_seconds=settings.telegram_edit_throttle_seconds,
     )
+    membership = None
+    if invites is not None and settings.telegram_admin_ids:
+        membership = TelegramMembership(invites[0], settings.telegram_admin_ids)
     poller = TelegramPoller(
         client=client,
         registry=registry,
         poll_timeout_seconds=settings.telegram_poll_timeout_seconds,
+        membership=membership,
     )
     return registry, asyncio.create_task(_run_telegram(poller, registry, dialogs))
 

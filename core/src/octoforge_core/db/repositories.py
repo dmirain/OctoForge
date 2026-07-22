@@ -1,6 +1,9 @@
 """Repositories and stores mapping between ORM rows and domain objects."""
 
+from __future__ import annotations
+
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, insert, select
@@ -13,6 +16,20 @@ from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.time import utc_now
+
+
+@dataclass(frozen=True, slots=True)
+class MessageStats:
+    """Per-user message counters of one channel (admin/reporting read model)."""
+
+    user_id: str
+    message_count: int
+    total_chars: int
+
+
+# Inside MessageRepository the method named `list` shadows the builtin in
+# class-scope annotations, so the return type of stats_by_channel aliases it here.
+MessageStatsList = list[MessageStats]
 
 
 class DialogRepository:
@@ -46,6 +63,12 @@ class DialogRepository:
                 select(DialogRow.user_id).where(DialogRow.channel == channel)
             )
             return list(result.all())
+
+    async def list_by_channel(self, channel: str) -> list[Dialog]:
+        """Return the full dialogs of the given channel (activity timestamps included)."""
+        async with self._session_factory() as session:
+            result = await session.scalars(select(DialogRow).where(DialogRow.channel == channel))
+            return [_to_dialog(row) for row in result.all()]
 
     @staticmethod
     async def _find_row(session: AsyncSession, user_id: str, channel: str) -> DialogRow | None:
@@ -158,6 +181,25 @@ class MessageRepository:
                 select(MessageRow).where(MessageRow.dialog_id == dialog_id).order_by(MessageRow.seq)
             )
             return [_to_chat_message(row) for row in result.all()]
+
+    async def stats_by_channel(self, channel: str) -> MessageStatsList:
+        """Return per-user message counters of the channel, one entry per dialog owner."""
+        async with self._session_factory() as session:
+            statement = (
+                select(
+                    DialogRow.user_id,
+                    func.count(MessageRow.id),
+                    func.coalesce(func.sum(func.length(MessageRow.content)), 0),
+                )
+                .join(DialogRow, MessageRow.dialog_id == DialogRow.id)
+                .where(DialogRow.channel == channel)
+                .group_by(DialogRow.user_id)
+            )
+            rows = (await session.execute(statement)).all()
+            return [
+                MessageStats(user_id=user_id, message_count=count, total_chars=total)
+                for user_id, count, total in rows
+            ]
 
 
 class SqlAlchemyTaskStore:
