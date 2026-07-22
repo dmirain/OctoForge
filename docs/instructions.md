@@ -193,11 +193,13 @@ refused, report the refusal honestly instead of retrying variations.
 
 ```
 Scenario: find and author skill scenarios.
-1. For every intent in the user's message call skills_search with the canonical form:
-   the normalized intent (remind, schedule, report, track, lookup, save, call-api)
-   and the entity type (reminder, recurring-report, user-data, weather, history,
-   web-fact); add free text only when it narrows the search. Do not improvise tool
-   usage before searching — the scenario says how to use the tools correctly.
+1. For every intent in the user's message call skills_search with a single
+   free-text query: phrase it as the normalized intent (remind, schedule,
+   report, track, lookup, save, call-api) plus the entity type (reminder,
+   recurring-report, user-data, weather, history, web-fact), e.g.
+   'remind reminder'; add free text only when it narrows the search. Do not
+   improvise tool usage before searching — the scenario says how to use the
+   tools correctly.
 2. After completing a novel multi-step task, save the working scenario with
    instruction_save (type skill): clear steps, naming every tool the scenario uses.
    Save durable facts as type knowledge.
@@ -208,12 +210,14 @@ Scenario: find and author skill scenarios.
 
 Системный промпт держит только мета-правила: формат ответов; «не импровизируй
 применение тулов — следуй сценариям из контекста, а для любого непокрытого интента
-сначала вызови `skills_search`»; каноническая форма запроса (intent + entity)
-с примером маппинга; «после новой многошаговой задачи сохрани сценарий через
-`instruction_save`». Пер-туловые правила (крон vs `task_spawn`, работа с памятью,
-датасеты, `web_search`, `history_search`) живут в системных сценариях (раздел выше),
-не в промпте. Нормализация интентов — на модели при вызове `skills_search` (форма
-описана в системном скиле `skill_authoring`); роутер нормализацией не занимается.
+сначала вызови `skills_search`»; рекомендация формулировать запрос как
+«нормализованный интент + тип сущности» (инструмент принимает один аргумент —
+свободный текст `query`, канонические поля intent/entity отложены); «после новой
+многошаговой задачи сохрани сценарий через `instruction_save`». Пер-туловые правила
+(крон vs `task_spawn`, работа с памятью, датасеты, `web_search`, `history_search`)
+живут в системных сценариях (раздел выше), не в промпте. Нормализация интентов — на
+модели при вызове `skills_search` (форма описана в системном скиле
+`skill_authoring`); роутер нормализацией не занимается.
 
 ## Оптимизация итераций
 
@@ -323,6 +327,16 @@ Discovery скилов — **поиском, а не всегда-видимым
 - Standalone: cosine brute-force по таблице (или sqlite-vec позже), буст точного
   title, опциональный cross-encoder реранк. Distributed: pgvector + tsvector
   (гибридный поиск), `usage_count`/`success_count` влияют на ранг.
+- Реранк — опциональный второй этап: сбой реранкера не ломает поиск — warning в лог
+  и деградация до cosine-шортлиста; хит с точным совпадением title удерживается
+  первым и после реранка (cross-encoder может занизить ему балл).
+- Выдача `skills_search` — двумя блоками без общей сортировки: сначала инструкции
+  (в порядке своего ранжирования), затем дескрипторы датасетов (в своём) — шкалы
+  score несравнимы (после реранка у инструкций — логиты cross-encoder'а, у
+  датасетов — cosine), score в текстовую выдачу не выводится. Итог ограничен
+  единым top-k после слияния (не k инструкций + k датасетов) и потолком символов
+  на всю выдачу (`MAX_OUTPUT_CHARS`); при усечении добавляется пометка, что список
+  неполный.
 - Полнота формулы (70/30 + MMR + decay) — бэклог исследований (plan.md, п. 9).
 
 ## Модульность: выделение в сервис, замена реализации

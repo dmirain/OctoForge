@@ -5,8 +5,11 @@ constructor: the shipped `SqlAlchemyInstructionStore` ranks brute-force in
 the process, an installer can substitute a pgvector/vector-DB store
 (implementing `InstructionVectorSearch`) without touching this service.
 When a reranker is configured, the cosine shortlist is re-scored by a
-cross-encoder (the b2e two-stage pattern).
+cross-encoder (the b2e two-stage pattern); a reranker failure degrades
+gracefully to the cosine shortlist.
 """
+
+import logging
 
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
@@ -22,6 +25,8 @@ from octoforge_core.instructions.api import (
 from octoforge_core.instructions.ranking import rank, rerank
 from octoforge_core.llm.embeddings import EmbeddingClient
 from octoforge_core.llm.reranker import RerankerClient
+
+logger = logging.getLogger(__name__)
 
 EMBEDDED_TEXT_SEPARATOR = "\n"
 DEFAULT_RERANK_CANDIDATES = 20
@@ -161,8 +166,14 @@ class LocalInstructionService:
             (query, _embedded_text(hit.instruction.title, hit.instruction.content))
             for hit in shortlist
         )
-        scores = await self._reranker.score(pairs)
-        return rerank(shortlist, scores, k)
+        try:
+            scores = await self._reranker.score(pairs)
+        except Exception:
+            # The reranker is an optional second stage: an outage must not take
+            # down search — degrade to the cosine shortlist.
+            logger.warning("reranker failed, falling back to the cosine shortlist", exc_info=True)
+            return shortlist[:k]
+        return rerank(shortlist, scores, k, query)
 
 
 def _embedded_text(title: str, content: str) -> str:

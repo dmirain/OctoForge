@@ -1,6 +1,5 @@
 """Tools of the instructions module: store search and scenario authoring."""
 
-from dataclasses import dataclass
 from typing import Any
 
 from octoforge_core.datasets.api import DatasetHit, DatasetService
@@ -12,12 +11,17 @@ SEARCH_NAME = "skills_search"
 SEARCH_DESCRIPTION = (
     "Search the instructions store and the user's datasets for relevant skill "
     "scenarios, knowledge, endpoints and dataset descriptors. "
-    "Returns the top-k records with type, title, tags, relevance score and full content. "
+    "Returns the top-k records with type, title, tags and full content: "
+    "instructions first, dataset descriptors after them. "
     "Call it for any user intent not covered by the scenarios already in your context."
 )
 MAX_K = 20
 DATASET_SNIPPET_CHARS = 300
+MAX_OUTPUT_CHARS = 8000
 NO_HITS_MESSAGE = "no skills found"
+TRUNCATED_MESSAGE = (
+    "... output truncated: {omitted} more hit(s) not shown — refine the query or lower k"
+)
 SEARCH_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -57,15 +61,6 @@ SAVE_SCHEMA: dict[str, Any] = {
 }
 
 
-@dataclass(frozen=True, slots=True)
-class _MergedEntry:
-    """One preformatted hit of either kind, merged and numbered after sorting."""
-
-    score: float
-    key: str
-    body: str
-
-
 class SkillsSearchSkill:
     """Thin adapter over the InstructionService facade (and, optionally, DatasetService)."""
 
@@ -88,20 +83,26 @@ class SkillsSearchSkill:
         )
 
     async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
-        """Validate arguments, search both stores and format the merged hits as text."""
+        """Validate arguments, search both stores and format the hits as text.
+
+        Instructions come first (in the service's ranking order), dataset
+        descriptors after them — the two rankings use incomparable score
+        scales, so the blocks are never merged by score. The merged list is
+        capped at k entries and the whole output at MAX_OUTPUT_CHARS, with a
+        truncation note when the list is cut short.
+        """
         query = arguments.get("query")
         if not isinstance(query, str) or not query.strip():
             raise SkillArgumentsError("query must be a non-empty string")
         k = self._parse_k(arguments.get("k"))
         hits = await self._service.search(query, k)
-        entries = [_instruction_entry(hit) for hit in hits]
+        bodies = [_instruction_body(hit) for hit in hits]
         if self._datasets is not None:
             dataset_hits = await self._datasets.search(context.user_id, query, k)
-            entries.extend(_dataset_entry(hit) for hit in dataset_hits)
-        if not entries:
+            bodies.extend(_dataset_body(hit) for hit in dataset_hits)
+        if not bodies:
             return NO_HITS_MESSAGE
-        entries.sort(key=lambda entry: (-entry.score, entry.key))
-        return "\n".join(f"{index}. {entry.body}" for index, entry in enumerate(entries, start=1))
+        return _render(bodies[:k])
 
     def _parse_k(self, raw: object) -> int:
         if raw is None:
@@ -145,30 +146,50 @@ class InstructionSaveSkill:
         )
 
 
-def _instruction_entry(hit: SearchHit) -> _MergedEntry:
+def _render(bodies: list[str]) -> str:
+    """Number the bodies and join them, capping the whole output at MAX_OUTPUT_CHARS.
+
+    The first body is always emitted whole; further bodies that would cross the
+    cap are dropped and replaced with a truncation note so the model knows the
+    list is partial.
+    """
+    lines: list[str] = []
+    length = 0
+    omitted = 0
+    for index, body in enumerate(bodies, start=1):
+        numbered = f"{index}. {body}"
+        if lines and length + len(numbered) + 1 > MAX_OUTPUT_CHARS:
+            omitted = len(bodies) - index + 1
+            break
+        lines.append(numbered)
+        length += len(numbered) + 1
+    if omitted:
+        lines.append(TRUNCATED_MESSAGE.format(omitted=omitted))
+    return "\n".join(lines)
+
+
+def _instruction_body(hit: SearchHit) -> str:
     """Format an instruction hit with the FULL content (scenarios are read in place)."""
     instruction = hit.instruction
-    body = "\n".join(
+    return "\n".join(
         [
-            f"[{instruction.type.value}] {instruction.title} (score {hit.score:.3f})",
+            f"[{instruction.type.value}] {instruction.title}",
             f"   tags: {', '.join(instruction.tags) if instruction.tags else '-'}",
             instruction.content,
         ]
     )
-    return _MergedEntry(score=hit.score, key=instruction.title, body=body)
 
 
-def _dataset_entry(hit: DatasetHit) -> _MergedEntry:
+def _dataset_body(hit: DatasetHit) -> str:
     dataset = hit.dataset
     field_names = ", ".join(field.name for field in dataset.schema.fields)
-    body = "\n".join(
+    return "\n".join(
         [
-            f"[dataset] {dataset.name} (score {hit.score:.3f})",
+            f"[dataset] {dataset.name}",
             f"   fields: {field_names or '-'}",
             f"   {_snippet(dataset.description)}",
         ]
     )
-    return _MergedEntry(score=hit.score, key=dataset.name, body=body)
 
 
 def _snippet(content: str) -> str:

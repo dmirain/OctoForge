@@ -91,11 +91,13 @@ refused, report the refusal honestly instead of retrying variations."""
 
 SKILL_AUTHORING_CONTENT = """\
 Scenario: find and author skill scenarios.
-1. For every intent in the user's message call skills_search with the canonical form:
-   the normalized intent (remind, schedule, report, track, lookup, save, call-api)
-   and the entity type (reminder, recurring-report, user-data, weather, history,
-   web-fact); add free text only when it narrows the search. Do not improvise tool
-   usage before searching — the scenario says how to use the tools correctly.
+1. For every intent in the user's message call skills_search with a single
+   free-text query: phrase it as the normalized intent (remind, schedule,
+   report, track, lookup, save, call-api) plus the entity type (reminder,
+   recurring-report, user-data, weather, history, web-fact), e.g.
+   'remind reminder'; add free text only when it narrows the search. Do not
+   improvise tool usage before searching — the scenario says how to use the
+   tools correctly.
 2. After completing a novel multi-step task, save the working scenario with
    instruction_save (type skill): clear steps, naming every tool the scenario uses.
    Save durable facts as type knowledge.

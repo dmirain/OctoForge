@@ -391,7 +391,9 @@ HIT = SearchHit(
         created_at=CREATED_AT,
         updated_at=CREATED_AT,
     ),
-    score=0.5,
+    # a cross-encoder logit (rerank stage) — the scales of instruction and
+    # dataset scores are incomparable, so the blocks must not merge by score
+    score=-3.2,
 )
 
 
@@ -488,7 +490,7 @@ class FakeDatasetService:
         raise NotImplementedError
 
 
-async def test_search_merges_and_orders_dataset_hits() -> None:
+async def test_search_instructions_block_precedes_datasets() -> None:
     datasets = FakeDatasetService(hits=[DATASET_HIT])
     skill = SkillsSearchSkill(
         service=FakeInstructionService(hits=[HIT]),
@@ -498,11 +500,16 @@ async def test_search_merges_and_orders_dataset_hits() -> None:
 
     output = await skill.execute({"query": "food"}, CTX)
 
+    # instructions first (even with a negative cross-encoder logit against a
+    # higher dataset cosine), datasets after; no scores in the output
     lines = output.splitlines()
-    assert lines[0] == f"1. [dataset] {FOOD_DATASET} (score 0.900)"
-    assert lines[1] == "   fields: item, kcal"
-    assert lines[2] == f"   {FOOD_DESCRIPTION}"
-    assert lines[3] == "2. [knowledge] nutrition facts (score 0.500)"
+    assert lines[0] == "1. [knowledge] nutrition facts"
+    assert lines[1] == "   tags: food"
+    assert lines[2] == "kcal tables"
+    assert lines[3] == f"2. [dataset] {FOOD_DATASET}"
+    assert lines[4] == "   fields: item, kcal"
+    assert lines[5] == f"   {FOOD_DESCRIPTION}"
+    assert "score" not in output
     assert datasets.search_calls == [(CTX.user_id, "food", DEFAULT_K)]
 
 

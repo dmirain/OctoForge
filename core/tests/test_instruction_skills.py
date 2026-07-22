@@ -15,6 +15,7 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.instructions.tools import (
     MAX_K,
+    MAX_OUTPUT_CHARS,
     NO_HITS_MESSAGE,
     SAVE_NAME,
     SEARCH_NAME,
@@ -170,7 +171,7 @@ async def test_search_skill_formats_hits() -> None:
     assert "[endpoint]" in output
     assert TOOL_NAME in output
     assert "http, weather" in output
-    assert "0.875" in output
+    assert "score" not in output  # scores are omitted: rerank logits are uninformative
     assert "url_template" in output  # full content
 
 
@@ -214,6 +215,51 @@ async def test_search_skill_no_hits_message() -> None:
     skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     assert await skill.execute({"query": "nothing"}, CTX) == NO_HITS_MESSAGE
+
+
+def make_hit(title: str, content: str = "content") -> SearchHit:
+    """Build a minimal skill hit with the given title and content."""
+    return SearchHit(
+        instruction=Instruction(
+            id=f"id-{title}",
+            type=InstructionType.SKILL,
+            title=title,
+            content=content,
+            tags=(),
+            version=1,
+            usage_count=0,
+            success_count=0,
+            created_at=CREATED_AT,
+            updated_at=CREATED_AT,
+        ),
+        score=0.5,
+    )
+
+
+async def test_search_caps_the_merged_list_at_k() -> None:
+    # the stub ignores k and hands back more hits than requested: the merged
+    # list (instructions + datasets) must still be capped at k entries
+    hits = [make_hit(f"scenario {index}") for index in range(CUSTOM_K + 1)]
+    skill = SkillsSearchSkill(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
+
+    output = await skill.execute({"query": "q", "k": CUSTOM_K}, CTX)
+
+    assert "scenario 0" in output
+    assert f"scenario {CUSTOM_K - 1}" in output
+    assert f"scenario {CUSTOM_K}" not in output
+
+
+async def test_search_truncates_long_output_with_a_note() -> None:
+    big_content = "x" * MAX_OUTPUT_CHARS
+    hits = [make_hit("first", big_content), make_hit("second", big_content)]
+    skill = SkillsSearchSkill(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
+
+    output = await skill.execute({"query": "q", "k": 2}, CTX)
+
+    assert "first" in output  # the first hit is always emitted whole
+    assert "second" not in output
+    assert "truncated" in output
+    assert "1 more hit(s)" in output
 
 
 @pytest.mark.parametrize(

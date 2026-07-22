@@ -53,11 +53,19 @@ def rank(
     return scored[:k]
 
 
-def rerank(hits: list[SearchHit], scores: tuple[float, ...], k: int) -> list[SearchHit]:
+def rerank(
+    hits: list[SearchHit],
+    scores: tuple[float, ...],
+    k: int,
+    query: str,
+) -> list[SearchHit]:
     """Replace hit scores with cross-encoder scores and return the top-k.
 
     `scores` aligns with `hits` by position (zip is strict: a length mismatch
-    is a bug and raises). Ties break by title for determinism.
+    is a bug and raises). Ties break by title for determinism. A hit whose
+    title equals the query (case-insensitively) stays first regardless of the
+    cross-encoder score: the exact-title guarantee of `rank` must survive the
+    rerank stage.
     """
     if k <= 0:
         return []
@@ -66,7 +74,14 @@ def rerank(hits: list[SearchHit], scores: tuple[float, ...], k: int) -> list[Sea
         for hit, score in zip(hits, scores, strict=True)
     ]
     rescored.sort(key=lambda hit: (-hit.score, hit.instruction.title))
-    return rescored[:k]
+    exact = next(
+        (hit for hit in rescored if hit.instruction.title.casefold() == query.casefold()),
+        None,
+    )
+    if exact is None:
+        return rescored[:k]
+    rest = [hit for hit in rescored if hit is not exact]
+    return [exact, *rest][:k]
 
 
 def _score(
