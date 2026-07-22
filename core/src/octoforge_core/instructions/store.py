@@ -12,6 +12,7 @@ from typing import Any, cast
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.instructions.api import (
@@ -36,27 +37,49 @@ class SqlAlchemyInstructionStore:
         """Create the record or replace content/tags/embedding, bumping the version."""
         async with self._session_factory() as session:
             row = await self._find_row(session, draft.kind, draft.title)
-            if row is None:
-                row = InstructionRow(
-                    id=uuid.uuid4().hex,
-                    type=draft.kind.value,
-                    title=draft.title,
-                    content=draft.content,
-                    embedding=list(draft.embedding),
-                    tags=list(draft.tags),
-                    version=FIRST_VERSION,
-                    system=draft.system,
-                )
-                session.add(row)
-            else:
-                row.content = draft.content
-                row.embedding = list(draft.embedding)
-                row.tags = list(draft.tags)
-                row.version += 1
-                row.system = draft.system
-                row.updated_at = utc_now()
-            await session.commit()
-            return _to_instruction(row)
+            if row is not None:
+                return await self._update_row(session, row, draft)
+            try:
+                return await self._insert_row(session, draft)
+            except IntegrityError:
+                # lost the find-then-insert race with a concurrent process
+                # (e.g. web + standalone syncing the registry at startup over
+                # one SQLite file): redo as an update of the winner's row
+                await session.rollback()
+                winner = await self._find_row(session, draft.kind, draft.title)
+                if winner is None:  # the concurrent transaction rolled back too
+                    raise
+                return await self._update_row(session, winner, draft)
+
+    async def _insert_row(self, session: AsyncSession, draft: InstructionDraft) -> Instruction:
+        row = InstructionRow(
+            id=uuid.uuid4().hex,
+            type=draft.kind.value,
+            title=draft.title,
+            content=draft.content,
+            embedding=list(draft.embedding),
+            tags=list(draft.tags),
+            version=FIRST_VERSION,
+            system=draft.system,
+        )
+        session.add(row)
+        await session.commit()
+        return _to_instruction(row)
+
+    async def _update_row(
+        self,
+        session: AsyncSession,
+        row: InstructionRow,
+        draft: InstructionDraft,
+    ) -> Instruction:
+        row.content = draft.content
+        row.embedding = list(draft.embedding)
+        row.tags = list(draft.tags)
+        row.version += 1
+        row.system = draft.system
+        row.updated_at = utc_now()
+        await session.commit()
+        return _to_instruction(row)
 
     async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
         """Return the record by title (oldest first when types collide), or None."""
@@ -71,7 +94,7 @@ class SqlAlchemyInstructionStore:
     async def list_with_embeddings(self) -> list[EmbeddedInstruction]:
         """Return every record with its embedding (brute-force search input)."""
         async with self._session_factory() as session:
-            rows = (await session.scalars(select(InstructionRow))).all()
+            rows = (await session.scalars(select(InstructionRow).order_by(InstructionRow.id))).all()
             return [
                 EmbeddedInstruction(
                     instruction=_to_instruction(row),

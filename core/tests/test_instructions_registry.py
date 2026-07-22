@@ -22,6 +22,7 @@ MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 FIRST_VERSION = 1
 SECOND_VERSION = 2
 CORE_SKILLS_COUNT = 8
+TWO_ENTRIES = 2
 
 ENTRY_ALPHA = SystemSkill(
     kind=InstructionType.SKILL,
@@ -41,6 +42,17 @@ class LenientEmbedder:
     """EmbeddingClient stub returning the same vector for every text."""
 
     async def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        return tuple((1.0, 0.0) for _ in texts)
+
+
+class CountingEmbedder:
+    """EmbeddingClient stub counting every embedded text."""
+
+    def __init__(self) -> None:
+        self.embedded = 0
+
+    async def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        self.embedded += len(texts)
         return tuple((1.0, 0.0) for _ in texts)
 
 
@@ -121,3 +133,22 @@ async def test_sync_never_touches_user_records(service: InstructionService) -> N
     # the second sync must not delete it either (only system records are pruned)
     await sync_system_registry(service, (ENTRY_BETA,))
     assert (await service.get_by_name("my scenario", InstructionType.SKILL)).system is False
+
+
+async def test_resync_with_unchanged_registry_skips_embedding() -> None:
+    engine = create_engine(MEMORY_DATABASE_URL)
+    await init_db(engine)
+    embedder = CountingEmbedder()
+    service = LocalInstructionService(
+        SqlAlchemyInstructionStore(create_session_factory(engine)), embedder
+    )
+    try:
+        await sync_system_registry(service, (ENTRY_ALPHA, ENTRY_BETA))
+        embedded_on_first_sync = embedder.embedded
+        assert embedded_on_first_sync == TWO_ENTRIES
+
+        await sync_system_registry(service, (ENTRY_ALPHA, ENTRY_BETA))
+
+        assert embedder.embedded == embedded_on_first_sync  # nothing changed: no re-embed
+    finally:
+        await engine.dispose()

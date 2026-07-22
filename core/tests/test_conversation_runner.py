@@ -29,14 +29,13 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
-    INTERRUPTED_NOTE,
     REPORT_NUDGE,
     ConversationEvent,
     ConversationManager,
     RunnerConfig,
     TaskOutcomeListener,
 )
-from octoforge_core.context.api import ContextCompactor
+from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.models import MessageRow
@@ -168,6 +167,7 @@ class FakeCompactor:
         self._compact_result = compact_result
         self._compact_error = compact_error
         self.compact_calls = 0
+        self.closed: list[str] = []
 
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
         return list(history)
@@ -178,8 +178,8 @@ class FakeCompactor:
             raise self._compact_error
         return self._compact_result
 
-    async def aclose(self) -> None:
-        pass
+    async def aclose(self, dialog_id: str) -> None:
+        self.closed.append(dialog_id)
 
 
 class OverflowLLM:
@@ -1543,3 +1543,63 @@ async def test_concurrent_spawns_do_not_exceed_the_process_limit(
     assert sorted(task.status for task in tasks) == [TaskStatus.CANCELLED, TaskStatus.RUNNING]
 
     await collect_completions(queue, 2)  # background result + the report run
+
+
+# --- graceful shutdown ---------------------------------------------------------
+
+
+async def test_stop_cancels_and_awaits_actor_and_pumps(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    skill = BlockingSkill()
+    llm = ToolStallingLLM()
+    manager = make_manager(llm, blocking_registry(skill), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("work")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+
+    # the pump is stalled mid-stream: stop must cancel it directly, not hang
+    await runner.stop()
+    llm.release.set()
+    skill.release.set()
+
+    actor = runner._actor_task
+    assert actor is not None
+    assert actor.done()  # awaited by stop, not left to die with the event loop
+    assert runner._processes == {}  # every pump was awaited and terminated
+
+
+async def test_stop_closes_only_the_own_dialogs_compaction(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    compactor = FakeCompactor()
+    manager = make_manager(
+        ScriptedLLM([reply()]),
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(compactor=compactor),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    await runner.stop()
+
+    assert compactor.closed == [runner.dialog_id]
+
+
+async def test_stop_all_stops_and_deregisters_every_runner(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = make_manager(ScriptedLLM([reply()]), SkillRegistry(), session_factory)
+    first = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    second = await manager.get_or_create_runner("user-2", CHANNEL)
+
+    await manager.stop_all()
+
+    for runner in (first, second):
+        actor = runner._actor_task
+        assert actor is not None
+        assert actor.done()
+    # the registry was cleared: a late request builds a fresh runner
+    assert await manager.get_or_create_runner(USER_ID, CHANNEL) is not first

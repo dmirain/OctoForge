@@ -18,7 +18,7 @@ SEARCH_DESCRIPTION = (
 MAX_K = 20
 DATASET_SNIPPET_CHARS = 300
 MAX_OUTPUT_CHARS = 8000
-NO_HITS_MESSAGE = "no skills found"
+NO_HITS_MESSAGE = "no matching instructions or datasets"
 TRUNCATED_MESSAGE = (
     "... output truncated: {omitted} more hit(s) not shown — refine the query or lower k"
 )
@@ -135,7 +135,7 @@ class InstructionSaveSkill:
         if not isinstance(title, str) or not title.strip():
             raise SkillArgumentsError("title must be a non-empty string")
         content = arguments.get("content")
-        if not isinstance(content, str) or not content:
+        if not isinstance(content, str) or not content.strip():
             raise SkillArgumentsError("content must be a non-empty string")
         tags = _parse_tags(arguments.get("tags"))
         instruction = await self._service.save(kind, title, content, tags)

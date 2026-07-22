@@ -8,7 +8,7 @@ from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.agent.runner import INTERRUPTED_NOTE
+from octoforge_core.context.api import INTERRUPTED_NOTE
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.errors import DialogNotFoundError
 from octoforge_core.db.models import MessageRow

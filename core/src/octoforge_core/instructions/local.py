@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 EMBEDDED_TEXT_SEPARATOR = "\n"
 DEFAULT_RERANK_CANDIDATES = 20
+SYSTEM_RECORD_MESSAGE = (
+    "'{title}' is a system instruction managed by the registry; it cannot be modified"
+)
 
 
 class LocalInstructionService:
@@ -56,7 +59,7 @@ class LocalInstructionService:
         shortlist of `rerank_candidates` which the cross-encoder re-scores
         down to top-k.
         """
-        if not query.strip():
+        if not query.strip() or k <= 0:
             return []
         (query_embedding,) = await self._embedder.embed((query,))
         candidates = await self._candidates(query_embedding, k)
@@ -86,7 +89,20 @@ class LocalInstructionService:
         content: str,
         tags: tuple[str, ...] = (),
     ) -> Instruction:
-        """Upsert a system record; a (kind, title) match is adopted as system."""
+        """Upsert a system record; a (kind, title) match is adopted as system.
+
+        An unchanged system record is returned as-is: re-embedding identical
+        title+content on every startup registry sync is a wasted (paid with
+        an HTTP backend) call.
+        """
+        existing = await self._store.get_by_title(title, kind)
+        if (
+            existing is not None
+            and existing.system
+            and existing.content == content
+            and existing.tags == tags
+        ):
+            return existing
         return await self._upsert(kind, title, content, tags, system=True)
 
     async def get_by_name(self, name: str, kind: InstructionType | None = None) -> Instruction:
@@ -109,7 +125,7 @@ class LocalInstructionService:
         if existing is None:
             raise InstructionNotFoundError(name)
         if existing.system:
-            raise SystemInstructionError(name)
+            raise SystemInstructionError(SYSTEM_RECORD_MESSAGE.format(title=name))
         await self._store.delete_by_title(name, kind)
 
     async def delete_system(self, name: str, kind: InstructionType) -> None:
@@ -139,7 +155,7 @@ class LocalInstructionService:
     async def _ensure_not_system(self, kind: InstructionType, title: str) -> None:
         existing = await self._store.get_by_title(title, kind)
         if existing is not None and existing.system:
-            raise SystemInstructionError(title)
+            raise SystemInstructionError(SYSTEM_RECORD_MESSAGE.format(title=title))
 
     def _shortlist_size(self, k: int) -> int:
         return max(k, self._rerank_candidates) if self._reranker is not None else k

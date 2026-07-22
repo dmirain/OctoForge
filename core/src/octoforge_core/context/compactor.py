@@ -18,8 +18,8 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 
-from octoforge_core.agent.runner import INTERRUPTED_NOTE
 from octoforge_core.context.api import (
+    INTERRUPTED_NOTE,
     ArchivedMessage,
     ContextCompactor,
     DialogueSummary,
@@ -75,7 +75,7 @@ class NoopContextCompactor(ContextCompactor):
         """Never compacts: there is nothing to rebuild against."""
         return False
 
-    async def aclose(self) -> None:
+    async def aclose(self, dialog_id: str) -> None:
         """Nothing to cancel."""
 
 
@@ -124,15 +124,18 @@ class LlmContextCompactor(ContextCompactor):
         threshold = self._config.model_context_tokens - self._config.context_buffer_tokens
         return prompt_tokens >= threshold
 
-    async def aclose(self) -> None:
-        """Cancel pending compactions (the owning runner is stopping)."""
-        tasks = list(self._running.values())
-        self._running.clear()
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            with suppress(asyncio.CancelledError):
-                await task
+    async def aclose(self, dialog_id: str) -> None:
+        """Cancel the dialog's pending compaction (its runner is stopping).
+
+        Scoped to the given dialog: the instance is shared by every runner of
+        the manager, so other dialogs' compactions keep running.
+        """
+        task = self._running.pop(dialog_id, None)
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     async def compact_now(self, dialog: Dialog) -> bool:
         """Compact synchronously; True when the covered range advanced.

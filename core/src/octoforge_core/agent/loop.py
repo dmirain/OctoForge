@@ -226,9 +226,9 @@ class AgentLoop:
             if outcome.interrupted:
                 yield Cancelled()
                 return
-            if outcome.message is None:
-                yield Failed(error=EMPTY_STREAM_MESSAGE)
-                return
+            # a message-less outcome already failed above: the assistant
+            # finalizer yields Failed whenever no final message was produced
+            assert outcome.message is not None
             if not outcome.message.tool_calls:
                 yield Finished(message=outcome.message, usage=outcome.usage)
                 return

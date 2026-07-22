@@ -11,8 +11,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.agent.runner import INTERRUPTED_NOTE
-from octoforge_core.context.api import ArchivedMessage, DialogueSummary
+from octoforge_core.context.api import INTERRUPTED_NOTE, ArchivedMessage, DialogueSummary
 from octoforge_core.context.compactor import (
     CompactorConfig,
     LlmContextCompactor,
@@ -332,7 +331,7 @@ async def test_noop_compactor_returns_the_history_unchanged(
     compactor = NoopContextCompactor()
 
     assert await compactor.assemble(dialog, history) == history
-    await compactor.aclose()
+    await compactor.aclose(dialog.id)
 
 
 async def test_assemble_without_summaries_returns_the_full_tail(
@@ -724,8 +723,30 @@ async def test_aclose_cancels_a_pending_compaction(
     await compactor.assemble(dialog, history)
     await wait_for_condition(lambda: llm.calls == 1)
 
-    await compactor.aclose()
+    await compactor.aclose(dialog.id)
     llm.release.set()
     await asyncio.sleep(0)
 
     assert await store.list_for_dialog(dialog.id) == []  # the cancelled run wrote nothing
+
+
+async def test_aclose_leaves_other_dialogs_compactions_running(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    other = await DialogRepository(session_factory).get_or_create("user-2", CHANNEL)
+    llm = GatedSummarizingLLM([SUMMARY_REPLY, SECOND_SUMMARY_REPLY])
+    compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
+    history = await append_history(session_factory, dialog.id, [TEN_CHARS] * THREE_MESSAGES)
+    other_history = await append_history(session_factory, other.id, [TEN_CHARS] * THREE_MESSAGES)
+
+    await compactor.assemble(dialog, history)
+    await compactor.assemble(other, other_history)
+    await wait_for_condition(lambda: llm.calls >= 1)
+
+    await compactor.aclose(other.id)  # cancels only the other dialog's run
+    llm.release.set()
+    await _wait_for_summaries(store, dialog.id, count=1)
+
+    assert await store.list_for_dialog(other.id) == []  # the cancelled run wrote nothing

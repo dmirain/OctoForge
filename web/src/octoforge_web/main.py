@@ -212,6 +212,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, telegram)
+                await manager.stop_all()
     finally:
         await engine.dispose()
 

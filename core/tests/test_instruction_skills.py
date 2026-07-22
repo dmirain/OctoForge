@@ -214,7 +214,10 @@ async def test_search_skill_explicit_k_overrides_default() -> None:
 async def test_search_skill_no_hits_message() -> None:
     skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
 
-    assert await skill.execute({"query": "nothing"}, CTX) == NO_HITS_MESSAGE
+    output = await skill.execute({"query": "nothing"}, CTX)
+
+    assert output == NO_HITS_MESSAGE
+    assert output == "no matching instructions or datasets"  # covers knowledge/endpoints too
 
 
 def make_hit(title: str, content: str = "content") -> SearchHit:
@@ -330,6 +333,7 @@ async def test_save_skill_defaults_tags_to_empty() -> None:
         {"type": "dataset", "title": "t", "content": "c"},
         {"type": "skill", "title": "", "content": "c"},
         {"type": "skill", "title": "t", "content": ""},
+        {"type": "skill", "title": "t", "content": "   "},
         {"type": "skill", "title": "t", "content": "c", "tags": "not-a-list"},
         {"type": "skill", "title": "t", "content": "c", "tags": ["ok", 1]},
     ],

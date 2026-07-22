@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -26,7 +27,7 @@ from octoforge_core.agent.router import (
     RouteDecision,
     RouteOp,
 )
-from octoforge_core.context.api import ContextCompactor
+from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.errors import ContextOverflowError
@@ -46,7 +47,6 @@ REPORT_NUDGE = (
     "The system notification above is new: briefly report it to the user "
     "in the user's language, then stop."
 )
-INTERRUPTED_NOTE = "[The previous assistant message was interrupted and may be incomplete.]"
 TASK_DONE_TEMPLATE = (
     "Background task '{title}' has finished with status {status}.\nResult:\n{result}"
 )
@@ -127,7 +127,6 @@ class _Cancel:
 
 @dataclass(frozen=True, slots=True)
 class _ProcessTerminated:
-    process_id: str
     task_id: str | None
 
 
@@ -218,12 +217,27 @@ class ConversationRunner:
             logger.error("actor task exited unexpectedly: dialog=%s", self._dialog.id, exc_info=exc)
 
     async def stop(self) -> None:
-        """Cancel all processes and the actor itself."""
+        """Cancel all processes and the actor itself, awaiting their shutdown.
+
+        The pump tasks are cancelled directly (a hung LLM stream must not
+        stall the shutdown) and awaited, so no runner task outlives stop();
+        only this dialog's background compaction is cancelled (the compactor
+        instance is shared with the other runners).
+        """
         for process in self._processes.values():
             process.control.cancel()
+        pending: list[asyncio.Task[None]] = []
+        for process in self._processes.values():
+            if process.pump is not None:
+                process.pump.cancel()
+                pending.append(process.pump)
         if self._actor_task is not None:
             self._actor_task.cancel()
-        await self._compactor.aclose()
+            pending.append(self._actor_task)
+        for task in pending:
+            with suppress(asyncio.CancelledError):
+                await task
+        await self._compactor.aclose(self._dialog.id)
 
     async def submit(self, content: str, client_message_id: str | None = None) -> None:
         """Submit a user message; the router decides how it maps to processes.
@@ -545,23 +559,27 @@ class ConversationRunner:
     async def _pump_process(self, process: _Process) -> None:
         """Stream the process loop, then always finalize and release the slot.
 
-        Finalization writes to the store; even if that fails, the process is
-        removed and its termination is signalled so the slot is never leaked.
+        Finalization writes to the store; even if that fails (or the pump is
+        cancelled at shutdown), the process is removed and its termination is
+        signalled so the slot is never leaked.
         """
-        try:
-            terminal = await self._stream_terminal(process)
-        except Exception as exc:  # reactive compaction (store/provider) may raise
-            logger.exception(
-                "process stream setup failed: dialog=%s process=%s", self._dialog.id, process.id
-            )
-            terminal = self._fail_run(process, format_error(exc))
         status = TaskStatus.FAILED
         try:
-            status = await self._finalize(process, terminal)
-        except Exception:  # a store failure must not wedge the process slot
-            logger.exception(
-                "process finalize failed: dialog=%s process=%s", self._dialog.id, process.id
-            )
+            try:
+                terminal = await self._stream_terminal(process)
+            except Exception as exc:  # reactive compaction (store/provider) may raise
+                logger.exception(
+                    "process stream setup failed: dialog=%s process=%s",
+                    self._dialog.id,
+                    process.id,
+                )
+                terminal = self._fail_run(process, format_error(exc))
+            try:
+                status = await self._finalize(process, terminal)
+            except Exception:  # a store failure must not wedge the process slot
+                logger.exception(
+                    "process finalize failed: dialog=%s process=%s", self._dialog.id, process.id
+                )
         finally:
             self._terminate_process(process, status)
 
@@ -638,7 +656,7 @@ class ConversationRunner:
         self._broadcast(
             ProcessCompleted(process_id=process.id, title=process.title, status=status.value)
         )
-        self._inbox.put_nowait(_ProcessTerminated(process_id=process.id, task_id=process.task_id))
+        self._inbox.put_nowait(_ProcessTerminated(task_id=process.task_id))
         for leftover in process.control.drain():
             self._inbox.put_nowait(_Submit(leftover, recorded=True))
 
@@ -823,3 +841,14 @@ class ConversationManager:
         """Deliver a cron firing into the user's dialog as a background process."""
         runner = await self.get_or_create_runner(user_id, channel)
         await runner.wake(title, prompt, cron_job_id)
+
+    async def stop_all(self) -> None:
+        """Stop and deregister every live runner (the app is shutting down)."""
+        async with self._lock:
+            runners = tuple(self._runners.values())
+            self._runners.clear()
+        for runner in runners:
+            try:
+                await runner.stop()
+            except Exception:  # one failing runner must not block the shutdown
+                logger.exception("runner stop failed: dialog=%s", runner.dialog_id)

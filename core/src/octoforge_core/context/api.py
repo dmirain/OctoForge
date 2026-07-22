@@ -24,6 +24,7 @@ from typing import Protocol
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 
 NO_COMPACTED_SEQ = 0
+INTERRUPTED_NOTE = "[The previous assistant message was interrupted and may be incomplete.]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,17 +82,17 @@ class ContextCompactor(Protocol):
         """
         ...
 
-    async def aclose(self) -> None:
-        """Cancel pending background work (the owning runner is stopping)."""
+    async def aclose(self, dialog_id: str) -> None:
+        """Cancel pending background work of the dialog (its runner is stopping).
+
+        Scoped to one dialog: the compactor instance is shared by all runners
+        of the manager, so closing must not touch other dialogs' work.
+        """
         ...
 
 
 class SummaryStore(Protocol):
     """Port of the summaries storage (level 2: compressed topics)."""
-
-    async def create(self, summary: DialogueSummary) -> DialogueSummary:
-        """Persist a fully populated summary; return the stored copy."""
-        ...
 
     async def list_for_dialog(self, dialog_id: str) -> list[DialogueSummary]:
         """Return all summaries of the dialog, ordered by seq_from."""

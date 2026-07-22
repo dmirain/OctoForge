@@ -211,6 +211,8 @@ class InstructionService(Protocol):
         Management surface for the composition root's system-registry sync,
         not for agent-facing tools: a (kind, title) match is adopted — its
         content/tags/embedding are replaced and the record becomes system.
+        An already-system record with unchanged content and tags is returned
+        as-is (no re-embedding, no version bump).
         """
         ...
 

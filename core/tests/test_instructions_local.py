@@ -32,6 +32,7 @@ USAGE_ONCE = 1
 USAGE_TWICE = 2
 TWO_HITS = 2
 THREE_HITS = 3
+TWO_EMBED_CALLS = 2
 
 V_RIGHT = (1.0, 0.0)
 V_UP = (0.0, 1.0)
@@ -207,6 +208,14 @@ async def test_search_blank_query_short_circuits(
     assert embedder.calls == []
 
 
+async def test_search_non_positive_k_short_circuits_before_embedding(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    assert await service.search(QUERY, k=0) == []
+    assert embedder.calls == []  # no paid embed call for an empty request
+
+
 async def test_search_closer_vector_wins(
     service: InstructionService,
     embedder: StubEmbedder,
@@ -340,7 +349,7 @@ async def test_save_refuses_to_overwrite_a_system_record(
     service = make_lenient_service(session_factory)
     await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
 
-    with pytest.raises(SystemInstructionError):
+    with pytest.raises(SystemInstructionError, match="managed by the registry"):
         await service.save(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B)
     # a same-titled record of another type is untouched by the protection
     await service.save(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
@@ -352,9 +361,37 @@ async def test_delete_refuses_a_system_record(
     service = make_lenient_service(session_factory)
     await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
 
-    with pytest.raises(SystemInstructionError):
+    with pytest.raises(SystemInstructionError, match="managed by the registry"):
         await service.delete(TITLE_ALPHA, InstructionType.SKILL)
     assert (await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL)).system is True
+
+
+async def test_save_system_skips_reembedding_an_unchanged_record(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
+    created = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+
+    again = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+
+    assert again.id == created.id
+    assert again.version == VERSION_CREATED  # no bump: nothing changed
+    assert embedder.calls == [(f"{TITLE_ALPHA}{EMBEDDED_TEXT_SEPARATOR}{CONTENT_A}",)]
+
+
+async def test_save_system_reembeds_when_tags_change(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
+    await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+
+    updated = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("new",))
+
+    assert updated.tags == ("new",)
+    assert updated.version == VERSION_REPLACED
+    assert len(embedder.calls) == TWO_EMBED_CALLS
 
 
 async def test_delete_system_removes_the_record(

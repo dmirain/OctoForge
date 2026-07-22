@@ -148,11 +148,14 @@ instructions/datasets/memory/cron):
     list[ChatMessage]` — ветка процесса (темы + горячий хвост); внутри — триггер
     фоновой компакции при переполнении; `compact_now(dialog) -> bool` —
     синхронная компакция (реактивный путь после context-overflow; True =
-    покрытый диапазон продвинулся); `aclose()` — отмена фоновых задач при
-    остановке runner'а.
-  - `SummaryStore` (Protocol): CRUD саммари, `replace_for_dialog` (rolling
-    merge — одна запись на диалог), `max_seq_to(dialog_id)`,
-    `find_by_topic` для скилла. DTO `DialogueSummary` (JSON-friendly, как везде).
+    покрытый диапазон продвинулся); `aclose(dialog_id)` — отмена фоновой
+    компакции указанного диалога при остановке его runner'а (инстанс
+    компактора shared на весь ConversationManager, чужие диалоги не трогает).
+  - `SummaryStore` (Protocol): чтение саммари + `replace_for_dialog` (rolling
+    merge — одна запись на диалог; единственный путь записи в проде),
+    `max_seq_to(dialog_id)`, `find_by_topic` для скилла. DTO `DialogueSummary`
+    (JSON-friendly, как везде). (`SqlAlchemySummaryStore` дополнительно держит
+    `create` вне порта — для тестовых сидов.)
   - `MessageArchive` (Protocol): чтение архива сообщений — `count_after`/
     `tail_after` (хвост с seq) и `search` (LIKE-подстрока + `ArchiveFilter`:
     seq-диапазоны, даты) для компакции и скилла. DTO `ArchivedMessage`.
@@ -182,7 +185,8 @@ instructions/datasets/memory/cron):
   плодит второго — следующая сборка ветки дотриггерит при необходимости;
 - фейл суммаризации — warning-лог, диалог не страдает; хвост продолжает расти
   до следующего триггера (деградация мягкая, не ошибка);
-- задача отменяется при остановке runner'а (`stop()` вызывает `aclose()`);
+- задача отменяется при остановке runner'а (`stop()` вызывает `aclose(dialog_id)` —
+  только своего диалога: инстанс компактора shared на весь ConversationManager);
   runner получает компактор через `RunnerConfig` из composition root (DI,
   подменяемо как прочие порты — см. [modularity.md](modularity.md)).
 
