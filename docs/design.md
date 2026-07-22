@@ -38,7 +38,7 @@ core/                          # библиотека octoforge-core — дом�
                                #   dev: pytest, pytest-asyncio, ruff, mypy
   src/octoforge_core/
     domain.py                  # ChatMessage, ToolCall, MessageRole, Dialog
-    config.py                  # LLMConfig, EmbeddingConfig
+    config.py                  # LLMConfig, EmbeddingConfig, RerankerConfig, HttpRerankerConfig
     time.py                    # utc_now() — единая точка времени (UTC aware)
     errors.py                  # LLMResponseError
     ports.py                   # Protocol-порты: LLMClient, TaskStore
@@ -393,13 +393,21 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 HTTP-статусу и телу ошибки (`error.code`/`error.type` OpenAI-пayload'а) —
 `RateLimitError` (с `retry_after` из заголовка Retry-After), `AuthError`, `QuotaError`,
 `ContextOverflowError`, `ProviderInternalError`, `TransportError` (httpx-ошибки
-транспорта), `ClientError` (прочие 4xx). Маркеры тела информативнее статуса и
+транспорта), `ClientError` (прочие 4xx). Общий хелпер `raise_for_error_status`
+применяют все три HTTP-клиента пакета (чат, эмбеддинги, реранкер), транспортные
+httpx-ошибки каждый оборачивает в `TransportError`. Маркеры тела информативнее статуса и
 проверяются первыми: провайдеры отдают исчерпание квоты как голый 429 с
 `insufficient_quota` в теле — это фатальный `QuotaError`, а не ретраибельный
 rate-limit. Поле `retry_after` живёт в базовом `LLMError` — подсказку Retry-After
 несёт любая HTTP-ошибка (например, 503), а не только 429; заголовок парсится в обеих
 формах (секунды и HTTP-date). Транзиентные классы — rate_limit,
-provider_internal, transport; остальные фатальны.
+provider_internal, transport; остальные фатальны. Одноразовые HTTP-бэкенды
+(эмбеддинги, реранкер) ретраят транзиентные классы через хелпер `retry_transient` —
+одна дополнительная попытка с минимальной фиксированной задержкой
+(`SHORT_RETRY_MAX_RETRIES`/`SHORT_RETRY_DELAY_SECONDS`): транзиентный 429 эндпоинта
+эмбеддингов не должен валить `skills_search`, но и сталлить поиск нельзя.
+Ленивая загрузка локальных моделей (bi-encoder, cross-encoder) — под
+`threading.Lock`: конкурентные первые вызовы из worker-потоков не грузят модель дважды.
 
 Поверх порта `LLMClient` — декоратор `RetryingLLMClient` (оборачивает любую
 реализацию, навешивается только в composition root, `build_llm_client`): экспоненциальный

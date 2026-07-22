@@ -162,7 +162,7 @@ async def main() -> None:
         async with httpx.AsyncClient(base_url=BASE_URL) as http:
             llm = OpenAICompatibleClient(
                 http_client=http,
-                config=LLMConfig(base_url=BASE_URL, api_key="sk-...", model="gpt-4o-mini"),
+                config=LLMConfig(api_key="sk-...", model="gpt-4o-mini"),
             )
             prompts = StaticPromptProvider()  # встроенные промпты; свои — через порт
             manager = ConversationManager(

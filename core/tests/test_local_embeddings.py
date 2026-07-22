@@ -1,5 +1,8 @@
 """Tests for the local sentence-transformers embedder."""
 
+import asyncio
+import time
+
 import numpy as np
 import pytest
 
@@ -9,6 +12,8 @@ from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 MODEL_NAME = "fake-bi-encoder"
 BATCH_SIZE = 8
 EXPECTED_CALLS_ONE = 1
+CONCURRENT_CALLS = 2
+LOAD_DELAY_SECONDS = 0.05
 
 
 class FakeSentenceTransformer:
@@ -82,3 +87,23 @@ async def test_empty_input_short_circuits_without_loading_the_model(
 
     assert await embedder.embed(()) == ()
     assert created_models == []
+
+
+async def test_concurrent_first_calls_load_the_model_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two parallel first calls race on the lazy load; the lock must admit one."""
+    created: list[FakeSentenceTransformer] = []
+
+    def slow_factory(model_name: str) -> FakeSentenceTransformer:
+        time.sleep(LOAD_DELAY_SECONDS)  # widen the race window
+        instance = FakeSentenceTransformer(model_name)
+        created.append(instance)
+        return instance
+
+    monkeypatch.setattr(local_embeddings, "SentenceTransformer", slow_factory)
+    embedder = SentenceTransformerEmbedder(MODEL_NAME)
+
+    await asyncio.gather(*(embedder.embed((f"text {index}",)) for index in range(CONCURRENT_CALLS)))
+
+    assert len(created) == EXPECTED_CALLS_ONE

@@ -31,7 +31,7 @@ CACHED_TOKENS = 300
 
 
 def make_config() -> LLMConfig:
-    return LLMConfig(base_url=BASE_URL, api_key=API_KEY, model=MODEL)
+    return LLMConfig(api_key=API_KEY, model=MODEL)
 
 
 def success_response() -> httpx.Response:

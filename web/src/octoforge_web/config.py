@@ -111,7 +111,6 @@ class Settings(BaseSettings):
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""
         return LLMConfig(
-            base_url=self.llm_base_url,
             api_key=self.llm_api_key,
             model=self.llm_model,
             max_retries=self.llm_max_retries,
@@ -122,7 +121,6 @@ class Settings(BaseSettings):
     def to_embedding_config(self) -> EmbeddingConfig:
         """Build the core embeddings configuration."""
         return EmbeddingConfig(
-            base_url=self.embedding_base_url,
             api_key=self.embedding_api_key,
             model=self.embedding_model,
             backend=self.embedding_backend,

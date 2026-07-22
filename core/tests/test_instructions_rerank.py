@@ -12,7 +12,7 @@ from octoforge_core.instructions.api import Instruction, InstructionType, Search
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.ranking import rerank
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
-from octoforge_core.llm.http_reranker import RerankerError
+from octoforge_core.llm.errors import TransportError
 from octoforge_core.time import utc_now
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -167,7 +167,7 @@ class FailingReranker:
     """RerankerClient stub that always raises, like an outage would."""
 
     async def score(self, pairs: tuple[tuple[str, str], ...]) -> tuple[float, ...]:
-        raise RerankerError("rerank API unavailable")
+        raise TransportError("rerank API unavailable")
 
 
 async def test_service_falls_back_to_cosine_when_the_reranker_fails(

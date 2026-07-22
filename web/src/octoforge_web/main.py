@@ -37,7 +37,7 @@ from octoforge_core import (
 )
 from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
 from octoforge_core.composition import RunnerOptions, SkillLimits, SkillServices, SkillStores
-from octoforge_core.config import EmbeddingBackend
+from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
 from octoforge_core.context.compactor import CompactorConfig
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.api import CronStore
@@ -50,9 +50,10 @@ from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.registry import CORE_SYSTEM_SKILLS, sync_system_registry
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
-from octoforge_core.llm.http_reranker import HttpRerankerClient, HttpRerankerConfig
+from octoforge_core.llm.errors import LLMError
+from octoforge_core.llm.http_reranker import HttpRerankerClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
-from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient, RerankerConfig
+from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.external import ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
@@ -288,7 +289,7 @@ async def _sync_system_skills(instructions: InstructionService, settings: Settin
         return
     try:
         await sync_system_registry(instructions, CORE_SYSTEM_SKILLS + WEB_SYSTEM_SKILLS)
-    except (httpx.HTTPError, LLMResponseError, SQLAlchemyError):
+    except (LLMError, LLMResponseError, SQLAlchemyError):
         logger.warning(
             "System skill registry sync failed; starting without it",
             exc_info=True,

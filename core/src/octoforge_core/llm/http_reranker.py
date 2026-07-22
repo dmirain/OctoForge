@@ -1,28 +1,22 @@
-"""HTTP reranker over a SiliconFlow-compatible POST /rerank endpoint."""
+"""HTTP reranker over a SiliconFlow-compatible POST /rerank endpoint.
 
-from dataclasses import dataclass
+HTTP failures are classified into the shared `llm/errors.py` taxonomy and
+transient kinds get one short retry per query group (see `llm/retry.py`).
+"""
+
+import asyncio
 from typing import Any
 
 import httpx
 
+from octoforge_core.config import HttpRerankerConfig
 from octoforge_core.errors import LLMResponseError
+from octoforge_core.llm.errors import TransportError, raise_for_error_status
+from octoforge_core.llm.retry import Sleeper, retry_transient
 
-DEFAULT_RERANK_API_URL = "https://api.siliconflow.cn/v1/rerank"
-DEFAULT_RERANK_TIMEOUT_SECONDS = 30.0
+__all__ = ["HttpRerankerClient", "HttpRerankerConfig"]
 
-
-class RerankerError(Exception):
-    """Raised when the rerank endpoint cannot serve the request."""
-
-
-@dataclass(frozen=True, slots=True)
-class HttpRerankerConfig:
-    """Connection settings of an HTTP reranker backend."""
-
-    model: str
-    api_key: str
-    api_url: str = DEFAULT_RERANK_API_URL
-    timeout_seconds: float = DEFAULT_RERANK_TIMEOUT_SECONDS
+PARSE_ERROR_MESSAGE = "Unexpected rerank response payload"
 
 
 class HttpRerankerClient:
@@ -33,9 +27,16 @@ class HttpRerankerClient:
     scores are mapped back by the returned document index.
     """
 
-    def __init__(self, http_client: httpx.AsyncClient, config: HttpRerankerConfig) -> None:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        config: HttpRerankerConfig,
+        *,
+        sleeper: Sleeper = asyncio.sleep,
+    ) -> None:
         self._http = http_client
         self._config = config
+        self._sleeper = sleeper
 
     async def score(self, pairs: tuple[tuple[str, str], ...]) -> tuple[float, ...]:
         """Score every pair via the endpoint, preserving the input order."""
@@ -43,12 +44,19 @@ class HttpRerankerClient:
             return ()
         scores = [0.0] * len(pairs)
         for query, indexes in _group_by_query(pairs).items():
-            group_scores = await self._score_one_query(
+            group_scores = await self._score_group(
                 query, tuple(pairs[index][1] for index in indexes)
             )
             for index, group_score in zip(indexes, group_scores, strict=True):
                 scores[index] = group_score
         return tuple(scores)
+
+    async def _score_group(self, query: str, documents: tuple[str, ...]) -> list[float]:
+        """Score one query group, retrying transient failures once."""
+        return await retry_transient(
+            lambda: self._score_one_query(query, documents),
+            sleeper=self._sleeper,
+        )
 
     async def _score_one_query(self, query: str, documents: tuple[str, ...]) -> list[float]:
         payload: dict[str, Any] = {
@@ -66,9 +74,8 @@ class HttpRerankerClient:
                 timeout=self._config.timeout_seconds,
             )
         except httpx.HTTPError as exc:
-            raise RerankerError(f"rerank failed: {type(exc).__name__}") from exc
-        if response.status_code != httpx.codes.OK:
-            raise RerankerError(f"rerank API returned HTTP {response.status_code}")
+            raise TransportError(str(exc) or type(exc).__name__) from exc
+        raise_for_error_status(response)
         return _parse_scores(response.json(), len(documents))
 
 
@@ -84,20 +91,20 @@ def _parse_scores(payload: dict[str, Any], expected: int) -> list[float]:
     """Map the sorted results back to the input document order by index."""
     raw_results = payload.get("results")
     if not isinstance(raw_results, list):
-        raise LLMResponseError("Unexpected rerank response payload")
+        raise LLMResponseError(PARSE_ERROR_MESSAGE)
     scores = [0.0] * expected
     seen = 0
     for raw in raw_results:
         if not isinstance(raw, dict):
-            raise LLMResponseError("Unexpected rerank response payload")
+            raise LLMResponseError(PARSE_ERROR_MESSAGE)
         index = raw.get("index")
         score = raw.get("relevance_score")
         if not isinstance(index, int) or not 0 <= index < expected:
-            raise LLMResponseError("Unexpected rerank response payload")
+            raise LLMResponseError(PARSE_ERROR_MESSAGE)
         if not isinstance(score, int | float):
-            raise LLMResponseError("Unexpected rerank response payload")
+            raise LLMResponseError(PARSE_ERROR_MESSAGE)
         scores[index] = float(score)
         seen += 1
     if seen != expected:
-        raise LLMResponseError("Unexpected rerank response payload")
+        raise LLMResponseError(PARSE_ERROR_MESSAGE)
     return scores

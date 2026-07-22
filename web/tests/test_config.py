@@ -124,7 +124,7 @@ def test_embedding_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings()
     config = settings.to_embedding_config()
 
-    assert config.base_url == "http://localhost:11434/v1"
+    assert settings.embedding_base_url == "http://localhost:11434/v1"
     assert config.api_key == "ollama"
     assert config.model == "nomic-embed-text"
     assert settings.instructions_top_k == CUSTOM_TOP_K

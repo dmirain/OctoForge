@@ -7,6 +7,7 @@ encoding runs in a worker thread because the library is synchronous.
 """
 
 import asyncio
+import threading
 
 from sentence_transformers import SentenceTransformer
 
@@ -20,6 +21,7 @@ class SentenceTransformerEmbedder:
         self._model_name = model_name
         self._batch_size = batch_size
         self._model: SentenceTransformer | None = None
+        self._load_lock = threading.Lock()
 
     async def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
         """Return one L2-normalized embedding vector per input text, in order."""
@@ -37,6 +39,10 @@ class SentenceTransformerEmbedder:
         return tuple(tuple(float(component) for component in row) for row in vectors)
 
     def _load_model(self) -> SentenceTransformer:
+        # The lock serializes concurrent first calls from worker threads:
+        # without it two of them would each load their own copy of the model.
         if self._model is None:
-            self._model = SentenceTransformer(self._model_name)
+            with self._load_lock:
+                if self._model is None:
+                    self._model = SentenceTransformer(self._model_name)
         return self._model

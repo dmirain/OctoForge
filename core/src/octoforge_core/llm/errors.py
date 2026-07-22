@@ -10,6 +10,8 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from http import HTTPStatus
 
+import httpx
+
 from octoforge_core.time import utc_now
 
 DEFAULT_ERROR_MESSAGE = "LLM request failed"
@@ -137,6 +139,18 @@ def parse_retry_after(raw: str | None) -> float | None:
     except ValueError:
         return _parse_http_date(raw.strip())
     return value if value >= 0 else None
+
+
+def raise_for_error_status(response: httpx.Response) -> None:
+    """Raise a typed LLMError when the response carries an error status."""
+    if response.status_code < HTTPStatus.BAD_REQUEST:
+        return
+    try:
+        body: object = response.json()
+    except ValueError:
+        body = None
+    retry_after = parse_retry_after(response.headers.get("retry-after"))
+    raise classify_http_error(response.status_code, body, retry_after)
 
 
 def _parse_http_date(raw: str) -> float | None:

@@ -42,7 +42,7 @@ USER_MESSAGE = ChatMessage(role=MessageRole.USER, content="hi")
 
 
 def make_config() -> LLMConfig:
-    return LLMConfig(base_url=BASE_URL, api_key=API_KEY, model=MODEL)
+    return LLMConfig(api_key=API_KEY, model=MODEL)
 
 
 def sse_body(chunks: list[dict[str, object]]) -> str:

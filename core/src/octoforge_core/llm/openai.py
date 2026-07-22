@@ -11,7 +11,7 @@ import httpx
 from octoforge_core.config import LLMConfig
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.errors import LLMResponseError
-from octoforge_core.llm.errors import TransportError, classify_http_error, parse_retry_after
+from octoforge_core.llm.errors import TransportError, classify_http_error, raise_for_error_status
 from octoforge_core.llm.events import (
     StreamEvent,
     StreamFinished,
@@ -29,18 +29,6 @@ ARGUMENTS_NOT_OBJECT_MESSAGE = "tool call arguments are not a JSON object"
 FUNCTION_TOOL_TYPE = "function"
 SSE_DATA_PREFIX = "data:"
 SSE_DONE_MARKER = "[DONE]"
-
-
-def _raise_for_status(response: httpx.Response) -> None:
-    """Raise a typed LLMError for an error HTTP status."""
-    if response.status_code < HTTPStatus.BAD_REQUEST:
-        return
-    try:
-        body: object = response.json()
-    except ValueError:
-        body = None
-    retry_after = parse_retry_after(response.headers.get("retry-after"))
-    raise classify_http_error(response.status_code, body, retry_after)
 
 
 def _stream_error_status(chunk: dict[str, Any]) -> int:
@@ -72,7 +60,7 @@ class OpenAICompatibleClient:
             )
         except httpx.HTTPError as exc:
             raise TransportError(str(exc) or type(exc).__name__) from exc
-        _raise_for_status(response)
+        raise_for_error_status(response)
         try:
             data = response.json()
         except ValueError as exc:
@@ -93,7 +81,7 @@ class OpenAICompatibleClient:
                 headers={"Authorization": f"Bearer {self._config.api_key}"},
                 timeout=self._config.timeout_seconds,
             ) as response:
-                _raise_for_status(response)
+                raise_for_error_status(response)
                 accumulator = _StreamAccumulator()
                 async for line in response.aiter_lines():
                     if not line.startswith(SSE_DATA_PREFIX):

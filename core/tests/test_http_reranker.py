@@ -5,23 +5,32 @@ import json
 import httpx
 import pytest
 
+from octoforge_core.config import HttpRerankerConfig
 from octoforge_core.errors import LLMResponseError
-from octoforge_core.llm.http_reranker import (
-    HttpRerankerClient,
-    HttpRerankerConfig,
-    RerankerError,
+from octoforge_core.llm.errors import (
+    AuthError,
+    ProviderInternalError,
+    RateLimitError,
+    TransportError,
 )
+from octoforge_core.llm.http_reranker import HttpRerankerClient
 
 API_KEY = "test-rerank-key"
 API_URL = "https://rerank.example/v1/rerank"
 MODEL = "BAAI/bge-reranker-v2-m3"
 QUERY = "meaning of life"
+EXPECTED_ATTEMPTS_WITH_RETRY = 2
+
+
+async def _no_sleep(delay: float) -> None:
+    """Skip the retry backoff in tests."""
 
 
 def make_client(handler: httpx.MockTransport) -> HttpRerankerClient:
     return HttpRerankerClient(
         http_client=httpx.AsyncClient(transport=handler),
         config=HttpRerankerConfig(model=MODEL, api_key=API_KEY, api_url=API_URL),
+        sleeper=_no_sleep,
     )
 
 
@@ -82,20 +91,72 @@ async def test_score_empty_pairs_short_circuits() -> None:
     assert await make_client(httpx.MockTransport(handler)).score(()) == ()
 
 
-async def test_http_error_status_raises_reranker_error() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, content=b"Forbidden")
+async def test_rate_limit_raises_typed_error_after_one_retry() -> None:
+    calls = 0
 
-    with pytest.raises(RerankerError, match="HTTP 403"):
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, json={"error": {"message": "slow down"}})
+
+    with pytest.raises(RateLimitError):
         await make_client(httpx.MockTransport(handler)).score(((QUERY, "doc"),))
+    assert calls == EXPECTED_ATTEMPTS_WITH_RETRY
 
 
-async def test_transport_error_raises_reranker_error() -> None:
+async def test_provider_internal_error_is_retried_and_can_recover() -> None:
+    calls = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(500, content=b"boom")
+        return httpx.Response(200, content=json.dumps(rerank_payload([0.7])).encode())
+
+    scores = await make_client(httpx.MockTransport(handler)).score(((QUERY, "doc"),))
+
+    assert scores == (0.7,)
+    assert calls == EXPECTED_ATTEMPTS_WITH_RETRY
+
+
+async def test_provider_internal_error_raises_typed_error_after_one_retry() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, content=b"boom")
+
+    with pytest.raises(ProviderInternalError):
+        await make_client(httpx.MockTransport(handler)).score(((QUERY, "doc"),))
+    assert calls == EXPECTED_ATTEMPTS_WITH_RETRY
+
+
+async def test_transport_error_raises_typed_error_after_one_retry() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         raise httpx.ConnectError("boom")
 
-    with pytest.raises(RerankerError, match="ConnectError"):
+    with pytest.raises(TransportError):
         await make_client(httpx.MockTransport(handler)).score(((QUERY, "doc"),))
+    assert calls == EXPECTED_ATTEMPTS_WITH_RETRY
+
+
+async def test_auth_error_is_not_retried() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(403, content=b"Forbidden")
+
+    with pytest.raises(AuthError):
+        await make_client(httpx.MockTransport(handler)).score(((QUERY, "doc"),))
+    assert calls == 1
 
 
 async def test_malformed_payload_raises_response_error() -> None:

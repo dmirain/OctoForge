@@ -1,15 +1,21 @@
 """Tests for the local cross-encoder reranker."""
 
+import asyncio
+import time
+
 import numpy as np
 import pytest
 
+from octoforge_core.config import RerankerConfig
 from octoforge_core.llm import reranker as reranker_module
-from octoforge_core.llm.reranker import DEVICE_CPU, DEVICE_MPS, CrossEncoderReranker, RerankerConfig
+from octoforge_core.llm.reranker import DEVICE_CPU, DEVICE_MPS, CrossEncoderReranker
 
 MODEL_NAME = "fake-cross-encoder"
 MAX_LENGTH = 256
 BATCH_SIZE = 5
 EXPECTED_LOADS_ONE = 1
+CONCURRENT_CALLS = 2
+LOAD_DELAY_SECONDS = 0.05
 
 
 class FakeCrossEncoder:
@@ -82,3 +88,25 @@ async def test_empty_input_short_circuits_without_loading_the_model(
 
     assert await reranker.score(()) == ()
     assert created_models == []
+
+
+async def test_concurrent_first_calls_load_the_model_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two parallel first calls race on the lazy load; the lock must admit one."""
+    created: list[FakeCrossEncoder] = []
+
+    def slow_factory(model: str, max_length: int, device: str) -> FakeCrossEncoder:
+        time.sleep(LOAD_DELAY_SECONDS)  # widen the race window
+        instance = FakeCrossEncoder(model, max_length, device)
+        created.append(instance)
+        return instance
+
+    monkeypatch.setattr(reranker_module, "CrossEncoder", slow_factory)
+    reranker = CrossEncoderReranker(RerankerConfig(model=MODEL_NAME))
+
+    await asyncio.gather(
+        *(reranker.score(((f"q{index}", "doc"),)) for index in range(CONCURRENT_CALLS))
+    )
+
+    assert len(created) == EXPECTED_LOADS_ONE

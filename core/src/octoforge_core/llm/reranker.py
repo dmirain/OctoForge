@@ -7,14 +7,16 @@ inference runs in a worker thread because the library is synchronous.
 """
 
 import asyncio
-from dataclasses import dataclass
+import threading
 from typing import Protocol
 
 import torch
 from sentence_transformers import CrossEncoder
 
-DEFAULT_MAX_LENGTH = 512
-DEFAULT_RERANK_BATCH_SIZE = 32
+from octoforge_core.config import RerankerConfig
+
+__all__ = ["CrossEncoderReranker", "RerankerClient", "RerankerConfig"]
+
 DEVICE_MPS = "mps"
 DEVICE_CPU = "cpu"
 
@@ -27,21 +29,13 @@ class RerankerClient(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
-class RerankerConfig:
-    """Settings of the local cross-encoder reranker."""
-
-    model: str
-    max_length: int = DEFAULT_MAX_LENGTH
-    batch_size: int = DEFAULT_RERANK_BATCH_SIZE
-
-
 class CrossEncoderReranker:
     """RerankerClient over a local sentence-transformers CrossEncoder."""
 
     def __init__(self, config: RerankerConfig) -> None:
         self._config = config
         self._model: CrossEncoder | None = None
+        self._load_lock = threading.Lock()
 
     async def score(self, pairs: tuple[tuple[str, str], ...]) -> tuple[float, ...]:
         """Return one cross-encoder score per pair, preserving input order."""
@@ -59,12 +53,16 @@ class CrossEncoderReranker:
         return tuple(float(score) for score in scores)
 
     def _load_model(self) -> CrossEncoder:
+        # The lock serializes concurrent first calls from worker threads:
+        # without it two of them would each load their own copy of the model.
         if self._model is None:
-            self._model = CrossEncoder(
-                self._config.model,
-                max_length=self._config.max_length,
-                device=_default_device(),
-            )
+            with self._load_lock:
+                if self._model is None:
+                    self._model = CrossEncoder(
+                        self._config.model,
+                        max_length=self._config.max_length,
+                        device=_default_device(),
+                    )
         return self._model
 
 

@@ -144,9 +144,7 @@ async def test_openai_complete_raises_typed_error_with_retry_after() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
-        client = OpenAICompatibleClient(
-            http_client=http, config=LLMConfig(base_url=BASE_URL, api_key="k", model="m")
-        )
+        client = OpenAICompatibleClient(http_client=http, config=LLMConfig(api_key="k", model="m"))
         with pytest.raises(RateLimitError) as caught:
             await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
     assert caught.value.retry_after == HEADER_RETRY_AFTER
@@ -158,9 +156,7 @@ async def test_openai_stream_raises_typed_error_before_events() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
-        client = OpenAICompatibleClient(
-            http_client=http, config=LLMConfig(base_url=BASE_URL, api_key="k", model="m")
-        )
+        client = OpenAICompatibleClient(http_client=http, config=LLMConfig(api_key="k", model="m"))
         with pytest.raises(ProviderInternalError):
             async for _ in client.stream([ChatMessage(role=MessageRole.USER, content="hi")]):
                 pass
