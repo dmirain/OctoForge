@@ -14,7 +14,7 @@ import httpx
 from octoforge_core.config import DEFAULT_TIMEOUT_SECONDS
 from octoforge_core.instructions.api import InstructionService, InstructionType
 from octoforge_core.net.errors import ExternalCallError
-from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
 from octoforge_core.net.tool_spec import ToolSpec, parse_tool_spec
 
 MAX_BODY_CHARS = 8000
@@ -24,8 +24,10 @@ USER_ID_PLACEHOLDER = "{user_id}"
 
 @dataclass(frozen=True, slots=True)
 class ExternalCallAuth:
-    """Internal authorization injected for a whitelisted base-url prefix.
+    """Internal authorization injected for an allowlisted origin.
 
+    The base-url prefix is compared by parsed origin (scheme/host/port, the
+    path ignored), so userinfo-spoofed URLs never receive the header.
     `header_value` may contain the `{user_id}` placeholder, substituted with
     the calling user's id at execution time; a call without a user id then
     sends no header at all.
@@ -88,7 +90,7 @@ class ExternalCallExecutor:
 
     def _auth_headers_for(self, url: str, user_id: str | None) -> dict[str, str]:
         for entry in self._auth_whitelist:
-            if url.startswith(entry.base_url_prefix):
+            if matches_url_prefix(url, entry.base_url_prefix):
                 return _render_auth_header(entry, user_id)
         return {}
 

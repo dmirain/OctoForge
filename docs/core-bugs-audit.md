@@ -2,12 +2,17 @@
 
 > Точечный код-ревью `octoforge-core` (все файлы `core/src`), в отличие от
 > [quality-audit.md](quality-audit.md) — не архитектурный обзор, а список конкретных
-> багов с подтверждённым местом и сценарием воспроизведения. Ничего не исправлено —
-> это снимок находок для последующей приоритизации. Связанные доки:
+> багов с подтверждённым местом и сценарием воспроизведения. Все находки разобраны
+> и закрыты — статусы проставлены под каждым пунктом 2026-07-22. Связанные доки:
 > [quality-audit.md](quality-audit.md) (S6 — общая заметка про SSRF/`self_base_url`,
 > уточняется находкой №1 ниже), [process-model.md](process-model.md), [cron.md](cron.md).
 
 ## 1. Обход SSRF-гарда через allowlist (критично, эксплуатируется) — `net/guard.py:64`
+
+**Статус:** исправлено 2026-07-22 — allowlist сравнивается по распарсенному origin
+(scheme/host/port с дефолтом порта по схеме), userinfo-спуфинг не проходит; тем же
+хелпером (`matches_url_prefix`) закрыта утечка auth-заголовка на spoofed URL в
+`_auth_headers_for` (`net/external.py`).
 
 ```python
 if any(url.startswith(prefix) for prefix in self._allowed_prefixes):
@@ -27,6 +32,10 @@ if any(url.startswith(prefix) for prefix in self._allowed_prefixes):
 строки.
 
 ## 2. Частичный ответ теряется при отмене хода с незавершённым tool-call — `agent/loop.py:338-353` + `agent/runner.py:646-654`
+
+**Статус:** уже исправлено в `0faa343` (до снимка аудита) — `_salvage_interrupted_turn`
+ищет последнее ASSISTANT-сообщение с контентом (`_latest_assistant_with_content`),
+пропуская TOOL-хвост, а не проверяет только `branch[-1]`.
 
 `_interrupt_iteration` добавляет в branch сначала частичное `ASSISTANT`-сообщение, а
 затем `TOOL`-реплики (плейсхолдеры отменённых вызовов):
@@ -57,6 +66,9 @@ if last is None or last.role is not MessageRole.ASSISTANT or not last.content:
 
 ## 3. Крон-задача на паузе всё равно может сработать — `cron/store.py:112-135`
 
+**Статус:** исправлено 2026-07-22 — `CronJobRow.enabled` добавлен в WHERE CAS-апдейта
+`claim()`: пауза, вклинившаяся между `list_due` и `claim`, теперь выигрывает гонку.
+
 `list_due()` фильтрует по `CronJobRow.enabled`, но CAS-апдейт в `claim()` — нет:
 
 ```python
@@ -82,6 +94,9 @@ async def claim(self, job_id, expected_next_fire_at, owner, now, stale_before):
 
 ## 4. `PROMOTE` необоснованно отклоняется на пределе лимита процессов — `agent/runner.py:407-424`
 
+**Статус:** уже исправлено в `0faa343` (до снимка аудита) — `_apply_promote` не
+применяет `_exceeds_limit`: промоушен лишь двигает существующий процесс.
+
 ```python
 def _exceeds_limit(self, cancelled: set[str]) -> bool:
     return len(self._processes) - len(cancelled) + 1 > self._max_processes
@@ -99,6 +114,12 @@ def _exceeds_limit(self, cancelled: set[str]) -> bool:
 
 ## 5. `spawn_task`/`wake` мутируют состояние процессов в обход сериализации актора — `agent/runner.py:229-250`
 
+**Статус:** исправлено 2026-07-22 — последовательность check→create закрыта
+`asyncio.Lock` (`_spawn_lock`) в `spawn_task`, `wake` и `_apply_start_new`
+(двойная проверка после await под локом избыточна и убрана). Репорт-прогон
+(`_start_report_run`) сознательно остаётся привилегированным: без лока и без
+проверки лимита — системная заметка должна доставляться и на пределе процессов.
+
 Все прочие мутации `self._processes` идут через inbox актора (`_dispatch`,
 однопоточно сериализован по построению). `spawn_task` (вызывается напрямую из скилла
 `task_spawn`, который сам выполняется внутри pump-задачи процесса) и `wake`
@@ -115,6 +136,12 @@ def _exceeds_limit(self, cancelled: set[str]) -> bool:
 
 ## 6. Дублирующиеся глобальные записи памяти при конкурентной записи — `memory/store.py:32-57`
 
+**Статус:** исправлено 2026-07-22 — частичный уникальный индекс
+`uq_memories_global_key` на `key WHERE user_id IS NULL` (миграция `b3e7a91d4c05`
+с дедупликацией существующих строк) + проигравший гонку insert повторяется как
+UPDATE по `IntegrityError` (паттерн `instructions/store.py`); побочно закрыта и
+user-scope гонка по `(user_id, key)`.
+
 Докстринг модуля сам объясняет, что уникальность `(user_id, key)` для глобальных
 записей (`user_id IS NULL`) не гарантируется констрейнтом БД (NULL никогда не
 совпадает с NULL), поэтому уникальность обеспечивает сам store через find-then-insert.
@@ -129,6 +156,11 @@ index / сентинел-значение для глобальной облас
 
 ## 7. `date_to` трактуется как исключающая граница для полного datetime вопреки описанию — `context/tools.py:35-38,114-134`, `context/store.py:165`
 
+**Статус:** не актуально — описание тула уже синхронизировано с реализацией:
+схема `history_search` прямо говорит, что date-only значение inclusive, а полный
+datetime — exclusive (`context/tools.py:35-41`). Расхождения «сказано inclusive /
+сделано exclusive» больше нет.
+
 Схема тула `history_search`, которую видит агент, говорит, что `date_to` —
 «inclusive upper bound» для «ISO date/datetime». Внутренний контракт
 (`context/api.py:122`) и store (`created_at < restriction.date_to`) трактуют её как
@@ -141,6 +173,10 @@ index / сентинел-значение для глобальной облас
 поправить описание тула на «exclusive».
 
 ## 8. Опциональный шаблонный URL-параметр даёт сырой `KeyError` вместо чистой ошибки — `net/tool_spec.py:113-116`, `net/external.py:104-118`
+
+**Статус:** исправлено 2026-07-22 — `_validate_template_fields` требует
+`required: true` для любого поля, упомянутого в `url_template` (иначе
+`ToolSpecError` при разборе спеки).
 
 `_validate_template_fields` проверяет только, что `{placeholder}` в `url_template`
 *объявлен* в `params_schema`, но не то, что он `required: true`. `_validate_params`
@@ -155,6 +191,10 @@ index / сентинел-значение для глобальной облас
 упомянутого в `url_template`.
 
 ## 9. Мелкое: `RouteDecision.ops == ()` задокументирован как passthrough, а реализован как неявный `START_NEW` — `agent/router.py:33`, `agent/runner.py:373`
+
+**Статус:** исправлено 2026-07-22 — докстринг `RouteDecision` описывает пустой
+пакет как дефолтный маршрут, который runner превращает в `START_NEW` (поведение
+не менялось — оно и есть задуманный fallback).
 
 ```python
 ops = decision.ops or (RouteOp(action=RouteAction.START_NEW),)
@@ -172,7 +212,7 @@ Owner-изоляция запросов datasets, жизненный цикл с
 
 ## Приоритизация
 
-№1 (обход SSRF) и №3 (крон на паузе всё равно срабатывает) — security/correctness,
-закрывать в первую очередь. №2 и №5 — надёжность процессной модели, видимая
-пользователю. №4 — баг UX. №6–8 — точечные, среднего/низкого риска. №9 — минимальная
-сверка докстринга с кодом.
+Все пункты закрыты (2026-07-22): №2 и №4 оказались исправлены ещё до снимка
+(`0faa343`), №7 — описание тула уже синхронизировано с кодом; №1, №3, №5, №6,
+№8, №9 исправлены отдельным проходом вместе с аннотацией статусов выше (для №1
+заодно закрыт однотипный сырой префикс-матч в `_auth_headers_for`).

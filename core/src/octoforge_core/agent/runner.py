@@ -195,6 +195,10 @@ class ConversationRunner:
         self._narrative = history
         self._processes: dict[str, _Process] = {}
         self._foreground_id: str | None = None
+        # serializes the limit-check → process-create sequence between the
+        # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
+        # which run in pump/scheduler tasks outside the actor's inbox
+        self._spawn_lock = asyncio.Lock()
         self._spawner: TaskSpawner = _DialogTaskSpawner(self)
         self._inbox: asyncio.Queue[_Command] = asyncio.Queue()
         self._subscribers: set[asyncio.Queue[ConversationEvent]] = set()
@@ -258,14 +262,11 @@ class ConversationRunner:
 
     async def spawn_task(self, title: str, prompt: str) -> str:
         """Create a RUN task with its background process; refuse when the limit is hit."""
-        if len(self._processes) >= self._max_processes:
-            return self._spawn_refusal()
-        task = await self._prepare_process_task(title, prompt, cron_job_id=None)
-        if len(self._processes) >= self._max_processes:
-            # a concurrent spawn claimed the last slot while the task was being stored
-            await self._tasks.cancel(task.id)
-            return self._spawn_refusal()
-        self._start_process(task, title, prompt)
+        async with self._spawn_lock:
+            if len(self._processes) >= self._max_processes:
+                return self._spawn_refusal()
+            task = await self._prepare_process_task(title, prompt, cron_job_id=None)
+            self._start_process(task, title, prompt)
         return SPAWNED_TEMPLATE.format(task_id=task.id)
 
     async def wake(self, title: str, prompt: str, cron_job_id: str) -> None:
@@ -274,16 +275,13 @@ class ConversationRunner:
         Unlike `spawn_task`, hitting the process limit publishes a system note
         (the delayed impossibility notification) instead of returning a text.
         """
-        if len(self._processes) >= self._max_processes:
+        async with self._spawn_lock:
+            over_limit = len(self._processes) >= self._max_processes
+            if not over_limit:
+                task = await self._prepare_process_task(title, prompt, cron_job_id=cron_job_id)
+                self._start_process(task, title, prompt)
+        if over_limit:
             await self._publish_cron_limit_note(title)
-            return
-        task = await self._prepare_process_task(title, prompt, cron_job_id=cron_job_id)
-        if len(self._processes) >= self._max_processes:
-            # a concurrent spawn claimed the last slot while the task was being stored
-            await self._tasks.cancel(task.id)
-            await self._publish_cron_limit_note(title)
-            return
-        self._start_process(task, title, prompt)
 
     def _spawn_refusal(self) -> str:
         return SPAWN_REFUSAL_TEMPLATE.format(
@@ -460,10 +458,11 @@ class ConversationRunner:
         message: ChatMessage,
         cancelled: set[str],
     ) -> None:
-        if self._exceeds_limit(cancelled):
-            await self._reject_for_limit(message)
-            return
-        await self._start_new(title=message.content[:TITLE_MAX_LENGTH])
+        async with self._spawn_lock:
+            if not self._exceeds_limit(cancelled):
+                await self._start_new(title=message.content[:TITLE_MAX_LENGTH])
+                return
+        await self._reject_for_limit(message)
 
     def _apply_promote(self, target_id: str | None) -> None:
         target = self._processes.get(target_id) if target_id is not None else None
@@ -517,6 +516,9 @@ class ConversationRunner:
         A trailing system note leaves some models without anything to answer
         to (they reason but emit no content), so the run ends with a user-role
         nudge asking for the report.
+
+        Privileged on purpose: no process-limit check and no spawn lock — the
+        note it reacts to must be reported even at the process limit.
         """
         await self._start_new(
             title=REPORT_TITLE,

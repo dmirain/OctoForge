@@ -9,10 +9,13 @@ from collections.abc import AsyncIterator, Callable
 from datetime import UTC
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import octoforge_core.memory.store as memory_store_module
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.memory.api import MemoryNotFoundError, MemoryStore
+from octoforge_core.memory.models import MemoryRow
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -208,3 +211,34 @@ async def test_search_blank_query_short_circuits(store: MemoryStore) -> None:
 
     assert await store.search(OWNER_A, "   ", limit=10) == []
     assert await store.search(OWNER_A, "", limit=10) == []
+
+
+async def test_put_recovers_from_a_find_then_insert_race(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SQL-specific: a find-then-insert race resolves into an update."""
+    real_find = memory_store_module._find_row
+    raced = False
+
+    async def racy_find(session: AsyncSession, user_id: str | None, key: str) -> MemoryRow | None:
+        nonlocal raced
+        if raced:
+            return await real_find(session, user_id, key)
+        raced = True
+        # a concurrent writer commits after our find, before our insert
+        async with session_factory() as other:
+            other.add(MemoryRow(user_id=None, key=GLOBAL_KEY, content="stale", tags=[]))
+            await other.commit()
+        return None
+
+    monkeypatch.setattr(memory_store_module, "_find_row", racy_find)
+    store = SqlAlchemyMemoryStore(session_factory)
+
+    memory, created = await store.put(None, GLOBAL_KEY, GLOBAL_CONTENT)
+
+    assert created is False  # resolved as an update of the winner's row
+    assert memory.content == GLOBAL_CONTENT
+    async with session_factory() as session:
+        rows = (await session.scalars(select(MemoryRow).where(MemoryRow.user_id.is_(None)))).all()
+    assert len(rows) == 1  # the partial unique index keeps one row per global key

@@ -1529,7 +1529,7 @@ async def test_concurrent_spawns_do_not_exceed_the_process_limit(
     first = asyncio.create_task(runner.spawn_task("job a", "do a"))
     await asyncio.wait_for(store.entered.wait(), timeout=TIMEOUT_SECONDS)
     second = asyncio.create_task(runner.spawn_task("job b", "do b"))
-    await asyncio.sleep(0)  # let the second spawn pass the check and reach the gate
+    await asyncio.sleep(0)  # let the second spawn reach the spawn lock
     await asyncio.sleep(0)
     store.release.set()
     results = {await first, await second}
@@ -1540,9 +1540,56 @@ async def test_concurrent_spawns_do_not_exceed_the_process_limit(
     assert len(refused) == 1
     assert "process limit (1)" in refused[0]
     tasks = await store.list(runner.dialog_id)
-    assert sorted(task.status for task in tasks) == [TaskStatus.CANCELLED, TaskStatus.RUNNING]
+    # the loser is refused before storing anything under the spawn lock
+    assert [task.status for task in tasks] == [TaskStatus.RUNNING]
 
     await collect_completions(queue, 2)  # background result + the report run
+
+
+class GatedCompactor:
+    """ContextCompactor stub pausing assemble until released, to force a spawn race."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
+        self.entered.set()
+        await self.release.wait()
+        return list(history)
+
+    async def compact_now(self, dialog: Dialog) -> bool:
+        return True
+
+    async def aclose(self, dialog_id: str) -> None:
+        pass
+
+
+async def test_spawn_during_a_pending_start_new_does_not_exceed_the_limit(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    compactor = GatedCompactor()
+    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
+    manager = make_manager(
+        llm,
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(compactor=compactor, max_processes=ONE_PROCESS),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hello")  # the default empty route decision maps to START_NEW
+    await asyncio.wait_for(compactor.entered.wait(), timeout=TIMEOUT_SECONDS)
+    spawn = asyncio.create_task(runner.spawn_task(TASK_TITLE, TASK_PROMPT))
+    await asyncio.sleep(0)  # let the spawn reach the spawn lock
+    compactor.release.set()
+    result = await spawn
+
+    # the actor's foreground run claimed the single slot while the spawn waited
+    assert "cannot spawn" in result
+    assert "process limit (1)" in result
+    await collect_completions(queue, 1)
 
 
 # --- graceful shutdown ---------------------------------------------------------

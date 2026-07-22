@@ -112,5 +112,12 @@ def _parse_param(name: str, raw: object) -> ToolParamSpec:
 
 def _validate_template_fields(url_template: str, params: dict[str, ToolParamSpec]) -> None:
     for _, field_name, _, _ in string.Formatter().parse(url_template):
-        if field_name is not None and field_name not in params:
+        if field_name is None:
+            continue
+        param = params.get(field_name)
+        if param is None:
             raise ToolSpecError(f"url_template references undeclared parameter: {field_name!r}")
+        if not param.required:
+            # an optional template field would crash `_render_url` with a raw
+            # KeyError the moment a caller omits it
+            raise ToolSpecError(f"url_template parameter must be required: {field_name!r}")

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, String, UniqueConstraint
+from sqlalchemy import JSON, Index, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from octoforge_core.db.base import Base, UTCDateTime
@@ -14,7 +14,17 @@ class MemoryRow(Base):
     """A user-owned memory entry; a NULL user_id marks a global entry."""
 
     __tablename__ = "memories"
-    __table_args__ = (UniqueConstraint("user_id", "key"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "key"),
+        # a unique constraint cannot guard NULL owners (NULLs never compare
+        # equal), so global keys get a partial unique index instead
+        Index(
+            "uq_memories_global_key",
+            "key",
+            unique=True,
+            sqlite_where=text("user_id IS NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
     user_id: Mapped[str | None] = mapped_column(String, index=True)

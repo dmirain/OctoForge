@@ -30,7 +30,12 @@ class RouteOp:
 
 @dataclass(frozen=True, slots=True)
 class RouteDecision:
-    """Ordered package of operations; an empty package is a passthrough."""
+    """Ordered package of operations; an empty package is the default route.
+
+    The runner maps an empty package to a START_NEW op (`agent/runner.py`),
+    so a message the router had nothing to say about still starts a new
+    foreground process — it is never dropped as a no-op passthrough.
+    """
 
     ops: tuple[RouteOp, ...] = ()
 

@@ -123,6 +123,8 @@ class SqlAlchemyCronStore(CronStore):
                 update(CronJobRow)
                 .where(
                     CronJobRow.id == job_id,
+                    # a pause racing the claim after list_due must win
+                    CronJobRow.enabled,
                     CronJobRow.next_fire_at == expected_next_fire_at,
                     _claimable_clause(stale_before),
                 )

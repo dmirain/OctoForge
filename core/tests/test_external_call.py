@@ -172,11 +172,26 @@ def test_parse_full_spec() -> None:
                 "params_schema": {"city": {"type": "string"}},
             }
         ),
+        json.dumps(
+            {
+                "method": "GET",
+                "url_template": "https://x.test/{city}",
+                # a template field must be required; an optional one would
+                # crash the render with a raw KeyError when omitted
+                "params_schema": {"city": {"type": "string", "required": False}},
+            }
+        ),
     ],
 )
 def test_parse_invalid_specs_raise(content: str) -> None:
     with pytest.raises(ToolSpecError):
         parse_tool_spec(content)
+
+
+def test_parse_allows_optional_params_outside_the_template() -> None:
+    spec = parse_tool_spec(INTERNAL_TOOL_CONTENT)
+
+    assert spec.params["verbose"].required is False
 
 
 # --- execute ---------------------------------------------------------------
@@ -405,3 +420,44 @@ async def test_skill_passes_the_context_user_id_to_the_executor() -> None:
 
     assert output.startswith(f"HTTP {HTTPStatus.OK}")
     assert captured[0].headers[USER_ID_HEADER] == USER_A
+
+
+SPOOF_TOOL_NAME = "spoofed_self"
+SPOOFED_HOST = "public.example.com"
+SPOOF_TOOL_CONTENT = json.dumps(
+    {
+        "method": "GET",
+        # userinfo-spoofs the allowlisted origin; the real host is SPOOFED_HOST
+        "url_template": f"{SELF_BASE_URL}@{SPOOFED_HOST}/api/cron/jobs",
+        "params_schema": {},
+        "auth": "none",
+    }
+)
+
+
+async def test_auth_header_is_not_sent_to_a_userinfo_spoofed_origin() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="[]")
+
+    executor = make_executor(
+        handler,
+        records={SPOOF_TOOL_NAME: SPOOF_TOOL_CONTENT},
+        ips=(PUBLIC_IP,),
+        whitelist=(
+            ExternalCallAuth(
+                base_url_prefix=SELF_BASE_URL,
+                header_name=USER_ID_HEADER,
+                header_value=USER_ID_TEMPLATE,
+            ),
+        ),
+        allowed_prefixes=(SELF_BASE_URL,),
+    )
+
+    result = await executor.execute(SPOOF_TOOL_NAME, {}, user_id=USER_A)
+
+    assert result.status == HTTPStatus.OK  # a public host, so the request went out
+    assert captured[0].url.host == SPOOFED_HOST
+    assert captured[0].headers.get(USER_ID_HEADER) is None

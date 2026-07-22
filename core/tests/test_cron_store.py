@@ -164,6 +164,16 @@ async def test_claim_is_a_cas_lease(store: SqlAlchemyCronStore) -> None:
     assert claimed.claimed_at == NOW
 
 
+async def test_claim_loses_to_a_concurrent_pause(store: SqlAlchemyCronStore) -> None:
+    await store.create(BASE_JOB)
+    await store.set_enabled(USER_A, BASE_JOB.id, False)
+
+    claimed = await store.claim(BASE_JOB.id, DUE_AT, OWNER_A, NOW, STALE_BEFORE)
+
+    assert claimed is False  # a pause racing the claim after list_due must win
+    assert (await store.get(BASE_JOB.id)).claimed_by is None
+
+
 async def test_claim_fails_on_a_moved_next_fire(store: SqlAlchemyCronStore) -> None:
     await store.create(BASE_JOB)
 

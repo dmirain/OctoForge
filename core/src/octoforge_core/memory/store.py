@@ -5,15 +5,17 @@ Follows the `datasets/store.py` style: sessions come from an injected
 
 Uniqueness note: the (user_id, key) UniqueConstraint does NOT guard global
 entries — both SQLite and PostgreSQL treat NULLs as distinct in unique
-constraints, so duplicate (NULL, key) rows would be accepted. The store
-therefore enforces uniqueness itself: put always selects by owner first
-(comparing the NULL owner via `user_id.is_(None)`, never `== None`) and
-updates the found row in place.
+constraints, so duplicate (NULL, key) rows would be accepted. A partial
+unique index (`user_id IS NULL`) enforces one row per global key instead.
+The store still selects by owner first (comparing the NULL owner via
+`user_id.is_(None)`, never `== None`), and a lost find-then-insert race is
+redone as an update of the winner's row on the IntegrityError.
 """
 
 import uuid
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.memory.api import Memory, MemoryNotFoundError, MemoryStore
@@ -48,7 +50,22 @@ class SqlAlchemyMemoryStore(MemoryStore):
                     tags=list(tags),
                 )
                 session.add(row)
-                await session.commit()
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    # lost the find-then-insert race with a concurrent writer
+                    # (global keys hit the partial unique index, user keys the
+                    # (user_id, key) constraint): redo as an update
+                    await session.rollback()
+                    winner = await _find_row(session, user_id, key)
+                    if winner is None:  # the concurrent transaction rolled back too
+                        raise
+                    row = winner
+                    row.content = content
+                    row.tags = list(tags)
+                    row.updated_at = utc_now()
+                    await session.commit()
+                    return _to_memory(row), False
                 return _to_memory(row), True
             row.content = content
             row.tags = list(tags)

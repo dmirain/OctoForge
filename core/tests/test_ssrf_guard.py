@@ -135,3 +135,37 @@ async def test_non_prefixed_urls_are_still_checked() -> None:
         await guard.check(TARGET_URL)
 
     assert resolver.calls == [RESOLVED_HOST]
+
+
+async def test_userinfo_spoofed_allowed_origin_is_not_allowlisted() -> None:
+    resolver = StubResolver((CLOUD_METADATA_IP,))
+    guard = SsrfGuard(resolver=resolver, allowed_prefixes=(SELF_BASE_URL,))
+
+    with pytest.raises(SsrfBlockedError):
+        # a raw prefix match would skip the check; the real host is 169.254.169.254
+        await guard.check(f"{SELF_BASE_URL}@{CLOUD_METADATA_IP}/latest/meta-data")
+
+    assert resolver.calls == [CLOUD_METADATA_IP]
+
+
+async def test_lookalike_prefix_host_is_not_allowlisted() -> None:
+    resolver = StubResolver((PRIVATE_IP,))
+    guard = SsrfGuard(resolver=resolver, allowed_prefixes=(SELF_BASE_URL,))
+
+    with pytest.raises(SsrfBlockedError):
+        await guard.check("http://127.0.0.1.evil.com/data")
+
+    assert resolver.calls == ["127.0.0.1.evil.com"]
+
+
+async def test_different_port_on_the_allowed_host_is_not_allowlisted() -> None:
+    resolver = StubResolver((PRIVATE_IP,))
+    guard = SsrfGuard(resolver=resolver, allowed_prefixes=(SELF_BASE_URL,))
+
+    with pytest.raises(SsrfBlockedError):
+        await guard.check("http://127.0.0.1:9000/admin")
+
+
+def test_invalid_allowed_prefix_fails_fast() -> None:
+    with pytest.raises(ValueError, match="allowed prefix"):
+        SsrfGuard(allowed_prefixes=("not-a-url",))
