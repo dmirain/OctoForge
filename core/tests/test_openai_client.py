@@ -193,6 +193,36 @@ async def test_tool_calls_parsed_from_reply() -> None:
     )
 
 
+async def test_complete_raises_on_non_object_tool_arguments() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            HTTPStatus.OK,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": CALL_ID,
+                                    "type": "function",
+                                    "function": {"name": TOOL_NAME, "arguments": "[1, 2]"},
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
+        client = OpenAICompatibleClient(http_client=http, config=make_config())
+        with pytest.raises(LLMResponseError, match="not a JSON object"):
+            await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
+
+
 async def test_tool_history_serialized_into_payload() -> None:
     captured: list[httpx.Request] = []
 

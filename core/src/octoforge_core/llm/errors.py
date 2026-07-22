@@ -5,8 +5,12 @@ set of error kinds; only transient kinds are worth retrying (see
 `RetryingLLMClient` in `llm/retry.py`).
 """
 
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from http import HTTPStatus
+
+from octoforge_core.time import utc_now
 
 DEFAULT_ERROR_MESSAGE = "LLM request failed"
 
@@ -38,9 +42,17 @@ _QUOTA_MARKERS = ("insufficient_quota", "quota_exceeded", "billing")
 
 
 class LLMError(Exception):
-    """Base class for typed LLM call failures."""
+    """Base class for typed LLM call failures.
+
+    `retry_after` carries the provider's Retry-After hint (seconds) when the
+    response had one, whatever the error kind is.
+    """
 
     kind: ErrorKind
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
     @property
     def transient(self) -> bool:
@@ -52,10 +64,6 @@ class RateLimitError(LLMError):
     """The provider throttled the request (HTTP 429)."""
 
     kind = ErrorKind.RATE_LIMIT
-
-    def __init__(self, message: str, retry_after: float | None = None) -> None:
-        super().__init__(message)
-        self.retry_after = retry_after
 
 
 class AuthError(LLMError):
@@ -95,32 +103,51 @@ class ClientError(LLMError):
 
 
 def classify_http_error(status: int, body: object, retry_after: float | None) -> LLMError:
-    """Map an HTTP status and a parsed error body onto the typed taxonomy."""
+    """Map an HTTP status and a parsed error body onto the typed taxonomy.
+
+    Body markers win over the status: providers report exhausted quota as a
+    bare 429, and the payload tells throttling apart from a fatal quota
+    failure that must not be retried.
+    """
     code, message = _extract_error_fields(body)
     text = f"{code} {message}".lower()
     detail = message or f"{DEFAULT_ERROR_MESSAGE} (HTTP {status})"
-    if status == HTTPStatus.TOO_MANY_REQUESTS:
-        return RateLimitError(detail, retry_after=retry_after)
-    if status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
-        return AuthError(detail)
-    if status == HTTPStatus.PAYMENT_REQUIRED or any(marker in text for marker in _QUOTA_MARKERS):
-        return QuotaError(detail)
-    if any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS):
-        return ContextOverflowError(detail)
-    if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
-        return ProviderInternalError(detail)
-    return ClientError(detail)
+    error_type: type[LLMError] = ClientError
+    if any(marker in text for marker in _QUOTA_MARKERS):
+        error_type = QuotaError
+    elif any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS):
+        error_type = ContextOverflowError
+    elif status == HTTPStatus.TOO_MANY_REQUESTS:
+        error_type = RateLimitError
+    elif status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+        error_type = AuthError
+    elif status == HTTPStatus.PAYMENT_REQUIRED:
+        error_type = QuotaError
+    elif status >= HTTPStatus.INTERNAL_SERVER_ERROR:
+        error_type = ProviderInternalError
+    return error_type(detail, retry_after=retry_after)
 
 
 def parse_retry_after(raw: str | None) -> float | None:
-    """Parse a Retry-After header value (seconds) into a float."""
+    """Parse a Retry-After header value (seconds or HTTP-date) into a float."""
     if raw is None:
         return None
     try:
         value = float(raw.strip())
     except ValueError:
-        return None
+        return _parse_http_date(raw.strip())
     return value if value >= 0 else None
+
+
+def _parse_http_date(raw: str) -> float | None:
+    """Parse the HTTP-date form of Retry-After into seconds from now."""
+    try:
+        moment = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return max(0.0, (moment - utc_now()).total_seconds())
 
 
 def _extract_error_fields(body: object) -> tuple[str, str]:

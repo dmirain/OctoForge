@@ -178,9 +178,11 @@ class OpenAICompatibleClient:
         """Extract a single tool call from the wire format."""
         try:
             arguments = json.loads(raw["function"]["arguments"] or "{}")
-            return ToolCall(id=raw["id"], name=raw["function"]["name"], arguments=arguments)
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
+        if not isinstance(arguments, dict):
+            raise LLMResponseError(ARGUMENTS_NOT_OBJECT_MESSAGE)
+        return ToolCall(id=raw["id"], name=raw["function"]["name"], arguments=arguments)
 
 
 @dataclass(slots=True)

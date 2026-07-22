@@ -29,6 +29,7 @@ from octoforge_core.llm.events import RetryScheduled as LlmRetryScheduled
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.openai import OpenAICompatibleClient
+from octoforge_core.llm.retry import RETRY_AFTER_DELAY_CAP_SECONDS
 from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
 
@@ -39,9 +40,13 @@ RETRY_AFTER_SECONDS = 2.5
 PARSED_RETRY_AFTER = 1.5
 HEADER_RETRY_AFTER = 7.0
 FLOOR_RETRY_AFTER = 2.0
+LARGE_RETRY_AFTER = 3600.0
+JITTER_SECONDS = 0.005
 MAX_DELAY_SECONDS = 0.05
 RETRIED_CALLS = 2
 EXHAUSTED_CALLS = 3
+HTTP_DATE_FUTURE = "Wed, 21 Oct 2099 07:28:00 GMT"
+HTTP_DATE_PAST = "Wed, 21 Oct 2015 07:28:00 GMT"
 
 
 def error_body(code: str, message: str) -> dict[str, object]:
@@ -69,13 +74,20 @@ def test_classify_quota_by_status_and_body() -> None:
     by_body = classify_http_error(
         HTTPStatus.TOO_MANY_REQUESTS, error_body("insufficient_quota", "no credit"), None
     )
-    # 429 wins over body markers: throttling is retriable, quota is not.
-    assert isinstance(by_body, RateLimitError)
+    # Body markers win over the status: 429 + insufficient_quota is a fatal
+    # quota failure, not retriable throttling.
+    assert isinstance(by_body, QuotaError)
+    assert not by_body.transient
     bad_request = classify_http_error(
         HTTPStatus.BAD_REQUEST, error_body("insufficient_quota", "no credit"), None
     )
     assert isinstance(bad_request, QuotaError)
-    assert not bad_request.transient
+
+
+def test_classify_bare_429_without_body_markers() -> None:
+    error = classify_http_error(HTTPStatus.TOO_MANY_REQUESTS, None, None)
+    assert isinstance(error, RateLimitError)
+    assert error.transient
 
 
 def test_classify_context_overflow_by_body() -> None:
@@ -101,11 +113,25 @@ def test_classify_transport_is_transient() -> None:
     assert TransportError("boom").transient
 
 
+def test_classify_provider_internal_carries_retry_after() -> None:
+    error = classify_http_error(HTTPStatus.SERVICE_UNAVAILABLE, None, RETRY_AFTER_SECONDS)
+    assert isinstance(error, ProviderInternalError)
+    assert error.retry_after == RETRY_AFTER_SECONDS
+    assert error.transient
+
+
 def test_parse_retry_after() -> None:
     assert parse_retry_after(None) is None
     assert parse_retry_after("1.5") == PARSED_RETRY_AFTER
     assert parse_retry_after("-3") is None
     assert parse_retry_after("tomorrow") is None
+
+
+def test_parse_retry_after_http_date() -> None:
+    future = parse_retry_after(HTTP_DATE_FUTURE)
+    assert future is not None
+    assert future > 0
+    assert parse_retry_after(HTTP_DATE_PAST) == 0.0
 
 
 async def test_openai_complete_raises_typed_error_with_retry_after() -> None:
@@ -212,7 +238,41 @@ async def test_complete_retry_delay_floored_at_retry_after() -> None:
 
     await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
 
-    assert sleeper.delays == [FLOOR_RETRY_AFTER]
+    # Retry-After is the floor; positive jitter is added on top.
+    assert len(sleeper.delays) == 1
+    assert FLOOR_RETRY_AFTER <= sleeper.delays[0] <= FLOOR_RETRY_AFTER + MAX_DELAY_SECONDS
+
+
+async def test_retry_after_delay_includes_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("octoforge_core.llm.retry.random.uniform", lambda low, high: JITTER_SECONDS)
+    inner = ScriptedFailureLLM([RateLimitError("slow down", retry_after=FLOOR_RETRY_AFTER)])
+    sleeper = RecordingSleeper()
+    client = make_retrying(inner, sleeper)
+
+    await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
+
+    assert sleeper.delays == [FLOOR_RETRY_AFTER + JITTER_SECONDS]
+
+
+async def test_retry_after_delay_is_capped() -> None:
+    inner = ScriptedFailureLLM([RateLimitError("slow down", retry_after=LARGE_RETRY_AFTER)])
+    sleeper = RecordingSleeper()
+    client = make_retrying(inner, sleeper)
+
+    await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
+
+    assert sleeper.delays == [RETRY_AFTER_DELAY_CAP_SECONDS]
+
+
+async def test_retry_delay_floored_for_provider_internal_retry_after() -> None:
+    inner = ScriptedFailureLLM([ProviderInternalError("boom", retry_after=FLOOR_RETRY_AFTER)])
+    sleeper = RecordingSleeper()
+    client = make_retrying(inner, sleeper)
+
+    await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
+
+    assert len(sleeper.delays) == 1
+    assert FLOOR_RETRY_AFTER <= sleeper.delays[0] <= FLOOR_RETRY_AFTER + MAX_DELAY_SECONDS
 
 
 async def test_complete_does_not_retry_fatal_errors() -> None:

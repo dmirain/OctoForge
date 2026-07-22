@@ -13,7 +13,7 @@ import random
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 from octoforge_core.domain import ChatMessage
-from octoforge_core.llm.errors import LLMError, RateLimitError
+from octoforge_core.llm.errors import LLMError
 from octoforge_core.llm.events import RetryScheduled, StreamEvent
 from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
@@ -22,6 +22,10 @@ from octoforge_core.skills.base import SkillSpec
 logger = logging.getLogger(__name__)
 
 Sleeper = Callable[[float], Awaitable[None]]
+
+# Hard ceiling for a single retry sleep: a provider hint like
+# `Retry-After: 3600` must not park the process for an hour.
+RETRY_AFTER_DELAY_CAP_SECONDS = 300.0
 
 
 class RetryingLLMClient:
@@ -96,9 +100,15 @@ class RetryingLLMClient:
                 await self._sleeper(delay)
 
     def _delay(self, attempt: int, exc: LLMError) -> float:
-        """Exponential backoff with full jitter, floored at Retry-After."""
+        """Exponential backoff with full jitter, floored at Retry-After.
+
+        A provider hint is the floor, not the exact delay: positive jitter is
+        added on top so clients that received the same Retry-After do not
+        retry in lockstep, and the total is capped so an extreme hint cannot
+        park the process (see RETRY_AFTER_DELAY_CAP_SECONDS).
+        """
         ceiling = min(self._max_seconds, self._base_seconds * (2 ** (attempt - 1)))
-        delay = random.uniform(0, ceiling)
-        if isinstance(exc, RateLimitError) and exc.retry_after is not None:
-            delay = max(delay, exc.retry_after)
-        return delay
+        if exc.retry_after is not None:
+            delay = exc.retry_after + random.uniform(0, ceiling)
+            return min(delay, RETRY_AFTER_DELAY_CAP_SECONDS)
+        return random.uniform(0, ceiling)

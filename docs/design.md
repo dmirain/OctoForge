@@ -393,14 +393,22 @@ delta.tool_calls — аккумуляция по index со склейкой arg
 HTTP-статусу и телу ошибки (`error.code`/`error.type` OpenAI-пayload'а) —
 `RateLimitError` (с `retry_after` из заголовка Retry-After), `AuthError`, `QuotaError`,
 `ContextOverflowError`, `ProviderInternalError`, `TransportError` (httpx-ошибки
-транспорта), `ClientError` (прочие 4xx). Транзиентные классы — rate_limit,
+транспорта), `ClientError` (прочие 4xx). Маркеры тела информативнее статуса и
+проверяются первыми: провайдеры отдают исчерпание квоты как голый 429 с
+`insufficient_quota` в теле — это фатальный `QuotaError`, а не ретраибельный
+rate-limit. Поле `retry_after` живёт в базовом `LLMError` — подсказку Retry-After
+несёт любая HTTP-ошибка (например, 503), а не только 429; заголовок парсится в обеих
+формах (секунды и HTTP-date). Транзиентные классы — rate_limit,
 provider_internal, transport; остальные фатальны.
 
 Поверх порта `LLMClient` — декоратор `RetryingLLMClient` (оборачивает любую
 реализацию, навешивается только в composition root, `build_llm_client`): экспоненциальный
-backoff с full-jitter, задержка не ниже `Retry-After`, ретраятся только транзиентные
-классы, лимит — в `LLMConfig` (`OF_LLM_MAX_RETRIES`, `OF_LLM_RETRY_BASE_SECONDS`,
-`OF_LLM_RETRY_MAX_SECONDS`). `complete()` ретраится молча (warning-лог). `stream()`
+backoff с full-jitter, ретраятся только транзиентные классы, лимит — в `LLMConfig`
+(`OF_LLM_MAX_RETRIES`, `OF_LLM_RETRY_BASE_SECONDS`,
+`OF_LLM_RETRY_MAX_SECONDS`). `Retry-After` — пол задержки, а не точное значение: сверху
+добавляется положительный джиттер (клиенты с одинаковой подсказкой провайдера не
+ретраятся в унисон), а итог капится константой `RETRY_AFTER_DELAY_CAP_SECONDS` (300 с),
+чтобы экстремальный hint вроде `Retry-After: 3600` не усыплял процесс на часы. `complete()` ретраится молча (warning-лог). `stream()`
 ретраится только если сбой случился ДО первого события стрима (после первой дельты
 повтор задвоил бы вывод); перед повтором в стрим отдаётся событие `RetryScheduled`,
 которое петля мапит в LoopEvent — web (SSE `retry_scheduled`, статус-строка в UI) и
