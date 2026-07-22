@@ -182,3 +182,61 @@ async def test_count_active_counts_pending_and_running_of_the_dialog() -> None:
     await store.cancel(cancelled.id)
 
     assert await store.count_active(CTX.dialog_id) == ACTIVE_COUNT
+
+
+RESTART_ERROR = "interrupted by restart"
+
+
+async def test_fail_orphaned_fails_only_pending_and_running() -> None:
+    store = InMemoryTaskStore()
+    pending = make_task(title="pending")
+    running = make_task(title="running")
+    done = make_task(title="done")
+    cancelled = make_task(title="cancelled")
+    for task in (pending, running, done, cancelled):
+        await store.add(task)
+    await store.mark_running(running)
+    await store.mark_done(done, "ok")
+    await store.cancel(cancelled.id)
+
+    orphaned = await store.fail_orphaned(RESTART_ERROR)
+
+    assert {task.id for task in orphaned} == {pending.id, running.id}
+    for task in (pending, running):
+        stored = await store.get(task.id)
+        assert stored.status is TaskStatus.FAILED
+        assert stored.error == RESTART_ERROR
+        assert stored.finished_at is not None
+        assert stored.finished_at.tzinfo is not None
+    assert (await store.get(done.id)).status is TaskStatus.DONE
+    assert (await store.get(cancelled.id)).status is TaskStatus.CANCELLED
+
+
+async def test_fail_orphaned_without_candidates_returns_empty() -> None:
+    store = InMemoryTaskStore()
+    done = make_task()
+    await store.add(done)
+    await store.mark_done(done, "ok")
+
+    assert await store.fail_orphaned(RESTART_ERROR) == []
+
+
+async def test_list_undelivered_returns_finished_undelivered_only() -> None:
+    store = InMemoryTaskStore()
+    done = make_task(title="done")
+    failed = make_task(title="failed")
+    delivered = make_task(title="delivered")
+    cancelled = make_task(title="cancelled")
+    running = make_task(title="running")
+    for task in (done, failed, delivered, cancelled, running):
+        await store.add(task)
+    await store.mark_done(done, "ok")
+    await store.mark_failed(failed, "boom")
+    await store.mark_done(delivered, "ok")
+    await store.mark_delivered(delivered.id)
+    await store.cancel(cancelled.id)
+    await store.mark_running(running)
+
+    undelivered = await store.list_undelivered()
+
+    assert {task.id for task in undelivered} == {done.id, failed.id}

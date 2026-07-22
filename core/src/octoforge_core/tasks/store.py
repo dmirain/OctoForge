@@ -4,6 +4,10 @@ from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskStatus
 from octoforge_core.time import utc_now
 
+# Inside InMemoryTaskStore the method named `list` shadows the builtin in
+# class-scope annotations, so list-returning signatures alias it here.
+TaskList = list[Task]
+
 
 class InMemoryTaskStore:
     """Dict-backed task store; used in tests and as a behavioral reference."""
@@ -57,3 +61,20 @@ class InMemoryTaskStore:
     async def mark_delivered(self, task_id: str) -> None:
         task = await self.get(task_id)
         task.result_delivered = True
+
+    async def fail_orphaned(self, error: str) -> TaskList:
+        active = (TaskStatus.PENDING, TaskStatus.RUNNING)
+        orphaned = [task for task in self._tasks.values() if task.status in active]
+        for task in orphaned:
+            task.status = TaskStatus.FAILED
+            task.error = error
+            task.finished_at = utc_now()
+        return orphaned
+
+    async def list_undelivered(self) -> TaskList:
+        finished = (TaskStatus.DONE, TaskStatus.FAILED)
+        return [
+            task
+            for task in self._tasks.values()
+            if task.status in finished and not task.result_delivered
+        ]

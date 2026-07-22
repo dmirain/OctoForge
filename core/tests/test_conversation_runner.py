@@ -30,6 +30,8 @@ from octoforge_core.agent.router import (
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
     REPORT_NUDGE,
+    RESTART_INTERRUPT_ERROR,
+    TASK_INTERRUPTED_TEMPLATE,
     ConversationEvent,
     ConversationManager,
     RunnerConfig,
@@ -48,7 +50,7 @@ from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient, TaskStore
 from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
-from octoforge_core.tasks.models import Task, TaskStatus
+from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.tasks.tools import TaskSpawnSkill
 
@@ -1652,3 +1654,136 @@ async def test_stop_all_stops_and_deregisters_every_runner(
         assert actor.done()
     # the registry was cleared: a late request builds a fresh runner
     assert await manager.get_or_create_runner(USER_ID, CHANNEL) is not first
+
+
+# --- startup recovery ----------------------------------------------------------
+
+
+def orphaned_task(dialog: Dialog, cron_job_id: str | None = None) -> Task:
+    """Build a RUN task as a previous instance left it: stored and running."""
+    task_input: dict[str, Any] = {"title": TASK_TITLE, "prompt": TASK_PROMPT}
+    if cron_job_id is not None:
+        task_input["cron_job_id"] = cron_job_id
+    return Task(
+        dialog_id=dialog.id,
+        user_id=dialog.user_id,
+        channel=dialog.channel,
+        title=TASK_TITLE,
+        kind=TaskKind.RUN,
+        input=task_input,
+    )
+
+
+async def test_recover_interrupted_fails_orphaned_tasks(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([])
+    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog)
+    await store.add(task)
+    await store.mark_running(task)
+
+    await manager.recover_interrupted()
+
+    stored = await store.get(task.id)
+    assert stored.status is TaskStatus.FAILED
+    assert stored.error == RESTART_INTERRUPT_ERROR
+    assert stored.finished_at is not None
+    assert stored.result_delivered is True  # the note is the delivery
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    history = runner.history()
+    assert [message.role for message in history] == [MessageRole.SYSTEM]
+    assert history[0].content == TASK_INTERRUPTED_TEMPLATE.format(title=TASK_TITLE)
+    # a passive note must not start a report run
+    assert llm.requests == []
+
+
+class RecordingListener:
+    """TaskOutcomeListener stub recording report calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, TaskStatus]] = []
+
+    async def report_outcome(self, task: Task, status: TaskStatus) -> None:
+        self.calls.append((task.id, status))
+
+
+async def test_recover_interrupted_reports_only_cron_tagged_orphans(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    listener = RecordingListener()
+    manager = make_manager(
+        ScriptedLLM([]),
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(store=store, listener=listener),
+    )
+    dialog = await get_dialog(session_factory)
+    cron_task = orphaned_task(dialog, cron_job_id="job-1")
+    plain_task = orphaned_task(dialog)
+    for task in (cron_task, plain_task):
+        await store.add(task)
+        await store.mark_running(task)
+
+    await manager.recover_interrupted()
+
+    assert listener.calls == [(cron_task.id, TaskStatus.FAILED)]
+
+
+async def test_recover_interrupted_redelivers_undelivered_results(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = RecordingDeliveryStore()
+    llm = ScriptedLLM([reply("your background result is ready")])
+    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog)
+    await store.add(task)
+    await store.mark_running(task)
+    await store.mark_done(task, TASK_RESULT)
+    # result_delivered stays False: the previous instance died before delivery
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.recover_interrupted()
+    await collect_completions(queue, 1)  # the report run reacting to the note
+
+    assert store.delivered == [task.id]
+    contents = [message.content for message in runner.history()]
+    assert any(TASK_RESULT in content for content in contents)
+
+
+async def test_recover_interrupted_noop_without_candidates(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = ScriptedLLM([])
+    manager = make_manager(llm, SkillRegistry(), session_factory)
+
+    await manager.recover_interrupted()
+
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    assert runner.history() == []
+    assert llm.requests == []
+
+
+class SweepFailingStore(InMemoryTaskStore):
+    """Task store failing the orphaned sweep (database outage at startup)."""
+
+    async def fail_orphaned(self, error: str) -> list[Task]:
+        raise RuntimeError("database down")
+
+
+async def test_recover_interrupted_survives_store_failures(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = make_manager(
+        ScriptedLLM([]),
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(store=SweepFailingStore()),
+    )
+
+    await manager.recover_interrupted()  # a recovery failure must not take the app down

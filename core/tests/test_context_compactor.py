@@ -743,7 +743,10 @@ async def test_aclose_leaves_other_dialogs_compactions_running(
 
     await compactor.assemble(dialog, history)
     await compactor.assemble(other, other_history)
-    await wait_for_condition(lambda: llm.calls >= 1)
+    # both compactions must be parked inside the gated LLM call: cancelling
+    # mid-DB-read (calls >= 1 races the other run's queries) leaves aiosqlite
+    # transaction state that can lock the surviving run's commit
+    await wait_for_condition(lambda: llm.calls >= TWO_CALLS)
 
     await compactor.aclose(other.id)  # cancels only the other dialog's run
     llm.release.set()

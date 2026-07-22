@@ -38,6 +38,10 @@ class MessageStats:
 # class-scope annotations, so the return type of stats_by_channel aliases it here.
 MessageStatsList = list[MessageStats]
 
+# Same shadowing inside SqlAlchemyTaskStore: list-returning signatures defined
+# after its `list` method use this alias.
+TaskList = list[Task]
+
 
 class DialogRepository:
     """Dialogs keyed by the unique (user_id, channel) pair."""
@@ -305,6 +309,33 @@ class SqlAlchemyTaskStore:
                 raise TaskNotFoundError(task_id)
             row.result_delivered = True
             await session.commit()
+
+    async def fail_orphaned(self, error: str) -> TaskList:
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(TaskRow).where(
+                    TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value))
+                )
+            )
+            rows = list(result.all())
+            for row in rows:
+                row.status = TaskStatus.FAILED.value
+                row.error = error
+                row.finished_at = utc_now()
+            await session.commit()
+            return [_to_task(row) for row in rows]
+
+    async def list_undelivered(self) -> TaskList:
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(TaskRow)
+                .where(
+                    TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)),
+                    TaskRow.result_delivered.is_(False),
+                )
+                .order_by(TaskRow.created_at)
+            )
+            return [_to_task(row) for row in result.all()]
 
     async def _update(self, task: Task) -> None:
         async with self._session_factory() as session:

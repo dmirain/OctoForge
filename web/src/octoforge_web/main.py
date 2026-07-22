@@ -221,6 +221,10 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 messages=messages,
                 tasks=task_store,
             )
+            # Sweep before the scheduler and surfaces start: orphaned tasks
+            # are failed (cron-tagged ones get a bounded retry) and persisted
+            # results that never reached their dialog are redelivered.
+            await manager.recover_interrupted()
             scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
             telegram = _start_telegram(
                 settings,

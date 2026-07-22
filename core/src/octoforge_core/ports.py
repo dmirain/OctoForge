@@ -9,6 +9,10 @@ from octoforge_core.llm.usage import Completion
 from octoforge_core.skills.base import SkillSpec
 from octoforge_core.tasks.models import Task
 
+# Inside TaskStore the method named `list` shadows the builtin in class-scope
+# annotations, so list-returning signatures defined after it alias it here.
+TaskList = list[Task]
+
 
 class LLMClient(Protocol):
     """Async chat-completion client port."""
@@ -71,4 +75,16 @@ class TaskStore(Protocol):
 
     async def mark_delivered(self, task_id: str) -> None:
         """Mark the task result as delivered to its dialog."""
+        ...
+
+    async def fail_orphaned(self, error: str) -> TaskList:
+        """Fail every PENDING/RUNNING task with `error`; return the affected tasks.
+
+        Their in-memory executors (actor pump processes) died with the previous
+        service instance, so they can never finish on their own.
+        """
+        ...
+
+    async def list_undelivered(self) -> TaskList:
+        """Return finished (DONE/FAILED) tasks whose result was never delivered."""
         ...

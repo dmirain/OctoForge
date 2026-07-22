@@ -61,6 +61,10 @@ CRON_LIMIT_NOTE_TEMPLATE = (
     "Cron job '{title}' could not start: process limit ({limit}) reached; active: {titles}"
 )
 SPAWNED_TEMPLATE = "task {task_id} spawned"
+RESTART_INTERRUPT_ERROR = "interrupted by restart"
+TASK_INTERRUPTED_TEMPLATE = (
+    "Background task '{title}' was interrupted by a service restart and marked as failed."
+)
 BACKGROUND_TASK_PROMPT = (
     "You are solving a background task. User message is the task. "
     "Produce the final answer as the result."
@@ -741,11 +745,31 @@ class ConversationRunner:
     def _active_titles(self) -> str:
         return ", ".join(process.title for process in self._processes.values())
 
-    async def _publish_system_note(self, content: str) -> None:
-        """Record a system note in the narrative and route it: inject or report run."""
+    async def record_system_note(self, content: str) -> ChatMessage:
+        """Persist a system note in the narrative without routing it.
+
+        A passive note (like INTERRUPTED_NOTE): the agent sees it in the
+        history, but it neither injects into a live process nor starts a
+        report run — used for recovery facts that need no immediate answer.
+        Returns the recorded note.
+        """
         note = ChatMessage(role=MessageRole.SYSTEM, content=content)
         await self._persist(note)
         self._narrative.append(note)
+        return note
+
+    def request_result_delivery(self, task_id: str) -> None:
+        """Enqueue delivery of a finished task result via the exactly-once path.
+
+        Used by startup recovery: the same command the pump enqueues when a
+        live process terminates, so redelivery shares the status/delivered
+        checks and the note/report-run semantics of `_handle_terminated`.
+        """
+        self._inbox.put_nowait(_ProcessTerminated(task_id=task_id))
+
+    async def _publish_system_note(self, content: str) -> None:
+        """Record a system note in the narrative and route it: inject or report run."""
+        note = await self.record_system_note(content)
         foreground = self._foreground()
         if foreground is not None:
             foreground.control.inject(note)
@@ -850,6 +874,70 @@ class ConversationManager:
         """
         runner = await self.get_or_create_runner(user_id, channel)
         return await runner.wake(title, prompt, cron_job_id)
+
+    async def recover_interrupted(self) -> None:
+        """Fail orphaned tasks and redeliver undelivered results after a restart.
+
+        Processes live in memory, so a restart strands PENDING/RUNNING tasks
+        forever and loses results persisted but not yet delivered. The sweep
+        runs once at startup (before the scheduler and the surfaces start) and
+        never raises: a recovery failure must not take the app down — every
+        operation is idempotent and simply retried on the next restart.
+        """
+        orphaned = await self._fail_orphaned()
+        for task in orphaned:
+            await self._recover_orphaned(task)
+        undelivered = await self._list_undelivered()
+        for task in undelivered:
+            await self._redeliver_undelivered(task)
+        logger.info("startup recovery: orphaned=%s redelivered=%s", len(orphaned), len(undelivered))
+
+    async def _fail_orphaned(self) -> list[Task]:
+        try:
+            return await self._tasks.fail_orphaned(RESTART_INTERRUPT_ERROR)
+        except Exception:
+            logger.exception("orphaned task sweep failed")
+            return []
+
+    async def _list_undelivered(self) -> list[Task]:
+        try:
+            return await self._tasks.list_undelivered()
+        except Exception:
+            logger.exception("undelivered task sweep failed")
+            return []
+
+    async def _recover_orphaned(self, task: Task) -> None:
+        """Record the interruption in the narrative and report the cron outcome."""
+        try:
+            runner = await self.get_or_create_runner(task.user_id, task.channel)
+            await runner.record_system_note(TASK_INTERRUPTED_TEMPLATE.format(title=task.title))
+            await self._tasks.mark_delivered(task.id)
+            await self._report_orphaned_outcome(task)
+        except Exception:
+            logger.exception("orphaned task recovery failed: task=%s", task.id)
+
+    async def _report_orphaned_outcome(self, task: Task) -> None:
+        """Route an orphaned cron-fired task through the outcome listener.
+
+        Without this an interrupted one-shot job is lost without a trace (its
+        next_fire_at was already advanced past all occurrences); the reporter
+        applies the standard FAILED policy — last_error plus a bounded retry.
+        """
+        listener = self._config.task_outcome_listener
+        if listener is None or "cron_job_id" not in task.input:
+            return
+        try:
+            await listener.report_outcome(task, TaskStatus.FAILED)
+        except Exception:
+            logger.exception("orphaned cron outcome report failed: task=%s", task.id)
+
+    async def _redeliver_undelivered(self, task: Task) -> None:
+        """Redeliver a persisted-but-undelivered result via the standard path."""
+        try:
+            runner = await self.get_or_create_runner(task.user_id, task.channel)
+            runner.request_result_delivery(task.id)
+        except Exception:
+            logger.exception("undelivered task redelivery failed: task=%s", task.id)
 
     async def stop_all(self) -> None:
         """Stop and deregister every live runner (the app is shutting down)."""

@@ -463,7 +463,8 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
   денормализованы в задачу: уведомление уходит на поверхность, с которой задача запущена,
   без join'а к dialogs.
 - `TaskStore` (Protocol в `ports.py`): add/get/list(dialog_id)/mark_running/mark_done/
-  mark_failed/cancel/is_cancelled/count_active/mark_delivered. Реализации:
+  mark_failed/cancel/is_cancelled/count_active/mark_delivered/fail_orphaned/
+  list_undelivered. Реализации:
   `SqlAlchemyTaskStore` (`db/repositories.py`, боевой путь) и `InMemoryTaskStore` (тесты);
   `next_pending` из порта удалён вместе с поллером.
 - **Спавн**: скил `task_spawn` делегирует порту `TaskSpawner` (`tasks/spawner.py`),
@@ -475,10 +476,22 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
 - **Завершение**: терминальный статус процесса мапится на задачу (DONE → mark_done с
   финальным ответом, FAILED → mark_failed, отмена → cancel). Уведомление в диалог —
   по факту терминации (см. «Актор диалога»), ровно один раз (`result_delivered`).
-- **Регрессия-допущение**: процессы живут в памяти — после рестарта приложения задачи в
-  статусах PENDING/RUNNING осиротевают (их процессы не восстанавливаются). Редоставка
-  недоставленных результатов и реанимация/фейл осиротевших задач — в списке
-  «не реализовано» (см. AGENTS.md).
+- **Startup-recovery** (`ConversationManager.recover_interrupted()`, вызов из
+  `runtime()` до старта планировщика и поверхностей): процессы живут в памяти, поэтому
+  при рестарте их «тени» в `tasks` подметает sweep — порт `TaskStore` +=
+  `fail_orphaned(error)` (PENDING/RUNNING → FAILED «interrupted by restart»,
+  возвращает затронутые) и `list_undelivered()` (DONE/FAILED с
+  `result_delivered=false`; CANCELLED доставки не требуют). Каждая осиротевшая
+  задача получает пассивную системную заметку в нарратив (`record_system_note` —
+  без инъекции и репорт-прогона, как `INTERRUPTED_NOTE`) и `mark_delivered`;
+  cron-tagged дополнительно проходят через `TaskOutcomeListener` — штатная
+  FAILED-политика `CronOutcomeReporter` (last_error + bounded-ретрай) спасает
+  one-shot, чей `next_fire_at` уже продвинут мимо всех огней. Недоставленные
+  результаты редоставляются штатным exactly-once путём:
+  `runner.request_result_delivery(task_id)` кладёт в инбокс ту же команду
+  `_ProcessTerminated`, что и pump живого процесса (несколько результатов одного
+  диалога батчатся в один репорт-прогон). Sweep никогда не роняет старт: каждый
+  шаг под try/except, операции идемпотентны и дожидаются следующего рестарта.
 
 Скилы задач: `task_spawn` (title + prompt → фоновая задача-процесс текущего диалога) и
 `task_list` (задачи диалога со статусами, включая cancelled, и результатами).
