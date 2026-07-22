@@ -100,18 +100,25 @@ class LlmContextCompactor(ContextCompactor):
         max_seq_to = await self._store.max_seq_to(dialog.id)
         tail_count = await self._archive.count_after(dialog.id, max_seq_to)
         tail = _tail_of(history, tail_count)
-        if _chars(tail) > self._config.hot_max_chars or await self._token_overflow(dialog):
+        if _chars(tail) > self._config.hot_max_chars or await self._token_overflow(
+            dialog, max_seq_to
+        ):
             self._trigger_compact(dialog)
         summaries = await self._store.list_for_dialog(dialog.id)
         if not summaries:
             return tail
         return [_topics_block(summaries), *tail]
 
-    async def _token_overflow(self, dialog: Dialog) -> bool:
-        """Whether the last run's prompt approached the model's context window."""
+    async def _token_overflow(self, dialog: Dialog, after_seq: int) -> bool:
+        """Whether the last run's prompt approached the model's context window.
+
+        Only usage recorded past the compaction boundary counts: an assistant
+        message compacted into the summary describes a pre-compaction prompt
+        and must not retrigger compaction.
+        """
         if self._config.model_context_tokens <= 0:
             return False
-        prompt_tokens = await self._archive.latest_prompt_tokens(dialog.id)
+        prompt_tokens = await self._archive.latest_prompt_tokens(dialog.id, after_seq)
         if prompt_tokens is None:
             return False
         threshold = self._config.model_context_tokens - self._config.context_buffer_tokens
@@ -130,15 +137,20 @@ class LlmContextCompactor(ContextCompactor):
     async def compact_now(self, dialog: Dialog) -> bool:
         """Compact synchronously; True when the covered range advanced.
 
-        An in-flight background compaction is awaited first: its result
-        counts, so a reactive call does not redo the same work.
+        Goes through the same one-run-per-dialog guard as the background
+        trigger: an in-flight compaction (background or a concurrent
+        compact_now) is awaited, and when it already advanced the boundary
+        the call is done — the reactive path never redoes the same work.
         """
         before = await self._store.max_seq_to(dialog.id)
         running = self._running.get(dialog.id)
         if running is not None and not running.done():
             with suppress(asyncio.CancelledError):
                 await running
-        await self._compact(dialog)
+            if await self._store.max_seq_to(dialog.id) > before:
+                return True  # the awaited run already advanced the range
+        task = self._start_compact(dialog)
+        await task
         return await self._store.max_seq_to(dialog.id) > before
 
     def _trigger_compact(self, dialog: Dialog) -> None:
@@ -146,12 +158,18 @@ class LlmContextCompactor(ContextCompactor):
         running = self._running.get(dialog.id)
         if running is not None and not running.done():
             return  # one compaction per dialog at a time; the next assemble re-triggers
+        self._start_compact(dialog)
+
+    def _start_compact(self, dialog: Dialog) -> asyncio.Task[None]:
+        """Register a compaction task as the dialog's running one and return it."""
         task = asyncio.create_task(self._compact(dialog))
         self._running[dialog.id] = task
         task.add_done_callback(lambda done: self._on_compact_done(dialog.id, done))
+        return task
 
     def _on_compact_done(self, dialog_id: str, task: asyncio.Task[None]) -> None:
-        self._running.pop(dialog_id, None)
+        if self._running.get(dialog_id) is task:  # a newer run may already be registered
+            self._running.pop(dialog_id, None)
         if task.cancelled():
             return
         exc = task.exception()
@@ -199,20 +217,27 @@ def select_compact_segment(
 ) -> list[ArchivedMessage]:
     """Pick the oldest prefix of the tail up to `target_chars` of content.
 
-    The cut happens only between whole messages (at least one message is
-    always taken). A salvaged pair — an assistant message followed by the
-    INTERRUPTED_NOTE system note — is never split: a cut landing between the
-    two is moved past the note, so both go into the summary.
+    The cut happens only between whole messages, and the LAST message of the
+    tail is never taken (keep-recent: the freshest message — typically the
+    user's question being answered — always stays in the verbatim hot tail,
+    so a compaction racing a new submit cannot swallow it). A salvaged pair —
+    an assistant message followed by the INTERRUPTED_NOTE system note — is
+    never split: a cut landing between the two is moved past the note, so
+    both go into the summary; when the note is the kept-last message, the cut
+    moves before the pair instead, so both stay in the tail.
     """
     segment: list[ArchivedMessage] = []
     total = 0
-    for message in tail:
+    for message in tail[:-1]:  # keep-recent: the last message never leaves the tail
         if segment and total + len(message.content) > target_chars:
             break
         segment.append(message)
         total += len(message.content)
     if segment and len(tail) > len(segment) and _is_split_pair(segment[-1], tail[len(segment)]):
-        segment.append(tail[len(segment)])
+        if len(segment) + 1 == len(tail):
+            segment.pop()  # extending would swallow the kept-last note: cut before the pair
+        else:
+            segment.append(tail[len(segment)])
     return segment
 
 

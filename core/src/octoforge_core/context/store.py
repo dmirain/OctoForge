@@ -118,13 +118,14 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
             )
             return [_to_archived(row) for row in result.all()]
 
-    async def latest_prompt_tokens(self, dialog_id: str) -> int | None:
-        """Return prompt_tokens of the newest assistant message that has usage."""
+    async def latest_prompt_tokens(self, dialog_id: str, after_seq: int) -> int | None:
+        """Return prompt_tokens of the newest tail assistant message with usage."""
         async with self._session_factory() as session:
             value = await session.scalar(
                 select(MessageRow.prompt_tokens)
                 .where(
                     MessageRow.dialog_id == dialog_id,
+                    MessageRow.seq > after_seq,
                     MessageRow.role == MessageRole.ASSISTANT.value,
                     MessageRow.prompt_tokens.is_not(None),
                 )

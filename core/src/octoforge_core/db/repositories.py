@@ -101,6 +101,43 @@ class MessageRepository:
                 dialog.updated_at = utc_now()
             await session.commit()
 
+    async def append_pair(
+        self,
+        dialog_id: str,
+        first: ChatMessage,
+        second: ChatMessage,
+    ) -> None:
+        """Append two messages in one transaction, with consecutive seq values.
+
+        Used for indivisible narrative pairs (a salvaged partial answer and
+        its INTERRUPTED_NOTE): a reader snapshot between two separate commits
+        could otherwise see the first message without the second. Each INSERT
+        keeps the atomic seq subquery, so the pair also stays race-safe
+        against concurrent writers.
+        """
+        async with self._session_factory() as session:
+            next_seq = (
+                select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
+                .where(MessageRow.dialog_id == dialog_id)
+                .scalar_subquery()
+            )
+            for message in (first, second):
+                await session.execute(
+                    insert(MessageRow).values(
+                        id=uuid.uuid4().hex,
+                        dialog_id=dialog_id,
+                        seq=next_seq,
+                        role=message.role.value,
+                        content=message.content,
+                        tool_calls=_tool_calls_to_json(message.tool_calls),
+                        tool_call_id=message.tool_call_id,
+                    )
+                )
+            dialog = await session.get(DialogRow, dialog_id)
+            if dialog is not None:
+                dialog.updated_at = utc_now()
+            await session.commit()
+
     async def find_by_client_id(self, dialog_id: str, client_message_id: str) -> bool:
         """Return True when a message with this idempotency key already exists."""
         async with self._session_factory() as session:

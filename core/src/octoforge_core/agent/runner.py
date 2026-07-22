@@ -691,13 +691,17 @@ class ConversationRunner:
             await self._tasks.cancel(process.task_id)
 
     async def _salvage_interrupted_turn(self, process: _Process) -> None:
-        """Keep a cancelled run's partial answer in the narrative, flagged as incomplete."""
+        """Keep a cancelled run's partial answer in the narrative, flagged as incomplete.
+
+        The pair is persisted atomically: the note must never be orphaned nor
+        observed without the message it annotates (the compactor's tail
+        snapshot relies on the pair being indivisible).
+        """
         last = _latest_assistant_with_content(process.branch)
         if last is None:
             return
         note = ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE)
-        await self._persist(last)
-        await self._persist(note)
+        await self._messages.append_pair(self._dialog.id, last, note)
         self._narrative.extend((last, note))
 
     def _remove_process(self, process: _Process) -> None:

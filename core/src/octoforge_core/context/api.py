@@ -138,11 +138,13 @@ class MessageArchive(Protocol):
         """Return the dialog messages with `seq >` the given one, ordered by seq."""
         ...
 
-    async def latest_prompt_tokens(self, dialog_id: str) -> int | None:
-        """Return prompt_tokens of the newest assistant message that has usage.
+    async def latest_prompt_tokens(self, dialog_id: str, after_seq: int) -> int | None:
+        """Return prompt_tokens of the newest assistant message past the boundary.
 
-        None when no assistant message carries provider usage yet (the chars
-        heuristic stays the fallback trigger then).
+        Only messages with `seq > after_seq` count: usage recorded before the
+        compaction boundary describes a pre-compaction prompt and must not
+        retrigger compaction. None when no tail assistant message carries
+        provider usage (the chars heuristic stays the fallback trigger then).
         """
         ...
 

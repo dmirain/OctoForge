@@ -209,6 +209,19 @@ async def test_date_filters_bound_the_hits(
     assert "hotel" not in to_hits  # a date-only upper bound covers the whole day
 
 
+async def test_datetime_date_to_is_an_exclusive_bound(
+    skill: HistorySearchSkill,
+    dialogs: tuple[SkillContext, SkillContext],
+) -> None:
+    ctx_a, _ = dialogs
+
+    exact = await skill.execute({"query": "berlin", "date_to": "2026-01-10T10:00:00"}, ctx_a)
+    just_after = await skill.execute({"query": "berlin", "date_to": "2026-01-10T10:00:01"}, ctx_a)
+
+    assert exact == NO_HITS_MESSAGE  # the message at exactly the bound is excluded
+    assert "we flew" in just_after
+
+
 async def test_invalid_dates_are_rejected(
     skill: HistorySearchSkill,
     dialogs: tuple[SkillContext, SkillContext],

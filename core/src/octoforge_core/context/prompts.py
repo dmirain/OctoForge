@@ -80,7 +80,14 @@ def parse_summary_reply(text: str) -> tuple[tuple[str, ...], str]:
             line for line in text.splitlines() if not line.strip().upper().startswith(TOPICS_PREFIX)
         ]
     content = "\n".join(kept).strip()
-    return topics, content if content else text.strip()
+    if content:
+        return topics, content
+    fallback = "\n".join(
+        line
+        for line in text.splitlines()
+        if not line.strip().upper().startswith((TOPICS_PREFIX, SUMMARY_PREFIX))
+    ).strip()
+    return topics, fallback
 
 
 def _parse_topics(raw: str) -> tuple[str, ...]:

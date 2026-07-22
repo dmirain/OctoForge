@@ -34,7 +34,10 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
         },
         "date_to": {
             "type": "string",
-            "description": "ISO date/datetime, inclusive upper bound (UTC when naive)",
+            "description": (
+                "ISO date/datetime upper bound (UTC when naive): a date-only value "
+                "is inclusive (covers the whole day), a datetime is exclusive"
+            ),
         },
         "limit": {"type": "integer", "description": "How many messages to return"},
     },
@@ -116,7 +119,7 @@ def _parse_date(raw: object, name: str, *, end: bool) -> datetime | None:
 
     Naive values are read as UTC (the project is UTC-only). A date-only upper
     bound is inclusive: it is moved to the next midnight (the store's date_to
-    is exclusive).
+    is exclusive). A datetime upper bound is exact and stays exclusive.
     """
     if raw is None:
         return None

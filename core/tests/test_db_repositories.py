@@ -4,10 +4,11 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from octoforge_core.agent.runner import INTERRUPTED_NOTE
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.errors import DialogNotFoundError
 from octoforge_core.db.models import MessageRow
@@ -159,6 +160,46 @@ async def test_messages_get_monotonic_seq_and_order(
         ).all()
     assert [row.seq for row in rows] == [FIRST_SEQ, SECOND_SEQ, THIRD_SEQ]
     assert all(row.created_at.tzinfo == UTC for row in rows)
+
+
+async def test_append_pair_writes_both_messages_in_one_transaction() -> None:
+    engine = create_engine(MEMORY_DATABASE_URL)
+    await init_db(engine)
+    commits = 0
+
+    def _count_commit(_connection: object) -> None:
+        nonlocal commits
+        commits += 1
+
+    event.listen(engine.sync_engine, "commit", _count_commit)
+    try:
+        factory = create_session_factory(engine)
+        dialogs = DialogRepository(factory)
+        messages = MessageRepository(factory)
+        dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="question"))
+        commits_before = commits
+
+        await messages.append_pair(
+            dialog.id,
+            ChatMessage(role=MessageRole.ASSISTANT, content="partial answer"),
+            ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE),
+        )
+
+        assert commits == commits_before + 1  # one transaction for the whole pair
+        stored = await messages.list(dialog.id)
+        assert [m.content for m in stored] == ["question", "partial answer", INTERRUPTED_NOTE]
+        async with factory() as session:
+            rows = (
+                await session.scalars(
+                    select(MessageRow)
+                    .where(MessageRow.dialog_id == dialog.id)
+                    .order_by(MessageRow.seq)
+                )
+            ).all()
+        assert [row.seq for row in rows] == [FIRST_SEQ, SECOND_SEQ, THIRD_SEQ]
+    finally:
+        await engine.dispose()
 
 
 async def test_message_usage_round_trip(

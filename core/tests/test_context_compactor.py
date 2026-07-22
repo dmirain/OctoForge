@@ -1,9 +1,10 @@
 """Tests for the context compactor: assembly, background compaction, safe cuts."""
 
 import asyncio
+import inspect
 import logging
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -42,6 +43,8 @@ SUMMARY_REPLY = "TOPICS: alpha, beta\nSUMMARY:\ncompressed facts"
 SECOND_SUMMARY_REPLY = "TOPICS: gamma\nSUMMARY:\nmore facts"
 TWO_CALLS = 2
 BLOCK_AND_TAIL = 2
+SECOND_SEQ = 2
+THIRD_SEQ = 3
 THREE_MESSAGES = 3
 FOUR_MESSAGES = 4
 SIX_MESSAGES = 6
@@ -169,9 +172,14 @@ def make_compactor(
     )
 
 
-async def wait_for_condition(predicate: Callable[[], bool]) -> None:
+async def wait_for_condition(predicate: Callable[[], bool | Awaitable[bool]]) -> None:
     async def _wait() -> None:
-        while not predicate():
+        while True:
+            outcome = predicate()
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+            if outcome:
+                return
             await asyncio.sleep(POLL_SECONDS)
 
     await asyncio.wait_for(_wait(), timeout=TIMEOUT_SECONDS)
@@ -219,7 +227,30 @@ def test_segment_keeps_a_pair_whole_at_the_range_end() -> None:
 
     segment = select_compact_segment(tail, target_chars=200)
 
-    assert [m.seq for m in segment] == [1, 2, 3]
+    assert [m.seq for m in segment] == [1, 2]  # the pair is whole; keep-recent leaves seq 3
+
+
+def test_segment_never_takes_the_last_tail_message() -> None:
+    tail = [archived(1, TEN_CHARS), archived(2, TEN_CHARS)]
+
+    segment = select_compact_segment(tail, target_chars=1000)
+
+    assert [m.seq for m in segment] == [1]  # keep-recent: the last message stays verbatim
+    assert select_compact_segment(tail[:1], target_chars=1000) == []  # nothing else to take
+
+
+def test_segment_keeps_a_trailing_salvaged_pair_in_the_tail() -> None:
+    tail = [
+        archived(1, TEN_CHARS),
+        archived(2, "partial", MessageRole.ASSISTANT),
+        archived(3, INTERRUPTED_NOTE, MessageRole.SYSTEM),
+    ]
+
+    segment = select_compact_segment(tail, target_chars=1000)
+
+    # extending past the pair would swallow the kept-last note, so the cut
+    # moves before the pair: both messages stay in the hot tail, together
+    assert [m.seq for m in segment] == [1]
 
 
 def test_segment_may_cut_right_before_a_salvaged_pair() -> None:
@@ -255,6 +286,20 @@ def test_parse_summary_reply_normalizes_and_caps_topics() -> None:
     topics, _ = parse_summary_reply("TOPICS: One, two, ONE, three, four, five\nSUMMARY:\nx")
 
     assert topics == ("one", "two", "three", "four")
+
+
+def test_parse_summary_reply_drops_the_topics_line_from_the_fallback() -> None:
+    topics, content = parse_summary_reply("TOPICS: alpha, beta")
+
+    assert topics == ("alpha", "beta")
+    assert "TOPICS" not in content
+
+
+def test_parse_summary_reply_drops_the_marker_from_an_empty_summary_fallback() -> None:
+    topics, content = parse_summary_reply("TOPICS: alpha\nSUMMARY:")
+
+    assert topics == ("alpha",)
+    assert content == ""
 
 
 def test_format_merge_request_renders_previous_summary_and_segment() -> None:
@@ -399,11 +444,12 @@ async def test_guard_runs_one_compaction_per_dialog_and_retriggers_after(
 
     async def _merged() -> bool:
         summaries = await store.list_for_dialog(dialog.id)
-        return len(summaries) == 1 and summaries[0].seq_to == FOUR_MESSAGES
+        return len(summaries) == 1 and summaries[0].seq_to == THREE_MESSAGES
 
     await wait_for_condition(_merged)
     (merged,) = await store.list_for_dialog(dialog.id)
-    assert (merged.seq_from, merged.seq_to) == (1, FOUR_MESSAGES)
+    # keep-recent: the last tail message (seq 4) is never compacted
+    assert (merged.seq_from, merged.seq_to) == (1, THREE_MESSAGES)
     assert merged.topics == ("gamma",)
     assert merged.content == "more facts"
 
@@ -570,13 +616,44 @@ async def test_latest_prompt_tokens_reads_the_newest_assistant_usage(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     dialog = await make_dialog(session_factory)
-    assert await store.latest_prompt_tokens(dialog.id) is None
+    assert await store.latest_prompt_tokens(dialog.id, 0) is None
 
     await append_assistant_with_usage(session_factory, dialog.id, SMALL_PROMPT_TOKENS)
     await append_history(session_factory, dialog.id, ["user text"])
     await append_assistant_with_usage(session_factory, dialog.id, OVERFLOW_PROMPT_TOKENS)
 
-    assert await store.latest_prompt_tokens(dialog.id) == OVERFLOW_PROMPT_TOKENS
+    assert await store.latest_prompt_tokens(dialog.id, 0) == OVERFLOW_PROMPT_TOKENS
+    # the seq boundary scopes the read: usage at or before it does not count
+    assert await store.latest_prompt_tokens(dialog.id, SECOND_SEQ) == OVERFLOW_PROMPT_TOKENS
+    assert await store.latest_prompt_tokens(dialog.id, THIRD_SEQ) is None
+
+
+async def test_token_trigger_ignores_usage_left_behind_the_compaction_boundary(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    llm = SummarizingLLM([SUMMARY_REPLY, SECOND_SUMMARY_REPLY])
+    compactor = make_token_compactor(store, llm)
+    history = await append_history(session_factory, dialog.id, [TEN_CHARS, TEN_CHARS])
+    history.append(
+        await append_assistant_with_usage(session_factory, dialog.id, OVERFLOW_PROMPT_TOKENS)
+    )
+    history.extend(await append_history(session_factory, dialog.id, ["tail"]))
+
+    await compactor.assemble(dialog, history)  # 950 >= 900: triggers compaction
+    summaries = await _wait_for_summaries(store, dialog.id, count=1)
+    assert summaries[0].seq_to == THREE_MESSAGES  # keep-recent: the last message stays
+
+    await compactor.assemble(dialog, history)  # the usage is behind the boundary now
+    await asyncio.sleep(0)
+    assert len(llm.requests) == 1  # no retrigger on the stale pre-compaction usage
+
+    history.append(
+        await append_assistant_with_usage(session_factory, dialog.id, OVERFLOW_PROMPT_TOKENS)
+    )
+    await compactor.assemble(dialog, history)  # fresh usage past the boundary: retriggers
+    await wait_for_condition(lambda: len(llm.requests) == TWO_CALLS)
 
 
 async def test_compact_now_compacts_synchronously_and_reports_progress(
@@ -594,6 +671,45 @@ async def test_compact_now_compacts_synchronously_and_reports_progress(
     summaries = await store.list_for_dialog(dialog.id)  # written before the return
     assert len(summaries) == 1
     assert await compactor.compact_now(dialog) is False  # nothing new to compact
+
+
+async def test_concurrent_compact_now_runs_a_single_compaction(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    llm = GatedSummarizingLLM([SUMMARY_REPLY])
+    compactor = make_compactor(store, llm)  # high limits: no automatic trigger
+    await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
+
+    first = asyncio.create_task(compactor.compact_now(dialog))
+    await wait_for_condition(lambda: llm.calls == 1)
+    second = asyncio.create_task(compactor.compact_now(dialog))
+    await asyncio.sleep(0)
+    llm.release.set()
+    results = await asyncio.gather(first, second)
+
+    assert results == [True, True]
+    assert llm.calls == 1  # both callers share the one registered run
+
+
+async def test_compact_now_skips_recompacting_when_the_awaited_run_advanced(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    llm = GatedSummarizingLLM([SUMMARY_REPLY])
+    compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
+    history = await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
+
+    await compactor.assemble(dialog, history)  # overflow: background compaction starts
+    await wait_for_condition(lambda: llm.calls == 1)
+    compacted = asyncio.create_task(compactor.compact_now(dialog))
+    await asyncio.sleep(0)
+    llm.release.set()
+
+    assert await compacted is True  # the awaited background run counts
+    assert llm.calls == 1  # no extra segment is compacted on top of it
 
 
 async def test_aclose_cancels_a_pending_compaction(
