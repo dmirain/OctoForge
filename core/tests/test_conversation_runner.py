@@ -1198,6 +1198,54 @@ async def test_actor_survives_a_failing_command(
     assert seen["calls"] == SECOND_CALL
 
 
+class ConvertingRouter:
+    """MessageRouter stub turning a cancellation into a plain error.
+
+    Mirrors what a failing store does to an in-flight CancelledError (e.g.
+    SQLAlchemy raising OperationalError from a disposed engine): the error
+    escaping the dispatch is a regular Exception, so the actor's broad
+    except used to swallow the cancellation and loop forever.
+    """
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def route(
+        self,
+        processes: tuple[ProcessInfo, ...],
+        message: str,
+        max_processes: int,
+    ) -> RouteDecision:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()  # blocks until the actor is cancelled
+        except asyncio.CancelledError:
+            raise RuntimeError("converted cancellation") from None
+        raise AssertionError("unreachable: the wait only ends via cancellation")
+
+
+async def test_actor_dies_when_a_failing_command_races_its_cancellation(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    router = ConvertingRouter()
+    manager = make_manager(
+        ScriptedLLM([reply()]),
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(router=router),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    await runner.submit("hi")
+    await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.stop()  # cancels the actor mid-dispatch
+
+    actor = runner._actor_task
+    assert actor is not None
+    await wait_for_condition(actor.done)
+    assert actor.cancelled()
+
+
 async def test_process_slot_released_when_finalize_fails(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

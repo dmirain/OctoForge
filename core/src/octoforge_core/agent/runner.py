@@ -346,6 +346,16 @@ class ConversationRunner:
                     self._dialog.id,
                     type(command).__name__,
                 )
+                if self._cancellation_pending():
+                    # the failure raced with a cancellation that got swallowed
+                    # downstream (e.g. a store error replaces CancelledError):
+                    # honor the cancel instead of looping forever
+                    raise asyncio.CancelledError from None
+
+    @staticmethod
+    def _cancellation_pending() -> bool:
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > 0
 
     async def _dispatch(self, command: _Command) -> None:
         if isinstance(command, _Submit):
