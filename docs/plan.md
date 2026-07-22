@@ -257,7 +257,9 @@ distributed-профиль (scaling.md этап 2); секреты-заглуш�
 - **Аутентификация** — уже в «Дальше» выше и в [quality-audit.md](quality-audit.md)
   (S1, волна 4): users, токены, служебные токены для wake/cron. Дополнительно: allowlist
   telegram user id — сейчас бот отвечает любому аккаунту, который его нашёл
-  (`web/.../telegram/poller.py:119-125`).
+  (`web/.../telegram/poller.py:119-125`). Подробный план (инвайты по кодам без HTTP,
+  админский тул `admin_manage`, полностью изолированный от `core/`) — зафиксирован в
+  [telegram-invites-plan.md](telegram-invites-plan.md), реализация отложена.
 - **Хранилище секретов.** Токены уже в `.env` (файл `OctoForgeBotToken.txt` из корня
   убран); дальше — keychain/sops/age. Частично
   пересекается с [quality-audit.md](quality-audit.md) (P1 — операбельность).
