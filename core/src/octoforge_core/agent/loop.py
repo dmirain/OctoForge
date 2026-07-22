@@ -248,6 +248,10 @@ class AgentLoop:
         try:
             async for event in self._pump_stream(stream, control, tracker, state):
                 yield event
+        except BaseException:
+            # the stream died mid-run: abort the eager tool runs of this failed turn
+            await tracker.abort()
+            raise
         finally:
             if isinstance(stream, AsyncGenerator):
                 await stream.aclose()

@@ -43,7 +43,7 @@ from octoforge_core.db.models import MessageRow
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.llm.errors import ContextOverflowError
-from octoforge_core.llm.events import StreamEvent, StreamFinished
+from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient, TaskStore
@@ -74,6 +74,7 @@ POLL_SECONDS = 0.01
 MAX_ITERATIONS = 3
 MAX_PROCESSES = 5
 ONE_PROCESS = 1
+TWO_PROCESSES = 2
 USER_ID = "user-1"
 CHANNEL = "web"
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -1295,3 +1296,202 @@ async def test_listener_failure_does_not_break_finalize(
 
     (task,) = await store.list(runner.dialog_id)
     assert task.status is TaskStatus.DONE  # finalize completed despite the listener
+
+
+async def test_promote_at_the_process_limit_moves_the_process_to_foreground(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    skill = BlockingSkill()
+    llm = GatedLLM()
+    router = FakeRouter()
+    manager = make_manager(
+        llm,
+        blocking_registry(skill),
+        session_factory,
+        ManagerOptions(router=router, max_processes=TWO_PROCESSES),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit("second")
+    events = await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
+
+    suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
+    assert [(item.title) for item in suspended] == ["first"]
+    first_id = suspended[0].process_id
+
+    # both process slots are taken; promotion moves a process, it does not create one
+    router.decide(RouteOp(action=RouteAction.PROMOTE, target_id=first_id))
+    await runner.submit("bring back the first one")
+    events = await collect_until(queue, lambda e: isinstance(e.payload, ProcessResumed))
+
+    resumed = events[-1].payload
+    assert isinstance(resumed, ProcessResumed)
+    assert (resumed.process_id, resumed.title) == (first_id, "first")
+    assert not any("process limit" in m.content for m in runner.history())
+
+    skill.release.set()
+    llm.release.set()
+    events = await collect_completions(queue, 2)
+    done = completions(events)
+    assert {item.title for item in done} == {"first", "second"}
+
+
+class ToolStallingLLM:
+    """LLMClient stub emitting partial text plus a tool call, then stalling."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: list[ChatMessage],
+        tools: list[SkillSpec] | None = None,
+    ) -> Completion:
+        raise NotImplementedError
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[SkillSpec] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        yield LlmTextDelta(text=PARTIAL)
+        yield ToolCallReady(call=ToolCall(id=CALL_ID, name=BLOCKING_SKILL, arguments={}))
+        await self.release.wait()
+        yield StreamFinished(message=reply("full"))
+
+
+async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    skill = BlockingSkill()
+    llm = ToolStallingLLM()
+    manager = make_manager(llm, blocking_registry(skill), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("work")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await runner.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    llm.release.set()
+    events = await collect_until(queue, is_completed)
+
+    assert any(isinstance(e.payload, Cancelled) for e in events)
+    done = completions(events)
+    assert [item.status for item in done] == [TaskStatus.CANCELLED.value]
+    history = runner.history()
+    assert [message.role for message in history] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.SYSTEM,
+    ]
+    assert history[1].content == PARTIAL  # salvaged despite the trailing tool reply
+    assert history[2].content == INTERRUPTED_NOTE
+    dialog = await get_dialog(session_factory)
+    assert await MessageRepository(session_factory).list(dialog.id) == history
+
+
+class RecordingDeliveryStore(InMemoryTaskStore):
+    """Task store recording mark_delivered calls."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delivered: list[str] = []
+
+    async def mark_delivered(self, task_id: str) -> None:
+        self.delivered.append(task_id)
+        await super().mark_delivered(task_id)
+
+
+class SystemNoteFailingRepository(MessageRepository):
+    """Message repository failing to persist SYSTEM messages only."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        super().__init__(session_factory)
+        self.failed_attempts = 0
+
+    async def append(
+        self,
+        dialog_id: str,
+        message: ChatMessage,
+        usage: Usage | None = None,
+        client_message_id: str | None = None,
+    ) -> None:
+        if message.role is MessageRole.SYSTEM:
+            self.failed_attempts += 1
+            raise RuntimeError("store down")
+        await super().append(dialog_id, message, usage=usage, client_message_id=client_message_id)
+
+
+async def test_result_is_not_marked_delivered_when_the_note_persist_fails(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = RecordingDeliveryStore()
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
+    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    runner._messages = SystemNoteFailingRepository(session_factory)
+
+    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
+    await collect_completions(queue, 1)
+    failing = runner._messages
+    assert isinstance(failing, SystemNoteFailingRepository)
+    await wait_for_condition(lambda: failing.failed_attempts > 0)
+
+    (task,) = await store.list(runner.dialog_id)
+    assert task.status is TaskStatus.DONE
+    assert store.delivered == []  # not marked: the delivery itself failed
+    assert task.result_delivered is False
+
+
+class GatedTaskStore(InMemoryTaskStore):
+    """Task store pausing mark_running until released, to force a spawn race."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def mark_running(self, task: Task) -> None:
+        self.entered.set()
+        await self.release.wait()
+        await super().mark_running(task)
+
+
+async def test_concurrent_spawns_do_not_exceed_the_process_limit(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = GatedTaskStore()
+    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
+    manager = make_manager(
+        llm,
+        SkillRegistry(),
+        session_factory,
+        ManagerOptions(store=store, max_processes=ONE_PROCESS),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    first = asyncio.create_task(runner.spawn_task("job a", "do a"))
+    await asyncio.wait_for(store.entered.wait(), timeout=TIMEOUT_SECONDS)
+    second = asyncio.create_task(runner.spawn_task("job b", "do b"))
+    await asyncio.sleep(0)  # let the second spawn pass the check and reach the gate
+    await asyncio.sleep(0)
+    store.release.set()
+    results = {await first, await second}
+
+    spawned = [result for result in results if "spawned" in result]
+    refused = [result for result in results if "cannot spawn" in result]
+    assert len(spawned) == 1
+    assert len(refused) == 1
+    assert "process limit (1)" in refused[0]
+    tasks = await store.list(runner.dialog_id)
+    assert sorted(task.status for task in tasks) == [TaskStatus.CANCELLED, TaskStatus.RUNNING]
+
+    await collect_completions(queue, 2)  # background result + the report run

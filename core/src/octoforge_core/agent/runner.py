@@ -78,6 +78,22 @@ class ConversationEvent:
     payload: LoopEvent
 
 
+def _latest_assistant_with_content(branch: list[ChatMessage]) -> ChatMessage | None:
+    """Return the newest assistant message with content, skipping a trailing tool tail.
+
+    An interrupted tool iteration appends its tool replies after the assistant
+    message, so the salvaged turn is not necessarily the branch tail. Tool
+    messages are never persisted to the narrative, so the history stays valid.
+    """
+    for message in reversed(branch):
+        if message.role is MessageRole.TOOL:
+            continue
+        if message.role is MessageRole.ASSISTANT and message.content:
+            return message
+        return None
+    return None
+
+
 def _with_date_envelope(message: ChatMessage) -> ChatMessage:
     """Stamp the current UTC date/time on a copy of the branch's last message.
 
@@ -229,10 +245,13 @@ class ConversationRunner:
     async def spawn_task(self, title: str, prompt: str) -> str:
         """Create a RUN task with its background process; refuse when the limit is hit."""
         if len(self._processes) >= self._max_processes:
-            return SPAWN_REFUSAL_TEMPLATE.format(
-                limit=self._max_processes, titles=self._active_titles()
-            )
-        task = await self._spawn_process_task(title, prompt, cron_job_id=None)
+            return self._spawn_refusal()
+        task = await self._prepare_process_task(title, prompt, cron_job_id=None)
+        if len(self._processes) >= self._max_processes:
+            # a concurrent spawn claimed the last slot while the task was being stored
+            await self._tasks.cancel(task.id)
+            return self._spawn_refusal()
+        self._start_process(task, title, prompt)
         return SPAWNED_TEMPLATE.format(task_id=task.id)
 
     async def wake(self, title: str, prompt: str, cron_job_id: str) -> None:
@@ -242,20 +261,34 @@ class ConversationRunner:
         (the delayed impossibility notification) instead of returning a text.
         """
         if len(self._processes) >= self._max_processes:
-            note = CRON_LIMIT_NOTE_TEMPLATE.format(
-                title=title, limit=self._max_processes, titles=self._active_titles()
-            )
-            await self._publish_system_note(note)
+            await self._publish_cron_limit_note(title)
             return
-        await self._spawn_process_task(title, prompt, cron_job_id=cron_job_id)
+        task = await self._prepare_process_task(title, prompt, cron_job_id=cron_job_id)
+        if len(self._processes) >= self._max_processes:
+            # a concurrent spawn claimed the last slot while the task was being stored
+            await self._tasks.cancel(task.id)
+            await self._publish_cron_limit_note(title)
+            return
+        self._start_process(task, title, prompt)
 
-    async def _spawn_process_task(
+    def _spawn_refusal(self) -> str:
+        return SPAWN_REFUSAL_TEMPLATE.format(
+            limit=self._max_processes, titles=self._active_titles()
+        )
+
+    async def _publish_cron_limit_note(self, title: str) -> None:
+        note = CRON_LIMIT_NOTE_TEMPLATE.format(
+            title=title, limit=self._max_processes, titles=self._active_titles()
+        )
+        await self._publish_system_note(note)
+
+    async def _prepare_process_task(
         self,
         title: str,
         prompt: str,
         cron_job_id: str | None,
     ) -> Task:
-        """Create a RUN task with its background process; the limit check is the caller's."""
+        """Create and store the RUN task; the process is started by `_start_process`."""
         task_input: dict[str, Any] = {"title": title, "prompt": prompt}
         if cron_job_id is not None:
             task_input["cron_job_id"] = cron_job_id
@@ -269,6 +302,10 @@ class ConversationRunner:
         )
         await self._tasks.add(task)
         await self._tasks.mark_running(task)
+        return task
+
+    def _start_process(self, task: Task, title: str, prompt: str) -> None:
+        """Start the background process of an already-stored task."""
         self._create_process(
             process_id=task.id,
             title=title,
@@ -278,7 +315,6 @@ class ConversationRunner:
                 _with_date_envelope(ChatMessage(role=MessageRole.USER, content=prompt)),
             ],
         )
-        return task
 
     def subscribe(self) -> asyncio.Queue[ConversationEvent]:
         """Attach a subscriber queue receiving broadcast events."""
@@ -352,8 +388,9 @@ class ConversationRunner:
         task = await self._tasks.get(command.task_id)
         if task.status not in (TaskStatus.DONE, TaskStatus.FAILED) or task.result_delivered:
             return
-        await self._tasks.mark_delivered(task.id)
+        # deliver first, mark afterwards: a persist failure must not lose the result
         await self._publish_system_note(self._format_task_done(task))
+        await self._tasks.mark_delivered(task.id)
 
     def _snapshot(self) -> tuple[ProcessInfo, ...]:
         return tuple(
@@ -381,7 +418,7 @@ class ConversationRunner:
             elif op.action is RouteAction.START_NEW:
                 await self._apply_start_new(message, cancelled)
             elif op.action is RouteAction.PROMOTE:
-                await self._apply_promote(message, op.target_id, cancelled)
+                self._apply_promote(op.target_id)
 
     async def _apply_inject(
         self,
@@ -404,23 +441,17 @@ class ConversationRunner:
             return
         await self._start_new(title=message.content[:TITLE_MAX_LENGTH])
 
-    async def _apply_promote(
-        self,
-        message: ChatMessage,
-        target_id: str | None,
-        cancelled: set[str],
-    ) -> None:
+    def _apply_promote(self, target_id: str | None) -> None:
         target = self._processes.get(target_id) if target_id is not None else None
         if target is None or target.id == self._foreground_id:
             return  # only an active background process can be promoted
-        if self._exceeds_limit(cancelled):
-            await self._reject_for_limit(message)
-            return
+        # promotion only moves an existing process, so the process limit does not apply
         self._suspend_foreground()
         self._foreground_id = target.id
         self._broadcast(ProcessResumed(process_id=target.id, title=target.title))
 
     def _exceeds_limit(self, cancelled: set[str]) -> bool:
+        """Whether a NEW process would exceed the limit, counting pending cancellations."""
         return len(self._processes) - len(cancelled) + 1 > self._max_processes
 
     async def _reject_for_limit(self, message: ChatMessage) -> None:
@@ -651,8 +682,8 @@ class ConversationRunner:
 
     async def _salvage_interrupted_turn(self, process: _Process) -> None:
         """Keep a cancelled run's partial answer in the narrative, flagged as incomplete."""
-        last = process.branch[-1] if process.branch else None
-        if last is None or last.role is not MessageRole.ASSISTANT or not last.content:
+        last = _latest_assistant_with_content(process.branch)
+        if last is None:
             return
         note = ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE)
         await self._persist(last)

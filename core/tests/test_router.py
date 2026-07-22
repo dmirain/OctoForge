@@ -188,6 +188,38 @@ async def test_start_new_without_inject_is_kept() -> None:
     assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
 
 
+async def test_duplicate_start_new_ops_are_deduped() -> None:
+    llm = ScriptedLLM(
+        reply=route_reply(
+            [
+                {"action": "start_new", "target_id": None},
+                {"action": "start_new", "target_id": None},
+            ]
+        )
+    )
+    router = make_router(llm)
+
+    decision = await router.route((background(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
+
+
+async def test_duplicate_inject_ops_are_deduped() -> None:
+    llm = ScriptedLLM(
+        reply=route_reply(
+            [
+                {"action": "inject", "target_id": None},
+                {"action": "inject", "target_id": None},
+            ]
+        )
+    )
+    router = make_router(llm)
+
+    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
+
+
 async def test_inject_drops_start_new_but_keeps_cancel() -> None:
     llm = ScriptedLLM(
         reply=route_reply(

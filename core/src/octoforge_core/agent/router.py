@@ -164,10 +164,24 @@ def _fallback(processes: tuple[ProcessInfo, ...]) -> RouteDecision:
 
 
 def _resolve_conflicts(ops: tuple[RouteOp, ...]) -> tuple[RouteOp, ...]:
-    """Drop start_new ops when the message is injected into the foreground run."""
-    if any(op.action is RouteAction.INJECT for op in ops):
-        return tuple(op for op in ops if op.action is not RouteAction.START_NEW)
-    return ops
+    """Resolve contradictions: inject drops start_new; keep at most one op of each."""
+    deduped = _dedupe_singletons(ops)
+    if any(op.action is RouteAction.INJECT for op in deduped):
+        return tuple(op for op in deduped if op.action is not RouteAction.START_NEW)
+    return deduped
+
+
+def _dedupe_singletons(ops: tuple[RouteOp, ...]) -> tuple[RouteOp, ...]:
+    """Keep only the first start_new and the first inject op of the package."""
+    seen: set[RouteAction] = set()
+    result: list[RouteOp] = []
+    for op in ops:
+        if op.action in (RouteAction.START_NEW, RouteAction.INJECT):
+            if op.action in seen:
+                continue
+            seen.add(op.action)
+        result.append(op)
+    return tuple(result)
 
 
 def _parse_op(raw: object, known_ids: set[str]) -> RouteOp | None:

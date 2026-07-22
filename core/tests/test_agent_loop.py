@@ -4,6 +4,8 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
+
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
     AssistantMessage,
@@ -205,6 +207,30 @@ class StallingLLM:
         for event in self._first_events:
             yield event
         await asyncio.sleep(STALL_SECONDS)
+
+
+class CrashingLLM:
+    """LLMClient stub raising a transport error after its scripted events."""
+
+    def __init__(self, first_events: list[StreamEvent]) -> None:
+        self._first_events = first_events
+
+    async def complete(
+        self,
+        messages: list[ChatMessage],
+        tools: list[SkillSpec] | None = None,
+    ) -> Completion:
+        return Completion(message=final_reply())
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[SkillSpec] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        for event in self._first_events:
+            await asyncio.sleep(0)  # let spawned tool tasks start
+            yield event
+        raise ConnectionError("transport lost")
 
 
 class SlowLLM:
@@ -549,6 +575,19 @@ async def test_idle_timeout_fails_run_and_cancels_tools() -> None:
     failed = next(e for e in events if isinstance(e, Failed))
     assert failed.error == STREAM_IDLE_TIMEOUT_MESSAGE
     assert skill.cancelled is True
+    assert history == [user_message()]
+
+
+async def test_stream_exception_aborts_running_tools() -> None:
+    skill = GatedSkill()
+    llm = CrashingLLM([ToolCallReady(call=eager_call()), LlmTextDelta(text="tail")])
+    loop = AgentLoop(llm_client=llm, registry=make_registry(skill), max_iterations=3)
+    history = [user_message()]
+
+    with pytest.raises(ConnectionError, match="transport lost"):
+        await collect(loop.stream(history, LoopControl(), CTX))
+
+    assert skill.cancelled is True  # the eager tool run did not outlive the failed run
     assert history == [user_message()]
 
 

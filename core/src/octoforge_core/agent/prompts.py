@@ -76,5 +76,6 @@ ROUTER_SYSTEM_PROMPT = (
     "6. 'Stop everything' -> one cancel op per active process, optionally followed "
     "by start_new.\n"
     "7. Respect the limit: active processes minus your cancel ops plus one must not "
-    "exceed the limit, otherwise do not emit start_new/promote."
+    "exceed the limit, otherwise do not emit start_new (promote only moves an "
+    "existing process and is not limited)."
 )
