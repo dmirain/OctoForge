@@ -15,6 +15,7 @@ from octoforge_web.telegram.client import (
 )
 from octoforge_web.telegram.invites.api import (
     InviteAlreadyClaimedError,
+    InviteExpiredError,
     InviteNotFoundError,
     InviteStatus,
     InviteStore,
@@ -83,7 +84,7 @@ class TelegramMembership:
     async def _claim(self, code: str, user_id: str) -> MembershipDecision:
         try:
             await self._invites.claim(code, user_id)
-        except (InviteAlreadyClaimedError, InviteNotFoundError):
+        except (InviteAlreadyClaimedError, InviteExpiredError, InviteNotFoundError):
             return MembershipDecision.DENY_INVITE_INVALID
         return MembershipDecision.ALLOW_WITH_WELCOME
 

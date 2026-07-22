@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.telegram.invites.api import (
     InviteAlreadyClaimedError,
+    InviteExpiredError,
     InviteNotFoundError,
     InviteStatus,
 )
@@ -30,6 +31,17 @@ async def store() -> AsyncIterator[SqlAlchemyInviteStore]:
         await connection.run_sync(InviteBase.metadata.create_all)
     session_factory: async_sessionmaker[AsyncSession] = create_session_factory(engine)
     yield SqlAlchemyInviteStore(session_factory)
+    await engine.dispose()
+
+
+@pytest.fixture
+async def expiring_store() -> AsyncIterator[SqlAlchemyInviteStore]:
+    """Store with a zero TTL: every pending code is already expired."""
+    engine = create_engine(MEMORY_DATABASE_URL)
+    async with engine.begin() as connection:
+        await connection.run_sync(InviteBase.metadata.create_all)
+    session_factory: async_sessionmaker[AsyncSession] = create_session_factory(engine)
+    yield SqlAlchemyInviteStore(session_factory, ttl_seconds=0)
     await engine.dispose()
 
 
@@ -136,3 +148,26 @@ async def test_list_all_includes_every_status(store: SqlAlchemyInviteStore) -> N
         InviteStatus.CLAIMED,
         InviteStatus.REVOKED,
     ]
+
+
+async def test_expired_code_cannot_be_claimed(
+    expiring_store: SqlAlchemyInviteStore,
+) -> None:
+    invite = await expiring_store.create(NOTE)
+
+    with pytest.raises(InviteExpiredError):
+        await expiring_store.claim(invite.code, USER_ID)
+
+    fetched = await expiring_store.get_by_code(invite.code)
+    assert fetched is not None
+    assert fetched.status is InviteStatus.PENDING  # expired, not claimed
+
+
+async def test_store_without_ttl_claims_regardless_of_age(
+    store: SqlAlchemyInviteStore,
+) -> None:
+    invite = await store.create(NOTE)
+
+    claimed = await store.claim(invite.code, USER_ID)
+
+    assert claimed.status is InviteStatus.CLAIMED

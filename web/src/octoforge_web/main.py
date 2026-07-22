@@ -421,7 +421,10 @@ async def _build_invite_store(
     engine = create_engine(settings.telegram_database_url)
     async with engine.begin() as connection:
         await connection.run_sync(InviteBase.metadata.create_all)
-    return SqlAlchemyInviteStore(create_session_factory(engine)), engine
+    store = SqlAlchemyInviteStore(
+        create_session_factory(engine), ttl_seconds=settings.telegram_invite_ttl_seconds
+    )
+    return store, engine
 
 
 def _start_telegram(

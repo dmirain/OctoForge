@@ -486,3 +486,18 @@ async def test_start_with_invalid_code_is_denied(
     await poller.dispatch(make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} wrong-code"))
 
     assert client.sent == [(TELEGRAM_USER_ID, INVITE_INVALID_TEXT, None)]
+
+
+async def test_start_with_expired_code_is_denied() -> None:
+    engine = create_engine(MEMORY_DATABASE_URL)
+    async with engine.begin() as connection:
+        await connection.run_sync(InviteBase.metadata.create_all)
+    expiring = SqlAlchemyInviteStore(create_session_factory(engine), ttl_seconds=0)
+    invite = await expiring.create(INVITE_NOTE)
+    client = FakeTelegramClient()
+    poller = make_poller(client, forbidden_provider, membership=make_membership(expiring))
+
+    await poller.dispatch(make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} {invite.code}"))
+
+    assert client.sent == [(TELEGRAM_USER_ID, INVITE_INVALID_TEXT, None)]
+    await engine.dispose()

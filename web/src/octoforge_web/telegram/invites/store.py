@@ -2,6 +2,7 @@
 
 import secrets
 import uuid
+from datetime import timedelta
 from typing import Any, cast
 
 from octoforge_core.time import utc_now
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_web.telegram.invites.api import (
     Invite,
     InviteAlreadyClaimedError,
+    InviteExpiredError,
     InviteNotFoundError,
     InviteStatus,
     InviteStore,
@@ -21,10 +23,19 @@ _CODE_BYTES = 8
 
 
 class SqlAlchemyInviteStore(InviteStore):
-    """Invite codes in the dedicated Telegram SQLite database."""
+    """Invite codes in the dedicated Telegram SQLite database.
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    `ttl_seconds` bounds how long a pending code stays claimable (None =
+    never expires); claimed/revoked invites are unaffected by the TTL.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        ttl_seconds: float | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._ttl_seconds = ttl_seconds
 
     async def create(self, note: str) -> Invite:
         async with self._session_factory() as session:
@@ -57,15 +68,20 @@ class SqlAlchemyInviteStore(InviteStore):
             if row is None:
                 raise InviteNotFoundError(code)
             now = utc_now()
+            conditions = [InviteRow.code == code, InviteRow.status == InviteStatus.PENDING.value]
+            if self._ttl_seconds is not None:
+                conditions.append(InviteRow.created_at > now - timedelta(seconds=self._ttl_seconds))
             statement = (
                 update(InviteRow)
-                .where(InviteRow.code == code, InviteRow.status == InviteStatus.PENDING.value)
+                .where(*conditions)
                 .values(status=InviteStatus.CLAIMED.value, claimed_by=user_id, claimed_at=now)
             )
             # DML executes into a CursorResult at runtime; the stubs type
             # AsyncSession.execute loosely, so narrow it for rowcount.
             result = cast(CursorResult[Any], await session.execute(statement))
             if result.rowcount == 0:
+                if row.status == InviteStatus.PENDING.value:
+                    raise InviteExpiredError(code)
                 raise InviteAlreadyClaimedError(code)
             await session.commit()
             claimed = await session.get(InviteRow, row.id)

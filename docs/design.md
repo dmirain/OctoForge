@@ -762,14 +762,17 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
 - **Конфиг**: `OF_TELEGRAM_BOT_TOKEN` (пусто = адаптер выключен),
   `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` (30), `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` (1.5),
   `OF_TELEGRAM_ADMIN_IDS` (CSV telegram user id админов), `OF_TELEGRAM_DATABASE_URL`
-  (отдельная SQLite-база инвайтов, по умолчанию `./telegram.db`).
+  (отдельная SQLite-база инвайтов, по умолчанию `./telegram.db`),
+  `OF_TELEGRAM_INVITE_TTL_SECONDS` (срок жизни pending-кода, по умолчанию 3 суток;
+  протухший код остаётся в базе, но не клеймится).
 - **Инвайты и гейт членства** (`telegram/invites/`, реализация
   [telegram-invites-plan.md](telegram-invites-plan.md)): доступ по приглашениям,
   целиком в web-слое — своя SQLite-база, свой `Base`, без Alembic и без касания core.
   Гейт `TelegramMembership` в поллере: админы (`OF_TELEGRAM_ADMIN_IDS`) проходят
-  всегда; `/start <код>` атомарно клеймит код (CAS в `InviteStore.claim`);
-  обладатель CLAIMED-инвайта проходит; остальным — вежливый отказ без создания
-  бриджа. Гейт (и админский тул) активируется только при непустом списке админов —
+  всегда; `/start <код>` атомарно клеймит код (CAS в `InviteStore.claim`, pending-код
+  протухает по `OF_TELEGRAM_INVITE_TTL_SECONDS` — `InviteExpiredError`, гейт отвечает
+  отказом, запись остаётся в базе); обладатель CLAIMED-инвайта проходит; остальным —
+  вежливый отказ без создания бриджа. Гейт (и админский тул) активируется только при непустом списке админов —
   иначе поверхность открыта, как раньше.
 - **Админский тул** (`telegram/admin.py`): скилл `admin_manage` (действия
   `list_users`/`generate_invite`/`revoke_invite`/`restore_invite`) регистрируется

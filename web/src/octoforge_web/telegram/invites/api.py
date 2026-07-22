@@ -42,6 +42,10 @@ class InviteAlreadyClaimedError(Exception):
     """The invite code was already used (or revoked)."""
 
 
+class InviteExpiredError(Exception):
+    """The invite code is still pending but its TTL has run out."""
+
+
 class InviteStore(Protocol):
     """Storage port for invite codes (substitutable in tests)."""
 
@@ -61,8 +65,9 @@ class InviteStore(Protocol):
         """Atomically mark the pending code as claimed by the user.
 
         The conditional UPDATE decides the race: only the first concurrent
-        claim succeeds. Raises InviteNotFoundError for an unknown code and
-        InviteAlreadyClaimedError for a code not in the pending state.
+        claim succeeds. Raises InviteNotFoundError for an unknown code,
+        InviteAlreadyClaimedError for a code not in the pending state and
+        InviteExpiredError for a pending code whose TTL has run out.
         """
         ...
 

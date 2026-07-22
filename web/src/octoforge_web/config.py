@@ -48,6 +48,7 @@ DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
 DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30.0
 DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS = 1.5
 DEFAULT_TELEGRAM_DATABASE_URL = "sqlite+aiosqlite:///./telegram.db"
+DEFAULT_TELEGRAM_INVITE_TTL_SECONDS = 259200.0  # 3 days
 FILE_SCHEME_PREFIX = "file:"
 
 
@@ -107,6 +108,7 @@ class Settings(BaseSettings):
     telegram_poll_timeout_seconds: float = DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
     telegram_edit_throttle_seconds: float = DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
     telegram_database_url: str = DEFAULT_TELEGRAM_DATABASE_URL
+    telegram_invite_ttl_seconds: float = DEFAULT_TELEGRAM_INVITE_TTL_SECONDS
     telegram_admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     serper_token: str = ""
     system_prompt_source: str = ""
