@@ -1099,7 +1099,8 @@ async def test_wake_runs_cron_tagged_background_process(
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    assert delivered is True
     await collect_completions(queue, 2)
 
     tasks = await store.list(runner.dialog_id)
@@ -1139,7 +1140,8 @@ async def test_wake_over_the_process_limit_publishes_a_system_note(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
 
-    await runner.wake(CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    delivered = await runner.wake(CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    assert delivered is False
 
     await wait_for_condition(lambda: any("could not start" in m.content for m in runner.history()))
     note = runner.history()[-1]

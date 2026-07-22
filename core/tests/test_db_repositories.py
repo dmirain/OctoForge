@@ -41,6 +41,7 @@ PROMPT_TOKENS = 321
 COMPLETION_TOKENS = 12
 CLIENT_MESSAGE_ID = "client-key-1"
 EXPECTED_UNKEYED_PLUS_ONE = 3
+EXPECTED_RETRY_COMMIT_ATTEMPTS = 2
 EXPECTED_STATS_MESSAGE_COUNT = 2
 CREATED_EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
 TOOL_CALL = ToolCall(id="call-1", name="http_request", arguments={"url": "https://example.com"})
@@ -313,6 +314,68 @@ async def test_message_tool_calls_round_trip(
     assert stored[0].tool_call_id is None
     assert stored[1].tool_calls == ()
     assert stored[1].tool_call_id == TOOL_CALL.id
+
+
+async def test_append_retries_a_transient_seq_conflict(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost seq race (two writers reading the same MAX before either commits)
+    surfaces as an IntegrityError on the loser's commit; `append` must retry
+    with a freshly recomputed seq rather than lose the message.
+    """
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    original_commit = AsyncSession.commit
+    calls = 0
+
+    async def flaky_commit(self: AsyncSession) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise IntegrityError("insert", {}, Exception("seq collision"))
+        await original_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", flaky_commit)
+
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hello"))
+
+    assert calls == EXPECTED_RETRY_COMMIT_ATTEMPTS  # lost the race, then the retry succeeded
+    stored = await messages.list(dialog.id)
+    assert [m.content for m in stored] == ["hello"]
+
+
+async def test_append_pair_retries_a_transient_seq_conflict(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    original_commit = AsyncSession.commit
+    calls = 0
+
+    async def flaky_commit(self: AsyncSession) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise IntegrityError("insert", {}, Exception("seq collision"))
+        await original_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", flaky_commit)
+
+    await messages.append_pair(
+        dialog.id,
+        ChatMessage(role=MessageRole.ASSISTANT, content="partial answer"),
+        ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE),
+    )
+
+    assert calls == EXPECTED_RETRY_COMMIT_ATTEMPTS
+    stored = await messages.list(dialog.id)
+    assert [m.content for m in stored] == ["partial answer", INTERRUPTED_NOTE]
 
 
 async def test_messages_are_isolated_per_dialog(

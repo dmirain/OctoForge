@@ -269,11 +269,14 @@ class ConversationRunner:
             self._start_process(task, title, prompt)
         return SPAWNED_TEMPLATE.format(task_id=task.id)
 
-    async def wake(self, title: str, prompt: str, cron_job_id: str) -> None:
+    async def wake(self, title: str, prompt: str, cron_job_id: str) -> bool:
         """Start a cron-fired background process tagged with its cron job id.
 
         Unlike `spawn_task`, hitting the process limit publishes a system note
         (the delayed impossibility notification) instead of returning a text.
+        Returns whether the process was actually started, so the caller (the
+        scheduler) can tell a real delivery from a limit-skip and avoid
+        advancing the job's schedule on a skip.
         """
         async with self._spawn_lock:
             over_limit = len(self._processes) >= self._max_processes
@@ -282,6 +285,7 @@ class ConversationRunner:
                 self._start_process(task, title, prompt)
         if over_limit:
             await self._publish_cron_limit_note(title)
+        return not over_limit
 
     def _spawn_refusal(self) -> str:
         return SPAWN_REFUSAL_TEMPLATE.format(
@@ -839,10 +843,13 @@ class ConversationManager:
         title: str,
         prompt: str,
         cron_job_id: str,
-    ) -> None:
-        """Deliver a cron firing into the user's dialog as a background process."""
+    ) -> bool:
+        """Deliver a cron firing into the user's dialog as a background process.
+
+        Returns whether the process was actually started (see `ConversationRunner.wake`).
+        """
         runner = await self.get_or_create_runner(user_id, channel)
-        await runner.wake(title, prompt, cron_job_id)
+        return await runner.wake(title, prompt, cron_job_id)
 
     async def stop_all(self) -> None:
         """Stop and deregister every live runner (the app is shutting down)."""

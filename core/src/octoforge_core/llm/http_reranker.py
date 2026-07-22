@@ -93,7 +93,7 @@ def _parse_scores(payload: dict[str, Any], expected: int) -> list[float]:
     if not isinstance(raw_results, list):
         raise LLMResponseError(PARSE_ERROR_MESSAGE)
     scores = [0.0] * expected
-    seen = 0
+    seen: set[int] = set()
     for raw in raw_results:
         if not isinstance(raw, dict):
             raise LLMResponseError(PARSE_ERROR_MESSAGE)
@@ -104,7 +104,7 @@ def _parse_scores(payload: dict[str, Any], expected: int) -> list[float]:
         if not isinstance(score, int | float):
             raise LLMResponseError(PARSE_ERROR_MESSAGE)
         scores[index] = float(score)
-        seen += 1
-    if seen != expected:
+        seen.add(index)
+    if len(seen) != expected:
         raise LLMResponseError(PARSE_ERROR_MESSAGE)
     return scores

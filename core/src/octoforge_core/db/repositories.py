@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, insert, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.errors import DialogNotFoundError
@@ -16,6 +17,12 @@ from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.time import utc_now
+
+# A lost seq race (concurrent writers reading the same MAX(seq) before either
+# commits) surfaces as a unique (dialog_id, seq) violation; retried with a
+# freshly recomputed seq rather than propagated. Bounded so a genuine
+# duplicate client_message_id still raises instead of looping forever.
+MESSAGE_SEQ_RETRY_ATTEMPTS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,36 +100,48 @@ class MessageRepository:
     ) -> None:
         """Append a message assigning it the next seq within the dialog.
 
-        The seq is computed inside the INSERT statement, so concurrent writers
-        (the actor and the process pumps) cannot assign the same seq. `usage`
-        (provider token accounting) is stored only on assistant messages.
-        `client_message_id` is the idempotency key of client submits; the
-        unique (dialog_id, client_message_id) constraint rejects duplicates.
+        The seq is computed from the current max inside the INSERT statement;
+        two concurrent writers (the actor and a process pump, each on its own
+        session) can still both read the same max before either commits. The
+        loser's unique (dialog_id, seq) violation is retried with a freshly
+        recomputed seq (see `MESSAGE_SEQ_RETRY_ATTEMPTS`) rather than lost.
+        `usage` (provider token accounting) is stored only on assistant
+        messages. `client_message_id` is the idempotency key of client
+        submits; the unique (dialog_id, client_message_id) constraint rejects
+        duplicates (raised on the final attempt, not silently retried away).
         """
-        async with self._session_factory() as session:
-            next_seq = (
-                select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
-                .where(MessageRow.dialog_id == dialog_id)
-                .scalar_subquery()
-            )
-            await session.execute(
-                insert(MessageRow).values(
-                    id=uuid.uuid4().hex,
-                    dialog_id=dialog_id,
-                    seq=next_seq,
-                    role=message.role.value,
-                    content=message.content,
-                    tool_calls=_tool_calls_to_json(message.tool_calls),
-                    tool_call_id=message.tool_call_id,
-                    client_message_id=client_message_id,
-                    prompt_tokens=usage.prompt_tokens if usage is not None else None,
-                    completion_tokens=usage.completion_tokens if usage is not None else None,
+        for attempt in range(MESSAGE_SEQ_RETRY_ATTEMPTS):
+            async with self._session_factory() as session:
+                next_seq = (
+                    select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
+                    .where(MessageRow.dialog_id == dialog_id)
+                    .scalar_subquery()
                 )
-            )
-            dialog = await session.get(DialogRow, dialog_id)
-            if dialog is not None:
-                dialog.updated_at = utc_now()
-            await session.commit()
+                await session.execute(
+                    insert(MessageRow).values(
+                        id=uuid.uuid4().hex,
+                        dialog_id=dialog_id,
+                        seq=next_seq,
+                        role=message.role.value,
+                        content=message.content,
+                        tool_calls=_tool_calls_to_json(message.tool_calls),
+                        tool_call_id=message.tool_call_id,
+                        client_message_id=client_message_id,
+                        prompt_tokens=usage.prompt_tokens if usage is not None else None,
+                        completion_tokens=usage.completion_tokens if usage is not None else None,
+                    )
+                )
+                dialog = await session.get(DialogRow, dialog_id)
+                if dialog is not None:
+                    dialog.updated_at = utc_now()
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
+                    if attempt == MESSAGE_SEQ_RETRY_ATTEMPTS - 1:
+                        raise
+                    continue
+                return
 
     async def append_pair(
         self,
@@ -135,31 +154,42 @@ class MessageRepository:
         Used for indivisible narrative pairs (a salvaged partial answer and
         its INTERRUPTED_NOTE): a reader snapshot between two separate commits
         could otherwise see the first message without the second. Each INSERT
-        keeps the atomic seq subquery, so the pair also stays race-safe
-        against concurrent writers.
+        keeps the atomic seq subquery, so the pair also stays consistent
+        against concurrent writers within the transaction; a losing unique
+        (dialog_id, seq) violation against another transaction is retried
+        with a freshly recomputed pair rather than lost (see
+        `MESSAGE_SEQ_RETRY_ATTEMPTS`).
         """
-        async with self._session_factory() as session:
-            next_seq = (
-                select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
-                .where(MessageRow.dialog_id == dialog_id)
-                .scalar_subquery()
-            )
-            for message in (first, second):
-                await session.execute(
-                    insert(MessageRow).values(
-                        id=uuid.uuid4().hex,
-                        dialog_id=dialog_id,
-                        seq=next_seq,
-                        role=message.role.value,
-                        content=message.content,
-                        tool_calls=_tool_calls_to_json(message.tool_calls),
-                        tool_call_id=message.tool_call_id,
-                    )
+        for attempt in range(MESSAGE_SEQ_RETRY_ATTEMPTS):
+            async with self._session_factory() as session:
+                next_seq = (
+                    select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
+                    .where(MessageRow.dialog_id == dialog_id)
+                    .scalar_subquery()
                 )
-            dialog = await session.get(DialogRow, dialog_id)
-            if dialog is not None:
-                dialog.updated_at = utc_now()
-            await session.commit()
+                for message in (first, second):
+                    await session.execute(
+                        insert(MessageRow).values(
+                            id=uuid.uuid4().hex,
+                            dialog_id=dialog_id,
+                            seq=next_seq,
+                            role=message.role.value,
+                            content=message.content,
+                            tool_calls=_tool_calls_to_json(message.tool_calls),
+                            tool_call_id=message.tool_call_id,
+                        )
+                    )
+                dialog = await session.get(DialogRow, dialog_id)
+                if dialog is not None:
+                    dialog.updated_at = utc_now()
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
+                    if attempt == MESSAGE_SEQ_RETRY_ATTEMPTS - 1:
+                        raise
+                    continue
+                return
 
     async def find_by_client_id(self, dialog_id: str, client_message_id: str) -> bool:
         """Return True when a message with this idempotency key already exists."""

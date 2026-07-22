@@ -1,6 +1,8 @@
 """Tests for the cron scheduler (real SQL store, recording waker) and schedule math."""
 
+import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
@@ -29,6 +31,7 @@ LEASE_TTL_SECONDS = 60.0
 REPLAY_LIMIT = 5
 SMALL_REPLAY_LIMIT = 2
 THREE_JOBS = 3
+TWO_CALLS = 2
 MISSED_TWO = 2
 MISSED_CAP = 5
 DAILY_9AM = "0 9 * * *"
@@ -73,11 +76,12 @@ class WakeCall:
 
 
 class RecordingWaker:
-    """CronWaker stub recording delivered wakes; can be told to fail."""
+    """CronWaker stub recording delivered wakes; can be told to fail or skip (limit hit)."""
 
     def __init__(self) -> None:
         self.calls: list[WakeCall] = []
         self.fail = False
+        self.skip = False
 
     async def wake(
         self,
@@ -86,7 +90,7 @@ class RecordingWaker:
         title: str,
         prompt: str,
         cron_job_id: str,
-    ) -> None:
+    ) -> bool:
         if self.fail:
             raise RuntimeError(WAKE_FAILURE)
         self.calls.append(
@@ -98,6 +102,7 @@ class RecordingWaker:
                 cron_job_id=cron_job_id,
             )
         )
+        return not self.skip
 
 
 def make_job(**overrides: object) -> CronJob:
@@ -246,6 +251,108 @@ async def test_failed_wake_releases_the_claim(
     await scheduler.tick(now=NOW)
 
     assert len(waker.calls) == 1
+
+
+async def test_wake_skipped_by_limit_keeps_the_claim_without_advancing_schedule(
+    store: SqlAlchemyCronStore,
+    waker: RecordingWaker,
+    no_stagger: None,
+) -> None:
+    """A `wake()` that returns False (process limit hit) must not be treated as a fire.
+
+    Regression: advancing `next_fire_at` here would silently skip a one-shot
+    reminder to its next schedule slot (up to a year away for a dated
+    expression) even though no process was ever started.
+    """
+    await store.create(BASE_JOB)
+    waker.skip = True
+
+    await make_scheduler(store, waker).tick(now=NOW)
+
+    assert len(waker.calls) == 1  # wake was attempted...
+    job = await store.get(BASE_JOB.id)
+    assert job.last_fire_at is None  # ...but not counted as a completed fire
+    assert job.next_fire_at == DUE_AT  # schedule untouched, still due
+    assert job.claimed_by == OWNER  # claim kept, retried once the lease goes stale
+
+    waker.skip = False
+    await make_scheduler(store, waker).tick(now=NOW + timedelta(seconds=LEASE_TTL_SECONDS + 1))
+
+    assert len(waker.calls) == TWO_CALLS
+    assert (await store.get(BASE_JOB.id)).next_fire_at == NEXT_9AM
+
+
+class FlakyCompleteFireStore:
+    """Delegates to a real store, but `complete_fire` raises on the first call."""
+
+    def __init__(self, inner: SqlAlchemyCronStore) -> None:
+        self._inner = inner
+        self.complete_fire_calls = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def complete_fire(self, job_id: str, fired_at: datetime, next_fire_at: datetime) -> None:
+        self.complete_fire_calls += 1
+        if self.complete_fire_calls == 1:
+            raise RuntimeError("db hiccup")
+        await self._inner.complete_fire(job_id, fired_at=fired_at, next_fire_at=next_fire_at)
+
+
+async def test_complete_fire_failure_does_not_kill_the_tick_or_lose_the_job(
+    store: SqlAlchemyCronStore,
+    waker: RecordingWaker,
+    no_stagger: None,
+) -> None:
+    """A `complete_fire` failure after a successful wake must not crash the scheduler.
+
+    Regression: an unguarded `complete_fire` call used to propagate out of
+    `_fire`/`tick`, and since `run_forever` had no catch-all either, one
+    transient store error during bookkeeping would permanently stop the
+    scheduler loop for every user's cron jobs.
+    """
+    flaky_store = FlakyCompleteFireStore(store)
+    await store.create(BASE_JOB)
+    scheduler = make_scheduler(flaky_store, waker)  # type: ignore[arg-type]
+
+    await scheduler.tick(now=NOW)  # complete_fire raises, must not propagate
+
+    assert len(waker.calls) == 1
+    job = await store.get(BASE_JOB.id)
+    assert job.claimed_by == OWNER  # bookkeeping failed, claim kept for a stale-reclaim retry
+    assert job.next_fire_at == DUE_AT  # not advanced: complete_fire never committed
+
+    await scheduler.tick(now=NOW + timedelta(seconds=LEASE_TTL_SECONDS + 1))
+
+    assert len(waker.calls) == TWO_CALLS  # reclaimed once stale, complete_fire now succeeds
+    assert (await store.get(BASE_JOB.id)).next_fire_at == NEXT_9AM
+
+
+async def test_run_forever_survives_a_tick_failure(
+    waker: RecordingWaker,
+) -> None:
+    class ExplodingStore:
+        async def list_due(self, *args: object, **kwargs: object) -> list[CronJob]:
+            raise RuntimeError("store outage")
+
+    scheduler = CronScheduler(
+        store=ExplodingStore(),  # type: ignore[arg-type]
+        waker=waker,
+        owner=OWNER,
+        config=CronSchedulerConfig(
+            poll_interval_seconds=POLL_INTERVAL_SECONDS,
+            lease_ttl_seconds=LEASE_TTL_SECONDS,
+            replay_limit=REPLAY_LIMIT,
+        ),
+    )
+    task = asyncio.create_task(scheduler.run_forever())
+    await asyncio.sleep(POLL_INTERVAL_SECONDS * 3)
+
+    assert not task.done()  # the loop kept polling despite the exception
+
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 async def test_a_fresh_claim_by_another_owner_skips_the_job(

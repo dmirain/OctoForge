@@ -16,6 +16,9 @@ class ManagerCronWaker:
         title: str,
         prompt: str,
         cron_job_id: str,
-    ) -> None:
-        """Get-or-create the user's runner and start the job's process in it."""
-        await self._manager.wake(user_id, channel, title, prompt, cron_job_id)
+    ) -> bool:
+        """Get-or-create the user's runner and start the job's process in it.
+
+        Returns whether the process was actually started (see `ConversationManager.wake`).
+        """
+        return await self._manager.wake(user_id, channel, title, prompt, cron_job_id)

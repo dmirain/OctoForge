@@ -174,3 +174,20 @@ async def test_missing_result_index_raises_response_error() -> None:
 
     with pytest.raises(LLMResponseError):
         await make_client(httpx.MockTransport(handler)).score(((QUERY, "a"), (QUERY, "b")))
+
+
+async def test_duplicate_result_index_raises_response_error() -> None:
+    """A response repeating one index (and so omitting another) must not pass
+    as complete just because the result count matches the document count."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = {
+            "results": [
+                {"index": 0, "relevance_score": 0.7},
+                {"index": 0, "relevance_score": 0.9},
+            ]
+        }
+        return httpx.Response(200, content=json.dumps(payload).encode())
+
+    with pytest.raises(LLMResponseError):
+        await make_client(httpx.MockTransport(handler)).score(((QUERY, "a"), (QUERY, "b")))

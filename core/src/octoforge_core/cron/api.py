@@ -169,8 +169,13 @@ class CronWaker(Protocol):
         title: str,
         prompt: str,
         cron_job_id: str,
-    ) -> None:
-        """Start the job's background process in the user's dialog."""
+    ) -> bool:
+        """Start the job's background process in the user's dialog.
+
+        Returns `False` when the process limit was hit and the job was not
+        actually started (a system note is published instead); the caller
+        must not advance the job's schedule in that case.
+        """
         ...
 
 

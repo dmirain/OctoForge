@@ -60,9 +60,17 @@ class CronScheduler:
         self._replay_limit = config.replay_limit
 
     async def run_forever(self) -> None:
-        """Poll until cancelled: one tick per poll interval."""
+        """Poll until cancelled: one tick per poll interval.
+
+        A tick failure (store outage, unexpected error) must not kill the
+        loop forever — every user's cron would stop firing until a process
+        restart. Log and retry on the next poll instead.
+        """
         while True:
-            await self.tick()
+            try:
+                await self.tick()
+            except Exception:
+                logger.exception("cron scheduler tick failed")
             await asyncio.sleep(self._poll_interval_seconds)
 
     async def tick(self, now: datetime | None = None) -> None:
@@ -80,7 +88,7 @@ class CronScheduler:
         if not claimed:
             return  # another scheduler instance won the CAS race
         try:
-            await self._waker.wake(
+            delivered = await self._waker.wake(
                 user_id=job.user_id,
                 channel=job.channel,
                 title=job.title,
@@ -92,11 +100,31 @@ class CronScheduler:
             logger.exception("cron wake delivery failed: job=%s user=%s", job.id, job.user_id)
             await self._store.release_claim(job.id)
             return
-        await self._store.complete_fire(
-            job.id,
-            fired_at=now,
-            next_fire_at=compute_next_fire(job.schedule, job.timezone, now),
-        )
+        if not delivered:
+            # process limit was hit: no process was started, so this was not a
+            # real fire. Leave the claim in place rather than advancing
+            # next_fire_at (which would silently skip the job to its next
+            # schedule slot, up to a year away for a dated one-shot
+            # expression) or releasing it (which would retry every poll tick
+            # and spam the limit note). It naturally retries once the lease
+            # goes stale.
+            return
+        try:
+            await self._store.complete_fire(
+                job.id,
+                fired_at=now,
+                next_fire_at=compute_next_fire(job.schedule, job.timezone, now),
+            )
+        except Exception:
+            # bookkeeping failed after a successful delivery: don't let this
+            # kill the scheduler loop (run_forever also guards, but fail late
+            # here too so a partial tick doesn't abort the remaining due
+            # jobs). The claim stays in place and is reclaimed once stale.
+            logger.exception(
+                "cron complete_fire failed after successful delivery: job=%s user=%s",
+                job.id,
+                job.user_id,
+            )
 
     def _prompt_for(self, job: CronJob, now: datetime) -> str:
         since = job.last_fire_at if job.last_fire_at is not None else job.created_at

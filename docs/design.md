@@ -805,8 +805,11 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - **dialogs**: `id` (uuid str PK), `user_id` (str, index), `channel` (str), `created_at`,
   `updated_at`; unique (`user_id`, `channel`)
 - **messages**: `id`, `dialog_id` FK (index), `seq` (int, монотонно растёт в рамках диалога;
-  unique (`dialog_id`, `seq`); присваивается подзапросом `max(seq)+1` прямо в INSERT —
-  конкурирующие писатели, актор и pump'ы процессов, не конфликтуют), `role` (значение
+  unique (`dialog_id`, `seq`); присваивается подзапросом `max(seq)+1` прямо в INSERT.
+  Конкурирующие писатели (актор и pump'ы процессов, каждый в своей сессии) всё же могут
+  прочитать один и тот же max до коммита друг друга — проигравший ловит `IntegrityError`
+  на `(dialog_id, seq)` и повторяет вставку с пересчитанным seq (`append`/`append_pair`,
+  до `MESSAGE_SEQ_RETRY_ATTEMPTS` попыток), а не теряет сообщение), `role` (значение
   MessageRole), `content`, `tool_calls` (JSON, nullable), `tool_call_id` (nullable),
   `created_at`. Пишется только нарратив (см. «Актор диалога»), не полные ветки прогонов
 - **tasks**: `id`, `dialog_id` FK (index), `user_id` (index), `channel`, `kind`
