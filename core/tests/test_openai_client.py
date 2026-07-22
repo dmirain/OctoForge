@@ -113,6 +113,17 @@ async def test_complete_raises_on_malformed_payload() -> None:
             await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
 
 
+async def test_complete_raises_on_invalid_json_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(HTTPStatus.OK, text="not a json body")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as http:
+        client = OpenAICompatibleClient(http_client=http, config=make_config())
+        with pytest.raises(LLMResponseError):
+            await client.complete([ChatMessage(role=MessageRole.USER, content="hi")])
+
+
 async def test_tools_serialized_into_payload() -> None:
     captured: list[httpx.Request] = []
 

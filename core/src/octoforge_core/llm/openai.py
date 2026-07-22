@@ -43,6 +43,13 @@ def _raise_for_status(response: httpx.Response) -> None:
     raise classify_http_error(response.status_code, body, retry_after)
 
 
+def _stream_error_status(chunk: dict[str, Any]) -> int:
+    """Pick an HTTP status for a mid-stream error payload (numeric code or 500)."""
+    error = chunk["error"]
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, int) else HTTPStatus.INTERNAL_SERVER_ERROR
+
+
 class OpenAICompatibleClient:
     """LLMClient implementation for OpenAI-compatible endpoints."""
 
@@ -66,7 +73,10 @@ class OpenAICompatibleClient:
         except httpx.HTTPError as exc:
             raise TransportError(str(exc) or type(exc).__name__) from exc
         _raise_for_status(response)
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
         return Completion(message=self._parse_reply(data), usage=parse_usage(data.get("usage")))
 
     async def stream(
@@ -213,6 +223,8 @@ class _StreamAccumulator:
             raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
         if not isinstance(chunk, dict):
             raise LLMResponseError(PARSE_ERROR_MESSAGE)
+        if isinstance(chunk.get("error"), dict):
+            raise classify_http_error(_stream_error_status(chunk), chunk, retry_after=None)
         usage = parse_usage(chunk.get("usage"))
         if usage is not None:
             self._usage = usage

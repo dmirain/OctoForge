@@ -507,7 +507,13 @@ class ConversationRunner:
         Finalization writes to the store; even if that fails, the process is
         removed and its termination is signalled so the slot is never leaked.
         """
-        terminal = await self._stream_terminal(process)
+        try:
+            terminal = await self._stream_terminal(process)
+        except Exception as exc:  # reactive compaction (store/provider) may raise
+            logger.exception(
+                "process stream setup failed: dialog=%s process=%s", self._dialog.id, process.id
+            )
+            terminal = self._fail_run(process, format_error(exc))
         status = TaskStatus.FAILED
         try:
             status = await self._finalize(process, terminal)

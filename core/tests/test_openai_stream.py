@@ -5,8 +5,17 @@ from collections.abc import AsyncIterator
 from http import HTTPStatus
 
 import httpx
+import pytest
 
-from octoforge_core import ChatMessage, LLMConfig, MessageRole, ToolCall, Usage
+from octoforge_core import (
+    ChatMessage,
+    LLMConfig,
+    MessageRole,
+    ProviderInternalError,
+    RateLimitError,
+    ToolCall,
+    Usage,
+)
 from octoforge_core.llm.events import (
     StreamEvent,
     StreamFinished,
@@ -251,6 +260,24 @@ async def test_stream_without_usage_chunk_finishes_with_none_usage() -> None:
     final = events[-1]
     assert isinstance(final, StreamFinished)
     assert final.usage is None
+
+
+async def test_stream_mid_stream_error_chunk_raises_typed_error() -> None:
+    client = make_client(
+        [content_chunk("Hel"), {"error": {"message": "upstream connection broken"}}]
+    )
+
+    with pytest.raises(ProviderInternalError):
+        await collect(client.stream([USER_MESSAGE]))
+
+
+async def test_stream_mid_stream_error_chunk_uses_numeric_code() -> None:
+    client = make_client(
+        [{"error": {"code": HTTPStatus.TOO_MANY_REQUESTS, "message": "slow down"}}]
+    )
+
+    with pytest.raises(RateLimitError):
+        await collect(client.stream([USER_MESSAGE]))
 
 
 async def test_stream_requests_usage_via_stream_options() -> None:

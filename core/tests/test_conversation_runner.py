@@ -163,8 +163,9 @@ class UsageLLM(ScriptedLLM):
 class FakeCompactor:
     """ContextCompactor stub: passthrough assemble, programmable compact_now."""
 
-    def __init__(self, compact_result: bool = True) -> None:
+    def __init__(self, compact_result: bool = True, compact_error: Exception | None = None) -> None:
         self._compact_result = compact_result
+        self._compact_error = compact_error
         self.compact_calls = 0
 
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
@@ -172,6 +173,8 @@ class FakeCompactor:
 
     async def compact_now(self, dialog: Dialog) -> bool:
         self.compact_calls += 1
+        if self._compact_error is not None:
+            raise self._compact_error
         return self._compact_result
 
     async def aclose(self) -> None:
@@ -620,6 +623,35 @@ async def test_context_overflow_without_compaction_fails_immediately(
     failed = [e.payload for e in events if isinstance(e.payload, Failed)]
     assert len(failed) == 1
     assert llm.stream_calls == 1  # no retry without a compaction
+
+
+async def test_compaction_crash_fails_the_run_and_releases_the_slot(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = OverflowLLM(overflows=1)
+    compactor = FakeCompactor(compact_error=RuntimeError("store down"))
+    manager = make_manager(
+        llm, SkillRegistry(), session_factory, ManagerOptions(compactor=compactor)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    events = await collect_until(queue, is_completed)
+
+    failed = [e.payload for e in events if isinstance(e.payload, Failed)]
+    assert len(failed) == 1
+    assert "RuntimeError" in failed[0].error
+    assert llm.stream_calls == 1  # no retry without a rebuilt branch
+    done = completions(events)
+    assert [(item.title, item.status) for item in done] == [("hi", TaskStatus.FAILED.value)]
+
+    # the crashed pump must not leak the slot: a follow-up runs a new foreground process
+    await runner.submit("again")
+    events = await collect_until(queue, is_completed)
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert len(finished) == 1
+    assert finished[0].message.content == REPLY
 
 
 async def test_new_question_suspends_foreground_and_starts_new_process(
