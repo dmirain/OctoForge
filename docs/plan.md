@@ -228,13 +228,13 @@ distributed-профиль (scaling.md этап 2); секреты-заглуш�
 
 ### 3. Telegram
 
-- **Rich Messages.** Bot API 10.1 добавил `sendRichMessage` (нативный markdown, таблицы,
-  заголовки, collapsible-блоки, чеклисты). Сейчас клиент умеет только
-  `sendMessage`/`editMessageText` с HTML-разметкой (`web/.../telegram/client.py:29-48`,
-  `markdown.py`); `sendPhoto`/`sendDocument`/клавиатур нет. Доработка: расширить порт
-  `TelegramClient` и мост; учесть конфликт со стримингом — промежуточные `editMessageText`
-  ломают rich-разметку (по опыту других проектов; вероятно, финальную версию отправлять
-  rich, черновик — как сейчас).
+- ~~**Rich Messages.** Bot API 10.1 добавил `sendRichMessage` (нативный markdown, таблицы,
+  заголовки, collapsible-блоки, чеклисты).~~ — **сделано** (2026-07-23): финал прогона
+  апгрейдится на месте в rich-сообщение через `editMessageText(rich_message={markdown})`,
+  когда детектор `telegram/rich.py` находит таблицу/чеклист/`<details>`/`$$math$$`, ответ —
+  одно сообщение ≤ 32 768; черновик-стрим и обычная проза остаются на HTML-пути, падение
+  rich-правки оставляет HTML-версию. Тумблер — `OF_TELEGRAM_RICH_MESSAGES`. Остались за
+  скоупом: live-preview на `sendRichMessageDraft`, `sendPhoto`/`sendDocument`/клавиатуры.
 - **Приём файлов/фото.** Сейчас нетекстовые сообщения отклоняются заглушкой «Пока понимаю
   только текстовые сообщения» (`web/.../telegram/poller.py:113-115`; в моделях нет полей
   photo/document — `telegram/models.py:35-43`). Доработка: модели под photo/document/voice,

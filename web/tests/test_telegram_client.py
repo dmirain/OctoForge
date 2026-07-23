@@ -108,3 +108,43 @@ async def test_http_error_hides_the_token() -> None:
             await client.send_message(CHAT_ID, "hi")
     assert BOT_TOKEN not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
+
+
+async def test_edit_message_rich_posts_the_rich_message_payload() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/bot{BOT_TOKEN}/editMessageText"
+        payload = json.loads(request.content)
+        assert payload["chat_id"] == CHAT_ID
+        assert payload["message_id"] == MESSAGE_ID
+        assert payload["rich_message"] == {"markdown": "| a |\n| --- |"}
+        assert "text" not in payload
+        return json_response({"ok": True, "result": {"message_id": MESSAGE_ID}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        await client.edit_message_rich(CHAT_ID, MESSAGE_ID, "| a |\n| --- |")
+
+
+async def test_edit_message_rich_swallows_not_modified() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            {"ok": False, "description": "Bad Request: message is not modified"},
+            status_code=400,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        await client.edit_message_rich(CHAT_ID, MESSAGE_ID, "same")
+
+
+async def test_edit_message_rich_propagates_other_errors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            {"ok": False, "description": "Bad Request: can't parse rich message"},
+            status_code=400,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        with pytest.raises(TelegramApiError, match="can't parse rich message"):
+            await client.edit_message_rich(CHAT_ID, MESSAGE_ID, "boom")

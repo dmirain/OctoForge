@@ -193,10 +193,12 @@ web/                           # приложение octoforge-web — FastAPI-
     telegram/                  # Telegram-адаптер (этап G): вторая поверхность, канал "telegram"
       models.py                # pydantic-модели Bot API (update/message/chat/user, extra=ignore)
       client.py                # порт TelegramClient + TelegramBotClient на httpx (getUpdates,
-                               #   sendMessage, editMessageText, sendChatAction)
+                               #   sendMessage, editMessageText + rich_message, sendChatAction)
       bridge.py                # TelegramBridge: события runner'а → черновик с throttle-правками,
                                #   чанкер 4096, статус-строки тулов; текст → runner.submit
       markdown.py              # markdown → Telegram-HTML (parse_mode=HTML) + split_html_safe
+      rich.py                  # needs_rich_message: детектор таблиц/чеклистов/details/math
+                               #   для rich-апгрейда финала (Bot API 10.1)
       poller.py                # TelegramPoller (long-poll, offset, backlog-drain, backoff) +
                                #   TelegramBridgeRegistry (get-or-create + прогрев из БД)
       __main__.py              # standalone-запуск: только Telegram-адаптер, без HTTP API
@@ -207,7 +209,8 @@ web/                           # приложение octoforge-web — FastAPI-
                                # test_system_skills.py, test_prompts.py, test_modularity.py,
                                # test_telegram_models.py, test_telegram_bridge.py,
                                # test_telegram_poller.py, test_telegram_client.py,
-                               # test_telegram_standalone.py, test_telegram_markdown.py
+                               # test_telegram_standalone.py, test_telegram_markdown.py,
+                               # test_telegram_rich.py
 ```
 
 ## Петля агента: события, управление, актор
@@ -781,13 +784,19 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   разбиение — `split_html_safe` (срез по границе строки/слова, никогда внутри тега; стек
   открытых тегов закрывается в голове и переоткрывается в хвосте). На ошибку Bot API
   «can't parse entities» клиент повторяет отправку без parse_mode (plain text-фолбэк).
-  Rich Messages из Bot API 10.1 (sendRichMessage/Draft) осознанно не используем: свежее
-  API, наш поток построен на editMessageText.
+  Финал прогона апгрейдится на месте в Rich Message (Bot API 10.1,
+  `editMessageText(rich_message={"markdown": сырой буфер})` — таблицы, чеклисты,
+  collapsible-details и блок-математика рендерятся нативно), но только когда детектор
+  `telegram/rich.py:needs_rich_message` находит такую конструкцию, ответ живёт в одном
+  сообщении (без запечатанных чанков) и влезает в лимит 32 768 символов
+  (`MAX_RICH_MESSAGE_LENGTH`); черновик-стрим остаётся на HTML-пути, обычная проза — тоже.
+  Падение rich-правки ловится `_render_safely`: на экране остаётся HTML-версия.
 - **Прогрев**: при старте мосты поднимаются для всех диалогов канала telegram из БД
   (`DialogRepository.list_user_ids_by_channel`) — иначе крон-выстрелы и уведомления задач
   после рестарта ушли бы в пустоту (подписчиков нет); chat_id выводится из `tg:<id>`.
 - **Конфиг**: `OF_TELEGRAM_BOT_TOKEN` (пусто = адаптер выключен),
   `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` (30), `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` (1.5),
+  `OF_TELEGRAM_RICH_MESSAGES` (true — rich-апгрейд финала; false = всегда HTML),
   `OF_TELEGRAM_ADMIN_IDS` (CSV telegram user id админов), `OF_TELEGRAM_DATABASE_URL`
   (отдельная SQLite-база инвайтов, по умолчанию `./telegram.db`),
   `OF_TELEGRAM_INVITE_TTL_SECONDS` (срок жизни pending-кода, по умолчанию 3 суток;

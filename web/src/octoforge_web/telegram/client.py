@@ -11,6 +11,7 @@ from octoforge_web.telegram.models import TelegramUpdate
 TELEGRAM_CHANNEL = "telegram"
 USER_ID_PREFIX = "tg:"
 MAX_MESSAGE_LENGTH = 4096
+MAX_RICH_MESSAGE_LENGTH = 32768
 API_BASE_URL = "https://api.telegram.org"
 CHAT_ACTION_TYPING = "typing"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
@@ -41,6 +42,10 @@ class TelegramClient(Protocol):
         self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
     ) -> None:
         """Replace the text of an existing message."""
+        ...
+
+    async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
+        """Upgrade an existing message to a Rich Message from raw Markdown."""
         ...
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
@@ -91,6 +96,18 @@ class TelegramBotClient:
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         await self._call("sendChatAction", {"chat_id": chat_id, "action": action})
+
+    async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "rich_message": {"markdown": markdown},
+        }
+        try:
+            await self._call("editMessageText", payload)
+        except TelegramApiError as exc:
+            if NOT_MODIFIED_MARKER not in str(exc):
+                raise
 
     async def _call_with_parse_fallback(
         self, method: str, payload: dict[str, Any]

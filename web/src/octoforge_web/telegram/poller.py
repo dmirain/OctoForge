@@ -7,7 +7,7 @@ from enum import StrEnum
 
 import httpx
 
-from octoforge_web.telegram.bridge import RunnerProvider, TelegramBridge
+from octoforge_web.telegram.bridge import RunnerProvider, TelegramBridge, TelegramBridgeOptions
 from octoforge_web.telegram.client import (
     USER_ID_PREFIX,
     TelegramApiError,
@@ -104,10 +104,14 @@ class TelegramBridgeRegistry:
         runner_provider: RunnerProvider,
         client: TelegramClient,
         edit_throttle_seconds: float,
+        rich_messages_enabled: bool = True,
     ) -> None:
         self._runner_provider = runner_provider
         self._client = client
-        self._edit_throttle_seconds = edit_throttle_seconds
+        self._options = TelegramBridgeOptions(
+            edit_throttle_seconds=edit_throttle_seconds,
+            rich_messages_enabled=rich_messages_enabled,
+        )
         self._bridges: dict[str, TelegramBridge] = {}
 
     def get_or_create(self, user_id: str, chat_id: int) -> TelegramBridge:
@@ -119,7 +123,7 @@ class TelegramBridgeRegistry:
                 chat_id=chat_id,
                 runner_provider=self._runner_provider,
                 client=self._client,
-                edit_throttle_seconds=self._edit_throttle_seconds,
+                options=self._options,
             )
             self._bridges[user_id] = bridge
         return bridge

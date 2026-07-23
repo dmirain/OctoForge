@@ -25,11 +25,13 @@ from octoforge_core.agent.runner import ConversationEvent, ConversationRunner
 from octoforge_web.telegram.client import (
     CHAT_ACTION_TYPING,
     MAX_MESSAGE_LENGTH,
+    MAX_RICH_MESSAGE_LENGTH,
     TELEGRAM_CHANNEL,
     TelegramApiError,
     TelegramClient,
 )
 from octoforge_web.telegram.markdown import markdown_to_telegram_html, split_html_safe
+from octoforge_web.telegram.rich import needs_rich_message
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,14 @@ CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
 RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
 PARSE_MODE_HTML = "HTML"
+
+
+@dataclass(slots=True)
+class TelegramBridgeOptions:
+    """Rendering knobs shared by every bridge of the surface."""
+
+    edit_throttle_seconds: float
+    rich_messages_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -64,13 +74,14 @@ class TelegramBridge:
         chat_id: int,
         runner_provider: RunnerProvider,
         client: TelegramClient,
-        edit_throttle_seconds: float,
+        options: TelegramBridgeOptions,
     ) -> None:
         self._user_id = user_id
         self._chat_id = chat_id
         self._runner_provider = runner_provider
         self._client = client
-        self._edit_throttle_seconds = edit_throttle_seconds
+        self._edit_throttle_seconds = options.edit_throttle_seconds
+        self._rich_messages_enabled = options.rich_messages_enabled
         self._runner: ConversationRunner | None = None
         self._forwarder: asyncio.Task[None] | None = None
         self._draft = _Draft()
@@ -147,7 +158,28 @@ class TelegramBridge:
         elif isinstance(event, Failed):
             self._append_line(FAILED_LINE_TEMPLATE.format(error=event.error))
         await self._flush_draft()
+        if isinstance(event, Finished):
+            await self._upgrade_to_rich()
         self._draft = _Draft()
+
+    async def _upgrade_to_rich(self) -> None:
+        """Re-render the final answer as a native Rich Message when it earns one.
+
+        The draft stays on the legacy HTML path; only a single-message final
+        with constructs the HTML rendering degrades is upgraded in place.
+        A failed upgrade leaves the HTML version on screen (logged upstream).
+        """
+        raw = self._draft.buffer.rstrip("\n")
+        if (
+            not self._rich_messages_enabled
+            or self._draft.message_id is None
+            or self._draft.sealed_chunks > 0
+            or not raw
+            or len(raw) > MAX_RICH_MESSAGE_LENGTH
+            or not needs_rich_message(raw)
+        ):
+            return
+        await self._client.edit_message_rich(self._chat_id, self._draft.message_id, raw)
 
     def _append_line(self, line: str) -> None:
         """Append a status line, keeping the arrival order with the answer text."""

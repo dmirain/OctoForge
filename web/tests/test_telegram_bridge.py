@@ -34,8 +34,9 @@ from octoforge_web.telegram.bridge import (
     PARSE_MODE_HTML,
     TOOL_LINE_TEMPLATE,
     TelegramBridge,
+    TelegramBridgeOptions,
 )
-from octoforge_web.telegram.client import MAX_MESSAGE_LENGTH, USER_ID_PREFIX
+from octoforge_web.telegram.client import MAX_MESSAGE_LENGTH, USER_ID_PREFIX, TelegramApiError
 
 CHAT_ID = 12345
 TELEGRAM_USER_ID = f"{USER_ID_PREFIX}{CHAT_ID}"
@@ -61,7 +62,9 @@ class FakeTelegramClient:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, str | None]] = []
         self.edited: list[tuple[int, int, str, str | None]] = []
+        self.rich_edited: list[tuple[int, int, str]] = []
         self.actions: list[tuple[int, str]] = []
+        self.rich_edit_error: TelegramApiError | None = None
         self._next_message_id = 0
 
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[Any]:
@@ -76,6 +79,11 @@ class FakeTelegramClient:
         self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
     ) -> None:
         self.edited.append((chat_id, message_id, text, parse_mode))
+
+    async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
+        if self.rich_edit_error is not None:
+            raise self.rich_edit_error
+        self.rich_edited.append((chat_id, message_id, markdown))
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         self.actions.append((chat_id, action))
@@ -243,13 +251,20 @@ async def make_manager(
     )
 
 
-def make_bridge(client: FakeTelegramClient, manager: ConversationManager) -> TelegramBridge:
+def make_bridge(
+    client: FakeTelegramClient,
+    manager: ConversationManager,
+    rich_messages_enabled: bool = True,
+) -> TelegramBridge:
     return TelegramBridge(
         user_id=TELEGRAM_USER_ID,
         chat_id=CHAT_ID,
         runner_provider=manager.get_or_create_runner,
         client=client,
-        edit_throttle_seconds=NO_THROTTLE,
+        options=TelegramBridgeOptions(
+            edit_throttle_seconds=NO_THROTTLE,
+            rich_messages_enabled=rich_messages_enabled,
+        ),
     )
 
 
@@ -377,4 +392,81 @@ async def test_markdown_reply_is_delivered_as_html(
     await wait_until(lambda: client.current_text() == expected_html if client.sent else False)
 
     assert client.sent == [(CHAT_ID, expected_html, PARSE_MODE_HTML)]
+    await bridge.aclose()
+
+
+async def test_table_reply_is_upgraded_to_a_rich_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    content = "| col | val |\n| --- | --- |\n| a | 1 |"
+    manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge.handle_text("hi")
+    await wait_until(lambda: bool(client.rich_edited))
+
+    assert client.rich_edited == [(CHAT_ID, 1, content)]
+    assert client.sent[0][2] == PARSE_MODE_HTML  # the draft streamed as HTML first
+    await bridge.aclose()
+
+
+async def test_plain_reply_stays_on_the_legacy_path(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    manager = await make_manager(ScriptedLLM([reply()]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge.handle_text("hi")
+    await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
+
+    assert client.rich_edited == []
+    await bridge.aclose()
+
+
+async def test_split_reply_is_not_upgraded(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    content = "| a |\n| --- |\n" + "x" * MAX_MESSAGE_LENGTH
+    manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge.handle_text("hi")
+    await wait_until(lambda: len(client.sent) == EXPECTED_MESSAGE_COUNT)
+
+    assert client.rich_edited == []
+    await bridge.aclose()
+
+
+async def test_rich_upgrade_can_be_disabled(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    content = "| col |\n| --- |\n| a |"
+    manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
+    bridge = make_bridge(client, manager, rich_messages_enabled=False)
+
+    await bridge.handle_text("hi")
+    await wait_until(lambda: bool(client.sent) and content in client.current_text())
+
+    assert client.rich_edited == []
+    await bridge.aclose()
+
+
+async def test_a_failing_rich_upgrade_keeps_the_html_version(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    client.rich_edit_error = TelegramApiError("Bad Request: can't parse rich message")
+    content = "| col |\n| --- |\n| a |"
+    manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge.handle_text("hi")
+    await wait_until(lambda: bool(client.sent) and content in client.current_text())
+
+    assert client.rich_edited == []
+    assert client.current_text() == content  # the HTML draft survived
     await bridge.aclose()
