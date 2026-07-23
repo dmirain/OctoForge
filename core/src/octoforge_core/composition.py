@@ -26,13 +26,7 @@ from octoforge_core.context.tools import HistorySearchSkill
 from octoforge_core.cron.api import CronStore, CronWaker, Scheduler
 from octoforge_core.cron.reporter import CronOutcomeReporter
 from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
-from octoforge_core.cron.tools import (
-    CronCreateSkill,
-    CronDeleteSkill,
-    CronListSkill,
-    CronPauseSkill,
-    CronResumeSkill,
-)
+from octoforge_core.cron.tools import CronPauseSkill, CronResumeSkill
 from octoforge_core.datasets.api import DatasetService, DatasetStore
 from octoforge_core.datasets.service import LocalDatasetService
 from octoforge_core.datasets.tools import DataForgetSkill, DataPutSkill, DataQuerySkill
@@ -49,11 +43,12 @@ from octoforge_core.memory.tools import MemoryDeleteSkill, MemorySearchSkill, Me
 from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import ExternalCallSkill, HttpRequestSkill
-from octoforge_core.ports import LLMClient, TaskStore
+from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.tools import WebSearchSkill
 from octoforge_core.skills.registry import SkillRegistry
-from octoforge_core.tasks.tools import TaskListSkill, TaskSpawnSkill
+from octoforge_core.tasks.store import TaskStore
+from octoforge_core.tasks.tools import TaskCreateSkill, TaskDeleteSkill, TaskListSkill
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,13 +262,11 @@ def _register_core_skills(
     task_store: TaskStore,
     cron_store: CronStore,
 ) -> None:
-    """Register the HTTP, background-task and cron skills."""
+    """Register the HTTP and deferred-work (task/cron) skills."""
     registry.register(HttpRequestSkill(http_client=outbound_http, guard=guard))
-    registry.register(TaskSpawnSkill())
-    registry.register(TaskListSkill(store=task_store))
-    registry.register(CronCreateSkill(store=cron_store))
-    registry.register(CronListSkill(store=cron_store))
-    registry.register(CronDeleteSkill(store=cron_store))
+    registry.register(TaskCreateSkill(cron_store=cron_store))
+    registry.register(TaskListSkill(store=task_store, cron_store=cron_store))
+    registry.register(TaskDeleteSkill(store=task_store, cron_store=cron_store))
     registry.register(CronPauseSkill(store=cron_store))
     registry.register(CronResumeSkill(store=cron_store))
 

@@ -40,7 +40,7 @@ def test_system_prompt_holds_meta_rules_only() -> None:
     assert "finished background task" in DEFAULT_SYSTEM_PROMPT
     assert "limited markup" in DEFAULT_SYSTEM_PROMPT
     # per-tool rules moved into the system skill scenarios
-    assert "cron_create" not in DEFAULT_SYSTEM_PROMPT
+    assert "task_create" not in DEFAULT_SYSTEM_PROMPT
     assert "memory_store" not in DEFAULT_SYSTEM_PROMPT
     assert "http_request" not in DEFAULT_SYSTEM_PROMPT
-    assert "task_spawn" not in DEFAULT_SYSTEM_PROMPT
+    assert "cron_pause" not in DEFAULT_SYSTEM_PROMPT

@@ -14,7 +14,7 @@
 
 ## Терминология и типы сущностей
 
-1. **Тул (tool)** — встроенная функция кода: `cron_create`, `memory_store`, `data_query`,
+1. **Тул (tool)** — встроенная функция кода: `task_create`, `memory_store`, `data_query`,
    `http_request` и т.п. У тула — ёмкое описание (как называется, что делает, какие
    аргументы принимает); методика его применения живёт не в описании тула, а в сценариях.
 2. **Скил (skill)** — сценарий использования тулов: текстовая запись в сторе
@@ -65,11 +65,12 @@
 
 Тулы покидают общий «чулан» и живут в модулях, которым принадлежат по смыслу:
 
-- `cron_create/list/delete/pause/resume` → `cron/`
+- `task_create/list/delete` → `tasks/` (фоновые задачи и крон-задачи — один тул:
+  со `schedule` `task_create` создаёт крон-задачу через `create_job` из `cron/`)
+- `cron_pause/resume` → `cron/`
 - `memory_store/search/delete` → `memory/`
 - `data_put/query/forget` → `datasets/`
 - `history_search` → `context/`
-- `task_spawn`, `task_list` → `tasks/`
 - `web_search` → `search/`
 - `http_request`, `external_call` → `net/`
 - `skills_search`, `instruction_save` → `instructions/`
@@ -99,40 +100,32 @@ Composition root собирает реестр из доменных модул�
 
 ## Системные скилы core-реестра
 
-По одному скилу на модуль, покрывающему его тулы. Назначение каждого — перенести
+По скилу на домен (один — `deferred_work` — покрывает связанные tasks/ и cron/). Назначение каждого — перенести
 методику из системного промпта в искомые сценарии: «когда применять / шаги /
 осторожности». Тексты сценариев — на английском (они идут в LLM). Деструктивные
 операции всегда с правилом «покажи и подтверди у пользователя перед удалением».
 
-### `cron_jobs` — отложенные и периодические задачи (cron/)
+### `deferred_work` — отложенная работа: фоновые задачи и крон (tasks/ + cron/)
 
 ```
-Scenario: scheduled and recurring jobs (reminders, periodic reports).
-Anything tied to a future time or a schedule belongs to cron — never to task_spawn.
-1. Work out the cadence. Compose the cron expression yourself ('0 9 * * *' = daily
-   09:00). Ask the user's IANA timezone when unknown; use 'UTC' when unclear.
-2. One-time reminder: one_shot=true and a dated expression (minute hour day-of-month
-   month *) with the nearest future occurrence, e.g. '30 15 21 7 *' for Jul 21 15:30.
-   One-shot jobs delete themselves after firing.
-3. Call cron_create with title, schedule, prompt and timezone. The prompt is the
-   instruction you receive on every firing — make it self-contained.
-4. Confirm to the user: title, schedule, timezone, next fire time.
-Managing jobs: cron_list to inspect, cron_pause/cron_resume for temporary disabling.
-Before cron_delete: show the job from cron_list and confirm the exact job with the user.
-Creating a duplicate returns 'already exists' — do not retry, show the existing job.
-```
-
-### `background_tasks` — фоновая работа (tasks/)
-
-```
-Scenario: run real work in the background (result needed once, when ready).
-1. Call task_spawn with a self-contained prompt describing the work.
-2. Confirm to the user that the task started, then continue the conversation —
-   do not wait for the result.
-3. When a system message reports the task finished, briefly relay the result.
-Use task_list to check status of this conversation's background tasks.
-Not for reminders or anything scheduled — that is cron_create. If spawning is
-refused because of the process limit, tell the user instead of retrying in a loop.
+Scenario: deferred work — background tasks and scheduled jobs (reminders, reports).
+1. Work now, result later: call task_create without a schedule — the task runs in
+   the background; confirm it started and continue the conversation, do not wait.
+   When a system message reports it finished, briefly relay the result.
+2. Future or recurring: call task_create with a schedule (compose the cron
+   expression yourself; '0 9 * * *' = daily 09:00) and timezone (ask the user
+   when unknown, else 'UTC'). One-time reminder: one_shot=true and a dated
+   expression (minute hour day-of-month month *), e.g. '30 15 21 7 *' for
+   Jul 21 15:30; one-shot jobs delete themselves after firing.
+3. The prompt is the instruction the task receives on start / every firing —
+   make it self-contained; this conversation's context may be gone by then.
+Managing: task_list shows running tasks and scheduled jobs (finished tasks
+disappear from it — their results stay in the conversation); task_delete removes
+either (stopping a running task first); cron_pause/cron_resume temporarily
+disable a scheduled job. Before deleting a scheduled job, show it from task_list
+and confirm with the user. A duplicate scheduled job returns 'already exists' —
+show the existing one instead of retrying. If spawning is refused because of the
+process limit, tell the user instead of retrying in a loop.
 ```
 
 ### `user_memory` — память пользователя (memory/)
@@ -214,7 +207,8 @@ Scenario: find and author skill scenarios.
 «нормализованный интент + тип сущности» (инструмент принимает один аргумент —
 свободный текст `query`, канонические поля intent/entity отложены); «после новой
 многошаговой задачи сохрани сценарий через `instruction_save`». Пер-туловые правила
-(крон vs `task_spawn`, работа с памятью, датасеты, `web_search`, `history_search`)
+(крон vs немедленный фон — один тул `task_create`, работа с памятью, датасеты,
+`web_search`, `history_search`)
 живут в системных сценариях (раздел выше), не в промпте. Нормализация интентов — на
 модели при вызове `skills_search` (форма описана в системном скиле
 `skill_authoring`); роутер нормализацией не занимается.

@@ -1,18 +1,26 @@
-"""Tests for background tasks: stores and task skills."""
+"""Tests for deferred work: the task store and the unified task skills."""
+
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
+from octoforge_core.cron.api import CronJob, CronJobNotFoundError
 from octoforge_core.skills.base import SkillContext
 from octoforge_core.skills.errors import SkillArgumentsError
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.spawner import TaskDeleteOutcome
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.tasks.tools import (
     NO_SPAWNER_MESSAGE,
-    NO_TASKS_MESSAGE,
+    NO_WORK_MESSAGE,
+    TaskCreateSkill,
+    TaskDeleteSkill,
     TaskListSkill,
-    TaskSpawnSkill,
 )
+from octoforge_core.time import utc_now
 
 CTX = SkillContext(user_id="user-1", channel="web", dialog_id="dlg-1")
 OTHER_CTX = SkillContext(user_id="user-2", channel="web", dialog_id="dlg-2")
@@ -20,8 +28,11 @@ PROMPT_CONTENT = "solve 2+2"
 SPAWNED_TEXT = "task abc123 spawned"
 REFUSAL_TEXT = "cannot spawn: process limit (5) reached"
 TITLE = "research"
-OWN_TASK_COUNT = 2
-ACTIVE_COUNT = 2
+VALID_SCHEDULE = "0 9 * * *"
+VALID_TIMEZONE = "Europe/Moscow"
+RESTART_ERROR = "interrupted by restart"
+EXPECTED_TWO_JOBS = 2
+RETRY_TWO = 2
 
 
 class FakeSpawner:
@@ -36,17 +47,69 @@ class FakeSpawner:
         return self.reply
 
 
-def ctx_with(spawner: FakeSpawner, base: SkillContext = CTX) -> SkillContext:
+class FakeDeleter:
+    """TaskDeleter stub with a programmed outcome and an optional side effect."""
+
+    def __init__(
+        self,
+        outcome: TaskDeleteOutcome = TaskDeleteOutcome.DELETED,
+        on_delete: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
+        self.outcome = outcome
+        self.on_delete = on_delete
+        self.calls: list[str] = []
+
+    async def delete(self, task_id: str) -> TaskDeleteOutcome:
+        self.calls.append(task_id)
+        if self.on_delete is not None:
+            await self.on_delete(task_id)
+        return self.outcome
+
+
+class FakeCronStore:
+    """In-memory CronStore; only the methods the task skills use are real."""
+
+    def __init__(self) -> None:
+        self.jobs: dict[str, CronJob] = {}
+
+    async def create(self, job: CronJob) -> CronJob:
+        self.jobs[job.id] = job
+        return job
+
+    async def get(self, job_id: str) -> CronJob:
+        try:
+            return self.jobs[job_id]
+        except KeyError as exc:
+            raise CronJobNotFoundError(job_id) from exc
+
+    async def list_for_user(self, user_id: str) -> list[CronJob]:
+        return [job for job in self.jobs.values() if job.user_id == user_id]
+
+    async def delete_for_user(self, user_id: str, job_id: str) -> None:
+        job = await self.get(job_id)
+        if job.user_id != user_id:
+            raise CronJobNotFoundError(job_id)
+        del self.jobs[job_id]
+
+
+def ctx_with(
+    spawner: FakeSpawner | None = None,
+    deleter: FakeDeleter | None = None,
+    owner_task_id: str | None = None,
+    base: SkillContext = CTX,
+) -> SkillContext:
     return SkillContext(
         user_id=base.user_id,
         channel=base.channel,
         dialog_id=base.dialog_id,
         task_spawner=spawner,
+        task_deleter=deleter,
+        owner_task_id=owner_task_id,
     )
 
 
-def make_task(ctx: SkillContext = CTX, title: str = "t") -> Task:
-    return Task(
+def make_task(ctx: SkillContext = CTX, title: str = "t", **overrides: object) -> Task:
+    task = Task(
         dialog_id=ctx.dialog_id,
         user_id=ctx.user_id,
         channel=ctx.channel,
@@ -54,11 +117,43 @@ def make_task(ctx: SkillContext = CTX, title: str = "t") -> Task:
         kind=TaskKind.RUN,
         input={"title": title, "prompt": PROMPT_CONTENT},
     )
+    return replace(task, **overrides) if overrides else task
 
 
-async def test_task_spawn_delegates_to_the_context_spawner() -> None:
+def make_cron_job(user_id: str = CTX.user_id, **overrides: object) -> CronJob:
+    base = CronJob(
+        id="job-1",
+        user_id=user_id,
+        channel=CTX.channel,
+        title="morning report",
+        schedule=VALID_SCHEDULE,
+        timezone=VALID_TIMEZONE,
+        prompt="good morning",
+        enabled=True,
+        next_fire_at=utc_now() + timedelta(hours=1),
+        last_fire_at=None,
+        claimed_by=None,
+        claimed_at=None,
+        created_at=utc_now(),
+        one_shot=False,
+        last_status=None,
+        last_error=None,
+        retry_count=0,
+    )
+    return replace(base, **overrides) if overrides else base
+
+
+def schedule_arguments(**overrides: object) -> dict[str, object]:
+    arguments: dict[str, object] = {"title": TITLE, "prompt": PROMPT_CONTENT}
+    return arguments | {"schedule": VALID_SCHEDULE, "timezone": VALID_TIMEZONE} | overrides
+
+
+# --- task_create: immediate path -------------------------------------------
+
+
+async def test_task_create_without_schedule_delegates_to_the_spawner() -> None:
     spawner = FakeSpawner()
-    skill = TaskSpawnSkill()
+    skill = TaskCreateSkill(FakeCronStore())
 
     output = await skill.execute({"title": TITLE, "prompt": PROMPT_CONTENT}, ctx_with(spawner))
 
@@ -66,138 +161,322 @@ async def test_task_spawn_delegates_to_the_context_spawner() -> None:
     assert spawner.calls == [(TITLE, PROMPT_CONTENT)]
 
 
-async def test_task_spawn_reports_spawner_refusals() -> None:
-    spawner = FakeSpawner(reply=REFUSAL_TEXT)
-    skill = TaskSpawnSkill()
+async def test_task_create_reports_spawner_refusals() -> None:
+    skill = TaskCreateSkill(FakeCronStore())
 
-    output = await skill.execute({"title": TITLE, "prompt": PROMPT_CONTENT}, ctx_with(spawner))
+    output = await skill.execute(
+        {"title": TITLE, "prompt": PROMPT_CONTENT}, ctx_with(FakeSpawner(reply=REFUSAL_TEXT))
+    )
 
     assert output == REFUSAL_TEXT
 
 
-async def test_task_spawn_without_spawner_fails() -> None:
-    skill = TaskSpawnSkill()
+async def test_task_create_without_spawner_fails() -> None:
+    skill = TaskCreateSkill(FakeCronStore())
 
     with pytest.raises(SkillArgumentsError, match=NO_SPAWNER_MESSAGE):
         await skill.execute({"title": TITLE, "prompt": PROMPT_CONTENT}, CTX)
+
+
+async def test_task_create_one_shot_without_schedule_fails() -> None:
+    skill = TaskCreateSkill(FakeCronStore())
+
+    with pytest.raises(SkillArgumentsError, match="one_shot"):
+        await skill.execute(
+            {"title": TITLE, "prompt": PROMPT_CONTENT, "one_shot": True},
+            ctx_with(FakeSpawner()),
+        )
 
 
 @pytest.mark.parametrize(
     "arguments",
     [{"prompt": "p"}, {"title": "t"}, {"title": "", "prompt": "p"}],
 )
-async def test_task_spawn_validates_arguments(arguments: dict[str, str]) -> None:
-    skill = TaskSpawnSkill()
+async def test_task_create_validates_arguments(arguments: dict[str, str]) -> None:
+    skill = TaskCreateSkill(FakeCronStore())
 
     with pytest.raises(SkillArgumentsError):
         await skill.execute(arguments, ctx_with(FakeSpawner()))
 
 
-async def test_task_list_scoped_by_dialog() -> None:
+# --- task_create: schedule path --------------------------------------------
+
+
+async def test_task_create_with_schedule_stores_an_enabled_job() -> None:
+    store = FakeCronStore()
+    skill = TaskCreateSkill(store)
+
+    result = await skill.execute(schedule_arguments(), CTX)
+
+    assert "created cron job" in result
+    (job,) = store.jobs.values()
+    assert job.user_id == CTX.user_id
+    assert job.channel == CTX.channel
+    assert job.timezone == VALID_TIMEZONE
+    assert job.enabled
+    assert job.next_fire_at > utc_now()
+    assert job.id in result
+
+
+async def test_task_create_with_schedule_defaults_the_timezone_to_utc() -> None:
+    store = FakeCronStore()
+    skill = TaskCreateSkill(store)
+
+    await skill.execute({"title": TITLE, "prompt": PROMPT_CONTENT, "schedule": VALID_SCHEDULE}, CTX)
+
+    (job,) = store.jobs.values()
+    assert job.timezone == "UTC"
+
+
+async def test_task_create_with_schedule_marks_one_shot_jobs() -> None:
+    store = FakeCronStore()
+    skill = TaskCreateSkill(store)
+
+    result = await skill.execute(schedule_arguments(one_shot=True), CTX)
+
+    (job,) = store.jobs.values()
+    assert job.one_shot
+    assert "one-shot" in result
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"schedule": "not a cron"}, {"timezone": "Mars/Olympus"}],
+)
+async def test_task_create_with_schedule_rejects_bad_input(overrides: dict[str, str]) -> None:
+    store = FakeCronStore()
+    skill = TaskCreateSkill(store)
+
+    result = await skill.execute(schedule_arguments(**overrides), CTX)
+
+    assert result.startswith("error:")
+    assert store.jobs == {}
+
+
+async def test_task_create_with_schedule_is_idempotent_for_an_identical_job() -> None:
+    store = FakeCronStore()
+    skill = TaskCreateSkill(store)
+
+    first = await skill.execute(schedule_arguments(), CTX)
+    second = await skill.execute(schedule_arguments(), CTX)
+
+    assert "created cron job" in first
+    assert "already exists" in second
+    assert len(store.jobs) == 1
+
+
+async def test_task_create_with_a_different_one_shot_is_not_a_duplicate() -> None:
+    store = FakeCronStore()
+    skill = TaskCreateSkill(store)
+
+    await skill.execute(schedule_arguments(), CTX)
+    result = await skill.execute(schedule_arguments(one_shot=True), CTX)
+
+    assert "created cron job" in result
+    assert len(store.jobs) == EXPECTED_TWO_JOBS
+
+
+# --- task_list --------------------------------------------------------------
+
+
+async def test_task_list_shows_tasks_and_jobs_in_two_sections() -> None:
     store = InMemoryTaskStore()
     await store.add(make_task(title="a"))
-    await store.add(make_task(title="b"))
-    await store.add(make_task(ctx=OTHER_CTX, title="c"))
-    skill = TaskListSkill(store=store)
-
-    own = await skill.execute({}, CTX)
-    other = await skill.execute({}, OTHER_CTX)
-
-    assert len(own.splitlines()) == OWN_TASK_COUNT
-    assert "a" in own and "b" in own
-    assert len(other.splitlines()) == 1
-    assert "c" in other
-
-
-async def test_task_list_shows_cancelled_status() -> None:
-    store = InMemoryTaskStore()
-    task = make_task()
-    await store.add(task)
-    await store.cancel(task.id)
-    skill = TaskListSkill(store=store)
+    await store.add(make_task(ctx=OTHER_CTX, title="foreign"))
+    cron = FakeCronStore()
+    await cron.create(make_cron_job())
+    await cron.create(make_cron_job(id="job-2", user_id=OTHER_CTX.user_id))
+    skill = TaskListSkill(store=store, cron_store=cron)
 
     output = await skill.execute({}, CTX)
 
-    assert f"[{TaskStatus.CANCELLED.value}]" in output
+    tasks_section, jobs_section = output.split("\n\n")
+    assert tasks_section.startswith("background tasks:")
+    assert "a" in tasks_section and "foreign" not in tasks_section
+    assert jobs_section.startswith("scheduled jobs:")
+    assert "job-1" in jobs_section and "job-2" not in jobs_section
+    assert "[enabled]" in jobs_section
+
+
+async def test_task_list_reports_empty_sections() -> None:
+    store = InMemoryTaskStore()
+    await store.add(make_task())
+    skill = TaskListSkill(store=store, cron_store=FakeCronStore())
+
+    output = await skill.execute({}, CTX)
+
+    assert "no cron jobs" in output
+    skill = TaskListSkill(store=InMemoryTaskStore(), cron_store=FakeCronStore())
+    assert "no tasks" in await skill.execute({}, CTX)
 
 
 async def test_task_list_empty() -> None:
-    skill = TaskListSkill(store=InMemoryTaskStore())
+    skill = TaskListSkill(store=InMemoryTaskStore(), cron_store=FakeCronStore())
 
-    assert await skill.execute({}, CTX) == NO_TASKS_MESSAGE
+    assert await skill.execute({}, CTX) == NO_WORK_MESSAGE
 
 
-async def test_mark_delivered_sets_flag() -> None:
+async def test_task_list_shows_the_last_run_and_retry_streak() -> None:
+    cron = FakeCronStore()
+    await cron.create(
+        make_cron_job(
+            last_status=TaskStatus.FAILED,
+            last_error="iteration limit reached",
+            retry_count=RETRY_TWO,
+        )
+    )
+    skill = TaskListSkill(store=InMemoryTaskStore(), cron_store=cron)
+
+    output = await skill.execute({}, CTX)
+
+    assert "last run: failed (iteration limit reached)" in output
+    assert "retry #2" in output
+
+
+# --- task_delete ------------------------------------------------------------
+
+
+async def test_task_delete_removes_a_terminal_task() -> None:
+    store = InMemoryTaskStore()
+    task = make_task(status=TaskStatus.DONE, result="ok")
+    await store.add(task)
+    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+
+    output = await skill.execute({"task_id": task.id}, CTX)
+
+    assert output == f"deleted task {task.id}"
+    with pytest.raises(TaskNotFoundError):
+        await store.get(task.id)
+
+
+async def test_task_delete_stops_a_running_task_via_the_deleter() -> None:
+    store = InMemoryTaskStore()
+    task = make_task(status=TaskStatus.RUNNING)
+    await store.add(task)
+    deleter = FakeDeleter()
+    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+
+    output = await skill.execute({"task_id": task.id}, ctx_with(deleter=deleter))
+
+    assert output == f"deleted task {task.id}"
+    assert deleter.calls == [task.id]
+    with pytest.raises(TaskNotFoundError):
+        await store.get(task.id)
+
+
+async def test_task_delete_tolerates_a_row_removed_by_the_finalization() -> None:
+    store = InMemoryTaskStore()
+    task = make_task(status=TaskStatus.RUNNING)
+    await store.add(task)
+    deleter = FakeDeleter(on_delete=store.delete)
+    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+
+    output = await skill.execute({"task_id": task.id}, ctx_with(deleter=deleter))
+
+    assert output == f"deleted task {task.id}"
+
+
+async def test_task_delete_refuses_self_deletion_from_inside_the_task() -> None:
+    store = InMemoryTaskStore()
+    task = make_task(status=TaskStatus.RUNNING)
+    await store.add(task)
+    deleter = FakeDeleter()
+    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+
+    output = await skill.execute(
+        {"task_id": task.id}, ctx_with(deleter=deleter, owner_task_id=task.id)
+    )
+
+    assert output.startswith("error:")
+    assert deleter.calls == []
+    assert (await store.get(task.id)).status is TaskStatus.RUNNING
+
+
+async def test_task_delete_removes_an_orphaned_running_row() -> None:
+    store = InMemoryTaskStore()
+    task = make_task(status=TaskStatus.RUNNING)
+    await store.add(task)
+    deleter = FakeDeleter(outcome=TaskDeleteOutcome.NOT_RUNNING)
+    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+
+    output = await skill.execute({"task_id": task.id}, ctx_with(deleter=deleter))
+
+    assert output == f"deleted task {task.id}"
+    with pytest.raises(TaskNotFoundError):
+        await store.get(task.id)
+
+
+async def test_task_delete_scopes_tasks_to_the_dialog() -> None:
+    store = InMemoryTaskStore()
+    task = make_task(ctx=OTHER_CTX)
+    await store.add(task)
+    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+
+    output = await skill.execute({"task_id": task.id}, CTX)
+
+    assert output.startswith("error:")
+    assert (await store.get(task.id)).id == task.id
+
+
+async def test_task_delete_removes_a_cron_job() -> None:
+    cron = FakeCronStore()
+    await cron.create(make_cron_job())
+    skill = TaskDeleteSkill(store=InMemoryTaskStore(), cron_store=cron)
+
+    output = await skill.execute({"task_id": "job-1"}, CTX)
+
+    assert output == "deleted cron job job-1"
+    assert cron.jobs == {}
+
+
+async def test_task_delete_refuses_a_foreign_cron_job() -> None:
+    cron = FakeCronStore()
+    await cron.create(make_cron_job(user_id=OTHER_CTX.user_id))
+    skill = TaskDeleteSkill(store=InMemoryTaskStore(), cron_store=cron)
+
+    output = await skill.execute({"task_id": "job-1"}, CTX)
+
+    assert output.startswith("error:")
+    assert "job-1" in cron.jobs
+
+
+async def test_task_delete_reports_unknown_ids() -> None:
+    skill = TaskDeleteSkill(store=InMemoryTaskStore(), cron_store=FakeCronStore())
+
+    output = await skill.execute({"task_id": "missing"}, CTX)
+
+    assert output.startswith("error:")
+
+
+# --- InMemoryTaskStore ------------------------------------------------------
+
+
+async def test_store_delete_removes_the_row() -> None:
     store = InMemoryTaskStore()
     task = make_task()
     await store.add(task)
 
-    await store.mark_delivered(task.id)
+    await store.delete(task.id)
 
-    assert (await store.get(task.id)).result_delivered is True
-
-
-async def test_cancel_marks_task_cancelled() -> None:
-    store = InMemoryTaskStore()
-    task = make_task()
-    await store.add(task)
-
-    await store.cancel(task.id)
-
-    stored = await store.get(task.id)
-    assert stored.status is TaskStatus.CANCELLED
-    assert stored.finished_at is not None
-    assert stored.finished_at.tzinfo is not None
-    assert await store.is_cancelled(task.id)
+    with pytest.raises(TaskNotFoundError):
+        await store.get(task.id)
 
 
-async def test_cancel_unknown_task_raises() -> None:
+async def test_store_delete_unknown_task_raises() -> None:
     store = InMemoryTaskStore()
 
     with pytest.raises(TaskNotFoundError):
-        await store.cancel("missing")
-
-
-async def test_is_cancelled_false_for_missing_or_running() -> None:
-    store = InMemoryTaskStore()
-    task = make_task()
-    await store.add(task)
-    await store.mark_running(task)
-
-    assert not await store.is_cancelled("missing")
-    assert not await store.is_cancelled(task.id)
-
-
-async def test_count_active_counts_pending_and_running_of_the_dialog() -> None:
-    store = InMemoryTaskStore()
-    pending = make_task(title="pending")
-    running = make_task(title="running")
-    done = make_task(title="done")
-    cancelled = make_task(title="cancelled")
-    other = make_task(ctx=OTHER_CTX, title="other")
-    for task in (pending, running, done, cancelled, other):
-        await store.add(task)
-    await store.mark_running(running)
-    await store.mark_done(done, "ok")
-    await store.cancel(cancelled.id)
-
-    assert await store.count_active(CTX.dialog_id) == ACTIVE_COUNT
-
-
-RESTART_ERROR = "interrupted by restart"
+        await store.delete("missing")
 
 
 async def test_fail_orphaned_fails_only_pending_and_running() -> None:
     store = InMemoryTaskStore()
     pending = make_task(title="pending")
-    running = make_task(title="running")
-    done = make_task(title="done")
-    cancelled = make_task(title="cancelled")
+    running = make_task(title="running", status=TaskStatus.RUNNING)
+    done = make_task(title="done", status=TaskStatus.DONE)
+    cancelled = make_task(title="cancelled", status=TaskStatus.CANCELLED)
     for task in (pending, running, done, cancelled):
         await store.add(task)
-    await store.mark_running(running)
-    await store.mark_done(done, "ok")
-    await store.cancel(cancelled.id)
 
     orphaned = await store.fail_orphaned(RESTART_ERROR)
 
@@ -214,28 +493,18 @@ async def test_fail_orphaned_fails_only_pending_and_running() -> None:
 
 async def test_fail_orphaned_without_candidates_returns_empty() -> None:
     store = InMemoryTaskStore()
-    done = make_task()
-    await store.add(done)
-    await store.mark_done(done, "ok")
+    await store.add(make_task(status=TaskStatus.DONE))
 
     assert await store.fail_orphaned(RESTART_ERROR) == []
 
 
-async def test_list_undelivered_returns_finished_undelivered_only() -> None:
+async def test_list_undelivered_returns_finished_rows_only() -> None:
     store = InMemoryTaskStore()
-    done = make_task(title="done")
-    failed = make_task(title="failed")
-    delivered = make_task(title="delivered")
-    cancelled = make_task(title="cancelled")
-    running = make_task(title="running")
-    for task in (done, failed, delivered, cancelled, running):
+    done = make_task(title="done", status=TaskStatus.DONE)
+    failed = make_task(title="failed", status=TaskStatus.FAILED)
+    running = make_task(title="running", status=TaskStatus.RUNNING)
+    for task in (done, failed, running):
         await store.add(task)
-    await store.mark_done(done, "ok")
-    await store.mark_failed(failed, "boom")
-    await store.mark_done(delivered, "ok")
-    await store.mark_delivered(delivered.id)
-    await store.cancel(cancelled.id)
-    await store.mark_running(running)
 
     undelivered = await store.list_undelivered()
 

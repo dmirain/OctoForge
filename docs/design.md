@@ -71,7 +71,7 @@ core/                          # библиотека octoforge-core — дом�
                                #   cron/tools.py, memory/tools.py, datasets/tools.py,
                                #   context/tools.py, tasks/tools.py, search/tools.py,
                                #   net/tools.py, instructions/tools.py
-      base.py                  # Skill (Protocol), SkillSpec, SkillContext (+ опциональный task_spawner)
+      base.py                  # Skill (Protocol), SkillSpec, SkillContext (+ опциональные task_spawner/task_deleter, owner_task_id)
       registry.py, errors.py   # реестр + ошибки
     tasks/
       models.py                # Task, TaskKind (RUN), TaskStatus (PENDING|RUNNING|DONE|FAILED|CANCELLED)
@@ -309,9 +309,9 @@ timeout")`. Подробности — [streaming.md](streaming.md).
   обёрнута в `try/finally` (`_pump_process`): даже при сбое записи в стор процесс всегда
   убирается из `_processes` и слот `max_processes` освобождается.
 - **Уведомление о задаче** (обработка `_ProcessTerminated`): task-backed процесс
-  завершился DONE/FAILED и результат ещё не доставлен → `mark_delivered` + system-
-  уведомление с результатом → нарратив + персист → инъекция в fg (занят) или репорт-
-  прогон (свободен). Отменённые задачи не уведомляют.
+  завершился DONE/FAILED → system-уведомление с результатом → нарратив + персист →
+  инъекция в fg (занят) или репорт-прогон (свободен) → удаление записи задачи
+  (отсутствие записи — норма: остановленные удаляются при финализации).
 - `cancel()` (web API) отменяет только форграунд; `stop()` — все процессы и сам актор:
   control-отмена процессов, прямая отмена pump-задач и таски актора **с ожиданием**
   (зависший стрим не должен вешать shutdown), затем `compactor.aclose(dialog_id)` —
@@ -455,46 +455,57 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
 ## Фоновые задачи
 
 Задача — это фоновый процесс актора, подкреплённый записью в `TaskStore`
-(исполнение = pump-процесс; глобальный поллер упразднён).
+(исполнение = pump-процесс; глобальный поллер упразднён). Запись живёт только
+в полёте: остановленный процесс удаляет её при финализации, завершённый — при
+доставке результата; история остаётся в нарративе (`messages`).
 
 - `tasks/models.py`: `Task` (id, dialog_id, user_id, channel, title, kind, input, status,
-  result, error, result_delivered, created_at/started_at/finished_at — через `utc_now()`);
-  `TaskKind(RUN)`, `TaskStatus(PENDING|RUNNING|DONE|FAILED|CANCELLED)`. `channel` и `user_id`
-  денормализованы в задачу: уведомление уходит на поверхность, с которой задача запущена,
-  без join'а к dialogs.
-- `TaskStore` (Protocol в `ports.py`): add/get/list(dialog_id)/mark_running/mark_done/
-  mark_failed/cancel/is_cancelled/count_active/mark_delivered/fail_orphaned/
-  list_undelivered. Реализации:
-  `SqlAlchemyTaskStore` (`db/repositories.py`, боевой путь) и `InMemoryTaskStore` (тесты);
-  `next_pending` из порта удалён вместе с поллером.
-- **Спавн**: скил `task_spawn` делегирует порту `TaskSpawner` (`tasks/spawner.py`),
-  который актор биндит на диалог (`SkillContext.task_spawner`, опциональный — контексты
-  вне актора обходятся без него). Спавнер проверяет лимит процессов (отказ текстом),
-  создаёт `Task(kind=RUN, input={title, prompt})`, сразу `mark_running` и поднимает
-  bg-процесс с id = task.id, коротким системным промптом фоновой задачи и
-  user-сообщением из prompt. Спавн — всегда в фон (вызывается из работающего fg).
-- **Завершение**: терминальный статус процесса мапится на задачу (DONE → mark_done с
-  финальным ответом, FAILED → mark_failed, отмена → cancel). Уведомление в диалог —
-  по факту терминации (см. «Актор диалога»), ровно один раз (`result_delivered`).
+  result, error, created_at/started_at/finished_at — через `utc_now()`);
+  `TaskKind(RUN)`, `TaskStatus(PENDING|RUNNING|DONE|FAILED|CANCELLED` — последний
+  терминал процессов и `cron_jobs.last_status`, в таблицу `tasks` не пишется).
+  `channel` и `user_id` денормализованы в задачу: уведомление уходит на поверхность,
+  с которой задача запущена, без join'а к dialogs.
+- `TaskStore` (Protocol в `tasks/store.py`): add/get/list(dialog_id)/mark_done/
+  mark_failed/delete/fail_orphaned/list_undelivered (терминальные строки — это
+  краш-остатки до редоставки). Реализации:
+  `SqlAlchemyTaskStore` (`db/repositories.py`, боевой путь) и `InMemoryTaskStore` (тесты).
+- **Спавн**: скил `task_create` без `schedule` делегирует порту `TaskSpawner`
+  (`tasks/spawner.py`), который актор биндит на диалог (`SkillContext.task_spawner`,
+  опциональный — контексты вне актора обходятся без него). Спавнер проверяет лимит
+  процессов (отказ текстом), создаёт `Task(kind=RUN, status=RUNNING,
+  input={title, prompt})` и сразу поднимает bg-процесс с id = task.id, коротким
+  системным промптом фоновой задачи и user-сообщением из prompt. Спавн — всегда
+  в фон (вызывается из работающего fg).
+- **Завершение**: DONE → mark_done с финальным ответом, FAILED → mark_failed;
+  уведомление в диалог — по факту терминации (см. «Актор диалога»), ровно один раз:
+  публикация заметки → удаление записи (краш между ними лечится редоставкой на
+  старте). Остановленный процесс записи CANCELLED не делает: репорт исхода в
+  `TaskOutcomeListener` → удаление записи.
+- **Удаление**: скил `task_delete` (поглощает удаление крон-задач): активную задачу
+  останавливает через порт `TaskDeleter` (`tasks/spawner.py`, bound в акторе —
+  `control.cancel()` + ожидание финализации pump), терминальную удаляет напрямую;
+  самоудаление из собственного прогона отклоняется (`SkillContext.owner_task_id`).
 - **Startup-recovery** (`ConversationManager.recover_interrupted()`, вызов из
   `runtime()` до старта планировщика и поверхностей): процессы живут в памяти, поэтому
-  при рестарте их «тени» в `tasks` подметает sweep — порт `TaskStore` +=
-  `fail_orphaned(error)` (PENDING/RUNNING → FAILED «interrupted by restart»,
-  возвращает затронутые) и `list_undelivered()` (DONE/FAILED с
-  `result_delivered=false`; CANCELLED доставки не требуют). Каждая осиротевшая
-  задача получает пассивную системную заметку в нарратив (`record_system_note` —
-  без инъекции и репорт-прогона, как `INTERRUPTED_NOTE`) и `mark_delivered`;
-  cron-tagged дополнительно проходят через `TaskOutcomeListener` — штатная
-  FAILED-политика `CronOutcomeReporter` (last_error + bounded-ретрай) спасает
-  one-shot, чей `next_fire_at` уже продвинут мимо всех огней. Недоставленные
+  при рестарте их «тени» в `tasks` подметает sweep — `fail_orphaned(error)`
+  (PENDING/RUNNING → FAILED «interrupted by restart», возвращает затронутые) и
+  `list_undelivered()` (терминальные строки — не доставлено из-за краша). Каждая
+  осиротевшая задача получает пассивную системную заметку в нарратив
+  (`record_system_note` — без инъекции и репорт-прогона, как `INTERRUPTED_NOTE`),
+  репорт исхода cron-tagged через `TaskOutcomeListener` (штатная FAILED-политика
+  `CronOutcomeReporter`: last_error + bounded-ретрай спасает one-shot, чей
+  `next_fire_at` уже продвинут мимо всех огней) и удаляется. Недоставленные
   результаты редоставляются штатным exactly-once путём:
   `runner.request_result_delivery(task_id)` кладёт в инбокс ту же команду
   `_ProcessTerminated`, что и pump живого процесса (несколько результатов одного
   диалога батчатся в один репорт-прогон). Sweep никогда не роняет старт: каждый
   шаг под try/except, операции идемпотентны и дожидаются следующего рестарта.
 
-Скилы задач: `task_spawn` (title + prompt → фоновая задача-процесс текущего диалога) и
-`task_list` (задачи диалога со статусами, включая cancelled, и результатами).
+Скилы задач (`tasks/tools.py`) — единая поверхность фоновых задач и крон-задач:
+`task_create` (без `schedule` — фоновая задача-процесс текущего диалога; со
+`schedule` — крон-задача через `create_job`, timezone по умолчанию UTC),
+`task_list` (две секции: задачи диалога в полёте + крон-задачи пользователя),
+`task_delete` (останавливает и удаляет задачу, удаляет крон-задачу).
 
 ## Скилы
 
@@ -506,10 +517,10 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
 v3 — тул; переименование кода отложено). Реализации живут в доменных модулях
 (`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`,
 `tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`):
-`http_request`, `task_spawn`, `task_list`, `skills_search`, `instruction_save`,
-`external_call`, `data_put`, `data_query`, `data_forget`, `memory_store`,
-`memory_search`, `memory_delete`, `cron_create`, `cron_list`, `cron_delete`,
-`cron_pause`, `cron_resume`, `web_search`, `history_search`.
+`http_request`, `task_create`, `task_list`, `task_delete`, `skills_search`,
+`instruction_save`, `external_call`, `data_put`, `data_query`, `data_forget`,
+`memory_store`, `memory_search`, `memory_delete`, `cron_pause`, `cron_resume`,
+`web_search`, `history_search`.
 Подключаются в composition root. Имена скилов — с подчёркиваниями, не с точками:
 точки в function-name несовместимы с OpenAI tool-calling (зафиксированное решение).
 `SkillOrigin` упразднён: `SkillRegistry` хранит скилы под уникальными именами
@@ -517,8 +528,9 @@ v3 — тул; переименование кода отложено). Реал
 
 Абстракция (`skills/base.py`): `SkillSpec` (name, description, parameters_schema — JSON Schema);
 `Skill` (Protocol): `spec` + `async execute(arguments, context) -> str`;
-`SkillContext` — per-invocation контекст (user_id, channel, dialog_id + опциональный
-`task_spawner: TaskSpawner | None` — None вне актора, `task_spawn` тогда отказывает).
+`SkillContext` — per-invocation контекст (user_id, channel, dialog_id + опциональные
+`task_spawner`/`task_deleter` — None вне актора, `task_create` без спавнера отказывает —
+и `owner_task_id` фоновой задачи, из которой вызван скил).
 Аргументы валидирует сам скил (`SkillArgumentsError`).
 
 Скил `web_search` зависит от порта `SearchProvider` (модуль `search/`: транспорт-нейтральные
@@ -704,12 +716,13 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   Добавление колонок в ревизии условное (пропуск уже существующих): legacy-БД штампуется
   на baseline даже когда её `create_all` был новее и колонки уже есть (баг: stamp на head
   помечал такую БД актуальной, и ALTER'ы никогда не применялись).
-- **One-shot напоминания**: флаг `one_shot` в `cron_jobs` и `cron_create` (и в HTTP
+- **One-shot напоминания**: флаг `one_shot` в `cron_jobs` и `task_create` (и в HTTP
   `POST /jobs`); расписание — датированное cron-выражение (`minute hour day month *`),
   агент строит сам под ближайшее будущее вхождение; после первого DONE задача удаляется.
-- **Идемпотентность `cron_create`**: совпадение `(title, schedule, prompt, one_shot)` по
-  `list_for_user` → ответ `already exists` вместо дубля. `cron_list` и HTTP API показывают
-  `last run: <status> (<error>)` и `retry #N`.
+- **Идемпотентность создания** (`create_job` в `cron/tools.py`): совпадение
+  `(title, schedule, prompt, one_shot)` по `list_for_user` → ответ `already exists`
+  вместо дубля. `task_list` и HTTP API показывают `last run: <status> (<error>)` и
+  `retry #N`.
 - **Выстрел в акторе**: `ConversationManager.wake` → get-or-create runner →
   `ConversationRunner.wake(title, prompt, cron_job_id)` — общий со `spawn_task` приватный
   хелпер, но `Task.input += {"cron_job_id"}`; переполнение лимита процессов → системная
@@ -720,8 +733,9 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   темплейт `{user_id}` (подстановка из `SkillContext.user_id`; вызов без user_id → без
   заголовка); скил `external_call` передаёт `context.user_id`. В whitelist composition
   root программно добавляется запись `(self_base_url, "X-User-Id", "{user_id}")`.
-- **Нативные скилы** (`cron/tools.py`): `cron_create`/`cron_list`/
-  `cron_delete`/`cron_pause`/`cron_resume` над `CronStore` — семантика HTTP-эндпоинтов
+- **Нативные скилы** (`tasks/tools.py` + `cron/tools.py`): `task_create` (создание
+  и фоновых задач, и крон-задач), `task_list`, `task_delete`, `cron_pause`,
+  `cron_resume` над `CronStore`/`TaskStore` — семантика HTTP-эндпоинтов
   (owner-скоуп, resume пересчитывает `next_fire_at` от now), но без loopback-вызовов:
   работают и в standalone Telegram-раннере. Регистрируются в composition root на всех
   поверхностях; agent-managed крон больше не зависит от поднятого HTTP API.
@@ -731,7 +745,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   (204; чужая/нет → 404), `POST /jobs/{id}/pause|resume`. Остаётся для внешних клиентов.
 - **Системный реестр**: HTTP-сид-тулы крона удалены синком `sync_system_registry`
   (их нет в реестре — системные записи вне реестра стираются); нативный сценарий
-  крона — системный скил `cron_jobs` в `CORE_SYSTEM_SKILLS`.
+  отложенной работы — системный скил `deferred_work` в `CORE_SYSTEM_SKILLS`.
 - **Промпт**: пер-туловые правила вынесены в системные сценарии — см. «Системный промпт».
 
 ## Telegram-адаптер (этап G)
@@ -827,8 +841,8 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   `created_at`. Пишется только нарратив (см. «Актор диалога»), не полные ветки прогонов
 - **tasks**: `id`, `dialog_id` FK (index), `user_id` (index), `channel`, `kind`
   (RUN), `title`, `input` (JSON: `{"title", "prompt"}`), `status` (PENDING|RUNNING|DONE|
-  FAILED|CANCELLED), `result`, `error`, `result_delivered` (bool, default False),
-  `created_at`, `started_at`, `finished_at`
+  FAILED), `result`, `error`, `created_at`, `started_at`, `finished_at`. Запись живёт
+  только в полёте: удаляется при доставке результата или остановке задачи.
 - **instructions** (таблица модуля `instructions/`, см. выше): `id` (uuid str PK), `type`
   (knowledge|skill|tool, index), `title` (index), `content` (Text), `embedding` (JSON
   list[float]), `tags` (JSON list[str]), `version`, `usage_count`, `success_count`,
@@ -909,7 +923,8 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   новый вопрос mid-run → ProcessSuspended + новый fg (bg дорабатывает молча); INJECT-руление;
   PROMOTE → ProcessResumed; CANCEL по решению роутера; cancel() снимает только форграунд;
   лимит (max=1) → отказ-заметка инъекцией (fg занят) и репорт-прогоном (fg свободен);
-  task_spawn через скил → bg-процесс → уведомление + репорт + `result_delivered`;
+  task_create через скил → bg-процесс → уведомление + репорт + удаление записи;
+  delete_task останавливает живой bg-процесс (самоудаление отклоняется);
   уведомление инъекцией в занятый fg; гигиена прерванного тёрна; недочитанная инъекция
   получает собственный процесс; пересборка нарратива после «перезапуска» менеджера;
   wake крон-задачи → bg-процесс с `cron_job_id` в `Task.input`, лимит → системная заметка
@@ -919,10 +934,14 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   target), фолбэки (нет tool_call, ошибка, таймаут), форма запроса (процессы, лимит, tool spec)
 - `core/tests/test_db_repositories.py` — диалоги (get-or-create, уникальность пары), сообщения
   (seq/порядок, tool_calls round-trip, изоляция), UTCDateTime round-trip, SqlAlchemyTaskStore
-  (те же сценарии, что у InMemoryTaskStore, + cancel/is_cancelled/count_active, mark_delivered)
-- `core/tests/test_tasks.py` — task_spawn через fake-спавнер (делегация, отказ текстом,
-  отсутствие спавнера — SkillArgumentsError), валидация, task_list по диалогу со статусом
-  cancelled, InMemoryTaskStore: cancel/is_cancelled/count_active, mark_delivered, UTC-даты
+  (те же сценарии, что у InMemoryTaskStore: add/get/list/mark_done/mark_failed/delete,
+  fail_orphaned, list_undelivered)
+- `core/tests/test_tasks.py` — task_create (немедленный путь через fake-спавнер: делегация,
+  отказ текстом, отсутствие спавнера — SkillArgumentsError; schedule-путь: создание
+  крон-задачи, дедуп, timezone UTC по умолчанию, one_shot без schedule — ошибка),
+  task_list (две секции), task_delete (терминальная, активная через fake-deleter,
+  самоудаление — отказ, крон-поглощение, чужой диалог), InMemoryTaskStore: delete,
+  fail_orphaned, list_undelivered, UTC-даты
 - `core/tests/test_http_request_skill.py`, `core/tests/test_skills_registry.py`
 - `core/tests/test_instructions_local.py` — контрактный набор фасада на `:memory:` (save/upsert
   с бампом версии и пересчётом эмбеддинга, get_by_name с сужением по типу, ранжирование:
@@ -1037,7 +1056,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 1. ✅ Скаффолд монорепо: библиотека `core/` + приложение `web/`, Makefile, ruff/mypy/pytest
 2. ✅ Чат без аутентификации: UI, `POST /api/chat`, ядро — прокси к LLM
 3. ✅ Петля + базовые скилы: `AgentLoop` (tool calling), `Skill/SkillSpec/SkillRegistry`, `http_request`
-4. ✅ Событийная петля + актор диалога + фоновые задачи (in-memory): стриминг токенов (SSE), инъекции, отмена, `task_spawn`/`task_list`, проактивные уведомления, системный промпт answer-first
+4. ✅ Событийная петля + актор диалога + фоновые задачи (in-memory): стриминг токенов (SSE), инъекции, отмена, `task_create`/`task_list`/`task_delete`, проактивные уведомления, системный промпт answer-first
 5. ✅ (без аутентификации: user_id — доверенная строка от клиента; users/токены отложены) БД (SQLAlchemy async, SQLite), перенос историй/задач в БД; диалоги keyed by (user, channel), поверхности — см. [dialogs.md](dialogs.md); две инсталляции (standalone/distributed) — см. [scaling.md](scaling.md)
 6. Динамические скилы: Jinja-движок + `skill.save/run`; скилы памяти (user/global) ✅ (этап D)
 7. Агентный контекст: память в контексте (автоинъекция), `GET /api/skills`, `GET /api/tasks`

@@ -25,30 +25,25 @@ class SystemSkill:
     tags: tuple[str, ...]
 
 
-CRON_JOBS_CONTENT = """\
-Scenario: scheduled and recurring jobs (reminders, periodic reports).
-Anything tied to a future time or a schedule belongs to cron — never to task_spawn.
-1. Work out the cadence. Compose the cron expression yourself ('0 9 * * *' = daily
-   09:00). Ask the user's IANA timezone when unknown; use 'UTC' when unclear.
-2. One-time reminder: one_shot=true and a dated expression (minute hour day-of-month
-   month *) with the nearest future occurrence, e.g. '30 15 21 7 *' for Jul 21 15:30.
-   One-shot jobs delete themselves after firing.
-3. Call cron_create with title, schedule, prompt and timezone. The prompt is the
-   instruction you receive on every firing — make it self-contained.
-4. Confirm to the user: title, schedule, timezone, next fire time.
-Managing jobs: cron_list to inspect, cron_pause/cron_resume for temporary disabling.
-Before cron_delete: show the job from cron_list and confirm the exact job with the user.
-Creating a duplicate returns 'already exists' — do not retry, show the existing job."""
-
-BACKGROUND_TASKS_CONTENT = """\
-Scenario: run real work in the background (result needed once, when ready).
-1. Call task_spawn with a self-contained prompt describing the work.
-2. Confirm to the user that the task started, then continue the conversation —
-   do not wait for the result.
-3. When a system message reports the task finished, briefly relay the result.
-Use task_list to check status of this conversation's background tasks.
-Not for reminders or anything scheduled — that is cron_create. If spawning is
-refused because of the process limit, tell the user instead of retrying in a loop."""
+DEFERRED_WORK_CONTENT = """\
+Scenario: deferred work — background tasks and scheduled jobs (reminders, reports).
+1. Work now, result later: call task_create without a schedule — the task runs in
+   the background; confirm it started and continue the conversation, do not wait.
+   When a system message reports it finished, briefly relay the result.
+2. Future or recurring: call task_create with a schedule (compose the cron
+   expression yourself; '0 9 * * *' = daily 09:00) and timezone (ask the user
+   when unknown, else 'UTC'). One-time reminder: one_shot=true and a dated
+   expression (minute hour day-of-month month *), e.g. '30 15 21 7 *' for
+   Jul 21 15:30; one-shot jobs delete themselves after firing.
+3. The prompt is the instruction the task receives on start / every firing —
+   make it self-contained; this conversation's context may be gone by then.
+Managing: task_list shows running tasks and scheduled jobs (finished tasks
+disappear from it — their results stay in the conversation); task_delete removes
+either (stopping a running task first); cron_pause/cron_resume temporarily
+disable a scheduled job. Before deleting a scheduled job, show it from task_list
+and confirm with the user. A duplicate scheduled job returns 'already exists' —
+show the existing one instead of retrying. If spawning is refused because of the
+process limit, tell the user instead of retrying in a loop."""
 
 USER_MEMORY_CONTENT = """\
 Scenario: durable user facts and preferences (name, city, diet, goals and the like).
@@ -106,15 +101,9 @@ Scenario: find and author skill scenarios.
 CORE_SYSTEM_SKILLS: tuple[SystemSkill, ...] = (
     SystemSkill(
         kind=InstructionType.SKILL,
-        title="cron_jobs",
-        content=CRON_JOBS_CONTENT,
-        tags=("cron", "scheduler", "scenario"),
-    ),
-    SystemSkill(
-        kind=InstructionType.SKILL,
-        title="background_tasks",
-        content=BACKGROUND_TASKS_CONTENT,
-        tags=("tasks", "background", "scenario"),
+        title="deferred_work",
+        content=DEFERRED_WORK_CONTENT,
+        tags=("cron", "scheduler", "tasks", "background", "scenario"),
     ),
     SystemSkill(
         kind=InstructionType.SKILL,

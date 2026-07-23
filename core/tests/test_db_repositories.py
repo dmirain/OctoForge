@@ -60,6 +60,7 @@ def make_task(
     user_id: str = USER_ID,
     title: str = TASK_TITLE,
     created_at: datetime = CREATED_EARLIER,
+    status: TaskStatus = TaskStatus.PENDING,
 ) -> Task:
     return Task(
         dialog_id=dialog_id,
@@ -69,6 +70,7 @@ def make_task(
         kind=TaskKind.RUN,
         input={"title": title, "prompt": "solve 2+2"},
         created_at=created_at,
+        status=status,
     )
 
 
@@ -403,7 +405,6 @@ async def test_task_add_and_get(session_factory: async_sessionmaker[AsyncSession
     assert stored.user_id == task.user_id
     assert stored.status is TaskStatus.PENDING
     assert stored.kind is TaskKind.RUN
-    assert stored.result_delivered is False
     assert stored.created_at.tzinfo == UTC
 
 
@@ -430,76 +431,26 @@ async def test_task_list_scoped_by_dialog(
     assert [task.title for task in other] == ["c"]
 
 
-async def test_cancel_marks_task_cancelled(
+async def test_task_delete_removes_the_row(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     task = make_task()
     await store.add(task)
 
-    await store.cancel(task.id)
+    await store.delete(task.id)
 
-    stored = await store.get(task.id)
-    assert stored.status is TaskStatus.CANCELLED
-    assert stored.finished_at is not None
-    assert stored.finished_at.tzinfo == UTC
-    assert await store.is_cancelled(task.id)
+    with pytest.raises(TaskNotFoundError):
+        await store.get(task.id)
 
 
-async def test_cancel_unknown_task_raises(
+async def test_task_delete_unknown_task_raises(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
 
     with pytest.raises(TaskNotFoundError):
-        await store.cancel("missing")
-
-
-async def test_is_cancelled_false_for_missing_or_running(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    store = SqlAlchemyTaskStore(session_factory)
-    task = make_task()
-    await store.add(task)
-    await store.mark_running(task)
-
-    assert not await store.is_cancelled("missing")
-    assert not await store.is_cancelled(task.id)
-
-
-async def test_count_active_counts_pending_and_running_of_the_dialog(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    store = SqlAlchemyTaskStore(session_factory)
-    pending = make_task(title="pending")
-    running = make_task(title="running")
-    done = make_task(title="done")
-    cancelled = make_task(title="cancelled")
-    other = make_task(dialog_id=OTHER_DIALOG_ID, user_id=OTHER_USER_ID, title="other")
-    for task in (pending, running, done, cancelled, other):
-        await store.add(task)
-    await store.mark_running(running)
-    await store.mark_done(done, TASK_RESULT)
-    await store.cancel(cancelled.id)
-
-    assert await store.count_active(DIALOG_ID) == OWN_TASK_COUNT
-    assert await store.count_active(OTHER_DIALOG_ID) == 1
-
-
-async def test_mark_running_sets_status_and_started_at(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    store = SqlAlchemyTaskStore(session_factory)
-    task = make_task()
-    await store.add(task)
-
-    await store.mark_running(task)
-
-    stored = await store.get(task.id)
-    assert stored.status is TaskStatus.RUNNING
-    assert stored.started_at is not None
-    assert stored.started_at.tzinfo == UTC
-    assert task.status is TaskStatus.RUNNING
+        await store.delete("missing")
 
 
 async def test_mark_done_sets_result_and_finished_at(
@@ -532,38 +483,16 @@ async def test_mark_failed_sets_error(session_factory: async_sessionmaker[AsyncS
     assert stored.finished_at is not None
 
 
-async def test_mark_delivered_sets_flag(session_factory: async_sessionmaker[AsyncSession]) -> None:
-    store = SqlAlchemyTaskStore(session_factory)
-    task = make_task()
-    await store.add(task)
-
-    await store.mark_delivered(task.id)
-
-    assert (await store.get(task.id)).result_delivered is True
-
-
-async def test_mark_delivered_unknown_task_raises(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    store = SqlAlchemyTaskStore(session_factory)
-
-    with pytest.raises(TaskNotFoundError):
-        await store.mark_delivered("missing")
-
-
 async def test_fail_orphaned_fails_only_pending_and_running(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     pending = make_task(title="pending")
-    running = make_task(title="running")
-    done = make_task(title="done")
-    cancelled = make_task(title="cancelled")
+    running = make_task(title="running", status=TaskStatus.RUNNING)
+    done = make_task(title="done", status=TaskStatus.DONE)
+    cancelled = make_task(title="cancelled", status=TaskStatus.CANCELLED)
     for task in (pending, running, done, cancelled):
         await store.add(task)
-    await store.mark_running(running)
-    await store.mark_done(done, TASK_RESULT)
-    await store.cancel(cancelled.id)
 
     orphaned = await store.fail_orphaned(TASK_ERROR)
 
@@ -583,30 +512,20 @@ async def test_fail_orphaned_without_candidates_returns_empty(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
-    done = make_task()
-    await store.add(done)
-    await store.mark_done(done, TASK_RESULT)
+    await store.add(make_task(status=TaskStatus.DONE))
 
     assert await store.fail_orphaned(TASK_ERROR) == []
 
 
-async def test_list_undelivered_returns_finished_undelivered_only(
+async def test_list_undelivered_returns_finished_rows_only(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
-    done = make_task(title="done")
-    failed = make_task(title="failed")
-    delivered = make_task(title="delivered")
-    cancelled = make_task(title="cancelled")
-    running = make_task(title="running")
-    for task in (done, failed, delivered, cancelled, running):
+    done = make_task(title="done", status=TaskStatus.DONE)
+    failed = make_task(title="failed", status=TaskStatus.FAILED)
+    running = make_task(title="running", status=TaskStatus.RUNNING)
+    for task in (done, failed, running):
         await store.add(task)
-    await store.mark_done(done, TASK_RESULT)
-    await store.mark_failed(failed, TASK_ERROR)
-    await store.mark_done(delivered, TASK_RESULT)
-    await store.mark_delivered(delivered.id)
-    await store.cancel(cancelled.id)
-    await store.mark_running(running)
 
     undelivered = await store.list_undelivered()
 

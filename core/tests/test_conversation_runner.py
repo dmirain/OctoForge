@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
@@ -30,7 +30,6 @@ from octoforge_core.agent.router import (
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
     REPORT_NUDGE,
-    RESTART_INTERRUPT_ERROR,
     TASK_INTERRUPTED_TEMPLATE,
     ConversationEvent,
     ConversationManager,
@@ -39,6 +38,7 @@ from octoforge_core.agent.runner import (
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
+from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.models import MessageRow
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
@@ -47,12 +47,15 @@ from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
-from octoforge_core.ports import LLMClient, TaskStore
+from octoforge_core.ports import LLMClient
 from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.registry import SkillRegistry
+from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.store import InMemoryTaskStore
-from octoforge_core.tasks.tools import TaskSpawnSkill
+from octoforge_core.tasks.spawner import TaskDeleteOutcome
+from octoforge_core.tasks.store import InMemoryTaskStore, TaskStore
+from octoforge_core.tasks.tools import TaskCreateSkill, TaskDeleteSkill
+from octoforge_core.time import utc_now
 
 PROMPT = "test system prompt"
 REPLY = "hello"
@@ -64,7 +67,7 @@ FIRST_CLIENT_KEY = "upd-1"
 SECOND_CLIENT_KEY = "upd-2"
 SECOND_REPLY = "world"
 BLOCKING_SKILL = "blocking"
-TASK_SPAWN_CALL = "task_spawn"
+TASK_CREATE_CALL = "task_create"
 CALL_ID = "call-1"
 TASK_RESULT = "42"
 TASK_TITLE = "research"
@@ -342,14 +345,14 @@ def blocking_call() -> ChatMessage:
     )
 
 
-def task_spawn_call() -> ChatMessage:
+def task_create_call() -> ChatMessage:
     return ChatMessage(
         role=MessageRole.ASSISTANT,
         content="",
         tool_calls=(
             ToolCall(
                 id=CALL_ID,
-                name=TASK_SPAWN_CALL,
+                name=TASK_CREATE_CALL,
                 arguments={"title": TASK_TITLE, "prompt": TASK_PROMPT},
             ),
         ),
@@ -905,8 +908,8 @@ async def test_process_limit_starts_report_run_when_foreground_is_free(
     llm.background_release.set()
     events = await collect_completions(queue, 2)
 
-    tasks = await store.list(runner.dialog_id)
-    assert [(task.status, task.result_delivered) for task in tasks] == [(TaskStatus.DONE, True)]
+    # the delivered result deletes its task row; the history keeps the content
+    assert await store.list(runner.dialog_id) == []
     contents = [m.content for m in runner.history()]
     assert any(TASK_RESULT in content for content in contents)
 
@@ -936,13 +939,107 @@ async def test_spawn_task_refuses_over_the_process_limit(
     await collect_until(queue, is_completed)
 
 
-async def test_task_spawn_skill_runs_background_process_and_reports(
+SELF_DELETE_SKILL = "self_delete"
+
+
+class SelfDeleteSkill:
+    """Routes into the real task_delete flow against the only stored task (itself)."""
+
+    def __init__(self, inner: TaskDeleteSkill, store: TaskStore) -> None:
+        self._inner = inner
+        self._store = store
+
+    @property
+    def spec(self) -> SkillSpec:
+        return SkillSpec(name=SELF_DELETE_SKILL, description="quick", parameters_schema={})
+
+    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+        (task,) = await self._store.list(context.dialog_id)
+        return await self._inner.execute({"task_id": task.id}, context)
+
+
+def self_delete_call() -> ChatMessage:
+    return ChatMessage(
+        role=MessageRole.ASSISTANT,
+        content="",
+        tool_calls=(ToolCall(id=CALL_ID, name=SELF_DELETE_SKILL, arguments={}),),
+    )
+
+
+async def test_delete_task_stops_a_live_background_process(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[reply("pong")], background=[reply(TASK_RESULT)])
+    llm.gate_background = True
+    store = InMemoryTaskStore()
+    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
+    (task,) = await store.list(runner.dialog_id)
+
+    deletion = asyncio.create_task(runner.delete_task(task.id))
+    await asyncio.sleep(0)  # let delete_task reach control.cancel()
+    llm.background_release.set()
+    outcome = await deletion
+    events = await collect_until(queue, is_completed)
+
+    assert outcome is TaskDeleteOutcome.DELETED
+    assert [(item.title, item.status) for item in completions(events)] == [
+        (TASK_TITLE, TaskStatus.CANCELLED.value)
+    ]
+    # the stopped task's row is gone and nothing is delivered for it
+    assert await store.list(runner.dialog_id) == []
+
+    # the actor survived the deleted-row termination notice
+    await runner.submit("ping")
+    await collect_completions(queue, 1)
+    assert runner.history()[-1] == reply("pong")
+
+
+async def test_delete_task_reports_not_running_for_an_unknown_task(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = make_manager(ScriptedLLM([]), SkillRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    assert await runner.delete_task("missing") is TaskDeleteOutcome.NOT_RUNNING
+
+
+async def test_delete_task_from_inside_its_own_process_is_refused(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    registry = SkillRegistry()
+    inner = TaskDeleteSkill(store=store, cron_store=SqlAlchemyCronStore(session_factory))
+    registry.register(SelfDeleteSkill(inner, store))
+    llm = BranchLLM(
+        main=[reply("report answer")],
+        background=[self_delete_call(), reply(TASK_RESULT)],
+    )
+    manager = make_manager(llm, registry, session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
+    events = await collect_completions(queue, 2)
+
+    # the self-deletion was refused: the task ran to completion and was delivered
+    by_title = {item.title: item.status for item in completions(events)}
+    assert by_title[TASK_TITLE] == TaskStatus.DONE.value
+    assert await store.list(runner.dialog_id) == []
+    contents = [m.content for m in runner.history()]
+    assert any(TASK_RESULT in content for content in contents)
+
+
+async def test_task_create_skill_runs_background_process_and_reports(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     registry = SkillRegistry()
-    registry.register(TaskSpawnSkill())
+    registry.register(TaskCreateSkill(cron_store=SqlAlchemyCronStore(session_factory)))
     llm = BranchLLM(
-        main=[task_spawn_call(), reply("spawn confirmed"), reply("report answer")],
+        main=[task_create_call(), reply("spawn confirmed"), reply("report answer")],
         background=[reply(TASK_RESULT)],
     )
     llm.gate_background = True
@@ -956,13 +1053,8 @@ async def test_task_spawn_skill_runs_background_process_and_reports(
     llm.background_release.set()
     events = await collect_completions(queue, 2)
 
-    tasks = await store.list(runner.dialog_id)
-    assert len(tasks) == 1
-    task = tasks[0]
-    assert task.title == TASK_TITLE
-    assert task.status is TaskStatus.DONE
-    assert task.result == TASK_RESULT
-    assert task.result_delivered is True
+    # the result is delivered and its row deleted; the content stays in the history
+    assert await store.list(runner.dialog_id) == []
 
     notification = runner.history()[-2]
     assert notification.role is MessageRole.SYSTEM
@@ -1005,8 +1097,8 @@ async def test_task_done_notification_injected_into_busy_foreground(
 
     second_request = llm.main_requests[1]
     assert any(m.role is MessageRole.SYSTEM and TASK_RESULT in m.content for m in second_request)
-    tasks = await store.list(runner.dialog_id)
-    assert [(task.status, task.result_delivered) for task in tasks] == [(TaskStatus.DONE, True)]
+    # the delivered result deletes its task row
+    assert await store.list(runner.dialog_id) == []
 
 
 async def test_interrupted_turn_is_salvaged_into_the_narrative(
@@ -1105,13 +1197,8 @@ async def test_wake_runs_cron_tagged_background_process(
     assert delivered is True
     await collect_completions(queue, 2)
 
-    tasks = await store.list(runner.dialog_id)
-    assert len(tasks) == 1
-    task = tasks[0]
-    assert task.title == CRON_TITLE
-    assert task.status is TaskStatus.DONE
-    assert task.result == TASK_RESULT
-    assert task.input["cron_job_id"] == CRON_JOB_ID
+    # the delivered result deletes its row; the notification keeps the content
+    assert await store.list(runner.dialog_id) == []
     notification = runner.history()[-2]
     assert notification.role is MessageRole.SYSTEM
     assert CRON_TITLE in notification.content
@@ -1346,8 +1433,10 @@ async def test_listener_failure_does_not_break_finalize(
     await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
     await collect_completions(queue, 2)
 
-    (task,) = await store.list(runner.dialog_id)
-    assert task.status is TaskStatus.DONE  # finalize completed despite the listener
+    # finalize and delivery completed despite the listener failure
+    assert await store.list(runner.dialog_id) == []
+    contents = [m.content for m in runner.history()]
+    assert any(TASK_RESULT in content for content in contents)
 
 
 async def test_promote_at_the_process_limit_moves_the_process_to_foreground(
@@ -1449,15 +1538,15 @@ async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
 
 
 class RecordingDeliveryStore(InMemoryTaskStore):
-    """Task store recording mark_delivered calls."""
+    """Task store recording delete calls (delivery deletes the row)."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.delivered: list[str] = []
+        self.deleted: list[str] = []
 
-    async def mark_delivered(self, task_id: str) -> None:
-        self.delivered.append(task_id)
-        await super().mark_delivered(task_id)
+    async def delete(self, task_id: str) -> None:
+        self.deleted.append(task_id)
+        await super().delete(task_id)
 
 
 class SystemNoteFailingRepository(MessageRepository):
@@ -1480,7 +1569,7 @@ class SystemNoteFailingRepository(MessageRepository):
         await super().append(dialog_id, message, usage=usage, client_message_id=client_message_id)
 
 
-async def test_result_is_not_marked_delivered_when_the_note_persist_fails(
+async def test_result_row_is_not_deleted_when_the_note_persist_fails(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = RecordingDeliveryStore()
@@ -1498,22 +1587,21 @@ async def test_result_is_not_marked_delivered_when_the_note_persist_fails(
 
     (task,) = await store.list(runner.dialog_id)
     assert task.status is TaskStatus.DONE
-    assert store.delivered == []  # not marked: the delivery itself failed
-    assert task.result_delivered is False
+    assert store.deleted == []  # the delivery itself failed, the row must survive
 
 
 class GatedTaskStore(InMemoryTaskStore):
-    """Task store pausing mark_running until released, to force a spawn race."""
+    """Task store pausing `add` until released, to force a spawn race."""
 
     def __init__(self) -> None:
         super().__init__()
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def mark_running(self, task: Task) -> None:
+    async def add(self, task: Task) -> None:
         self.entered.set()
         await self.release.wait()
-        await super().mark_running(task)
+        await super().add(task)
 
 
 async def test_concurrent_spawns_do_not_exceed_the_process_limit(
@@ -1659,19 +1747,22 @@ async def test_stop_all_stops_and_deregisters_every_runner(
 # --- startup recovery ----------------------------------------------------------
 
 
-def orphaned_task(dialog: Dialog, cron_job_id: str | None = None) -> Task:
+def orphaned_task(dialog: Dialog, cron_job_id: str | None = None, **overrides: object) -> Task:
     """Build a RUN task as a previous instance left it: stored and running."""
     task_input: dict[str, Any] = {"title": TASK_TITLE, "prompt": TASK_PROMPT}
     if cron_job_id is not None:
         task_input["cron_job_id"] = cron_job_id
-    return Task(
+    task = Task(
         dialog_id=dialog.id,
         user_id=dialog.user_id,
         channel=dialog.channel,
         title=TASK_TITLE,
         kind=TaskKind.RUN,
         input=task_input,
+        status=TaskStatus.RUNNING,
+        started_at=utc_now(),
     )
+    return replace(task, **overrides) if overrides else task
 
 
 async def test_recover_interrupted_fails_orphaned_tasks(
@@ -1683,15 +1774,12 @@ async def test_recover_interrupted_fails_orphaned_tasks(
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog)
     await store.add(task)
-    await store.mark_running(task)
 
     await manager.recover_interrupted()
 
-    stored = await store.get(task.id)
-    assert stored.status is TaskStatus.FAILED
-    assert stored.error == RESTART_INTERRUPT_ERROR
-    assert stored.finished_at is not None
-    assert stored.result_delivered is True  # the note is the delivery
+    # the interruption is recorded in the narrative and the row is deleted
+    with pytest.raises(TaskNotFoundError):
+        await store.get(task.id)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     history = runner.history()
     assert [message.role for message in history] == [MessageRole.SYSTEM]
@@ -1726,11 +1814,11 @@ async def test_recover_interrupted_reports_only_cron_tagged_orphans(
     plain_task = orphaned_task(dialog)
     for task in (cron_task, plain_task):
         await store.add(task)
-        await store.mark_running(task)
 
     await manager.recover_interrupted()
 
     assert listener.calls == [(cron_task.id, TaskStatus.FAILED)]
+    assert await store.list(dialog.id) == []
 
 
 async def test_recover_interrupted_redelivers_undelivered_results(
@@ -1740,18 +1828,16 @@ async def test_recover_interrupted_redelivers_undelivered_results(
     llm = ScriptedLLM([reply("your background result is ready")])
     manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
     dialog = await get_dialog(session_factory)
-    task = orphaned_task(dialog)
+    task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
     await store.add(task)
-    await store.mark_running(task)
-    await store.mark_done(task, TASK_RESULT)
-    # result_delivered stays False: the previous instance died before delivery
+    # the row survived: the previous instance died before delivering the result
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await manager.recover_interrupted()
     await collect_completions(queue, 1)  # the report run reacting to the note
 
-    assert store.delivered == [task.id]
+    assert store.deleted == [task.id]  # delivered, then the row is gone
     contents = [message.content for message in runner.history()]
     assert any(TASK_RESULT in content for content in contents)
 

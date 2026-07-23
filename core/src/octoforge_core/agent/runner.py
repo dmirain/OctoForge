@@ -32,10 +32,11 @@ from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
-from octoforge_core.ports import TaskStore
 from octoforge_core.skills.base import SkillContext
+from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.spawner import TaskSpawner
+from octoforge_core.tasks.spawner import TaskDeleteOutcome, TaskDeleter, TaskSpawner
+from octoforge_core.tasks.store import TaskStore
 from octoforge_core.time import utc_now
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,7 @@ class ConversationRunner:
         # which run in pump/scheduler tasks outside the actor's inbox
         self._spawn_lock = asyncio.Lock()
         self._spawner: TaskSpawner = _DialogTaskSpawner(self)
+        self._deleter: TaskDeleter = _DialogTaskDeleter(self)
         self._inbox: asyncio.Queue[_Command] = asyncio.Queue()
         self._subscribers: set[asyncio.Queue[ConversationEvent]] = set()
         self._seq = 0
@@ -291,6 +293,23 @@ class ConversationRunner:
             await self._publish_cron_limit_note(title)
         return not over_limit
 
+    async def delete_task(self, task_id: str) -> TaskDeleteOutcome:
+        """Stop a live task process so the task can be deleted.
+
+        The store row is removed by the finalization that follows the stop,
+        not here: deleting it earlier would crash the finalize/report path.
+        The caller must not pass the id of the process it runs in (the pump
+        cannot be awaited from within) — `TaskDeleteSkill` refuses that via
+        `SkillContext.owner_task_id`.
+        """
+        process = self._processes.get(task_id)
+        if process is None:
+            return TaskDeleteOutcome.NOT_RUNNING
+        process.control.cancel()
+        if process.pump is not None:
+            await process.pump
+        return TaskDeleteOutcome.DELETED
+
     def _spawn_refusal(self) -> str:
         return SPAWN_REFUSAL_TEMPLATE.format(
             limit=self._max_processes, titles=self._active_titles()
@@ -319,9 +338,10 @@ class ConversationRunner:
             title=title,
             kind=TaskKind.RUN,
             input=task_input,
+            status=TaskStatus.RUNNING,
+            started_at=utc_now(),
         )
         await self._tasks.add(task)
-        await self._tasks.mark_running(task)
         return task
 
     def _start_process(self, task: Task, title: str, prompt: str) -> None:
@@ -415,12 +435,15 @@ class ConversationRunner:
         """Deliver a finished task result to the dialog exactly once."""
         if command.task_id is None:
             return
-        task = await self._tasks.get(command.task_id)
-        if task.status not in (TaskStatus.DONE, TaskStatus.FAILED) or task.result_delivered:
+        try:
+            task = await self._tasks.get(command.task_id)
+        except TaskNotFoundError:
+            return  # a stopped task deletes its row at finalize; nothing to deliver
+        if task.status not in (TaskStatus.DONE, TaskStatus.FAILED):
             return
-        # deliver first, mark afterwards: a persist failure must not lose the result
+        # deliver first, delete afterwards: a persist failure must not lose the result
         await self._publish_system_note(self._format_task_done(task))
-        await self._tasks.mark_delivered(task.id)
+        await self._tasks.delete(task.id)
 
     def _snapshot(self) -> tuple[ProcessInfo, ...]:
         return tuple(
@@ -641,6 +664,8 @@ class ConversationRunner:
             channel=self._dialog.channel,
             dialog_id=self._dialog.id,
             task_spawner=self._spawner,
+            task_deleter=self._deleter,
+            owner_task_id=process.task_id,
         )
         terminal: LoopEvent = Failed(error="loop ended without a terminal event")
         try:
@@ -681,10 +706,14 @@ class ConversationRunner:
             await self._fail_task(process, terminal.error)
             status = TaskStatus.FAILED
         else:
-            await self._cancel_task(process)
             await self._salvage_interrupted_turn(process)
             status = TaskStatus.CANCELLED
         await self._report_outcome(process, status)
+        if status is TaskStatus.CANCELLED and process.task_id is not None:
+            # a stopped task leaves no row: the outcome is already reported and
+            # a cancelled result is never delivered to the dialog
+            with suppress(TaskNotFoundError):
+                await self._tasks.delete(process.task_id)
         return status
 
     async def _report_outcome(self, process: _Process, status: TaskStatus) -> None:
@@ -713,10 +742,6 @@ class ConversationRunner:
             return
         task = await self._tasks.get(process.task_id)
         await self._tasks.mark_failed(task, error)
-
-    async def _cancel_task(self, process: _Process) -> None:
-        if process.task_id is not None:
-            await self._tasks.cancel(process.task_id)
 
     async def _salvage_interrupted_turn(self, process: _Process) -> None:
         """Keep a cancelled run's partial answer in the narrative, flagged as incomplete.
@@ -762,8 +787,8 @@ class ConversationRunner:
         """Enqueue delivery of a finished task result via the exactly-once path.
 
         Used by startup recovery: the same command the pump enqueues when a
-        live process terminates, so redelivery shares the status/delivered
-        checks and the note/report-run semantics of `_handle_terminated`.
+        live process terminates, so redelivery shares the status checks and
+        the note/report-run semantics of `_handle_terminated`.
         """
         self._inbox.put_nowait(_ProcessTerminated(task_id=task_id))
 
@@ -819,6 +844,16 @@ class _DialogTaskSpawner:
 
     async def spawn(self, title: str, prompt: str) -> str:
         return await self._runner.spawn_task(title, prompt)
+
+
+class _DialogTaskDeleter:
+    """TaskDeleter port bound to one dialog: stops live task processes."""
+
+    def __init__(self, runner: ConversationRunner) -> None:
+        self._runner = runner
+
+    async def delete(self, task_id: str) -> TaskDeleteOutcome:
+        return await self._runner.delete_task(task_id)
 
 
 class ConversationManager:
@@ -911,8 +946,8 @@ class ConversationManager:
         try:
             runner = await self.get_or_create_runner(task.user_id, task.channel)
             await runner.record_system_note(TASK_INTERRUPTED_TEMPLATE.format(title=task.title))
-            await self._tasks.mark_delivered(task.id)
             await self._report_orphaned_outcome(task)
+            await self._tasks.delete(task.id)
         except Exception:
             logger.exception("orphaned task recovery failed: task=%s", task.id)
 

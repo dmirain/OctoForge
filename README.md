@@ -48,8 +48,9 @@ OctoForge строится вокруг другой идеи:
                      финал, отмена; LoopControl — инъекции и отмена прогона
                         /                                 \
          LLMClient (OpenAI-совм., SSE)         SkillRegistry — базовые скилы:
-                                               http_request, task_spawn/list, cron_*,
-                                               skills_search, instruction_save, external_call,
+                                               http_request, task_create/list/delete,
+                                               cron_pause/resume, skills_search,
+                                               instruction_save, external_call,
                                                data_*, memory_*, web_search
                                          |
     instructions · datasets · memory · cron · tasks — SQL-модули ядра (SQLite)

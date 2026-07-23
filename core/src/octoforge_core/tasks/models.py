@@ -39,7 +39,6 @@ class Task:
     status: TaskStatus = TaskStatus.PENDING
     result: str | None = None
     error: str | None = None
-    result_delivered: bool = False
     created_at: datetime = field(default_factory=utc_now)
     started_at: datetime | None = None
     finished_at: datetime | None = None

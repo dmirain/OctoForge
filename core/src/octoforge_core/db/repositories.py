@@ -261,11 +261,6 @@ class SqlAlchemyTaskStore:
             )
             return [_to_task(row) for row in result.all()]
 
-    async def mark_running(self, task: Task) -> None:
-        task.status = TaskStatus.RUNNING
-        task.started_at = utc_now()
-        await self._update(task)
-
     async def mark_done(self, task: Task, result: str) -> None:
         task.status = TaskStatus.DONE
         task.result = result
@@ -278,36 +273,12 @@ class SqlAlchemyTaskStore:
         task.finished_at = utc_now()
         await self._update(task)
 
-    async def cancel(self, task_id: str) -> None:
+    async def delete(self, task_id: str) -> None:
         async with self._session_factory() as session:
             row = await session.get(TaskRow, task_id)
             if row is None:
                 raise TaskNotFoundError(task_id)
-            row.status = TaskStatus.CANCELLED.value
-            row.finished_at = utc_now()
-            await session.commit()
-
-    async def is_cancelled(self, task_id: str) -> bool:
-        async with self._session_factory() as session:
-            row = await session.get(TaskRow, task_id)
-            return row is not None and row.status == TaskStatus.CANCELLED.value
-
-    async def count_active(self, dialog_id: str) -> int:
-        async with self._session_factory() as session:
-            count = await session.scalar(
-                select(func.count(TaskRow.id)).where(
-                    TaskRow.dialog_id == dialog_id,
-                    TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value)),
-                )
-            )
-            return int(count or 0)
-
-    async def mark_delivered(self, task_id: str) -> None:
-        async with self._session_factory() as session:
-            row = await session.get(TaskRow, task_id)
-            if row is None:
-                raise TaskNotFoundError(task_id)
-            row.result_delivered = True
+            await session.delete(row)
             await session.commit()
 
     async def fail_orphaned(self, error: str) -> TaskList:
@@ -329,10 +300,7 @@ class SqlAlchemyTaskStore:
         async with self._session_factory() as session:
             result = await session.scalars(
                 select(TaskRow)
-                .where(
-                    TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)),
-                    TaskRow.result_delivered.is_(False),
-                )
+                .where(TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)))
                 .order_by(TaskRow.created_at)
             )
             return [_to_task(row) for row in result.all()]
@@ -396,7 +364,6 @@ def _to_task_row(task: Task) -> TaskRow:
         status=task.status.value,
         result=task.result,
         error=task.error,
-        result_delivered=task.result_delivered,
         created_at=task.created_at,
         started_at=task.started_at,
         finished_at=task.finished_at,
@@ -415,7 +382,6 @@ def _to_task(row: TaskRow) -> Task:
         status=TaskStatus(row.status),
         result=row.result,
         error=row.error,
-        result_delivered=row.result_delivered,
         created_at=row.created_at,
         started_at=row.started_at,
         finished_at=row.finished_at,

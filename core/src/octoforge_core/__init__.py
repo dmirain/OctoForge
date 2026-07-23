@@ -80,7 +80,7 @@ from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.memory.api import MemoryStore
-from octoforge_core.ports import LLMClient, TaskStore
+from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.skills.base import Skill, SkillContext, SkillSpec
 from octoforge_core.skills.errors import (
@@ -90,7 +90,8 @@ from octoforge_core.skills.errors import (
 )
 from octoforge_core.skills.registry import SkillRegistry
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.spawner import TaskSpawner
+from octoforge_core.tasks.spawner import TaskDeleteOutcome, TaskDeleter, TaskSpawner
+from octoforge_core.tasks.store import TaskStore
 from octoforge_core.time import utc_now
 
 __all__ = [
@@ -161,6 +162,8 @@ __all__ = [
     "SqlAlchemyTaskStore",
     "SummaryStore",
     "Task",
+    "TaskDeleteOutcome",
+    "TaskDeleter",
     "TaskKind",
     "TaskOutcomeListener",
     "TaskSpawner",

@@ -21,7 +21,7 @@ from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 FIRST_VERSION = 1
 SECOND_VERSION = 2
-CORE_SKILLS_COUNT = 8
+CORE_SKILLS_COUNT = 7
 TWO_ENTRIES = 2
 
 ENTRY_ALPHA = SystemSkill(
@@ -66,13 +66,12 @@ async def service() -> AsyncIterator[InstructionService]:
     await engine.dispose()
 
 
-async def test_core_registry_covers_the_eight_module_scenarios() -> None:
+async def test_core_registry_covers_the_module_scenarios() -> None:
     assert len(CORE_SYSTEM_SKILLS) == CORE_SKILLS_COUNT
     assert {entry.kind for entry in CORE_SYSTEM_SKILLS} == {InstructionType.SKILL}
     titles = {entry.title for entry in CORE_SYSTEM_SKILLS}
     assert titles == {
-        "cron_jobs",
-        "background_tasks",
+        "deferred_work",
         "user_memory",
         "user_datasets",
         "history_lookup",

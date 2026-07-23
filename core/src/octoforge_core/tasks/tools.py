@@ -1,62 +1,135 @@
-"""Tools of the tasks module: spawn background tasks and list them."""
+"""Tools of the tasks module: create, list and delete deferred work.
 
+`task_create` covers both immediate background work (no `schedule`) and cron
+jobs (with `schedule`); `task_list` shows both in two sections; `task_delete`
+removes either. The two stores stay separate — only the tool surface is
+unified; the schedule path delegates to the cron domain (`create_job`).
+"""
+
+from contextlib import suppress
 from typing import Any
 
-from octoforge_core.ports import TaskStore
+from octoforge_core.cron.api import CronJobNotFoundError, CronStore
+from octoforge_core.cron.tools import (
+    DELETED_MESSAGE,
+    NO_JOBS_MESSAGE,
+    ONE_SHOT_PARAM,
+    PROMPT_PARAM,
+    SCHEDULE_PARAM,
+    TIMEZONE_PARAM,
+    TITLE_PARAM,
+    CronJobDraft,
+    create_job,
+    format_job,
+)
 from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.skills.errors import SkillArgumentsError
-from octoforge_core.tasks.models import Task
+from octoforge_core.tasks.errors import TaskNotFoundError
+from octoforge_core.tasks.models import Task, TaskStatus
+from octoforge_core.tasks.store import TaskStore
 
-SPAWN_NAME = "task_spawn"
-SPAWN_DESCRIPTION = (
-    "Spawn a background task that will be solved asynchronously right now. "
-    "Use it when the user asks to do work in the background (the result comes once, "
-    "when it is ready). NOT for reminders or anything on a schedule — use cron_create."
+CREATE_NAME = "task_create"
+CREATE_DESCRIPTION = (
+    "Create deferred work. Without 'schedule': a background task solved right now — "
+    "the result comes once, when it is ready; use it to keep the conversation free "
+    "during long work. With 'schedule': a cron job waking you with the prompt — "
+    "recurring, or one-time with one_shot=true. Make the prompt self-contained: "
+    "this conversation's context may be gone when the task runs."
 )
-SPAWN_SCHEMA: dict[str, Any] = {
+DEFAULT_TIMEZONE = "UTC"
+CREATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "title": {"type": "string", "description": "Short task title"},
-        "prompt": {"type": "string", "description": "Full instruction for the background solver"},
+        "title": TITLE_PARAM,
+        "prompt": PROMPT_PARAM,
+        "schedule": SCHEDULE_PARAM,
+        "timezone": TIMEZONE_PARAM,
+        "one_shot": ONE_SHOT_PARAM,
     },
     "required": ["title", "prompt"],
 }
-NO_SPAWNER_MESSAGE = "task spawning is not available in this context"
 
 LIST_NAME = "task_list"
-LIST_DESCRIPTION = "List background tasks of this dialog with their statuses and results."
+LIST_DESCRIPTION = (
+    "List your deferred work: background tasks of this dialog (running or awaiting "
+    "result delivery — finished tasks disappear, their results stay in the "
+    "conversation) and your scheduled cron jobs with next fire times."
+)
 LIST_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
+NO_WORK_MESSAGE = "no tasks or scheduled jobs"
 NO_TASKS_MESSAGE = "no tasks"
+TASKS_SECTION = "background tasks:"
+JOBS_SECTION = "scheduled jobs:"
+
+DELETE_NAME = "task_delete"
+DELETE_DESCRIPTION = (
+    "Delete a background task or a cron job by id (as reported by task_list). "
+    "A running task is stopped first, then removed; a scheduled job is removed "
+    "so it never fires again."
+)
+DELETE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {
+            "type": "string",
+            "description": "Task or cron job id as reported by task_list",
+        },
+    },
+    "required": ["task_id"],
+}
+DELETED_TASK_MESSAGE = "deleted task {task_id}"
+NOT_FOUND_MESSAGE = "error: no task or cron job with this id"
+SELF_DELETE_MESSAGE = "error: a running task cannot delete itself"
+NO_SPAWNER_MESSAGE = "task spawning is not available in this context"
 
 
-class TaskSpawnSkill:
-    """Delegates task spawning to the TaskSpawner bound to the skill context."""
+class TaskCreateSkill:
+    """Creates immediate background tasks (spawner) or cron jobs (schedule)."""
+
+    def __init__(self, cron_store: CronStore) -> None:
+        self._cron_store = cron_store
 
     @property
     def spec(self) -> SkillSpec:
         return SkillSpec(
-            name=SPAWN_NAME,
-            description=SPAWN_DESCRIPTION,
-            parameters_schema=SPAWN_SCHEMA,
+            name=CREATE_NAME,
+            description=CREATE_DESCRIPTION,
+            parameters_schema=CREATE_SCHEMA,
         )
 
     async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
-        title = arguments.get("title")
-        if not isinstance(title, str) or not title:
-            raise SkillArgumentsError("title must be a non-empty string")
-        prompt = arguments.get("prompt")
-        if not isinstance(prompt, str) or not prompt:
-            raise SkillArgumentsError("prompt must be a non-empty string")
-        if context.task_spawner is None:
-            raise SkillArgumentsError(NO_SPAWNER_MESSAGE)
-        return await context.task_spawner.spawn(title, prompt)
+        title = _non_empty_string(arguments.get("title"), "title")
+        prompt = _non_empty_string(arguments.get("prompt"), "prompt")
+        schedule = arguments.get("schedule")
+        if schedule is None:
+            if arguments.get("one_shot") is True:
+                raise SkillArgumentsError("one_shot requires a schedule")
+            if context.task_spawner is None:
+                raise SkillArgumentsError(NO_SPAWNER_MESSAGE)
+            return await context.task_spawner.spawn(title, prompt)
+        schedule = _non_empty_string(schedule, "schedule")
+        timezone = arguments.get("timezone")
+        if timezone is None:
+            timezone = DEFAULT_TIMEZONE
+        timezone = _non_empty_string(timezone, "timezone")
+        draft = CronJobDraft(
+            user_id=context.user_id,
+            channel=context.channel,
+            title=title,
+            schedule=schedule,
+            prompt=prompt,
+            timezone=timezone,
+            one_shot=arguments.get("one_shot") is True,
+        )
+        return await create_job(self._cron_store, draft)
 
 
 class TaskListSkill:
-    """Lists tasks of the current dialog."""
+    """Lists background tasks of the dialog and the user's cron jobs."""
 
-    def __init__(self, store: TaskStore) -> None:
+    def __init__(self, store: TaskStore, cron_store: CronStore) -> None:
         self._store = store
+        self._cron_store = cron_store
 
     @property
     def spec(self) -> SkillSpec:
@@ -68,15 +141,77 @@ class TaskListSkill:
 
     async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
         tasks = await self._store.list(context.dialog_id)
-        if not tasks:
-            return NO_TASKS_MESSAGE
-        return "\n".join(self._format_task(task) for task in tasks)
+        jobs = await self._cron_store.list_for_user(context.user_id)
+        if not tasks and not jobs:
+            return NO_WORK_MESSAGE
+        task_lines = "\n".join(_format_task(task) for task in tasks) or NO_TASKS_MESSAGE
+        job_lines = "\n".join(format_job(job) for job in jobs) or NO_JOBS_MESSAGE
+        return f"{TASKS_SECTION}\n{task_lines}\n\n{JOBS_SECTION}\n{job_lines}"
 
-    @staticmethod
-    def _format_task(task: Task) -> str:
-        line = f"{task.id} [{task.status.value}] {task.title}"
-        if task.result is not None:
-            line += f" -> {task.result}"
-        if task.error is not None:
-            line += f" -> error: {task.error}"
-        return line
+
+class TaskDeleteSkill:
+    """Deletes a background task (stopping it first when live) or a cron job."""
+
+    def __init__(self, store: TaskStore, cron_store: CronStore) -> None:
+        self._store = store
+        self._cron_store = cron_store
+
+    @property
+    def spec(self) -> SkillSpec:
+        return SkillSpec(
+            name=DELETE_NAME,
+            description=DELETE_DESCRIPTION,
+            parameters_schema=DELETE_SCHEMA,
+        )
+
+    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+        task_id = _non_empty_string(arguments.get("task_id"), "task_id")
+        task = await self._find_task(task_id, context.dialog_id)
+        if task is not None:
+            return await self._delete_task(task, context)
+        return await self._delete_cron_job(task_id, context)
+
+    async def _find_task(self, task_id: str, dialog_id: str) -> Task | None:
+        """Return the task when it exists and belongs to this dialog."""
+        try:
+            task = await self._store.get(task_id)
+        except TaskNotFoundError:
+            return None
+        if task.dialog_id != dialog_id:
+            return None
+        return task
+
+    async def _delete_task(self, task: Task, context: SkillContext) -> str:
+        if task.id == context.owner_task_id:
+            return SELF_DELETE_MESSAGE
+        if (
+            task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+            and context.task_deleter is not None
+        ):
+            await context.task_deleter.delete(task.id)
+        # the stopped process's finalization may have removed the row already
+        with suppress(TaskNotFoundError):
+            await self._store.delete(task.id)
+        return DELETED_TASK_MESSAGE.format(task_id=task.id)
+
+    async def _delete_cron_job(self, job_id: str, context: SkillContext) -> str:
+        try:
+            await self._cron_store.delete_for_user(context.user_id, job_id)
+        except CronJobNotFoundError:
+            return NOT_FOUND_MESSAGE
+        return DELETED_MESSAGE.format(job_id=job_id)
+
+
+def _non_empty_string(raw: object, argument: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise SkillArgumentsError(f"{argument} must be a non-empty string")
+    return raw
+
+
+def _format_task(task: Task) -> str:
+    line = f"{task.id} [{task.status.value}] {task.title}"
+    if task.result is not None:
+        line += f" -> {task.result}"
+    if task.error is not None:
+        line += f" -> error: {task.error}"
+    return line

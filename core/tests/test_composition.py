@@ -72,11 +72,9 @@ WAIT_TIMEOUT_SECONDS = 2.0
 
 ALL_BASIC_SKILLS = {
     "http_request",
-    "task_spawn",
+    "task_create",
     "task_list",
-    "cron_create",
-    "cron_list",
-    "cron_delete",
+    "task_delete",
     "cron_pause",
     "cron_resume",
     "web_search",

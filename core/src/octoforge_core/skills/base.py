@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from octoforge_core.tasks.spawner import TaskSpawner
+from octoforge_core.tasks.spawner import TaskDeleter, TaskSpawner
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,15 +19,19 @@ class SkillSpec:
 class SkillContext:
     """Per-invocation context available to skills.
 
-    task_spawner is optional: contexts built outside the dialog actor (unit
-    tests, one-off executions) simply have no spawner, and task_spawn reports
-    that instead of failing to construct the context.
+    task_spawner/task_deleter are optional: contexts built outside the dialog
+    actor (unit tests, one-off executions) simply have neither, and the task
+    skills report that instead of failing to construct the context.
+    owner_task_id is the background task the invocation belongs to (None for
+    the foreground): it lets a skill recognize acting upon itself.
     """
 
     user_id: str
     channel: str
     dialog_id: str
     task_spawner: TaskSpawner | None = None
+    task_deleter: TaskDeleter | None = None
+    owner_task_id: str | None = None
 
 
 class Skill(Protocol):
