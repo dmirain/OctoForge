@@ -8,8 +8,8 @@ import httpx
 
 from octoforge_core.net.external import ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.errors import SkillArgumentsError
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.errors import ToolArgumentsError
 
 REQUEST_NAME = "http_request"
 REQUEST_DESCRIPTION = (
@@ -29,7 +29,7 @@ CALL_DESCRIPTION = (
 
 
 class HttpMethod(StrEnum):
-    """HTTP methods allowed for the skill."""
+    """HTTP methods allowed for the tool."""
 
     GET = "GET"
     POST = "POST"
@@ -86,11 +86,11 @@ class HttpRequestParams:
         method = cls._parse_method(arguments.get("method"))
         url = arguments.get("url")
         if not isinstance(url, str) or not url:
-            raise SkillArgumentsError("url must be a non-empty string")
+            raise ToolArgumentsError("url must be a non-empty string")
         headers = cls._parse_headers(arguments.get("headers"))
         body = arguments.get("body")
         if body is not None and not isinstance(body, str):
-            raise SkillArgumentsError("body must be a string")
+            raise ToolArgumentsError("body must be a string")
         return cls(method=method, url=url, headers=headers, body=body)
 
     @staticmethod
@@ -98,7 +98,7 @@ class HttpRequestParams:
         try:
             return HttpMethod(str(raw))
         except ValueError as exc:
-            raise SkillArgumentsError(f"unsupported method: {raw!r}") from exc
+            raise ToolArgumentsError(f"unsupported method: {raw!r}") from exc
 
     @staticmethod
     def _parse_headers(raw: object) -> dict[str, str]:
@@ -108,11 +108,11 @@ class HttpRequestParams:
             isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
         ):
             return dict(raw)
-        raise SkillArgumentsError("headers must be an object of strings")
+        raise ToolArgumentsError("headers must be an object of strings")
 
 
-class HttpRequestSkill:
-    """Skill that performs HTTP requests via an injected client.
+class HttpRequestTool:
+    """Tool that performs HTTP requests via an injected client.
 
     Redirects are not followed: the SSRF guard validates only the requested
     URL, and following a redirect would re-enter unchecked address space.
@@ -131,14 +131,14 @@ class HttpRequestSkill:
         self._timeout = timeout_seconds
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=REQUEST_NAME,
             description=REQUEST_DESCRIPTION,
             parameters_schema=REQUEST_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, perform the request and format the response."""
         params = HttpRequestParams.from_arguments(arguments)
         await self._guard.check(params.url)
@@ -156,25 +156,25 @@ class HttpRequestSkill:
         return f"HTTP {response.status_code}\n{body}"
 
 
-class ExternalCallSkill:
+class ExternalCallTool:
     """Thin adapter over the ExternalCallExecutor."""
 
     def __init__(self, executor: ExternalCallExecutor) -> None:
         self._executor = executor
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=CALL_NAME,
             description=CALL_DESCRIPTION,
             parameters_schema=CALL_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, run the call and format status + body."""
         name = arguments.get("name")
         if not isinstance(name, str) or not name.strip():
-            raise SkillArgumentsError("name must be a non-empty string")
+            raise ToolArgumentsError("name must be a non-empty string")
         params = _parse_params(arguments.get("params"))
         result = await self._executor.execute(name, params, user_id=context.user_id)
         return f"HTTP {result.status}\n{result.body}"
@@ -187,4 +187,4 @@ def _parse_params(raw: object) -> dict[str, str]:
         isinstance(key, str) and isinstance(value, str) for key, value in raw.items()
     ):
         return dict(raw)
-    raise SkillArgumentsError("params must be an object of strings")
+    raise ToolArgumentsError("params must be an object of strings")

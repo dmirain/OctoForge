@@ -18,8 +18,8 @@ from octoforge_core.cron.api import (
     CronStore,
     compute_next_fire,
 )
-from octoforge_core.skills.base import SkillContext, SkillSpec
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolContext, ToolSpec
 
 PAUSE_NAME = "cron_pause"
 RESUME_NAME = "cron_resume"
@@ -129,43 +129,43 @@ async def _find_duplicate(store: CronStore, draft: CronJobDraft) -> CronJob | No
     return None
 
 
-class CronPauseSkill:
+class CronPauseTool:
     """Pauses one of the calling user's cron jobs."""
 
     def __init__(self, store: CronStore) -> None:
         self._store = store
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=PAUSE_NAME,
             description="Pause one of your cron jobs: it stays listed but never fires.",
             parameters_schema=JOB_ID_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         return await _set_enabled(self._store, context, str(arguments["job_id"]), enabled=False)
 
 
-class CronResumeSkill:
+class CronResumeTool:
     """Resumes one of the calling user's cron jobs."""
 
     def __init__(self, store: CronStore) -> None:
         self._store = store
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=RESUME_NAME,
             description="Resume a paused cron job; the next fire time is recomputed from now.",
             parameters_schema=JOB_ID_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         return await _set_enabled(self._store, context, str(arguments["job_id"]), enabled=True)
 
 
-async def _set_enabled(store: CronStore, context: SkillContext, job_id: str, enabled: bool) -> str:
+async def _set_enabled(store: CronStore, context: ToolContext, job_id: str, enabled: bool) -> str:
     """Shared pause/resume flow with ownership and schedule checks."""
     try:
         job = await store.get(job_id)

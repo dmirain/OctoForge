@@ -4,8 +4,8 @@ from typing import Any
 
 from octoforge_core.datasets.api import DatasetHit, DatasetService
 from octoforge_core.instructions.api import InstructionService, InstructionType, SearchHit
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.errors import SkillArgumentsError
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.errors import ToolArgumentsError
 
 SEARCH_NAME = "skills_search"
 SEARCH_DESCRIPTION = (
@@ -61,7 +61,7 @@ SAVE_SCHEMA: dict[str, Any] = {
 }
 
 
-class SkillsSearchSkill:
+class SkillsSearchTool:
     """Thin adapter over the InstructionService facade (and, optionally, DatasetService)."""
 
     def __init__(
@@ -75,14 +75,14 @@ class SkillsSearchSkill:
         self._datasets = datasets
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=SEARCH_NAME,
             description=SEARCH_DESCRIPTION,
             parameters_schema=SEARCH_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, search both stores and format the hits as text.
 
         Instructions come first (in the service's ranking order), dataset
@@ -93,7 +93,7 @@ class SkillsSearchSkill:
         """
         query = arguments.get("query")
         if not isinstance(query, str) or not query.strip():
-            raise SkillArgumentsError("query must be a non-empty string")
+            raise ToolArgumentsError("query must be a non-empty string")
         k = self._parse_k(arguments.get("k"))
         hits = await self._service.search(query, k)
         bodies = [_instruction_body(hit) for hit in hits]
@@ -108,35 +108,35 @@ class SkillsSearchSkill:
         if raw is None:
             return self._default_k
         if isinstance(raw, bool) or not isinstance(raw, int):
-            raise SkillArgumentsError("k must be an integer")
+            raise ToolArgumentsError("k must be an integer")
         if raw < 1 or raw > MAX_K:
-            raise SkillArgumentsError(f"k must be between 1 and {MAX_K}")
+            raise ToolArgumentsError(f"k must be between 1 and {MAX_K}")
         return raw
 
 
-class InstructionSaveSkill:
+class InstructionSaveTool:
     """Thin adapter over the InstructionService facade."""
 
     def __init__(self, service: InstructionService) -> None:
         self._service = service
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=SAVE_NAME,
             description=SAVE_DESCRIPTION,
             parameters_schema=SAVE_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, upsert the instruction and confirm with the version."""
         kind = _parse_kind(arguments.get("type"))
         title = arguments.get("title")
         if not isinstance(title, str) or not title.strip():
-            raise SkillArgumentsError("title must be a non-empty string")
+            raise ToolArgumentsError("title must be a non-empty string")
         content = arguments.get("content")
         if not isinstance(content, str) or not content.strip():
-            raise SkillArgumentsError("content must be a non-empty string")
+            raise ToolArgumentsError("content must be a non-empty string")
         tags = _parse_tags(arguments.get("tags"))
         instruction = await self._service.save(kind, title, content, tags)
         return SAVED_TEMPLATE.format(
@@ -202,7 +202,7 @@ def _parse_kind(raw: object) -> InstructionType:
     try:
         return InstructionType(str(raw))
     except ValueError as exc:
-        raise SkillArgumentsError(f"unsupported instruction type: {raw!r}") from exc
+        raise ToolArgumentsError(f"unsupported instruction type: {raw!r}") from exc
 
 
 def _parse_tags(raw: object) -> tuple[str, ...]:
@@ -210,4 +210,4 @@ def _parse_tags(raw: object) -> tuple[str, ...]:
         return ()
     if isinstance(raw, list) and all(isinstance(tag, str) for tag in raw):
         return tuple(raw)
-    raise SkillArgumentsError("tags must be an array of strings")
+    raise ToolArgumentsError("tags must be an array of strings")

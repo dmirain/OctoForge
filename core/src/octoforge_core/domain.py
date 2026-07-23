@@ -17,7 +17,7 @@ class MessageRole(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
-    """A skill invocation requested by the LLM."""
+    """A tool invocation requested by the LLM."""
 
     id: str
     name: str

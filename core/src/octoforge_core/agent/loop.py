@@ -1,4 +1,4 @@
-"""Agent loop: streams events while iterating LLM calls and skill executions."""
+"""Agent loop: streams events while iterating LLM calls and tool executions."""
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -29,8 +29,8 @@ from octoforge_core.llm.events import (
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Usage
 from octoforge_core.ports import LLMClient
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.registry import SkillRegistry
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.registry import ToolRegistry
 
 MAX_ITERATIONS_MESSAGE = "Agent loop reached the iteration limit"
 EMPTY_STREAM_MESSAGE = "LLM stream ended without a final message"
@@ -85,7 +85,7 @@ class _ToolRunTracker:
     deterministic under concurrent execution.
     """
 
-    def __init__(self, registry: SkillRegistry, context: SkillContext) -> None:
+    def __init__(self, registry: ToolRegistry, context: ToolContext) -> None:
         self._registry = registry
         self._context = context
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -173,9 +173,9 @@ class _ToolRunTracker:
     async def _execute_one(self, call: ToolCall) -> tuple[str, str | None]:
         """Execute one call; failures become error output for the LLM."""
         try:
-            skill = self._registry.get(call.name)
-            return await skill.execute(call.arguments, self._context), None
-        except Exception as exc:  # skill failures are reported back to the LLM
+            tool = self._registry.get(call.name)
+            return await tool.execute(call.arguments, self._context), None
+        except Exception as exc:  # tool failures are reported back to the LLM
             error = format_error(exc)
             return f"{ERROR_OUTPUT_PREFIX}{error}", error
 
@@ -186,7 +186,7 @@ class AgentLoop:
     def __init__(
         self,
         llm_client: LLMClient,
-        registry: SkillRegistry,
+        registry: ToolRegistry,
         max_iterations: int,
         stream_idle_timeout: float | None = None,
     ) -> None:
@@ -199,7 +199,7 @@ class AgentLoop:
         self,
         history: list[ChatMessage],
         control: LoopControl,
-        context: SkillContext,
+        context: ToolContext,
     ) -> AsyncIterator[LoopEvent]:
         """Run the loop, yielding events; new messages are appended to history."""
         return self._run(history, control, context)
@@ -208,7 +208,7 @@ class AgentLoop:
         self,
         history: list[ChatMessage],
         control: LoopControl,
-        context: SkillContext,
+        context: ToolContext,
     ) -> AsyncIterator[LoopEvent]:
         specs = self._registry.specs(context)
         for index in range(self._max_iterations):
@@ -242,7 +242,7 @@ class AgentLoop:
         history: list[ChatMessage],
         control: LoopControl,
         tracker: _ToolRunTracker,
-        specs: list[SkillSpec],
+        specs: list[ToolSpec],
     ) -> AsyncIterator[LoopEvent]:
         """Stream one LLM call, spawning eager tool runs as calls become ready."""
         stream = self._llm.stream(history, tools=specs)

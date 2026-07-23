@@ -15,8 +15,8 @@ from octoforge_core.datasets.api import (
     DatasetService,
 )
 from octoforge_core.datasets.validation import parse_schema, validate_record
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.errors import SkillArgumentsError
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.errors import ToolArgumentsError
 
 PUT_NAME = "data_put"
 PUT_DESCRIPTION = (
@@ -105,21 +105,21 @@ FORGET_SCHEMA: dict[str, Any] = {
 }
 
 
-class DataPutSkill:
+class DataPutTool:
     """Thin adapter over the DatasetService facade."""
 
     def __init__(self, service: DatasetService) -> None:
         self._service = service
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=PUT_NAME,
             description=PUT_DESCRIPTION,
             parameters_schema=PUT_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, create the dataset if absent and append the record."""
         name = _dataset_name(arguments.get("dataset"))
         record = _record_payload(arguments.get("record"))
@@ -127,7 +127,7 @@ class DataPutSkill:
         try:
             validate_record(dataset.schema, record)
         except DatasetRecordValidationError as exc:
-            raise SkillArgumentsError(
+            raise ToolArgumentsError(
                 f"record does not match the schema of dataset '{name}': "
                 + "; ".join(exc.violations)
             ) from exc
@@ -153,7 +153,7 @@ class DataPutSkill:
         schema = _creation_schema(arguments.get("schema"))
         description = _optional_text(arguments.get("description"), "description")
         if schema is None or description is None:
-            raise SkillArgumentsError(CREATION_HINT.format(name=name))
+            raise ToolArgumentsError(CREATION_HINT.format(name=name))
         usage_notes = _optional_text(arguments.get("usage_notes"), "usage_notes") or ""
         retention = _optional_text(arguments.get("retention"), "retention") or ""
         try:
@@ -166,7 +166,7 @@ class DataPutSkill:
         return dataset, True
 
 
-class DataQuerySkill:
+class DataQueryTool:
     """Thin adapter over the DatasetService facade."""
 
     def __init__(self, service: DatasetService, default_limit: int, max_limit: int) -> None:
@@ -175,14 +175,14 @@ class DataQuerySkill:
         self._max_limit = max_limit
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=QUERY_NAME,
             description=QUERY_DESCRIPTION,
             parameters_schema=QUERY_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, query and format the records as JSON lines."""
         name = _dataset_name(arguments.get("dataset"))
         equals = _equals_filter(arguments.get("equals"))
@@ -205,31 +205,31 @@ class DataQuerySkill:
         if raw is None:
             return self._default_limit
         if isinstance(raw, bool) or not isinstance(raw, int):
-            raise SkillArgumentsError("limit must be an integer")
+            raise ToolArgumentsError("limit must be an integer")
         if raw < 1 or raw > self._max_limit:
-            raise SkillArgumentsError(f"limit must be between 1 and {self._max_limit}")
+            raise ToolArgumentsError(f"limit must be between 1 and {self._max_limit}")
         return raw
 
 
-class DataForgetSkill:
+class DataForgetTool:
     """Thin adapter over the DatasetService facade."""
 
     def __init__(self, service: DatasetService) -> None:
         self._service = service
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=FORGET_NAME,
             description=FORGET_DESCRIPTION,
             parameters_schema=FORGET_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, delete the dataset and report the record count."""
         name = arguments.get("dataset")
         if not isinstance(name, str) or not name.strip():
-            raise SkillArgumentsError("dataset must be a non-empty string")
+            raise ToolArgumentsError("dataset must be a non-empty string")
         try:
             records_count = await self._service.delete_dataset(context.user_id, name)
         except DatasetNotFoundError:
@@ -239,13 +239,13 @@ class DataForgetSkill:
 
 def _dataset_name(raw: object) -> str:
     if not isinstance(raw, str) or not raw.strip():
-        raise SkillArgumentsError("dataset must be a non-empty string")
+        raise ToolArgumentsError("dataset must be a non-empty string")
     return raw
 
 
 def _record_payload(raw: object) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        raise SkillArgumentsError("record must be an object")
+        raise ToolArgumentsError("record must be an object")
     return raw
 
 
@@ -255,14 +255,14 @@ def _creation_schema(raw: object) -> DatasetSchema | None:
     try:
         return parse_schema(raw)
     except DatasetSchemaError as exc:
-        raise SkillArgumentsError(f"invalid schema: {exc}") from exc
+        raise ToolArgumentsError(f"invalid schema: {exc}") from exc
 
 
 def _optional_text(raw: object, argument: str) -> str | None:
     if raw is None:
         return None
     if not isinstance(raw, str) or not raw.strip():
-        raise SkillArgumentsError(f"{argument} must be a non-empty string")
+        raise ToolArgumentsError(f"{argument} must be a non-empty string")
     return raw
 
 
@@ -270,7 +270,7 @@ def _equals_filter(raw: object) -> dict[str, Any] | None:
     if raw is None:
         return None
     if not isinstance(raw, dict) or not all(isinstance(key, str) for key in raw):
-        raise SkillArgumentsError("equals must be an object with string keys")
+        raise ToolArgumentsError("equals must be an object with string keys")
     return raw
 
 
@@ -278,7 +278,7 @@ def _date_boundary(raw: object, argument: str, *, end_of_day: bool) -> datetime 
     if raw is None:
         return None
     if not isinstance(raw, str) or not raw.strip():
-        raise SkillArgumentsError(f"{argument} must be an ISO date or datetime string")
+        raise ToolArgumentsError(f"{argument} must be an ISO date or datetime string")
     text = raw.strip()
     try:
         parsed_date = date.fromisoformat(text)
@@ -291,7 +291,7 @@ def _date_boundary(raw: object, argument: str, *, end_of_day: bool) -> datetime 
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError as exc:
-        raise SkillArgumentsError(f"{argument} must be an ISO date or datetime string") from exc
+        raise ToolArgumentsError(f"{argument} must be an ISO date or datetime string") from exc
     if parsed.tzinfo is None:
         # naive datetimes are read as UTC (UTC everywhere convention)
         return parsed.replace(tzinfo=UTC)

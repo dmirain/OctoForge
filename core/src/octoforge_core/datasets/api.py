@@ -1,6 +1,6 @@
 """Public boundary of the datasets module.
 
-Everything the rest of the system (skills, executors) may know about datasets
+Everything the rest of the system (tools, executors) may know about datasets
 lives here: the `DatasetService` protocol, the `DatasetStore` storage port,
 the JSON-serializable DTOs and the module errors.
 
@@ -235,7 +235,7 @@ class DatasetService(Protocol):
         a dataset owned by someone else looks absent. Raises
         `DatasetNotFoundError` when no such dataset exists for this owner.
         Payload validation against the schema is the caller's duty — the
-        service trusts it (the skills validate before calling).
+        service trusts it (the tools validate before calling).
         """
         ...
 

@@ -16,7 +16,7 @@ from octoforge_core import (
     Usage,
 )
 from octoforge_core.llm.openai import OpenAICompatibleClient
-from octoforge_core.skills.base import SkillSpec
+from octoforge_core.tools.base import ToolSpec
 
 BASE_URL = "https://llm.example.com/v1"
 API_KEY = "secret-key"
@@ -132,7 +132,7 @@ async def test_tools_serialized_into_payload() -> None:
         return success_response()
 
     tools = [
-        SkillSpec(
+        ToolSpec(
             name=TOOL_NAME,
             description=TOOL_DESCRIPTION,
             parameters_schema={"type": "object"},

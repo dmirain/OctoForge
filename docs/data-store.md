@@ -14,7 +14,7 @@
 
 ### `datasets` — дескриптор (4-й тип инструкции)
 
-`id`, `owner_user_id` (**всегда per-user**, в отличие от глобальных knowledge/skill/tool),
+`id`, `owner_user_id` (**всегда per-user**, в отличие от глобальных knowledge/skill/endpoint),
 `name`, `description`, `schema` (JSON: поля, типы, обязательность), `usage_notes`
 (как писать/читать/агрегировать), `retention` (политика хранения), `embedding`,
 `version`, `created_at`, `updated_at`; unique (`owner_user_id`, `name`).

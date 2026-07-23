@@ -44,11 +44,11 @@ core/                          # библиотека octoforge-core — дом�
     ports.py                   # Protocol-порты: LLMClient, TaskStore
     composition.py             # переиспользуемые builder'ы сборки (P5): build_llm_client,
                                #   build_instruction_service, build_dataset_service,
-                               #   build_external_executor, build_skill_registry,
+                               #   build_external_executor, build_tool_registry,
                                #   build_agent_loop, build_compactor, build_router,
                                #   build_cron_outcome_reporter, build_runner_config,
                                #   build_conversation_manager, build_cron_scheduler;
-                               #   бандлы SkillLimits/SkillStores/SkillServices/RunnerOptions;
+                               #   бандлы ToolLimits/ToolStores/ToolServices/RunnerOptions;
                                #   только порты и конфиги, без fastapi и web-Settings
     agent/
       events.py                # LoopEvent: IterationStarted, TextDelta, AssistantMessage,
@@ -67,11 +67,11 @@ core/                          # библиотека octoforge-core — дом�
                                #   TaskSpawner, wake для крон-выстрелов, порт
                                #   TaskOutcomeListener для исходов cron-задач),
                                #   ConversationManager, RunnerConfig, ConversationEvent
-    skills/                    # фреймворк тулов; реализации — в доменных модулях:
+    tools/                     # фреймворк тулов; реализации — в доменных модулях:
                                #   cron/tools.py, memory/tools.py, datasets/tools.py,
                                #   context/tools.py, tasks/tools.py, search/tools.py,
                                #   net/tools.py, instructions/tools.py
-      base.py                  # Skill (Protocol), SkillSpec, SkillContext (+ опциональные task_spawner/task_deleter, owner_task_id)
+      base.py                  # Tool (Protocol), ToolSpec, ToolContext (+ опциональные task_spawner/task_deleter, owner_task_id)
       registry.py, errors.py   # реестр + ошибки
     tasks/
       models.py                # Task, TaskKind (RUN), TaskStatus (PENDING|RUNNING|DONE|FAILED|CANCELLED)
@@ -157,18 +157,18 @@ core/                          # библиотека octoforge-core — дом�
       external.py              # ExternalCallExecutor: шаблоны, whitelist-авторизация
                                #   (+ темплейт {user_id} в значении заголовка), SSRF-гвард
       errors.py                # SsrfBlockedError, ToolSpecError, ExternalCallError
-    # дальше: skills/dynamic/ (Jinja-движок)
+    # дальше: tools/dynamic/ (Jinja-движок)
   tests/                       # test_agent_loop, test_composition, test_conversation_runner,
                                # test_cron_store,
-                               # test_cron_scheduler, test_data_skills,
+                               # test_cron_scheduler, test_data_tools,
                                # test_datasets, test_datasets_store_port, test_dataset_validation,
                                # test_db_repositories, test_embeddings, test_external_call,
-                               # test_http_request_skill, test_instruction_skills,
+                               # test_http_request_tool, test_instruction_tools,
                                # test_instructions_local, test_instructions_store_port,
-                               # test_memory, test_memory_skills,
+                               # test_memory, test_memory_tools,
                                # test_openai_client, test_openai_stream, test_prompts,
-                               # test_router, test_serper_provider, test_skills_registry,
-                               # test_ssrf_guard, test_tasks, test_web_search_skill
+                               # test_router, test_serper_provider, test_tools_registry,
+                               # test_ssrf_guard, test_tasks, test_web_search_tool
 web/                           # приложение octoforge-web — FastAPI-обёртка
   pyproject.toml               # deps: octoforge-core, fastapi, uvicorn, pydantic-settings
   src/octoforge_web/
@@ -195,13 +195,13 @@ web/                           # приложение octoforge-web — FastAPI-
       client.py                # порт TelegramClient + TelegramBotClient на httpx (getUpdates,
                                #   sendMessage, editMessageText, sendChatAction)
       bridge.py                # TelegramBridge: события runner'а → черновик с throttle-правками,
-                               #   чанкер 4096, статус-строки скилов; текст → runner.submit
+                               #   чанкер 4096, статус-строки тулов; текст → runner.submit
       markdown.py              # markdown → Telegram-HTML (parse_mode=HTML) + split_html_safe
       poller.py                # TelegramPoller (long-poll, offset, backlog-drain, backoff) +
                                #   TelegramBridgeRegistry (get-or-create + прогрев из БД)
       __main__.py              # standalone-запуск: только Telegram-адаптер, без HTTP API
                                #   (python -m octoforge_web.telegram; порт не слушается)
-    static/index.html          # чат-UI: SSE-стрим, шаги скилов, маркеры процессов,
+    static/index.html          # чат-UI: SSE-стрим, шаги тулов, маркеры процессов,
                                #   кнопка «Стоп», поле имени (= user_id)
   tests/                       # test_dialog_api.py, test_cron_api.py, test_sse.py, test_config.py,
                                # test_system_skills.py, test_prompts.py, test_modularity.py,
@@ -220,7 +220,7 @@ web/                           # приложение octoforge-web — FastAPI-
 - `IterationStarted(index)` — начало итерации рассуждения;
 - `TextDelta(text)` — токен ответа по мере стриминга LLM;
 - `AssistantMessage(message, interrupted)` — завершённое сообщение итерации (interrupted — обрыв по отмене);
-- `ToolCallRequested / ToolCallCompleted(output) / ToolCallFailed(error)` — шаги скилов;
+- `ToolCallRequested / ToolCallCompleted(output) / ToolCallFailed(error)` — шаги тулов;
 - `Finished(message)` — финальный ответ; `Cancelled` — отмена; `Failed(error)` — срыв без ответа;
 - `ProcessSuspended / ProcessResumed(process_id, title)` и
   `ProcessCompleted(process_id, title, status)` — маркеры уровня актора (не петли):
@@ -340,7 +340,7 @@ timeout")`. Подробности — [streaming.md](streaming.md).
   дословно); при переполнении хвоста (`OF_CONTEXT_HOT_MAX_CHARS`) стартует
   фоновая компакция — старейшие сообщения хвоста одним LLM-вызовом в запись
   `dialog_summaries` (guard «одна компакция на диалог», фейл = warning-лог).
-  Модуль `context/` + скил `history_search` — см. [context.md](context.md).
+  Модуль `context/` + тул `history_search` — см. [context.md](context.md).
 
 ### Роутер сообщений (`agent/router.py`)
 
@@ -469,8 +469,8 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
   mark_failed/delete/fail_orphaned/list_undelivered (терминальные строки — это
   краш-остатки до редоставки). Реализации:
   `SqlAlchemyTaskStore` (`db/repositories.py`, боевой путь) и `InMemoryTaskStore` (тесты).
-- **Спавн**: скил `task_create` без `schedule` делегирует порту `TaskSpawner`
-  (`tasks/spawner.py`), который актор биндит на диалог (`SkillContext.task_spawner`,
+- **Спавн**: тул `task_create` без `schedule` делегирует порту `TaskSpawner`
+  (`tasks/spawner.py`), который актор биндит на диалог (`ToolContext.task_spawner`,
   опциональный — контексты вне актора обходятся без него). Спавнер проверяет лимит
   процессов (отказ текстом), создаёт `Task(kind=RUN, status=RUNNING,
   input={title, prompt})` и сразу поднимает bg-процесс с id = task.id, коротким
@@ -481,10 +481,10 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
   публикация заметки → удаление записи (краш между ними лечится редоставкой на
   старте). Остановленный процесс записи CANCELLED не делает: репорт исхода в
   `TaskOutcomeListener` → удаление записи.
-- **Удаление**: скил `task_delete` (поглощает удаление крон-задач): активную задачу
+- **Удаление**: тул `task_delete` (поглощает удаление крон-задач): активную задачу
   останавливает через порт `TaskDeleter` (`tasks/spawner.py`, bound в акторе —
   `control.cancel()` + ожидание финализации pump), терминальную удаляет напрямую;
-  самоудаление из собственного прогона отклоняется (`SkillContext.owner_task_id`).
+  самоудаление из собственного прогона отклоняется (`ToolContext.owner_task_id`).
 - **Startup-recovery** (`ConversationManager.recover_interrupted()`, вызов из
   `runtime()` до старта планировщика и поверхностей): процессы живут в памяти, поэтому
   при рестарте их «тени» в `tasks` подметает sweep — `fail_orphaned(error)`
@@ -510,7 +510,7 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
 ## Скилы
 
 > **Модель v3** ([instructions.md](instructions.md)): встроенные функции кода — тулы
-> (кодовые имена `Skill`/`SkillSpec` пока сохраняются), «скил» — сценарий в сторе
+> (кодовые имена `Tool`/`ToolSpec` пока сохраняются), «скил» — сценарий в сторе
 > инструкций, «инструкция типа tool» — эндпоинт. Раздел ниже — про фреймворк тулов.
 
 Скил — единица, которую агент вызывает через LLM tool calling (в терминологии модели
@@ -521,23 +521,23 @@ v3 — тул; переименование кода отложено). Реал
 `instruction_save`, `external_call`, `data_put`, `data_query`, `data_forget`,
 `memory_store`, `memory_search`, `memory_delete`, `cron_pause`, `cron_resume`,
 `web_search`, `history_search`.
-Подключаются в composition root. Имена скилов — с подчёркиваниями, не с точками:
+Подключаются в composition root. Имена тулов — с подчёркиваниями, не с точками:
 точки в function-name несовместимы с OpenAI tool-calling (зафиксированное решение).
-`SkillOrigin` упразднён: `SkillRegistry` хранит скилы под уникальными именами
+`SkillOrigin` упразднён: `ToolRegistry` хранит тулы под уникальными именами
 без деления на типы.
 
-Абстракция (`skills/base.py`): `SkillSpec` (name, description, parameters_schema — JSON Schema);
-`Skill` (Protocol): `spec` + `async execute(arguments, context) -> str`;
-`SkillContext` — per-invocation контекст (user_id, channel, dialog_id + опциональные
+Абстракция (`tools/base.py`): `ToolSpec` (name, description, parameters_schema — JSON Schema);
+`Tool` (Protocol): `spec` + `async execute(arguments, context) -> str`;
+`ToolContext` — per-invocation контекст (user_id, channel, dialog_id + опциональные
 `task_spawner`/`task_deleter` — None вне актора, `task_create` без спавнера отказывает —
-и `owner_task_id` фоновой задачи, из которой вызван скил).
-Аргументы валидирует сам скил (`SkillArgumentsError`).
+и `owner_task_id` фоновой задачи, из которой вызван тул).
+Аргументы валидирует сам тул (`ToolArgumentsError`).
 
 Скил `web_search` зависит от порта `SearchProvider` (модуль `search/`: транспорт-нейтральные
 DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от конкретного поисковика:
 дефолт — `SerperSearchProvider` (serper.dev, регистрируется при `OF_SERPER_TOKEN`),
 инсталлятор подставляет свой провайдер (Bing/Brave/Tavily) в composition root. Форматирование
-выдачи, клэмп `num_results` (1..10) и срез вывода — ответственность скилла.
+выдачи, клэмп `num_results` (1..10) и срез вывода — ответственность тула.
 
 ### Динамические скилы (план, после появления БД)
 
@@ -605,10 +605,10 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
 - **SSRF-гвард** (`net/guard.py`): resolve хоста (resolver инъектируется, в тестах — stub)
   → отказ, если ЛЮБОЙ из адресов private/loopback/link-local (включая 169.254.169.254)/
   multicast/reserved/unspecified или не globally-routable (CGNAT 100.64/10). Применён в
-  `ExternalCallExecutor` и в скиле `http_request` (там тоже `follow_redirects=False` —
+  `ExternalCallExecutor` и в туле `http_request` (там тоже `follow_redirects=False` —
   поведение не изменилось, httpx и раньше не следовал редиректам по умолчанию). Известное
   ограничение TOCTOU/DNS-rebinding задокументировано в docstring гварда.
-- **Рантайм-скилы** — тонкие адаптеры (`instructions/tools.py`): `skills_search(query, k?)`
+- **Рантайм-тулы** — тонкие адаптеры (`instructions/tools.py`): `skills_search(query, k?)`
   (k по умолчанию — `OF_INSTRUCTIONS_TOP_K`; ответ — полные сценарии, без сниппетов),
   `instruction_save(type, title, content, tags?)` (системные записи защищены:
   `SystemInstructionError`), `external_call(name, params?)` (`net/tools.py`).
@@ -631,7 +631,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
 - **Схема датасета** — JSON `{"fields": [{"name", "type", "required?"}]}`; типы
   `string|integer|number|boolean|date|datetime` (`validation.py`: bool не считается
   integer/number, date/datetime — ISO-строки; лишние поля записи разрешены). Валидация
-  записей — на стороне скилов (`data_put`), сервис доверяет вызывающему.
+  записей — на стороне тулов (`data_put`), сервис доверяет вызывающему.
 - **Запросы записей**: SQL-фильтр по `created_at` + `ORDER BY created_at DESC` + cap
   `MAX_SCAN_ROWS` (1000); фильтр `equals` — в памяти, тип-чувствительный (`5 != "5"`);
   агрегация — LLM по выборке. Owner-изоляция — `WHERE owner_user_id` на уровне SQL
@@ -642,7 +642,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `data_query(dataset, equals?, date_from?, date_to?, limit?)` (date-only = весь день
   UTC; лимиты `OF_DATASETS_QUERY_DEFAULT_LIMIT`/`OF_DATASETS_QUERY_MAX_LIMIT`),
   `data_forget(dataset)` (явный каскад DELETE записей, ответ — счётчик).
-- **Дескрипторы в `skills_search`**: скилу передан `DatasetService` (опциональный
+- **Дескрипторы в `skills_search`**: тулу передан `DatasetService` (опциональный
   параметр конструктора), хиты обоих фасадов сливаются по убыванию score; датасеты
   форматируются как `[dataset] <name>` со сниппетом description + списком полей.
 
@@ -671,7 +671,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `OF_MEMORY_SEARCH_MAX_LIMIT`, сниппет 300 символов в одну строку),
   `memory_delete(key, scope?)` (not-found — текстом, не исключением). Имена с
   подчёркиваниями (`memory_store`, не `memory.store`): точки в function-name несовместимы
-  с OpenAI tool-calling — зафиксированное решение, действует для всех будущих скилов.
+  с OpenAI tool-calling — зафиксированное решение, действует для всех будущих тулов.
 - **Промпт**: правило 10 — устойчивые факты и предпочтения пользователя сохранять через
   `memory_store` (scope=user; global — осторожно), перед персональными рекомендациями искать
   через `memory_search`, не дублировать инструкции/датасеты. Автоинъекция памяти в контекст
@@ -730,10 +730,10 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   текст-отказ. Уведомление о результате — существующий путь завершения фоновой задачи.
 - **Своё API как внешнее**: SSRF-гвард += `allowed_prefixes` (пропуск до resolve; в
   composition root — только `OF_SELF_BASE_URL`); `ExternalCallAuth.header_value` +=
-  темплейт `{user_id}` (подстановка из `SkillContext.user_id`; вызов без user_id → без
-  заголовка); скил `external_call` передаёт `context.user_id`. В whitelist composition
+  темплейт `{user_id}` (подстановка из `ToolContext.user_id`; вызов без user_id → без
+  заголовка); тул `external_call` передаёт `context.user_id`. В whitelist composition
   root программно добавляется запись `(self_base_url, "X-User-Id", "{user_id}")`.
-- **Нативные скилы** (`tasks/tools.py` + `cron/tools.py`): `task_create` (создание
+- **Нативные тулы** (`tasks/tools.py` + `cron/tools.py`): `task_create` (создание
   и фоновых задач, и крон-задач), `task_list`, `task_delete`, `cron_pause`,
   `cron_resume` над `CronStore`/`TaskStore` — семантика HTTP-эндпоинтов
   (owner-скоуп, resume пересчитывает `next_fire_at` от now), но без loopback-вызовов:
@@ -769,7 +769,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
 - **Мост** (`telegram/bridge.py`): `TelegramBridge` на чат: постоянная подписка на события
   runner'а (подписка ДО submit — события не реплеятся), рендер в одно «черновое» сообщение:
   дельты текста с throttle-правками (`OF_TELEGRAM_EDIT_THROTTLE_SECONDS`), статус-строки
-  скилов (⚙️/⚠️) и маркеры ухода/возврата процессов (⏸️/▶️) в порядке прихода;
+  тулов (⚙️/⚠️) и маркеры ухода/возврата процессов (⏸️/▶️) в порядке прихода;
   `ProcessCompleted` не рисуется (завершения приходят текстом репорт-прогона). Переполнение
   лимита 4096 — seal текущего сообщения и продолжение в новом (запечатанные головы в
   `_Draft.sealed_chunks`, буфер копится сырым). Зависимость
@@ -801,7 +801,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   отказом, запись остаётся в базе); обладатель CLAIMED-инвайта проходит; остальным —
   вежливый отказ без создания бриджа. Гейт (и админский тул) активируется только при непустом списке админов —
   иначе поверхность открыта, как раньше.
-- **Админский тул** (`telegram/admin.py`): скилл `admin_manage` (действия
+- **Админский тул** (`telegram/admin.py`): тул `admin_manage` (действия
   `list_users`/`generate_invite`/`revoke_invite`/`restore_invite`) регистрируется
   только при включённом Telegram и непустых админах. Отзыв обратим: инвайт
   переводится в REVOKED (поллер блокирует новые сообщения), крон-задачи пользователя
@@ -809,7 +809,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   включает обратно ровно их, не трогая паузы, поставленные самим пользователем;
   уже запущенные процессы добиваются естественно. Тул скрыт от не-админов на уровне
   списка тулов: общий duck-typed хук `visible_to(context)` в
-  `SkillRegistry.specs(context)` (core про инвайтов/админов не знает — хук общий),
+  `ToolRegistry.specs(context)` (core про инвайтов/админов не знает — хук общий),
   плюс проверка допуска первой строкой `execute()`.
 - **Standalone-режим** (`telegram/__main__.py`): `python -m octoforge_web.telegram` поднимает
   только адаптер и крон-планировщик на общем composition root'е (`runtime()` в `main.py`,
@@ -844,7 +844,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   FAILED), `result`, `error`, `created_at`, `started_at`, `finished_at`. Запись живёт
   только в полёте: удаляется при доставке результата или остановке задачи.
 - **instructions** (таблица модуля `instructions/`, см. выше): `id` (uuid str PK), `type`
-  (knowledge|skill|tool, index), `title` (index), `content` (Text), `embedding` (JSON
+  (knowledge|skill|endpoint, index), `title` (index), `content` (Text), `embedding` (JSON
   list[float]), `tags` (JSON list[str]), `version`, `usage_count`, `success_count`,
   `created_at`, `updated_at`; unique (`type`, `title`)
 - **datasets** (таблица модуля `datasets/`, см. выше): `id` (uuid str PK), `owner_user_id`
@@ -894,7 +894,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   поэтому подписаться можно до первого сообщения
 - `GET /health` — liveness (`{status: ok}`); `GET /health/ready` — readiness: проверяет
   `SELECT 1` к БД, при недоступности возвращает 503 `{status: not-ready}`
-- `GET /` — чат-UI (SSE-стрим токенов, шаги скилов, серая курсивная
+- `GET /` — чат-UI (SSE-стрим токенов, шаги тулов, серая курсивная
   строка-маркер о переключениях/завершениях процессов, «Стоп», поле имени =
   user_id, уходит заголовком `X-User-Id`; EventSource не умеет кастомные заголовки, поэтому
   стрим читается через fetch)
@@ -918,12 +918,12 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 
 - `core/tests/test_openai_stream.py` — SSE-парсинг (дельты, склейка tool_calls, [DONE]), `aclose`
 - `core/tests/test_openai_client.py` — non-streaming вызов, tools, tool-история, ошибки
-- `core/tests/test_agent_loop.py` — события прогона, инъекция mid-run, отмена с частичным текстом, ошибка скила, лимит итераций
+- `core/tests/test_agent_loop.py` — события прогона, инъекция mid-run, отмена с частичным текстом, ошибка тула, лимит итераций
 - `core/tests/test_conversation_runner.py` — процессы: submit → fg-стрим + ProcessCompleted;
   новый вопрос mid-run → ProcessSuspended + новый fg (bg дорабатывает молча); INJECT-руление;
   PROMOTE → ProcessResumed; CANCEL по решению роутера; cancel() снимает только форграунд;
   лимит (max=1) → отказ-заметка инъекцией (fg занят) и репорт-прогоном (fg свободен);
-  task_create через скил → bg-процесс → уведомление + репорт + удаление записи;
+  task_create через тул → bg-процесс → уведомление + репорт + удаление записи;
   delete_task останавливает живой bg-процесс (самоудаление отклоняется);
   уведомление инъекцией в занятый fg; гигиена прерванного тёрна; недочитанная инъекция
   получает собственный процесс; пересборка нарратива после «перезапуска» менеджера;
@@ -937,12 +937,12 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   (те же сценарии, что у InMemoryTaskStore: add/get/list/mark_done/mark_failed/delete,
   fail_orphaned, list_undelivered)
 - `core/tests/test_tasks.py` — task_create (немедленный путь через fake-спавнер: делегация,
-  отказ текстом, отсутствие спавнера — SkillArgumentsError; schedule-путь: создание
+  отказ текстом, отсутствие спавнера — ToolArgumentsError; schedule-путь: создание
   крон-задачи, дедуп, timezone UTC по умолчанию, one_shot без schedule — ошибка),
   task_list (две секции), task_delete (терминальная, активная через fake-deleter,
   самоудаление — отказ, крон-поглощение, чужой диалог), InMemoryTaskStore: delete,
   fail_orphaned, list_undelivered, UTC-даты
-- `core/tests/test_http_request_skill.py`, `core/tests/test_skills_registry.py`
+- `core/tests/test_http_request_tool.py`, `core/tests/test_tools_registry.py`
 - `core/tests/test_instructions_local.py` — контрактный набор фасада на `:memory:` (save/upsert
   с бампом версии и пересчётом эмбеддинга, get_by_name с сужением по типу, ранжирование:
   ближний вектор, буст точного title, k, инкремент usage_count, сидирование один раз;
@@ -955,7 +955,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   валидация параметров, whitelist-заголовок только для своего префикса, блок SSRF,
   редирект не следуется, обрезка тела; темплейт `{user_id}` в значении заголовка
   (подстановка, отсутствие user_id → без заголовка, статичное значение неизменно),
-  allowlist-префикс пропускает loopback, скил передаёт `context.user_id`
+  allowlist-префикс пропускает loopback, тул передаёт `context.user_id`
 - `core/tests/test_ssrf_guard.py` — stub-resolver: private/loopback/link-local/multicast/CGNAT/
   IPv6 заблокированы, публичные разрешены, любой приватный из многих блокирует, неразрешимый
   хост и не-http(s) URL заблокированы; allowed_prefixes — пропуск без resolve, остальные
@@ -975,9 +975,9 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   DONE удаляет one-shot задачу, FAILED → backoff с инкрементом серии, лимит → без ретрая
   + сброс, CANCELLED без ретрая, удалённая/непомеченная задача — тихо, обрезка ошибки
   до 500
-- `core/tests/test_cron_skills.py` — скилы cron_*: create (one_shot-флаг, дедуп тройки
-  → «already exists»), list с `last run`/`retry #N`, delete/pause/resume, owner-изоляция
-- `core/tests/test_instruction_skills.py` — адаптеры `skills_search`/`instruction_save`/
+- `core/tests/test_cron_tools.py` — тулы `cron_pause`/`cron_resume` (owner-изоляция,
+  resume пересчитывает `next_fire_at` от now)
+- `core/tests/test_instruction_tools.py` — адаптеры `skills_search`/`instruction_save`/
   `external_call` (валидация аргументов + happy path на фейках)
 - `core/tests/test_datasets.py` — контрактный набор фасада DatasetService на `:memory:`
   (create/get, дубликат имени, одно имя у разных owner'ов, изоляция, query: equals с
@@ -985,7 +985,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   ранжированием и бустом точного имени); сервис строится фабрикой-фикстурой, как у instructions
 - `core/tests/test_dataset_validation.py` — `parse_schema` (ок/ошибки, round-trip с
   `dump_schema`) и `validate_record` (все типы, required, bool ≠ int/number, лишние поля)
-- `core/tests/test_data_skills.py` — `data_put` (создание со schema+description, отказ без
+- `core/tests/test_data_tools.py` — `data_put` (создание со schema+description, отказ без
   них, запись в существующий, нарушения схемы текстом), `data_query` (JSON-строки, фильтры,
   лимиты, date-only границы, not-found текстом), `data_forget` (счётчик, not-found),
   `skills_search` с datasets (merged-выдача с `[dataset]`)
@@ -994,20 +994,20 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   скоуп виден всем, повторный put глобального ключа без дублей, delete, search: подстрока
   case-insensitive по key/content, литеральность LIKE-метасимволов, порядок updated_at DESC,
   limit, пустой query, tags round-trip); стор строится фабрикой-фикстурой, как у datasets
-- `core/tests/test_memory_skills.py` — `memory_store`/`memory_search`/`memory_delete` на
+- `core/tests/test_memory_tools.py` — `memory_store`/`memory_search`/`memory_delete` на
   реальном сторе `:memory:` (scope-парсинг и default, ошибки аргументов, формат ответов,
-  not-found тексты, изоляция и кросс-поверхностная видимость через SkillContext)
+  not-found тексты, изоляция и кросс-поверхностная видимость через ToolContext)
 - `core/tests/test_instructions_store_port.py`, `core/tests/test_datasets_store_port.py` —
   подмена store-портов (P1 модульности): in-memory `InstructionStore`/`DatasetStore`
   инъектируются в немодифицированные сервисы (save/search/get/delete без SQL), vector-capable
   fake получает `search_by_vector` (делегирование, owner в сигнатуре, буст поверх кандидатов)
 - `core/tests/test_composition.py` — переиспользуемые builder'ы (P5 модульности): полный
-  набор базовых скилов из `build_skill_registry` (без `web_search` при `search_provider=None`),
+  набор базовых тулов из `build_tool_registry` (без `web_search` при `search_provider=None`),
   подмена портов через builder'ы (fake `SearchProvider`, in-memory `InstructionStore`),
   рабочий `build_conversation_manager` на SQLite `:memory:` с прогоном диалога
 - `core/tests/test_prompts.py` — `StaticPromptProvider`: вшитые дефолты, кастомный маппинг,
   KeyError на неизвестное имя; `test_router.py` += роутерный промпт из провайдера
-- `core/tests/test_web_search_skill.py` — скил над fake-`SearchProvider` (подмена P3):
+- `core/tests/test_web_search_tool.py` — тул над fake-`SearchProvider` (подмена P3):
   форматирование answer box и позиций, клэмп num_results до провайдера, «no results»,
   SearchError → текст ошибки, срез длинного вывода
 - `core/tests/test_serper_provider.py` — `SerperSearchProvider` на мокнутом httpx: заголовок
@@ -1024,7 +1024,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   composition root (без `main.runtime()`), собранный из core-builder'ов
   (`octoforge_core.composition`): системный+роутерный промпты из файлов,
   fake-`SearchProvider`, in-memory `InstructionStore` — диалог прогоняется целиком
-  (промпты доезжают до LLM, скилы выполняются над подменёнными компонентами)
+  (промпты доезжают до LLM, тулы выполняются над подменёнными компонентами)
 - `web/tests/test_dialog_api.py` — get-or-create диалога, изоляция двух user_id, 400 без
   `X-User-Id`, messages/cancel/events (SSE через генератор), health, UI
 - `web/tests/test_cron_api.py` — create (201 + поля, next_fire_at в будущем, default UTC),
@@ -1035,7 +1035,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - `web/tests/test_telegram_models.py` — парсинг update'ов Bot API (лишние поля игнорируются,
   алиас `from`, неизвестный тип чата отклоняется)
 - `web/tests/test_telegram_bridge.py` — мост на реальном manager'е (ScriptedLLM) + fake
-  TelegramClient: дельты → одно редактируемое сообщение, статус-строки скилов перед ответом,
+  TelegramClient: дельты → одно редактируемое сообщение, статус-строки тулов перед ответом,
   чанкинг >4096 (seal и продолжение), отмена и ошибка LLM — строками в черновике; чанкер
   `split_message` (границы строки/слова, жёсткий рез)
 - `web/tests/test_telegram_poller.py` — команды `/start`/`/cancel`, уведомления группе и
@@ -1055,10 +1055,10 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 
 1. ✅ Скаффолд монорепо: библиотека `core/` + приложение `web/`, Makefile, ruff/mypy/pytest
 2. ✅ Чат без аутентификации: UI, `POST /api/chat`, ядро — прокси к LLM
-3. ✅ Петля + базовые скилы: `AgentLoop` (tool calling), `Skill/SkillSpec/SkillRegistry`, `http_request`
+3. ✅ Петля + базовые тулы: `AgentLoop` (tool calling), `Tool/ToolSpec/ToolRegistry`, `http_request`
 4. ✅ Событийная петля + актор диалога + фоновые задачи (in-memory): стриминг токенов (SSE), инъекции, отмена, `task_create`/`task_list`/`task_delete`, проактивные уведомления, системный промпт answer-first
 5. ✅ (без аутентификации: user_id — доверенная строка от клиента; users/токены отложены) БД (SQLAlchemy async, SQLite), перенос историй/задач в БД; диалоги keyed by (user, channel), поверхности — см. [dialogs.md](dialogs.md); две инсталляции (standalone/distributed) — см. [scaling.md](scaling.md)
-6. Динамические скилы: Jinja-движок + `skill.save/run`; скилы памяти (user/global) ✅ (этап D)
+6. Динамические скилы: Jinja-движок + `skill.save/run`; тулы памяти (user/global) ✅ (этап D)
 7. Агентный контекст: память в контексте (автоинъекция), `GET /api/skills`, `GET /api/tasks`
 8. ✅ LLM-роутер и процессная модель диалога (этап E) — см. [process-model.md](process-model.md)
 9. Инструкции в БД (знание/скил/тул + векторный поиск, этап B ✅) — см. [instructions.md](instructions.md); датасеты пользовательских данных (этап C ✅) — см. [data-store.md](data-store.md); крон-задачи (этап F ✅) — см. [cron.md](cron.md)
@@ -1068,5 +1068,5 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 ## Проверка
 
 - `make check` (ruff → mypy → pytest) — всё зелёное
-- Ручной сценарий: `make run` → http://127.0.0.1:8000 → токены текут по мере генерации; «выполни GET к <url>» — шаг скилла виден в чате; «реши в фоне X» — агент подтверждает и продолжает диалог, результат приходит сам; «Стоп» — ответ обрывается; два разных имени — истории и задачи изолированы; перезапуск приложения не теряет диалог (история восстанавливается из БД)
+- Ручной сценарий: `make run` → http://127.0.0.1:8000 → токены текут по мере генерации; «выполни GET к <url>» — шаг тула виден в чате; «реши в фоне X» — агент подтверждает и продолжает диалог, результат приходит сам; «Стоп» — ответ обрывается; два разных имени — истории и задачи изолированы; перезапуск приложения не теряет диалог (история восстанавливается из БД)
 - Целевой сценарий: два юзера → память не смешивается, скил общий, задачи разных юзеров изолированы

@@ -29,9 +29,9 @@ def test_web_pack_declares_the_weather_endpoint_and_scenarios() -> None:
     spec = json.loads(endpoint.content)
     assert spec["url_template"].startswith("https://wttr.in/")
     for skill_title in ("get_current_weather", "compare_weather_two_cities"):
-        skill = by_title[skill_title]
-        assert skill.kind is InstructionType.SKILL
-        assert "wttr_in_weather" in skill.content
+        record = by_title[skill_title]
+        assert record.kind is InstructionType.SKILL
+        assert "wttr_in_weather" in record.content
 
 
 @pytest.fixture()

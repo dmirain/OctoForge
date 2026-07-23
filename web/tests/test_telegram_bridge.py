@@ -12,8 +12,8 @@ from octoforge_core import (
     DialogRepository,
     MessageRepository,
     MessageRole,
-    SkillRegistry,
-    SkillSpec,
+    ToolRegistry,
+    ToolSpec,
 )
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ProcessInfo, RouteDecision
@@ -25,8 +25,8 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
-from octoforge_core.skills.base import SkillContext
 from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.tools.base import ToolContext
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.telegram.bridge import (
@@ -48,7 +48,7 @@ WAIT_TIMEOUT_SECONDS = 5.0
 POLL_SECONDS = 0.01
 REPLY = "final answer"
 PARTIAL = "partial"
-ECHO_SKILL = "echo_skill"
+ECHO_TOOL = "echo_tool"
 ECHO_OUTPUT = "echo output"
 CALL_ID = "call-1"
 LONG_REPLY_TAIL = "x" * 100
@@ -97,14 +97,14 @@ class ScriptedLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         reply = self._replies.pop(0)
         if reply.content:
@@ -121,14 +121,14 @@ class ChunkedLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         for chunk in self._chunks:
             yield LlmTextDelta(text=chunk)
@@ -146,14 +146,14 @@ class StallingLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         yield LlmTextDelta(text=PARTIAL)
         await self.release.wait()
@@ -166,27 +166,27 @@ class FailingLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         yield LlmTextDelta(text=PARTIAL)
         raise RuntimeError("boom")
 
 
-class EchoSkill:
-    """Skill stub returning a fixed output."""
+class EchoTool:
+    """Tool stub returning a fixed output."""
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=ECHO_SKILL, description="echo", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=ECHO_TOOL, description="echo", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         return ECHO_OUTPUT
 
 
@@ -207,7 +207,7 @@ def reply(content: str = REPLY) -> ChatMessage:
 
 
 def tool_call_reply() -> ChatMessage:
-    call = ToolCall(id=CALL_ID, name=ECHO_SKILL, arguments={})
+    call = ToolCall(id=CALL_ID, name=ECHO_TOOL, arguments={})
     return ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=(call,))
 
 
@@ -222,11 +222,11 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 async def make_manager(
     llm_client: LLMClient,
     session_factory: async_sessionmaker[AsyncSession],
-    registry: SkillRegistry | None = None,
+    registry: ToolRegistry | None = None,
 ) -> ConversationManager:
     loop = AgentLoop(
         llm_client=llm_client,
-        registry=registry or SkillRegistry(),
+        registry=registry or ToolRegistry(),
         max_iterations=MAX_ITERATIONS,
     )
     return ConversationManager(
@@ -312,8 +312,8 @@ async def test_long_reply_is_split_into_telegram_sized_messages(
 async def test_tool_call_renders_status_line_before_the_answer(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    registry = SkillRegistry()
-    registry.register(EchoSkill())
+    registry = ToolRegistry()
+    registry.register(EchoTool())
     client = FakeTelegramClient()
     manager = await make_manager(
         ScriptedLLM([tool_call_reply(), reply()]), session_factory, registry
@@ -321,7 +321,7 @@ async def test_tool_call_renders_status_line_before_the_answer(
     bridge = make_bridge(client, manager)
 
     await bridge.handle_text("hi")
-    tool_line = TOOL_LINE_TEMPLATE.format(name=ECHO_SKILL)
+    tool_line = TOOL_LINE_TEMPLATE.format(name=ECHO_TOOL)
     expected = f"{tool_line}\n{REPLY}"
     await wait_until(lambda: client.current_text() == expected if client.sent else False)
 

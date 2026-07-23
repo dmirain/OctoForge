@@ -26,9 +26,9 @@ from octoforge_core.agent.router import ROUTE_TOOL_NAME
 from octoforge_core.agent.runner import ConversationEvent, ConversationManager
 from octoforge_core.composition import (
     RunnerOptions,
-    SkillLimits,
-    SkillServices,
-    SkillStores,
+    ToolLimits,
+    ToolServices,
+    ToolStores,
     build_agent_loop,
     build_conversation_manager,
     build_dataset_service,
@@ -36,7 +36,7 @@ from octoforge_core.composition import (
     build_instruction_service,
     build_router,
     build_runner_config,
-    build_skill_registry,
+    build_tool_registry,
 )
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.context.store import SqlAlchemySummaryStore
@@ -58,9 +58,9 @@ from octoforge_core.llm.usage import Completion
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
-from octoforge_core.skills.base import SkillSpec
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolSpec
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.prompts import FilePromptProvider
@@ -179,7 +179,7 @@ class RootLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.complete_requests.append(list(messages))
         return Completion(
@@ -199,7 +199,7 @@ class RootLLM:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.stream_requests.append(list(messages))
         call_number = len(self.stream_requests)
@@ -251,17 +251,17 @@ def build_third_party_root(
     instructions = build_instruction_service(InMemoryInstructionStore(), LenientEmbedder())
     summary_store = SqlAlchemySummaryStore(session_factory)
     guard = SsrfGuard()
-    registry = build_skill_registry(
+    registry = build_tool_registry(
         http_client,
         guard,
-        stores=SkillStores(
+        stores=ToolStores(
             tasks=InMemoryTaskStore(),
             cron=SqlAlchemyCronStore(session_factory),
             memory=SqlAlchemyMemoryStore(session_factory),
             archive=summary_store,
             summaries=summary_store,
         ),
-        services=SkillServices(
+        services=ToolServices(
             instructions=instructions,
             datasets=build_dataset_service(
                 SqlAlchemyDatasetStore(session_factory),
@@ -274,7 +274,7 @@ def build_third_party_root(
             ),
             search_provider=FakeSearchProvider(),
         ),
-        limits=SkillLimits(
+        limits=ToolLimits(
             instructions_top_k=DEFAULT_K,
             datasets_query_default_limit=QUERY_LIMIT,
             datasets_query_max_limit=QUERY_LIMIT,
@@ -372,7 +372,7 @@ async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     router_system = root.llm.complete_requests[1][0]
     assert router_system.role is MessageRole.SYSTEM
     assert FIRST_QUESTION in router_system.content
-    # the skills ran over the substituted provider and instruction store
+    # the tools ran over the substituted provider and instruction store
     outputs = tool_outputs(events)
     assert any(FAKE_ANSWER in output for output in outputs)
     assert any(SAVED_TITLE in output for output in outputs)

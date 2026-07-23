@@ -25,8 +25,8 @@ from octoforge_web.api.sse import encode_frame, encode_heartbeat, event_to_paylo
 DIALOG_ID = "dlg-1"
 SEQ = 7
 CALL_ID = "call-1"
-SKILL_NAME = "http_request"
-OUTPUT = "skill output"
+TOOL_NAME = "http_request"
+OUTPUT = "tool output"
 ERROR = "boom"
 CONTENT = "answer"
 ITERATION_INDEX = 2
@@ -35,7 +35,7 @@ TITLE = "research"
 STATUS = "done"
 
 ASSISTANT = ChatMessage(role=MessageRole.ASSISTANT, content=CONTENT)
-CALL = ToolCall(id=CALL_ID, name=SKILL_NAME, arguments={"q": 1})
+CALL = ToolCall(id=CALL_ID, name=TOOL_NAME, arguments={"q": 1})
 
 PAYLOAD_CASES: list[tuple[LoopEvent, dict[str, object]]] = [
     (
@@ -54,15 +54,15 @@ PAYLOAD_CASES: list[tuple[LoopEvent, dict[str, object]]] = [
     ),
     (
         ToolCallRequested(call=CALL),
-        {"type": "tool_call_requested", "name": SKILL_NAME, "arguments": {"q": 1}},
+        {"type": "tool_call_requested", "name": TOOL_NAME, "arguments": {"q": 1}},
     ),
     (
         ToolCallCompleted(call=CALL, output=OUTPUT),
-        {"type": "tool_call_completed", "name": SKILL_NAME, "output": OUTPUT},
+        {"type": "tool_call_completed", "name": TOOL_NAME, "output": OUTPUT},
     ),
     (
         ToolCallFailed(call=CALL, error=ERROR),
-        {"type": "tool_call_failed", "name": SKILL_NAME, "error": ERROR},
+        {"type": "tool_call_failed", "name": TOOL_NAME, "error": ERROR},
     ),
     (Finished(message=ASSISTANT), {"type": "finished", "content": CONTENT}),
     (Cancelled(), {"type": "cancelled"}),

@@ -1,4 +1,4 @@
-"""Tests for the runtime tool-skill adapters over the instructions facade."""
+"""Tests for the runtime tool adapters over the instructions facade."""
 
 import json
 from datetime import UTC, datetime
@@ -19,17 +19,17 @@ from octoforge_core.instructions.tools import (
     NO_HITS_MESSAGE,
     SAVE_NAME,
     SEARCH_NAME,
-    InstructionSaveSkill,
-    SkillsSearchSkill,
+    InstructionSaveTool,
+    SkillsSearchTool,
 )
 from octoforge_core.net.external import ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import CALL_NAME as EXTERNAL_CALL_NAME
-from octoforge_core.net.tools import ExternalCallSkill
-from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.errors import SkillArgumentsError
+from octoforge_core.net.tools import ExternalCallTool
+from octoforge_core.tools.base import ToolContext
+from octoforge_core.tools.errors import ToolArgumentsError
 
-CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
+CTX = ToolContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 DEFAULT_K = 5
 CUSTOM_K = 3
 SAVED_VERSION = 3
@@ -107,7 +107,7 @@ class StubResolver:
         return self._ips
 
 
-def make_external_call_skill(body: str = "{}") -> ExternalCallSkill:
+def make_external_call_tool(body: str = "{}") -> ExternalCallTool:
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(HTTPStatus.OK, text=body))
     )
@@ -126,7 +126,7 @@ def make_external_call_skill(body: str = "{}") -> ExternalCallSkill:
         http_client=http_client,
         guard=SsrfGuard(resolver=StubResolver((PUBLIC_IP,))),
     )
-    return ExternalCallSkill(executor=executor)
+    return ExternalCallTool(executor=executor)
 
 
 class _ToolServingService(FakeInstructionService):
@@ -155,17 +155,17 @@ class _ToolServingService(FakeInstructionService):
 
 
 def test_search_skill_spec() -> None:
-    skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
 
-    assert skill.spec.name == SEARCH_NAME
-    assert skill.spec.parameters_schema["required"] == ["query"]
+    assert tool.spec.name == SEARCH_NAME
+    assert tool.spec.parameters_schema["required"] == ["query"]
 
 
 async def test_search_skill_formats_hits() -> None:
     service = FakeInstructionService(hits=[HIT])
-    skill = SkillsSearchSkill(service=service, default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=service, default_k=DEFAULT_K)
 
-    output = await skill.execute({"query": "weather"}, CTX)
+    output = await tool.execute({"query": "weather"}, CTX)
 
     assert service.search_calls == [("weather", DEFAULT_K)]
     assert "[endpoint]" in output
@@ -192,9 +192,9 @@ async def test_search_skill_returns_full_content_without_truncation() -> None:
         ),
         score=0.5,
     )
-    skill = SkillsSearchSkill(service=FakeInstructionService(hits=[hit]), default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=FakeInstructionService(hits=[hit]), default_k=DEFAULT_K)
 
-    output = await skill.execute({"query": "scenario"}, CTX)
+    output = await tool.execute({"query": "scenario"}, CTX)
 
     assert "x" * 400 in output  # beyond the old 300-char snippet cap
     assert "line one" in output
@@ -203,18 +203,18 @@ async def test_search_skill_returns_full_content_without_truncation() -> None:
 
 async def test_search_skill_explicit_k_overrides_default() -> None:
     service = FakeInstructionService()
-    skill = SkillsSearchSkill(service=service, default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=service, default_k=DEFAULT_K)
 
-    await skill.execute({"query": "q", "k": CUSTOM_K}, CTX)
-    await skill.execute({"query": "q", "k": MAX_K}, CTX)
+    await tool.execute({"query": "q", "k": CUSTOM_K}, CTX)
+    await tool.execute({"query": "q", "k": MAX_K}, CTX)
 
     assert service.search_calls == [("q", CUSTOM_K), ("q", MAX_K)]
 
 
 async def test_search_skill_no_hits_message() -> None:
-    skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
 
-    output = await skill.execute({"query": "nothing"}, CTX)
+    output = await tool.execute({"query": "nothing"}, CTX)
 
     assert output == NO_HITS_MESSAGE
     assert output == "no matching instructions or datasets"  # covers knowledge/endpoints too
@@ -243,9 +243,9 @@ async def test_search_caps_the_merged_list_at_k() -> None:
     # the stub ignores k and hands back more hits than requested: the merged
     # list (instructions + datasets) must still be capped at k entries
     hits = [make_hit(f"scenario {index}") for index in range(CUSTOM_K + 1)]
-    skill = SkillsSearchSkill(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
 
-    output = await skill.execute({"query": "q", "k": CUSTOM_K}, CTX)
+    output = await tool.execute({"query": "q", "k": CUSTOM_K}, CTX)
 
     assert "scenario 0" in output
     assert f"scenario {CUSTOM_K - 1}" in output
@@ -255,9 +255,9 @@ async def test_search_caps_the_merged_list_at_k() -> None:
 async def test_search_truncates_long_output_with_a_note() -> None:
     big_content = "x" * MAX_OUTPUT_CHARS
     hits = [make_hit("first", big_content), make_hit("second", big_content)]
-    skill = SkillsSearchSkill(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
 
-    output = await skill.execute({"query": "q", "k": 2}, CTX)
+    output = await tool.execute({"query": "q", "k": 2}, CTX)
 
     assert "first" in output  # the first hit is always emitted whole
     assert "second" not in output
@@ -279,28 +279,28 @@ async def test_search_truncates_long_output_with_a_note() -> None:
     ],
 )
 async def test_search_skill_invalid_arguments_rejected(arguments: dict[str, object]) -> None:
-    skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
 
-    with pytest.raises(SkillArgumentsError):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, CTX)
 
 
 # --- instruction_save ------------------------------------------------------
 
 
 def test_save_skill_spec() -> None:
-    skill = InstructionSaveSkill(service=FakeInstructionService())
+    tool = InstructionSaveTool(service=FakeInstructionService())
 
-    assert skill.spec.name == SAVE_NAME
-    assert skill.spec.parameters_schema["required"] == ["type", "title", "content"]
+    assert tool.spec.name == SAVE_NAME
+    assert tool.spec.parameters_schema["required"] == ["type", "title", "content"]
 
 
 async def test_save_skill_saves_and_confirms_version() -> None:
     service = FakeInstructionService()
     service.save_result = saved_instruction()
-    skill = InstructionSaveSkill(service=service)
+    tool = InstructionSaveTool(service=service)
 
-    output = await skill.execute(
+    output = await tool.execute(
         {
             "type": "skill",
             "title": "new scenario",
@@ -319,9 +319,9 @@ async def test_save_skill_saves_and_confirms_version() -> None:
 async def test_save_skill_defaults_tags_to_empty() -> None:
     service = FakeInstructionService()
     service.save_result = saved_instruction()
-    skill = InstructionSaveSkill(service=service)
+    tool = InstructionSaveTool(service=service)
 
-    await skill.execute({"type": "knowledge", "title": "t", "content": "c"}, CTX)
+    await tool.execute({"type": "knowledge", "title": "t", "content": "c"}, CTX)
 
     assert service.saved[0][3] == ()
 
@@ -339,35 +339,35 @@ async def test_save_skill_defaults_tags_to_empty() -> None:
     ],
 )
 async def test_save_skill_invalid_arguments_rejected(arguments: dict[str, object]) -> None:
-    skill = InstructionSaveSkill(service=FakeInstructionService())
+    tool = InstructionSaveTool(service=FakeInstructionService())
 
-    with pytest.raises(SkillArgumentsError):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, CTX)
 
 
 # --- external_call ---------------------------------------------------------
 
 
 def test_external_call_skill_spec() -> None:
-    skill = make_external_call_skill()
+    tool = make_external_call_tool()
 
-    assert skill.spec.name == EXTERNAL_CALL_NAME
-    assert skill.spec.parameters_schema["required"] == ["name"]
+    assert tool.spec.name == EXTERNAL_CALL_NAME
+    assert tool.spec.parameters_schema["required"] == ["name"]
 
 
 async def test_external_call_skill_returns_status_and_body() -> None:
-    skill = make_external_call_skill(body='{"temp_C": "11"}')
+    tool = make_external_call_tool(body='{"temp_C": "11"}')
 
-    output = await skill.execute({"name": TOOL_NAME, "params": {"city": "London"}}, CTX)
+    output = await tool.execute({"name": TOOL_NAME, "params": {"city": "London"}}, CTX)
 
     assert output == f"HTTP {HTTPStatus.OK}\n" + '{"temp_C": "11"}'
 
 
-async def test_external_call_skill_propagates_unknown_tool() -> None:
-    skill = make_external_call_skill()
+async def test_external_call_tool_propagates_unknown_tool() -> None:
+    tool = make_external_call_tool()
 
     with pytest.raises(InstructionNotFoundError):
-        await skill.execute({"name": "no_such_tool"}, CTX)
+        await tool.execute({"name": "no_such_tool"}, CTX)
 
 
 @pytest.mark.parametrize(
@@ -383,7 +383,7 @@ async def test_external_call_skill_propagates_unknown_tool() -> None:
 async def test_external_call_skill_invalid_arguments_rejected(
     arguments: dict[str, object],
 ) -> None:
-    skill = make_external_call_skill()
+    tool = make_external_call_tool()
 
-    with pytest.raises(SkillArgumentsError):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, CTX)

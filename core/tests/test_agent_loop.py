@@ -30,11 +30,11 @@ from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallBroken, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.registry import SkillRegistry
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.registry import ToolRegistry
 
-SKILL_NAME = "fake_skill"
-SKILL_OUTPUT = "skill output"
+TOOL_NAME = "fake_tool"
+TOOL_OUTPUT = "tool output"
 FINAL_CONTENT = "done"
 CALL_ID = "call-1"
 FAILURE_MESSAGE = "boom"
@@ -48,7 +48,7 @@ BROKEN_ERROR = "bad json"
 IDLE_TIMEOUT_SECONDS = 0.05
 STALL_SECONDS = 60.0
 PAUSE_SECONDS = 0.05
-CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
+CTX = ToolContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 
 
 class ScriptedLLM:
@@ -61,7 +61,7 @@ class ScriptedLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.requests.append(list(messages))
         return Completion(message=self._replies.pop(0))
@@ -69,7 +69,7 @@ class ScriptedLLM:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.requests.append(list(messages))
         reply = self._replies.pop(0)
@@ -87,7 +87,7 @@ class ChunkedLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         return Completion(
             message=ChatMessage(role=MessageRole.ASSISTANT, content="".join(self._parts))
@@ -96,7 +96,7 @@ class ChunkedLLM:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         for part in self._parts:
             yield LlmTextDelta(text=part)
@@ -105,56 +105,56 @@ class ChunkedLLM:
         )
 
 
-class RecordingSkill:
-    """Skill stub recording invocations."""
+class RecordingTool:
+    """Tool stub recording invocations."""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=SKILL_NAME, description="test stub", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=TOOL_NAME, description="test stub", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         self.calls.append(arguments)
-        return SKILL_OUTPUT
+        return TOOL_OUTPUT
 
 
-class FailingSkill:
-    """Skill stub raising an error."""
+class FailingTool:
+    """Tool stub raising an error."""
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=SKILL_NAME, description="failing stub", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=TOOL_NAME, description="failing stub", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         raise RuntimeError(FAILURE_MESSAGE)
 
 
-class EmptyFailingSkill:
-    """Skill stub raising an exception whose str() is empty."""
+class EmptyFailingTool:
+    """Tool stub raising an exception whose str() is empty."""
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=SKILL_NAME, description="empty failing stub", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=TOOL_NAME, description="empty failing stub", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         raise TimeoutError
 
 
-class InjectingSkill:
-    """Skill stub injecting a message into the running loop."""
+class InjectingTool:
+    """Tool stub injecting a message into the running loop."""
 
     def __init__(self, control: LoopControl) -> None:
         self._control = control
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=SKILL_NAME, description="injecting stub", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=TOOL_NAME, description="injecting stub", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         self._control.inject(ChatMessage(role=MessageRole.USER, content=INJECTED_CONTENT))
-        return SKILL_OUTPUT
+        return TOOL_OUTPUT
 
 
 class EagerLLM:
@@ -168,14 +168,14 @@ class EagerLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         return Completion(message=self._reply)
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.requests.append(list(messages))
         if len(self.requests) == 1:
@@ -195,14 +195,14 @@ class StallingLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         return Completion(message=final_reply())
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         for event in self._first_events:
             yield event
@@ -218,14 +218,14 @@ class CrashingLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         return Completion(message=final_reply())
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         for event in self._first_events:
             await asyncio.sleep(0)  # let spawned tool tasks start
@@ -243,22 +243,22 @@ class SlowLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         return Completion(message=self._reply)
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         yield LlmTextDelta(text=self._reply.content)
         await asyncio.sleep(self._pause)
         yield StreamFinished(message=self._reply)
 
 
-class NamedSkill:
-    """Skill stub with a configurable name and a delay before answering."""
+class NamedTool:
+    """Tool stub with a configurable name and a delay before answering."""
 
     def __init__(self, name: str, delay: float) -> None:
         self._name = name
@@ -266,37 +266,37 @@ class NamedSkill:
         self.calls: list[dict[str, Any]] = []
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=self._name, description="named stub", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=self._name, description="named stub", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         self.calls.append(arguments)
         await asyncio.sleep(self._delay)
-        return f"{SKILL_OUTPUT} {self._name}"
+        return f"{TOOL_OUTPUT} {self._name}"
 
 
-class GatedSkill:
-    """Skill stub blocking forever; records its cancellation."""
+class GatedTool:
+    """Tool stub blocking forever; records its cancellation."""
 
     def __init__(self) -> None:
         self.cancelled = False
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=SKILL_NAME, description="gated stub", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=TOOL_NAME, description="gated stub", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             self.cancelled = True
             raise
-        return SKILL_OUTPUT
+        return TOOL_OUTPUT
 
 
-def make_registry(skill: object) -> SkillRegistry:
-    registry = SkillRegistry()
-    registry.register(skill)
+def make_registry(tool: object) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(tool)
     return registry
 
 
@@ -304,7 +304,7 @@ def assistant_with_call() -> ChatMessage:
     return ChatMessage(
         role=MessageRole.ASSISTANT,
         content="",
-        tool_calls=(ToolCall(id=CALL_ID, name=SKILL_NAME, arguments={"q": 1}),),
+        tool_calls=(ToolCall(id=CALL_ID, name=TOOL_NAME, arguments={"q": 1}),),
     )
 
 
@@ -324,7 +324,7 @@ async def test_final_answer_event_sequence() -> None:
     history = [user_message()]
     loop = AgentLoop(
         llm_client=ScriptedLLM([final_reply()]),
-        registry=SkillRegistry(),
+        registry=ToolRegistry(),
         max_iterations=3,
     )
 
@@ -339,16 +339,16 @@ async def test_final_answer_event_sequence() -> None:
 
 async def test_tool_call_flow_events_and_history() -> None:
     llm = ScriptedLLM([assistant_with_call(), final_reply()])
-    skill = RecordingSkill()
-    loop = AgentLoop(llm_client=llm, registry=make_registry(skill), max_iterations=3)
+    tool = RecordingTool()
+    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
     history = [user_message()]
 
     events = await collect(loop.stream(history, LoopControl(), CTX))
 
-    assert skill.calls == [{"q": 1}]
+    assert tool.calls == [{"q": 1}]
     assert any(isinstance(event, ToolCallRequested) for event in events)
     assert any(
-        isinstance(event, ToolCallCompleted) and event.output == SKILL_OUTPUT for event in events
+        isinstance(event, ToolCallCompleted) and event.output == TOOL_OUTPUT for event in events
     )
     assert isinstance(events[-1], Finished)
     tool_messages = [m for m in history if m.role is MessageRole.TOOL]
@@ -362,7 +362,7 @@ async def test_injected_message_reaches_next_iteration() -> None:
     llm = ScriptedLLM([assistant_with_call(), final_reply()])
     loop = AgentLoop(
         llm_client=llm,
-        registry=make_registry(InjectingSkill(control)),
+        registry=make_registry(InjectingTool(control)),
         max_iterations=3,
     )
 
@@ -375,7 +375,7 @@ async def test_injected_message_reaches_next_iteration() -> None:
 async def test_cancel_mid_stream_keeps_partial_message() -> None:
     parts = ["part-1", "part-2", "part-3"]
     control = LoopControl()
-    loop = AgentLoop(llm_client=ChunkedLLM(parts), registry=SkillRegistry(), max_iterations=3)
+    loop = AgentLoop(llm_client=ChunkedLLM(parts), registry=ToolRegistry(), max_iterations=3)
     history = [user_message()]
     events: list[LoopEvent] = []
 
@@ -393,7 +393,7 @@ async def test_cancel_mid_stream_keeps_partial_message() -> None:
 
 async def test_skill_failure_emits_event_and_continues() -> None:
     llm = ScriptedLLM([assistant_with_call(), final_reply()])
-    loop = AgentLoop(llm_client=llm, registry=make_registry(FailingSkill()), max_iterations=3)
+    loop = AgentLoop(llm_client=llm, registry=make_registry(FailingTool()), max_iterations=3)
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -404,7 +404,7 @@ async def test_skill_failure_emits_event_and_continues() -> None:
 
 async def test_skill_failure_with_empty_message_uses_class_name() -> None:
     llm = ScriptedLLM([assistant_with_call(), final_reply()])
-    loop = AgentLoop(llm_client=llm, registry=make_registry(EmptyFailingSkill()), max_iterations=3)
+    loop = AgentLoop(llm_client=llm, registry=make_registry(EmptyFailingTool()), max_iterations=3)
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -418,7 +418,7 @@ async def test_skill_failure_with_empty_message_uses_class_name() -> None:
 async def test_max_iterations_emits_failed() -> None:
     replies = [assistant_with_call() for _ in range(5)]
     llm = ScriptedLLM(replies)
-    loop = AgentLoop(llm_client=llm, registry=make_registry(RecordingSkill()), max_iterations=2)
+    loop = AgentLoop(llm_client=llm, registry=make_registry(RecordingTool()), max_iterations=2)
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -426,7 +426,7 @@ async def test_max_iterations_emits_failed() -> None:
     assert events[-1].error == MAX_ITERATIONS_MESSAGE
 
 
-def eager_call(call_id: str = CALL_ID, name: str = SKILL_NAME) -> ToolCall:
+def eager_call(call_id: str = CALL_ID, name: str = TOOL_NAME) -> ToolCall:
     return ToolCall(id=call_id, name=name, arguments={"q": 1})
 
 
@@ -444,15 +444,15 @@ async def test_tool_call_requested_before_stream_finished() -> None:
         ],
         final_reply(),
     )
-    skill = RecordingSkill()
-    loop = AgentLoop(llm_client=llm, registry=make_registry(skill), max_iterations=3)
+    tool = RecordingTool()
+    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
     requested_at = next(i for i, e in enumerate(events) if isinstance(e, ToolCallRequested))
     assistant_at = next(i for i, e in enumerate(events) if isinstance(e, AssistantMessage))
     assert requested_at < assistant_at
-    assert skill.calls == [{"q": 1}]
+    assert tool.calls == [{"q": 1}]
     assert isinstance(events[-1], Finished)
 
 
@@ -467,9 +467,9 @@ async def test_eager_calls_run_concurrently_history_keeps_call_order() -> None:
         ],
         final_reply(),
     )
-    registry = SkillRegistry()
-    registry.register(NamedSkill(SLOW_NAME, delay=PAUSE_SECONDS))
-    registry.register(NamedSkill(FAST_NAME, delay=0.0))
+    registry = ToolRegistry()
+    registry.register(NamedTool(SLOW_NAME, delay=PAUSE_SECONDS))
+    registry.register(NamedTool(FAST_NAME, delay=0.0))
     loop = AgentLoop(llm_client=llm, registry=registry, max_iterations=3)
     history = [user_message()]
 
@@ -487,19 +487,19 @@ async def test_broken_tool_call_reports_error_without_execution() -> None:
     llm = EagerLLM(
         [
             ToolCallBroken(
-                index=0, call_id=CALL_ID, name=SKILL_NAME, error=BROKEN_ERROR, raw='{"q": '
+                index=0, call_id=CALL_ID, name=TOOL_NAME, error=BROKEN_ERROR, raw='{"q": '
             ),
             StreamFinished(message=eager_first_message((call,))),
         ],
         final_reply(),
     )
-    skill = RecordingSkill()
-    loop = AgentLoop(llm_client=llm, registry=make_registry(skill), max_iterations=3)
+    tool = RecordingTool()
+    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
     history = [user_message()]
 
     events = await collect(loop.stream(history, LoopControl(), CTX))
 
-    assert skill.calls == []
+    assert tool.calls == []
     failed = next(e for e in events if isinstance(e, ToolCallFailed))
     assert failed.error == BROKEN_ERROR
     tool_message = next(m for m in history if m.role is MessageRole.TOOL)
@@ -511,12 +511,12 @@ async def test_broken_tool_call_reports_error_without_execution() -> None:
 async def test_cancel_mid_stream_cancels_running_tool() -> None:
     call = eager_call()
     control = LoopControl()
-    skill = GatedSkill()
+    tool = GatedTool()
     llm = EagerLLM(
         [ToolCallReady(call=call), LlmTextDelta(text="more"), LlmTextDelta(text="even more")],
         final_reply(),
     )
-    loop = AgentLoop(llm_client=llm, registry=make_registry(skill), max_iterations=3)
+    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
     history = [user_message()]
     events: list[LoopEvent] = []
 
@@ -531,7 +531,7 @@ async def test_cancel_mid_stream_cancels_running_tool() -> None:
     tool_message = next(m for m in history if m.role is MessageRole.TOOL)
     assert tool_message.content == CANCELLED_OUTPUT
     assert tool_message.tool_call_id == CALL_ID
-    assert skill.cancelled is True
+    assert tool.cancelled is True
     assert isinstance(events[-1], Cancelled)
 
 
@@ -542,7 +542,7 @@ async def test_cancel_after_tool_completed_keeps_result() -> None:
         [ToolCallReady(call=call), LlmTextDelta(text="more"), LlmTextDelta(text="even more")],
         final_reply(),
     )
-    loop = AgentLoop(llm_client=llm, registry=make_registry(RecordingSkill()), max_iterations=3)
+    loop = AgentLoop(llm_client=llm, registry=make_registry(RecordingTool()), max_iterations=3)
     history = [user_message()]
     events: list[LoopEvent] = []
 
@@ -555,16 +555,16 @@ async def test_cancel_after_tool_completed_keeps_result() -> None:
     assert assistant.interrupted is True
     assert assistant.message.tool_calls == (call,)
     tool_message = next(m for m in history if m.role is MessageRole.TOOL)
-    assert tool_message.content == SKILL_OUTPUT
+    assert tool_message.content == TOOL_OUTPUT
     assert isinstance(events[-1], Cancelled)
 
 
 async def test_idle_timeout_fails_run_and_cancels_tools() -> None:
-    skill = GatedSkill()
+    tool = GatedTool()
     llm = StallingLLM([ToolCallReady(call=eager_call()), LlmTextDelta(text="chunk")])
     loop = AgentLoop(
         llm_client=llm,
-        registry=make_registry(skill),
+        registry=make_registry(tool),
         max_iterations=3,
         stream_idle_timeout=IDLE_TIMEOUT_SECONDS,
     )
@@ -574,20 +574,20 @@ async def test_idle_timeout_fails_run_and_cancels_tools() -> None:
 
     failed = next(e for e in events if isinstance(e, Failed))
     assert failed.error == STREAM_IDLE_TIMEOUT_MESSAGE
-    assert skill.cancelled is True
+    assert tool.cancelled is True
     assert history == [user_message()]
 
 
 async def test_stream_exception_aborts_running_tools() -> None:
-    skill = GatedSkill()
+    tool = GatedTool()
     llm = CrashingLLM([ToolCallReady(call=eager_call()), LlmTextDelta(text="tail")])
-    loop = AgentLoop(llm_client=llm, registry=make_registry(skill), max_iterations=3)
+    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
     history = [user_message()]
 
     with pytest.raises(ConnectionError, match="transport lost"):
         await collect(loop.stream(history, LoopControl(), CTX))
 
-    assert skill.cancelled is True  # the eager tool run did not outlive the failed run
+    assert tool.cancelled is True  # the eager tool run did not outlive the failed run
     assert history == [user_message()]
 
 
@@ -595,7 +595,7 @@ async def test_idle_timeout_before_first_event() -> None:
     llm = StallingLLM([])
     loop = AgentLoop(
         llm_client=llm,
-        registry=SkillRegistry(),
+        registry=ToolRegistry(),
         max_iterations=3,
         stream_idle_timeout=IDLE_TIMEOUT_SECONDS,
     )
@@ -608,7 +608,7 @@ async def test_idle_timeout_before_first_event() -> None:
 
 async def test_disabled_idle_timeout_keeps_waiting() -> None:
     llm = SlowLLM(pause=PAUSE_SECONDS, reply=final_reply())
-    loop = AgentLoop(llm_client=llm, registry=SkillRegistry(), max_iterations=3)
+    loop = AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=3)
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 

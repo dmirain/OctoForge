@@ -26,10 +26,10 @@ from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
-from octoforge_core.skills.base import SkillSpec
-from octoforge_core.skills.registry import SkillRegistry
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolSpec
+from octoforge_core.tools.registry import ToolRegistry
 
 USER_ID = "user-1"
 CHANNEL = "web"
@@ -82,7 +82,7 @@ class DialogLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.complete_requests.append(list(messages))
         return Completion(
@@ -92,7 +92,7 @@ class DialogLLM:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.stream_requests.append(list(messages))
         content = self._stream_replies.pop(0)
@@ -105,7 +105,7 @@ def make_manager(
     session_factory: async_sessionmaker[AsyncSession],
     compactor: LlmContextCompactor,
 ) -> ConversationManager:
-    loop = AgentLoop(llm_client=llm, registry=SkillRegistry(), max_iterations=MAX_ITERATIONS)
+    loop = AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=MAX_ITERATIONS)
     config = RunnerConfig(
         loop=loop,
         prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: PROMPT}),

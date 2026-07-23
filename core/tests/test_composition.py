@@ -1,6 +1,6 @@
 """Tests for the reusable composition builders (octoforge_core.composition).
 
-Covers the P5 seams: the default skill set assembled by `build_skill_registry`
+Covers the P5 seams: the default tool set assembled by `build_tool_registry`
 (with and without a search provider), port substitution through the builders
 (fake SearchProvider, in-memory InstructionStore) and a working
 `build_conversation_manager` on an in-memory SQLite database.
@@ -19,16 +19,16 @@ from octoforge_core.agent.router import ProcessInfo, RouteDecision
 from octoforge_core.agent.runner import ConversationEvent
 from octoforge_core.composition import (
     RunnerOptions,
-    SkillLimits,
-    SkillServices,
-    SkillStores,
+    ToolLimits,
+    ToolServices,
+    ToolStores,
     build_agent_loop,
     build_conversation_manager,
     build_dataset_service,
     build_external_executor,
     build_instruction_service,
     build_runner_config,
-    build_skill_registry,
+    build_tool_registry,
 )
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.context.store import SqlAlchemySummaryStore
@@ -49,10 +49,10 @@ from octoforge_core.llm.usage import Completion
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.registry import SkillRegistry
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.registry import ToolRegistry
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 USER_ID = "user-1"
@@ -70,7 +70,7 @@ MAX_ITERATIONS = 3
 MAX_PROCESSES = 5
 WAIT_TIMEOUT_SECONDS = 2.0
 
-ALL_BASIC_SKILLS = {
+ALL_BASIC_TOOLS = {
     "http_request",
     "task_create",
     "task_list",
@@ -90,7 +90,7 @@ ALL_BASIC_SKILLS = {
     "history_search",
 }
 
-CONTEXT = SkillContext(user_id=USER_ID, channel=CHANNEL, dialog_id=DIALOG_ID)
+CONTEXT = ToolContext(user_id=USER_ID, channel=CHANNEL, dialog_id=DIALOG_ID)
 
 
 @pytest.fixture
@@ -184,14 +184,14 @@ class ScriptedLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         yield LlmTextDelta(text=REPLY)
         yield StreamFinished(message=ChatMessage(role=MessageRole.ASSISTANT, content=REPLY))
@@ -209,8 +209,8 @@ class PassThroughRouter:
         return RouteDecision()
 
 
-def default_limits() -> SkillLimits:
-    return SkillLimits(
+def default_limits() -> ToolLimits:
+    return ToolLimits(
         instructions_top_k=5,
         datasets_query_default_limit=50,
         datasets_query_max_limit=200,
@@ -227,23 +227,23 @@ def build_registry(
     *,
     search_provider: FakeSearchProvider | None = None,
     instruction_store: InMemoryInstructionStore | None = None,
-) -> SkillRegistry:
-    """Assemble a skill registry from the builders over in-memory/SQLite parts."""
+) -> ToolRegistry:
+    """Assemble a tool registry from the builders over in-memory/SQLite parts."""
     store = instruction_store if instruction_store is not None else InMemoryInstructionStore()
     instructions = build_instruction_service(store, LenientEmbedder())
     summary_store = SqlAlchemySummaryStore(session_factory)
     guard = SsrfGuard()
-    return build_skill_registry(
+    return build_tool_registry(
         http_client,
         guard,
-        stores=SkillStores(
+        stores=ToolStores(
             tasks=InMemoryTaskStore(),
             cron=SqlAlchemyCronStore(session_factory),
             memory=SqlAlchemyMemoryStore(session_factory),
             archive=summary_store,
             summaries=summary_store,
         ),
-        services=SkillServices(
+        services=ToolServices(
             instructions=instructions,
             datasets=build_dataset_service(
                 SqlAlchemyDatasetStore(session_factory),
@@ -260,20 +260,20 @@ def build_registry(
     )
 
 
-async def test_build_skill_registry_registers_all_basic_skills(
+async def test_build_tool_registry_registers_all_basic_tools(
     session_factory: async_sessionmaker[AsyncSession],
     http_client: httpx.AsyncClient,
 ) -> None:
     registry = build_registry(http_client, session_factory, search_provider=FakeSearchProvider())
-    assert {spec.name for spec in registry.specs()} == ALL_BASIC_SKILLS
+    assert {spec.name for spec in registry.specs()} == ALL_BASIC_TOOLS
 
 
-async def test_build_skill_registry_skips_web_search_without_provider(
+async def test_build_tool_registry_skips_web_search_without_provider(
     session_factory: async_sessionmaker[AsyncSession],
     http_client: httpx.AsyncClient,
 ) -> None:
     registry = build_registry(http_client, session_factory)
-    assert {spec.name for spec in registry.specs()} == ALL_BASIC_SKILLS - {"web_search"}
+    assert {spec.name for spec in registry.specs()} == ALL_BASIC_TOOLS - {"web_search"}
 
 
 async def test_skills_run_over_substituted_ports(
@@ -302,7 +302,7 @@ async def test_build_conversation_manager_runs_a_dialog(
     llm = ScriptedLLM()
     manager = build_conversation_manager(
         config=build_runner_config(
-            build_agent_loop(llm, SkillRegistry(), max_iterations=MAX_ITERATIONS),
+            build_agent_loop(llm, ToolRegistry(), max_iterations=MAX_ITERATIONS),
             StaticPromptProvider(),
             PassThroughRouter(),
             NoopContextCompactor(),

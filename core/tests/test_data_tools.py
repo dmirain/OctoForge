@@ -1,4 +1,4 @@
-"""Tests for the dataset runtime skills and the merged skills_search."""
+"""Tests for the dataset runtime tools and the merged skills_search."""
 
 import json
 from collections.abc import AsyncIterator
@@ -20,7 +20,7 @@ from octoforge_core.datasets.api import (
 )
 from octoforge_core.datasets.service import LocalDatasetService
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
-from octoforge_core.datasets.tools import DataForgetSkill, DataPutSkill, DataQuerySkill
+from octoforge_core.datasets.tools import DataForgetTool, DataPutTool, DataQueryTool
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
     Instruction,
@@ -29,14 +29,14 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.instructions.tools import (
     NO_HITS_MESSAGE,
-    SkillsSearchSkill,
+    SkillsSearchTool,
 )
-from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.errors import SkillArgumentsError
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolContext
+from octoforge_core.tools.errors import ToolArgumentsError
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
+CTX = ToolContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 DEFAULT_LIMIT = 2
 MAX_LIMIT = 5
 THREE_RECORDS = 3
@@ -100,16 +100,16 @@ async def create_food_dataset(service: DatasetService) -> Dataset:
 
 
 def test_put_skill_spec(service: DatasetService) -> None:
-    skill = DataPutSkill(service=service)
+    tool = DataPutTool(service=service)
 
-    assert skill.spec.name == "data_put"
-    assert skill.spec.parameters_schema["required"] == ["dataset", "record"]
+    assert tool.spec.name == "data_put"
+    assert tool.spec.parameters_schema["required"] == ["dataset", "record"]
 
 
 async def test_put_creates_dataset_and_record(service: DatasetService) -> None:
-    skill = DataPutSkill(service=service)
+    tool = DataPutTool(service=service)
 
-    output = await skill.execute(
+    output = await tool.execute(
         {
             "dataset": FOOD_DATASET,
             "record": APPLE,
@@ -132,9 +132,9 @@ async def test_put_creates_dataset_and_record(service: DatasetService) -> None:
 
 async def test_put_into_existing_dataset(service: DatasetService) -> None:
     await create_food_dataset(service)
-    skill = DataPutSkill(service=service)
+    tool = DataPutTool(service=service)
 
-    output = await skill.execute({"dataset": FOOD_DATASET, "record": APPLE}, CTX)
+    output = await tool.execute({"dataset": FOOD_DATASET, "record": APPLE}, CTX)
 
     assert output.startswith("record ")
     assert f" added to dataset '{FOOD_DATASET}' at " in output
@@ -160,17 +160,17 @@ async def test_put_creation_requires_schema_and_description(
     service: DatasetService,
     arguments: dict[str, Any],
 ) -> None:
-    skill = DataPutSkill(service=service)
+    tool = DataPutTool(service=service)
 
-    with pytest.raises(SkillArgumentsError, match="will be created"):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError, match="will be created"):
+        await tool.execute(arguments, CTX)
 
     with pytest.raises(DatasetNotFoundError):
         await service.get_dataset(CTX.user_id, FOOD_DATASET)
 
 
 async def test_put_invalid_schema_rejected(service: DatasetService) -> None:
-    skill = DataPutSkill(service=service)
+    tool = DataPutTool(service=service)
     arguments = {
         "dataset": FOOD_DATASET,
         "record": APPLE,
@@ -178,16 +178,16 @@ async def test_put_invalid_schema_rejected(service: DatasetService) -> None:
         "schema": {"fields": [{"name": "item", "type": "unknown"}]},
     }
 
-    with pytest.raises(SkillArgumentsError, match="invalid schema"):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError, match="invalid schema"):
+        await tool.execute(arguments, CTX)
 
 
 async def test_put_record_violation_reported(service: DatasetService) -> None:
     await create_food_dataset(service)
-    skill = DataPutSkill(service=service)
+    tool = DataPutTool(service=service)
 
-    with pytest.raises(SkillArgumentsError, match="'item' is required"):
-        await skill.execute({"dataset": FOOD_DATASET, "record": {"kcal": 95}}, CTX)
+    with pytest.raises(ToolArgumentsError, match="'item' is required"):
+        await tool.execute({"dataset": FOOD_DATASET, "record": {"kcal": 95}}, CTX)
 
 
 @pytest.mark.parametrize(
@@ -211,24 +211,24 @@ async def test_put_invalid_arguments_rejected(
     service: DatasetService,
     arguments: dict[str, Any],
 ) -> None:
-    skill = DataPutSkill(service=service)
+    tool = DataPutTool(service=service)
 
-    with pytest.raises(SkillArgumentsError):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, CTX)
 
 
 # --- data_query -------------------------------------------------------------
 
 
-def make_query_skill(service: DatasetService) -> DataQuerySkill:
-    return DataQuerySkill(service=service, default_limit=DEFAULT_LIMIT, max_limit=MAX_LIMIT)
+def make_query_tool(service: DatasetService) -> DataQueryTool:
+    return DataQueryTool(service=service, default_limit=DEFAULT_LIMIT, max_limit=MAX_LIMIT)
 
 
 def test_query_skill_spec(service: DatasetService) -> None:
-    skill = make_query_skill(service)
+    tool = make_query_tool(service)
 
-    assert skill.spec.name == "data_query"
-    assert skill.spec.parameters_schema["required"] == ["dataset"]
+    assert tool.spec.name == "data_query"
+    assert tool.spec.parameters_schema["required"] == ["dataset"]
 
 
 async def seed_three_records(service: DatasetService) -> None:
@@ -239,9 +239,9 @@ async def seed_three_records(service: DatasetService) -> None:
 
 async def test_query_formats_records_as_json_lines(service: DatasetService) -> None:
     await seed_three_records(service)
-    skill = make_query_skill(service)
+    tool = make_query_tool(service)
 
-    output = await skill.execute({"dataset": FOOD_DATASET, "limit": MAX_LIMIT}, CTX)
+    output = await tool.execute({"dataset": FOOD_DATASET, "limit": MAX_LIMIT}, CTX)
 
     header, *lines = output.splitlines()
     assert header == f"{THREE_RECORDS} record(s) in dataset '{FOOD_DATASET}' (newest first):"
@@ -256,9 +256,9 @@ async def test_query_equals_filter(service: DatasetService) -> None:
     await create_food_dataset(service)
     await service.add_record(CTX.user_id, FOOD_DATASET, APPLE)
     await service.add_record(CTX.user_id, FOOD_DATASET, BANANA)
-    skill = make_query_skill(service)
+    tool = make_query_tool(service)
 
-    output = await skill.execute({"dataset": FOOD_DATASET, "equals": {"item": "apple"}}, CTX)
+    output = await tool.execute({"dataset": FOOD_DATASET, "equals": {"item": "apple"}}, CTX)
 
     header, *lines = output.splitlines()
     assert header.startswith("1 record(s)")
@@ -267,9 +267,9 @@ async def test_query_equals_filter(service: DatasetService) -> None:
 
 async def test_query_default_limit_applies(service: DatasetService) -> None:
     await seed_three_records(service)
-    skill = make_query_skill(service)
+    tool = make_query_tool(service)
 
-    output = await skill.execute({"dataset": FOOD_DATASET}, CTX)
+    output = await tool.execute({"dataset": FOOD_DATASET}, CTX)
 
     header, *lines = output.splitlines()
     assert header.startswith(f"{DEFAULT_LIMIT} record(s)")
@@ -278,32 +278,32 @@ async def test_query_default_limit_applies(service: DatasetService) -> None:
 
 async def test_query_date_only_boundaries(service: DatasetService) -> None:
     await seed_three_records(service)
-    skill = make_query_skill(service)
+    tool = make_query_tool(service)
     today = utc_now().date().isoformat()
     tomorrow = (utc_now().date() + timedelta(days=1)).isoformat()
 
-    inside = await skill.execute(
+    inside = await tool.execute(
         {"dataset": FOOD_DATASET, "date_from": today, "date_to": today}, CTX
     )
-    outside = await skill.execute({"dataset": FOOD_DATASET, "date_from": tomorrow}, CTX)
+    outside = await tool.execute({"dataset": FOOD_DATASET, "date_from": tomorrow}, CTX)
 
     assert inside.startswith(f"{DEFAULT_LIMIT} record(s)")
     assert outside == f"no records in dataset '{FOOD_DATASET}'"
 
 
 async def test_query_unknown_dataset_returns_text(service: DatasetService) -> None:
-    skill = make_query_skill(service)
+    tool = make_query_tool(service)
 
-    output = await skill.execute({"dataset": "missing"}, CTX)
+    output = await tool.execute({"dataset": "missing"}, CTX)
 
     assert output == "dataset 'missing' not found"
 
 
 async def test_query_empty_result_text(service: DatasetService) -> None:
     await create_food_dataset(service)
-    skill = make_query_skill(service)
+    tool = make_query_tool(service)
 
-    assert await skill.execute({"dataset": FOOD_DATASET}, CTX) == (
+    assert await tool.execute({"dataset": FOOD_DATASET}, CTX) == (
         f"no records in dataset '{FOOD_DATASET}'"
     )
 
@@ -329,40 +329,40 @@ async def test_query_invalid_arguments_rejected(
     arguments: dict[str, Any],
 ) -> None:
     await create_food_dataset(service)
-    skill = make_query_skill(service)
+    tool = make_query_tool(service)
 
-    with pytest.raises(SkillArgumentsError):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, CTX)
 
 
 # --- data_forget ------------------------------------------------------------
 
 
 def test_forget_skill_spec(service: DatasetService) -> None:
-    skill = DataForgetSkill(service=service)
+    tool = DataForgetTool(service=service)
 
-    assert skill.spec.name == "data_forget"
-    assert skill.spec.parameters_schema["required"] == ["dataset"]
+    assert tool.spec.name == "data_forget"
+    assert tool.spec.parameters_schema["required"] == ["dataset"]
 
 
 async def test_forget_deletes_and_reports_count(service: DatasetService) -> None:
     await create_food_dataset(service)
     await service.add_record(CTX.user_id, FOOD_DATASET, APPLE)
     await service.add_record(CTX.user_id, FOOD_DATASET, BANANA)
-    skill = DataForgetSkill(service=service)
+    tool = DataForgetTool(service=service)
 
-    output = await skill.execute({"dataset": FOOD_DATASET}, CTX)
+    output = await tool.execute({"dataset": FOOD_DATASET}, CTX)
 
     assert output == f"dataset '{FOOD_DATASET}' deleted with 2 record(s)"
-    assert await skill.execute({"dataset": FOOD_DATASET}, CTX) == (
+    assert await tool.execute({"dataset": FOOD_DATASET}, CTX) == (
         f"dataset '{FOOD_DATASET}' not found"
     )
 
 
 async def test_forget_unknown_dataset_returns_text(service: DatasetService) -> None:
-    skill = DataForgetSkill(service=service)
+    tool = DataForgetTool(service=service)
 
-    assert await skill.execute({"dataset": "missing"}, CTX) == "dataset 'missing' not found"
+    assert await tool.execute({"dataset": "missing"}, CTX) == "dataset 'missing' not found"
 
 
 @pytest.mark.parametrize("arguments", [{}, {"dataset": ""}, {"dataset": 42}])
@@ -370,10 +370,10 @@ async def test_forget_invalid_arguments_rejected(
     service: DatasetService,
     arguments: dict[str, Any],
 ) -> None:
-    skill = DataForgetSkill(service=service)
+    tool = DataForgetTool(service=service)
 
-    with pytest.raises(SkillArgumentsError):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, CTX)
 
 
 # --- skills_search with datasets --------------------------------------
@@ -492,13 +492,13 @@ class FakeDatasetService:
 
 async def test_search_instructions_block_precedes_datasets() -> None:
     datasets = FakeDatasetService(hits=[DATASET_HIT])
-    skill = SkillsSearchSkill(
+    tool = SkillsSearchTool(
         service=FakeInstructionService(hits=[HIT]),
         default_k=DEFAULT_K,
         datasets=datasets,
     )
 
-    output = await skill.execute({"query": "food"}, CTX)
+    output = await tool.execute({"query": "food"}, CTX)
 
     # instructions first (even with a negative cross-encoder logit against a
     # higher dataset cosine), datasets after; no scores in the output
@@ -515,18 +515,18 @@ async def test_search_instructions_block_precedes_datasets() -> None:
 
 async def test_search_dataset_hits_only() -> None:
     datasets = FakeDatasetService(hits=[DATASET_HIT])
-    skill = SkillsSearchSkill(
+    tool = SkillsSearchTool(
         service=FakeInstructionService(),
         default_k=DEFAULT_K,
         datasets=datasets,
     )
 
-    output = await skill.execute({"query": "food"}, CTX)
+    output = await tool.execute({"query": "food"}, CTX)
 
     assert "[dataset]" in output
 
 
 async def test_search_without_datasets_service_unchanged() -> None:
-    skill = SkillsSearchSkill(service=FakeInstructionService(), default_k=DEFAULT_K)
+    tool = SkillsSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
 
-    assert await skill.execute({"query": "nothing"}, CTX) == NO_HITS_MESSAGE
+    assert await tool.execute({"query": "nothing"}, CTX) == NO_HITS_MESSAGE

@@ -172,9 +172,9 @@ async def test_get_by_name_narrows_by_type(
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
     knowledge = await service.save(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
-    skill = await service.save(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B)
+    saved = await service.save(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B)
 
-    assert await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL) == skill
+    assert await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL) == saved
     assert await service.get_by_name(TITLE_ALPHA, InstructionType.KNOWLEDGE) == knowledge
     # without a type filter the oldest record wins
     assert await service.get_by_name(TITLE_ALPHA) == knowledge

@@ -21,7 +21,7 @@ from octoforge_core.llm.errors import LLMError
 from octoforge_core.llm.events import RetryScheduled, StreamEvent
 from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
-from octoforge_core.skills.base import SkillSpec
+from octoforge_core.tools.base import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ class RetryingLLMClient:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         """Call complete(), retrying transient failures silently (log only)."""
         attempt = 0
@@ -116,7 +116,7 @@ class RetryingLLMClient:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Call stream(), retrying failures that happened before the first event."""
         attempt = 0

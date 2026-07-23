@@ -28,7 +28,7 @@ OctoForge строится вокруг другой идеи:
 зависимости и тесты):
 
 - `core/` — библиотека `octoforge-core`: домен, порты-Protocol, агентная петля,
-  процессная модель, скилы, модули instructions/datasets/memory/cron, клиенты LLM
+  процессная модель, тулы, модули instructions/datasets/memory/cron, клиенты LLM
   и эмбеддингов, персист. **Не импортирует FastAPI.**
 - `web/` — приложение `octoforge-web`: тонкий адаптер — FastAPI-обёртка (REST + SSE),
   чат-UI, Telegram-адаптер, composition root (`web/src/octoforge_web/main.py`,
@@ -44,10 +44,10 @@ OctoForge строится вокруг другой идеи:
                            ConversationRunner — актор диалога:
                            нарратив (персистится в SQLite) + процессы (fg/bg, в памяти)
                                          |
-                     AgentLoop.stream() — поток событий: токены, вызовы скилов,
+                     AgentLoop.stream() — поток событий: токены, вызовы тулов,
                      финал, отмена; LoopControl — инъекции и отмена прогона
                         /                                 \
-         LLMClient (OpenAI-совм., SSE)         SkillRegistry — базовые скилы:
+         LLMClient (OpenAI-совм., SSE)         ToolRegistry — базовые тулы:
                                                http_request, task_create/list/delete,
                                                cron_pause/resume, skills_search,
                                                instruction_save, external_call,
@@ -98,7 +98,7 @@ make run-telegram     # python -m octoforge_web.telegram
 | `OF_DATABASE_URL` | async SQLAlchemy URL, по умолчанию `sqlite+aiosqlite:///./octoforge.db` |
 | `OF_EMBEDDING_BACKEND` | `local` (sentence-transformers в процессе) или `openai` (HTTP-эндпоинт) |
 | `OF_TELEGRAM_BOT_TOKEN` | токен бота от @BotFather; пусто = адаптер выключен |
-| `OF_SERPER_TOKEN` | поиск в вебе через serper.dev; пусто = скил `web_search` выключен |
+| `OF_SERPER_TOKEN` | поиск в вебе через serper.dev; пусто = тул `web_search` выключен |
 | `OF_MAX_PROCESSES` / `OF_ROUTER_TIMEOUT_SECONDS` | лимит процессов на диалог / таймаут LLM-роутера |
 | `OF_SYSTEM_PROMPT_SOURCE` / `OF_ROUTER_PROMPT_SOURCE` | переопределение промптов из файлов (`file:`, перечитывается на каждый ход) |
 
@@ -116,12 +116,12 @@ pip install -e core        # из корня репозитория; FastAPI н�
 
 Уровни встраивания — на выбор:
 
-- **`AgentLoop`** — минимум: событийная петля «LLM ↔ скилы» без БД и диалогов.
-  Нужны только `LLMClient` и `SkillRegistry`.
+- **`AgentLoop`** — минимум: событийная петля «LLM ↔ тулы» без БД и диалогов.
+  Нужны только `LLMClient` и `ToolRegistry`.
 - **`ConversationManager`** — полноценные диалоги: персист в SQLite, фон/форграунд
   процессы, LLM-роутер, подписка на события. Пример ниже.
 - **Полный набор** — добавить модули (instructions, datasets, memory, cron) и базовые
-  скилы по образцу composition root'а — `runtime()` в
+  тулы по образцу composition root'а — `runtime()` в
   [web/src/octoforge_web/main.py](web/src/octoforge_web/main.py) — это эталонная
   сборка всех зависимостей ядра.
 
@@ -139,7 +139,7 @@ from octoforge_core import (
     Finished,
     LLMConfig,
     MessageRepository,
-    SkillRegistry,
+    ToolRegistry,
     SqlAlchemyTaskStore,
     TextDelta,
     create_engine,
@@ -168,7 +168,7 @@ async def main() -> None:
             prompts = StaticPromptProvider()  # встроенные промпты; свои — через порт
             manager = ConversationManager(
                 config=RunnerConfig(
-                    loop=AgentLoop(llm_client=llm, registry=SkillRegistry(), max_iterations=10),
+                    loop=AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=10),
                     prompts=prompts,
                     router=LLMRouter(llm, timeout_seconds=10.0, prompts=prompts),
                     max_processes=5,
@@ -201,8 +201,8 @@ asyncio.run(main())
 
 Замечания к примеру:
 
-- С пустым `SkillRegistry` агент отвечает только текстом. Скилы регистрируются по одному
-  (`registry.register(HttpRequestSkill(...))` и т.д.) — полный набор
+- С пустым `ToolRegistry` агент отвечает только текстом. Скилы регистрируются по одному
+  (`registry.register(HttpRequestTool(...))` и т.д.) — полный набор
   смотрите в `runtime()`; эмбеддинги нужны только скилам инструкций и датасетов.
 - Диалог переживает рестарт: нарратив перечитывается из БД при
   `get_or_create_runner` (процессы — в памяти и не переживают).

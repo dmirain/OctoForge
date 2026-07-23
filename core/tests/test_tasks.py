@@ -1,4 +1,4 @@
-"""Tests for deferred work: the task store and the unified task skills."""
+"""Tests for deferred work: the task store and the unified task tools."""
 
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -7,8 +7,6 @@ from datetime import timedelta
 import pytest
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
-from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.errors import SkillArgumentsError
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.spawner import TaskDeleteOutcome
@@ -16,14 +14,16 @@ from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.tasks.tools import (
     NO_SPAWNER_MESSAGE,
     NO_WORK_MESSAGE,
-    TaskCreateSkill,
-    TaskDeleteSkill,
-    TaskListSkill,
+    TaskCreateTool,
+    TaskDeleteTool,
+    TaskListTool,
 )
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolContext
+from octoforge_core.tools.errors import ToolArgumentsError
 
-CTX = SkillContext(user_id="user-1", channel="web", dialog_id="dlg-1")
-OTHER_CTX = SkillContext(user_id="user-2", channel="web", dialog_id="dlg-2")
+CTX = ToolContext(user_id="user-1", channel="web", dialog_id="dlg-1")
+OTHER_CTX = ToolContext(user_id="user-2", channel="web", dialog_id="dlg-2")
 PROMPT_CONTENT = "solve 2+2"
 SPAWNED_TEXT = "task abc123 spawned"
 REFUSAL_TEXT = "cannot spawn: process limit (5) reached"
@@ -67,7 +67,7 @@ class FakeDeleter:
 
 
 class FakeCronStore:
-    """In-memory CronStore; only the methods the task skills use are real."""
+    """In-memory CronStore; only the methods the task tools use are real."""
 
     def __init__(self) -> None:
         self.jobs: dict[str, CronJob] = {}
@@ -96,9 +96,9 @@ def ctx_with(
     spawner: FakeSpawner | None = None,
     deleter: FakeDeleter | None = None,
     owner_task_id: str | None = None,
-    base: SkillContext = CTX,
-) -> SkillContext:
-    return SkillContext(
+    base: ToolContext = CTX,
+) -> ToolContext:
+    return ToolContext(
         user_id=base.user_id,
         channel=base.channel,
         dialog_id=base.dialog_id,
@@ -108,7 +108,7 @@ def ctx_with(
     )
 
 
-def make_task(ctx: SkillContext = CTX, title: str = "t", **overrides: object) -> Task:
+def make_task(ctx: ToolContext = CTX, title: str = "t", **overrides: object) -> Task:
     task = Task(
         dialog_id=ctx.dialog_id,
         user_id=ctx.user_id,
@@ -153,18 +153,18 @@ def schedule_arguments(**overrides: object) -> dict[str, object]:
 
 async def test_task_create_without_schedule_delegates_to_the_spawner() -> None:
     spawner = FakeSpawner()
-    skill = TaskCreateSkill(FakeCronStore())
+    tool = TaskCreateTool(FakeCronStore())
 
-    output = await skill.execute({"title": TITLE, "prompt": PROMPT_CONTENT}, ctx_with(spawner))
+    output = await tool.execute({"title": TITLE, "prompt": PROMPT_CONTENT}, ctx_with(spawner))
 
     assert output == SPAWNED_TEXT
     assert spawner.calls == [(TITLE, PROMPT_CONTENT)]
 
 
 async def test_task_create_reports_spawner_refusals() -> None:
-    skill = TaskCreateSkill(FakeCronStore())
+    tool = TaskCreateTool(FakeCronStore())
 
-    output = await skill.execute(
+    output = await tool.execute(
         {"title": TITLE, "prompt": PROMPT_CONTENT}, ctx_with(FakeSpawner(reply=REFUSAL_TEXT))
     )
 
@@ -172,17 +172,17 @@ async def test_task_create_reports_spawner_refusals() -> None:
 
 
 async def test_task_create_without_spawner_fails() -> None:
-    skill = TaskCreateSkill(FakeCronStore())
+    tool = TaskCreateTool(FakeCronStore())
 
-    with pytest.raises(SkillArgumentsError, match=NO_SPAWNER_MESSAGE):
-        await skill.execute({"title": TITLE, "prompt": PROMPT_CONTENT}, CTX)
+    with pytest.raises(ToolArgumentsError, match=NO_SPAWNER_MESSAGE):
+        await tool.execute({"title": TITLE, "prompt": PROMPT_CONTENT}, CTX)
 
 
 async def test_task_create_one_shot_without_schedule_fails() -> None:
-    skill = TaskCreateSkill(FakeCronStore())
+    tool = TaskCreateTool(FakeCronStore())
 
-    with pytest.raises(SkillArgumentsError, match="one_shot"):
-        await skill.execute(
+    with pytest.raises(ToolArgumentsError, match="one_shot"):
+        await tool.execute(
             {"title": TITLE, "prompt": PROMPT_CONTENT, "one_shot": True},
             ctx_with(FakeSpawner()),
         )
@@ -193,10 +193,10 @@ async def test_task_create_one_shot_without_schedule_fails() -> None:
     [{"prompt": "p"}, {"title": "t"}, {"title": "", "prompt": "p"}],
 )
 async def test_task_create_validates_arguments(arguments: dict[str, str]) -> None:
-    skill = TaskCreateSkill(FakeCronStore())
+    tool = TaskCreateTool(FakeCronStore())
 
-    with pytest.raises(SkillArgumentsError):
-        await skill.execute(arguments, ctx_with(FakeSpawner()))
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, ctx_with(FakeSpawner()))
 
 
 # --- task_create: schedule path --------------------------------------------
@@ -204,9 +204,9 @@ async def test_task_create_validates_arguments(arguments: dict[str, str]) -> Non
 
 async def test_task_create_with_schedule_stores_an_enabled_job() -> None:
     store = FakeCronStore()
-    skill = TaskCreateSkill(store)
+    tool = TaskCreateTool(store)
 
-    result = await skill.execute(schedule_arguments(), CTX)
+    result = await tool.execute(schedule_arguments(), CTX)
 
     assert "created cron job" in result
     (job,) = store.jobs.values()
@@ -220,9 +220,9 @@ async def test_task_create_with_schedule_stores_an_enabled_job() -> None:
 
 async def test_task_create_with_schedule_defaults_the_timezone_to_utc() -> None:
     store = FakeCronStore()
-    skill = TaskCreateSkill(store)
+    tool = TaskCreateTool(store)
 
-    await skill.execute({"title": TITLE, "prompt": PROMPT_CONTENT, "schedule": VALID_SCHEDULE}, CTX)
+    await tool.execute({"title": TITLE, "prompt": PROMPT_CONTENT, "schedule": VALID_SCHEDULE}, CTX)
 
     (job,) = store.jobs.values()
     assert job.timezone == "UTC"
@@ -230,9 +230,9 @@ async def test_task_create_with_schedule_defaults_the_timezone_to_utc() -> None:
 
 async def test_task_create_with_schedule_marks_one_shot_jobs() -> None:
     store = FakeCronStore()
-    skill = TaskCreateSkill(store)
+    tool = TaskCreateTool(store)
 
-    result = await skill.execute(schedule_arguments(one_shot=True), CTX)
+    result = await tool.execute(schedule_arguments(one_shot=True), CTX)
 
     (job,) = store.jobs.values()
     assert job.one_shot
@@ -245,9 +245,9 @@ async def test_task_create_with_schedule_marks_one_shot_jobs() -> None:
 )
 async def test_task_create_with_schedule_rejects_bad_input(overrides: dict[str, str]) -> None:
     store = FakeCronStore()
-    skill = TaskCreateSkill(store)
+    tool = TaskCreateTool(store)
 
-    result = await skill.execute(schedule_arguments(**overrides), CTX)
+    result = await tool.execute(schedule_arguments(**overrides), CTX)
 
     assert result.startswith("error:")
     assert store.jobs == {}
@@ -255,10 +255,10 @@ async def test_task_create_with_schedule_rejects_bad_input(overrides: dict[str, 
 
 async def test_task_create_with_schedule_is_idempotent_for_an_identical_job() -> None:
     store = FakeCronStore()
-    skill = TaskCreateSkill(store)
+    tool = TaskCreateTool(store)
 
-    first = await skill.execute(schedule_arguments(), CTX)
-    second = await skill.execute(schedule_arguments(), CTX)
+    first = await tool.execute(schedule_arguments(), CTX)
+    second = await tool.execute(schedule_arguments(), CTX)
 
     assert "created cron job" in first
     assert "already exists" in second
@@ -267,10 +267,10 @@ async def test_task_create_with_schedule_is_idempotent_for_an_identical_job() ->
 
 async def test_task_create_with_a_different_one_shot_is_not_a_duplicate() -> None:
     store = FakeCronStore()
-    skill = TaskCreateSkill(store)
+    tool = TaskCreateTool(store)
 
-    await skill.execute(schedule_arguments(), CTX)
-    result = await skill.execute(schedule_arguments(one_shot=True), CTX)
+    await tool.execute(schedule_arguments(), CTX)
+    result = await tool.execute(schedule_arguments(one_shot=True), CTX)
 
     assert "created cron job" in result
     assert len(store.jobs) == EXPECTED_TWO_JOBS
@@ -286,9 +286,9 @@ async def test_task_list_shows_tasks_and_jobs_in_two_sections() -> None:
     cron = FakeCronStore()
     await cron.create(make_cron_job())
     await cron.create(make_cron_job(id="job-2", user_id=OTHER_CTX.user_id))
-    skill = TaskListSkill(store=store, cron_store=cron)
+    tool = TaskListTool(store=store, cron_store=cron)
 
-    output = await skill.execute({}, CTX)
+    output = await tool.execute({}, CTX)
 
     tasks_section, jobs_section = output.split("\n\n")
     assert tasks_section.startswith("background tasks:")
@@ -301,19 +301,19 @@ async def test_task_list_shows_tasks_and_jobs_in_two_sections() -> None:
 async def test_task_list_reports_empty_sections() -> None:
     store = InMemoryTaskStore()
     await store.add(make_task())
-    skill = TaskListSkill(store=store, cron_store=FakeCronStore())
+    tool = TaskListTool(store=store, cron_store=FakeCronStore())
 
-    output = await skill.execute({}, CTX)
+    output = await tool.execute({}, CTX)
 
     assert "no cron jobs" in output
-    skill = TaskListSkill(store=InMemoryTaskStore(), cron_store=FakeCronStore())
-    assert "no tasks" in await skill.execute({}, CTX)
+    tool = TaskListTool(store=InMemoryTaskStore(), cron_store=FakeCronStore())
+    assert "no tasks" in await tool.execute({}, CTX)
 
 
 async def test_task_list_empty() -> None:
-    skill = TaskListSkill(store=InMemoryTaskStore(), cron_store=FakeCronStore())
+    tool = TaskListTool(store=InMemoryTaskStore(), cron_store=FakeCronStore())
 
-    assert await skill.execute({}, CTX) == NO_WORK_MESSAGE
+    assert await tool.execute({}, CTX) == NO_WORK_MESSAGE
 
 
 async def test_task_list_shows_the_last_run_and_retry_streak() -> None:
@@ -325,9 +325,9 @@ async def test_task_list_shows_the_last_run_and_retry_streak() -> None:
             retry_count=RETRY_TWO,
         )
     )
-    skill = TaskListSkill(store=InMemoryTaskStore(), cron_store=cron)
+    tool = TaskListTool(store=InMemoryTaskStore(), cron_store=cron)
 
-    output = await skill.execute({}, CTX)
+    output = await tool.execute({}, CTX)
 
     assert "last run: failed (iteration limit reached)" in output
     assert "retry #2" in output
@@ -340,9 +340,9 @@ async def test_task_delete_removes_a_terminal_task() -> None:
     store = InMemoryTaskStore()
     task = make_task(status=TaskStatus.DONE, result="ok")
     await store.add(task)
-    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+    tool = TaskDeleteTool(store=store, cron_store=FakeCronStore())
 
-    output = await skill.execute({"task_id": task.id}, CTX)
+    output = await tool.execute({"task_id": task.id}, CTX)
 
     assert output == f"deleted task {task.id}"
     with pytest.raises(TaskNotFoundError):
@@ -354,9 +354,9 @@ async def test_task_delete_stops_a_running_task_via_the_deleter() -> None:
     task = make_task(status=TaskStatus.RUNNING)
     await store.add(task)
     deleter = FakeDeleter()
-    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+    tool = TaskDeleteTool(store=store, cron_store=FakeCronStore())
 
-    output = await skill.execute({"task_id": task.id}, ctx_with(deleter=deleter))
+    output = await tool.execute({"task_id": task.id}, ctx_with(deleter=deleter))
 
     assert output == f"deleted task {task.id}"
     assert deleter.calls == [task.id]
@@ -369,9 +369,9 @@ async def test_task_delete_tolerates_a_row_removed_by_the_finalization() -> None
     task = make_task(status=TaskStatus.RUNNING)
     await store.add(task)
     deleter = FakeDeleter(on_delete=store.delete)
-    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+    tool = TaskDeleteTool(store=store, cron_store=FakeCronStore())
 
-    output = await skill.execute({"task_id": task.id}, ctx_with(deleter=deleter))
+    output = await tool.execute({"task_id": task.id}, ctx_with(deleter=deleter))
 
     assert output == f"deleted task {task.id}"
 
@@ -381,9 +381,9 @@ async def test_task_delete_refuses_self_deletion_from_inside_the_task() -> None:
     task = make_task(status=TaskStatus.RUNNING)
     await store.add(task)
     deleter = FakeDeleter()
-    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+    tool = TaskDeleteTool(store=store, cron_store=FakeCronStore())
 
-    output = await skill.execute(
+    output = await tool.execute(
         {"task_id": task.id}, ctx_with(deleter=deleter, owner_task_id=task.id)
     )
 
@@ -397,9 +397,9 @@ async def test_task_delete_removes_an_orphaned_running_row() -> None:
     task = make_task(status=TaskStatus.RUNNING)
     await store.add(task)
     deleter = FakeDeleter(outcome=TaskDeleteOutcome.NOT_RUNNING)
-    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+    tool = TaskDeleteTool(store=store, cron_store=FakeCronStore())
 
-    output = await skill.execute({"task_id": task.id}, ctx_with(deleter=deleter))
+    output = await tool.execute({"task_id": task.id}, ctx_with(deleter=deleter))
 
     assert output == f"deleted task {task.id}"
     with pytest.raises(TaskNotFoundError):
@@ -410,9 +410,9 @@ async def test_task_delete_scopes_tasks_to_the_dialog() -> None:
     store = InMemoryTaskStore()
     task = make_task(ctx=OTHER_CTX)
     await store.add(task)
-    skill = TaskDeleteSkill(store=store, cron_store=FakeCronStore())
+    tool = TaskDeleteTool(store=store, cron_store=FakeCronStore())
 
-    output = await skill.execute({"task_id": task.id}, CTX)
+    output = await tool.execute({"task_id": task.id}, CTX)
 
     assert output.startswith("error:")
     assert (await store.get(task.id)).id == task.id
@@ -421,9 +421,9 @@ async def test_task_delete_scopes_tasks_to_the_dialog() -> None:
 async def test_task_delete_removes_a_cron_job() -> None:
     cron = FakeCronStore()
     await cron.create(make_cron_job())
-    skill = TaskDeleteSkill(store=InMemoryTaskStore(), cron_store=cron)
+    tool = TaskDeleteTool(store=InMemoryTaskStore(), cron_store=cron)
 
-    output = await skill.execute({"task_id": "job-1"}, CTX)
+    output = await tool.execute({"task_id": "job-1"}, CTX)
 
     assert output == "deleted cron job job-1"
     assert cron.jobs == {}
@@ -432,18 +432,18 @@ async def test_task_delete_removes_a_cron_job() -> None:
 async def test_task_delete_refuses_a_foreign_cron_job() -> None:
     cron = FakeCronStore()
     await cron.create(make_cron_job(user_id=OTHER_CTX.user_id))
-    skill = TaskDeleteSkill(store=InMemoryTaskStore(), cron_store=cron)
+    tool = TaskDeleteTool(store=InMemoryTaskStore(), cron_store=cron)
 
-    output = await skill.execute({"task_id": "job-1"}, CTX)
+    output = await tool.execute({"task_id": "job-1"}, CTX)
 
     assert output.startswith("error:")
     assert "job-1" in cron.jobs
 
 
 async def test_task_delete_reports_unknown_ids() -> None:
-    skill = TaskDeleteSkill(store=InMemoryTaskStore(), cron_store=FakeCronStore())
+    tool = TaskDeleteTool(store=InMemoryTaskStore(), cron_store=FakeCronStore())
 
-    output = await skill.execute({"task_id": "missing"}, CTX)
+    output = await tool.execute({"task_id": "missing"}, CTX)
 
     assert output.startswith("error:")
 

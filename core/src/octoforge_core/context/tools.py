@@ -4,11 +4,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from octoforge_core.context.api import ArchivedMessage, ArchiveFilter, MessageArchive, SummaryStore
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.errors import SkillArgumentsError
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.errors import ToolArgumentsError
 
-SKILL_NAME = "history_search"
-SKILL_DESCRIPTION = (
+TOOL_NAME = "history_search"
+TOOL_DESCRIPTION = (
     "Search the full history of this conversation (including what fell out of the "
     "recent verbatim tail) by a case-insensitive substring over message content. "
     "Optionally restrict the hits to a topic tag of the compressed summaries or to "
@@ -45,7 +45,7 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
 }
 
 
-class HistorySearchSkill:
+class HistorySearchTool:
     """Thin adapter over the MessageArchive and SummaryStore ports."""
 
     def __init__(
@@ -61,18 +61,18 @@ class HistorySearchSkill:
         self._max_limit = max_limit
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
-            name=SKILL_NAME,
-            description=SKILL_DESCRIPTION,
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=TOOL_NAME,
+            description=TOOL_DESCRIPTION,
             parameters_schema=PARAMETERS_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, search the dialog's archive and format the hits."""
         query = arguments.get("query")
         if not isinstance(query, str) or not query.strip():
-            raise SkillArgumentsError("query must be a non-empty string")
+            raise ToolArgumentsError("query must be a non-empty string")
         limit = self._limit(arguments.get("limit"))
         seq_ranges = await self._seq_ranges(context.dialog_id, arguments.get("topic"))
         if seq_ranges == ():
@@ -97,9 +97,9 @@ class HistorySearchSkill:
         if raw is None:
             return self._default_limit
         if isinstance(raw, bool) or not isinstance(raw, int):
-            raise SkillArgumentsError("limit must be an integer")
+            raise ToolArgumentsError("limit must be an integer")
         if raw < 1 or raw > self._max_limit:
-            raise SkillArgumentsError(f"limit must be between 1 and {self._max_limit}")
+            raise ToolArgumentsError(f"limit must be between 1 and {self._max_limit}")
         return raw
 
     async def _seq_ranges(
@@ -109,7 +109,7 @@ class HistorySearchSkill:
         if raw_topic is None:
             return None
         if not isinstance(raw_topic, str) or not raw_topic.strip():
-            raise SkillArgumentsError("topic must be a non-empty string")
+            raise ToolArgumentsError("topic must be a non-empty string")
         summaries = await self._summaries.find_by_topic(dialog_id, raw_topic)
         return tuple((summary.seq_from, summary.seq_to) for summary in summaries)
 
@@ -124,12 +124,12 @@ def _parse_date(raw: object, name: str, *, end: bool) -> datetime | None:
     if raw is None:
         return None
     if not isinstance(raw, str) or not raw.strip():
-        raise SkillArgumentsError(f"{name} must be an ISO date or datetime string")
+        raise ToolArgumentsError(f"{name} must be an ISO date or datetime string")
     text = raw.strip()
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError as exc:
-        raise SkillArgumentsError(f"{name} must be an ISO date or datetime string") from exc
+        raise ToolArgumentsError(f"{name} must be an ISO date or datetime string") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     if end and len(text) == DATE_ONLY_LENGTH:

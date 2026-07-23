@@ -22,11 +22,11 @@ from octoforge_core.cron.tools import (
     create_job,
     format_job,
 )
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.errors import SkillArgumentsError
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskStatus
 from octoforge_core.tasks.store import TaskStore
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.errors import ToolArgumentsError
 
 CREATE_NAME = "task_create"
 CREATE_DESCRIPTION = (
@@ -83,29 +83,29 @@ SELF_DELETE_MESSAGE = "error: a running task cannot delete itself"
 NO_SPAWNER_MESSAGE = "task spawning is not available in this context"
 
 
-class TaskCreateSkill:
+class TaskCreateTool:
     """Creates immediate background tasks (spawner) or cron jobs (schedule)."""
 
     def __init__(self, cron_store: CronStore) -> None:
         self._cron_store = cron_store
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=CREATE_NAME,
             description=CREATE_DESCRIPTION,
             parameters_schema=CREATE_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         title = _non_empty_string(arguments.get("title"), "title")
         prompt = _non_empty_string(arguments.get("prompt"), "prompt")
         schedule = arguments.get("schedule")
         if schedule is None:
             if arguments.get("one_shot") is True:
-                raise SkillArgumentsError("one_shot requires a schedule")
+                raise ToolArgumentsError("one_shot requires a schedule")
             if context.task_spawner is None:
-                raise SkillArgumentsError(NO_SPAWNER_MESSAGE)
+                raise ToolArgumentsError(NO_SPAWNER_MESSAGE)
             return await context.task_spawner.spawn(title, prompt)
         schedule = _non_empty_string(schedule, "schedule")
         timezone = arguments.get("timezone")
@@ -124,7 +124,7 @@ class TaskCreateSkill:
         return await create_job(self._cron_store, draft)
 
 
-class TaskListSkill:
+class TaskListTool:
     """Lists background tasks of the dialog and the user's cron jobs."""
 
     def __init__(self, store: TaskStore, cron_store: CronStore) -> None:
@@ -132,14 +132,14 @@ class TaskListSkill:
         self._cron_store = cron_store
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=LIST_NAME,
             description=LIST_DESCRIPTION,
             parameters_schema=LIST_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         tasks = await self._store.list(context.dialog_id)
         jobs = await self._cron_store.list_for_user(context.user_id)
         if not tasks and not jobs:
@@ -149,7 +149,7 @@ class TaskListSkill:
         return f"{TASKS_SECTION}\n{task_lines}\n\n{JOBS_SECTION}\n{job_lines}"
 
 
-class TaskDeleteSkill:
+class TaskDeleteTool:
     """Deletes a background task (stopping it first when live) or a cron job."""
 
     def __init__(self, store: TaskStore, cron_store: CronStore) -> None:
@@ -157,14 +157,14 @@ class TaskDeleteSkill:
         self._cron_store = cron_store
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=DELETE_NAME,
             description=DELETE_DESCRIPTION,
             parameters_schema=DELETE_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         task_id = _non_empty_string(arguments.get("task_id"), "task_id")
         task = await self._find_task(task_id, context.dialog_id)
         if task is not None:
@@ -181,7 +181,7 @@ class TaskDeleteSkill:
             return None
         return task
 
-    async def _delete_task(self, task: Task, context: SkillContext) -> str:
+    async def _delete_task(self, task: Task, context: ToolContext) -> str:
         if task.id == context.owner_task_id:
             return SELF_DELETE_MESSAGE
         if (
@@ -194,7 +194,7 @@ class TaskDeleteSkill:
             await self._store.delete(task.id)
         return DELETED_TASK_MESSAGE.format(task_id=task.id)
 
-    async def _delete_cron_job(self, job_id: str, context: SkillContext) -> str:
+    async def _delete_cron_job(self, job_id: str, context: ToolContext) -> str:
         try:
             await self._cron_store.delete_for_user(context.user_id, job_id)
         except CronJobNotFoundError:
@@ -204,7 +204,7 @@ class TaskDeleteSkill:
 
 def _non_empty_string(raw: object, argument: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
-        raise SkillArgumentsError(f"{argument} must be a non-empty string")
+        raise ToolArgumentsError(f"{argument} must be a non-empty string")
     return raw
 
 

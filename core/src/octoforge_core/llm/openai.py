@@ -21,7 +21,7 @@ from octoforge_core.llm.events import (
     ToolCallStarted,
 )
 from octoforge_core.llm.usage import Completion, Usage, parse_usage
-from octoforge_core.skills.base import SkillSpec
+from octoforge_core.tools.base import ToolSpec
 
 CHAT_COMPLETIONS_PATH = "/chat/completions"
 PARSE_ERROR_MESSAGE = "Unexpected LLM response payload"
@@ -48,7 +48,7 @@ class OpenAICompatibleClient:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         """Call chat/completions (non-streaming) and return the reply."""
         try:
@@ -70,7 +70,7 @@ class OpenAICompatibleClient:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Call chat/completions with streaming and yield events."""
         try:
@@ -100,7 +100,7 @@ class OpenAICompatibleClient:
     def _build_payload(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None,
+        tools: list[ToolSpec] | None,
         *,
         stream: bool,
     ) -> dict[str, Any]:
@@ -134,8 +134,8 @@ class OpenAICompatibleClient:
         return data
 
     @staticmethod
-    def _serialize_tool(spec: SkillSpec) -> dict[str, Any]:
-        """Convert a skill spec into an OpenAI function tool."""
+    def _serialize_tool(spec: ToolSpec) -> dict[str, Any]:
+        """Convert a tool spec into an OpenAI function tool."""
         return {
             "type": FUNCTION_TOOL_TYPE,
             "function": {

@@ -16,8 +16,8 @@ from octoforge_core import (
     DialogRepository,
     MessageRepository,
     MessageRole,
-    SkillRegistry,
-    SkillSpec,
+    ToolRegistry,
+    ToolSpec,
 )
 from octoforge_core.agent.events import Cancelled, Failed, Finished
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
@@ -73,7 +73,7 @@ class ScriptedLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.requests.append(list(messages))
         return Completion(message=self._replies.pop(0))
@@ -81,7 +81,7 @@ class ScriptedLLM:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.requests.append(list(messages))
         reply = self._replies.pop(0)
@@ -112,7 +112,7 @@ async def make_manager(
 ) -> ConversationManager:
     loop = AgentLoop(
         llm_client=ScriptedLLM(replies),
-        registry=SkillRegistry(),
+        registry=ToolRegistry(),
         max_iterations=MAX_ITERATIONS,
     )
     return ConversationManager(

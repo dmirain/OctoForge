@@ -10,7 +10,7 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
-from octoforge_core.skills.base import SkillContext
+from octoforge_core.tools.base import ToolContext
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.telegram.admin import (
@@ -20,7 +20,7 @@ from octoforge_web.telegram.admin import (
     ACTION_REVOKE_INVITE,
     NOT_AUTHORIZED_MESSAGE,
     AdminAccess,
-    AdminManageSkill,
+    AdminManageTool,
 )
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL
 from octoforge_web.telegram.invites.api import InviteStatus
@@ -36,9 +36,9 @@ NOTE = "for Alice"
 CRON_SCHEDULE = "0 9 * * *"
 NEXT_FIRE = datetime(2026, 1, 2, 9, 0, tzinfo=UTC)
 
-ADMIN_CONTEXT = SkillContext(user_id=ADMIN_USER_ID, channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID)
-USER_CONTEXT = SkillContext(user_id=USER_ID, channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID)
-WEB_ADMIN_CONTEXT = SkillContext(user_id=ADMIN_USER_ID, channel="web", dialog_id=DIALOG_ID)
+ADMIN_CONTEXT = ToolContext(user_id=ADMIN_USER_ID, channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID)
+USER_CONTEXT = ToolContext(user_id=USER_ID, channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID)
+WEB_ADMIN_CONTEXT = ToolContext(user_id=ADMIN_USER_ID, channel="web", dialog_id=DIALOG_ID)
 
 StoresTuple = tuple[SqlAlchemyInviteStore, SqlAlchemyCronStore, MessageRepository, DialogRepository]
 
@@ -62,12 +62,12 @@ async def stores() -> AsyncIterator[StoresTuple]:
     await telegram_engine.dispose()
 
 
-def make_skill(
+def make_tool(
     stores: StoresTuple,
-) -> AdminManageSkill:
+) -> AdminManageTool:
     invites, cron_store, messages, dialogs = stores
     access = AdminAccess(admin_ids=frozenset({ADMIN_TELEGRAM_ID}))
-    return AdminManageSkill(invites, cron_store, messages, dialogs, access)
+    return AdminManageTool(invites, cron_store, messages, dialogs, access)
 
 
 def make_cron_job(job_id: str, user_id: str, enabled: bool = True) -> CronJob:
@@ -105,9 +105,9 @@ async def claim_invite(
 async def test_non_admin_gets_not_authorized(
     stores: StoresTuple,
 ) -> None:
-    skill = make_skill(stores)
+    tool = make_tool(stores)
 
-    result = await skill.execute({"action": ACTION_LIST_USERS}, USER_CONTEXT)
+    result = await tool.execute({"action": ACTION_LIST_USERS}, USER_CONTEXT)
 
     assert result == NOT_AUTHORIZED_MESSAGE
 
@@ -115,9 +115,9 @@ async def test_non_admin_gets_not_authorized(
 async def test_admin_on_web_channel_gets_not_authorized(
     stores: StoresTuple,
 ) -> None:
-    skill = make_skill(stores)
+    tool = make_tool(stores)
 
-    result = await skill.execute({"action": ACTION_LIST_USERS}, WEB_ADMIN_CONTEXT)
+    result = await tool.execute({"action": ACTION_LIST_USERS}, WEB_ADMIN_CONTEXT)
 
     assert result == NOT_AUTHORIZED_MESSAGE
 
@@ -125,20 +125,20 @@ async def test_admin_on_web_channel_gets_not_authorized(
 async def test_visible_to_only_for_telegram_admins(
     stores: StoresTuple,
 ) -> None:
-    skill = make_skill(stores)
+    tool = make_tool(stores)
 
-    assert skill.visible_to(ADMIN_CONTEXT) is True
-    assert skill.visible_to(USER_CONTEXT) is False
-    assert skill.visible_to(WEB_ADMIN_CONTEXT) is False
+    assert tool.visible_to(ADMIN_CONTEXT) is True
+    assert tool.visible_to(USER_CONTEXT) is False
+    assert tool.visible_to(WEB_ADMIN_CONTEXT) is False
 
 
 async def test_generate_invite_returns_the_code(
     stores: StoresTuple,
 ) -> None:
     invites, _, _, _ = stores
-    skill = make_skill(stores)
+    tool = make_tool(stores)
 
-    result = await skill.execute({"action": ACTION_GENERATE_INVITE, "note": NOTE}, ADMIN_CONTEXT)
+    result = await tool.execute({"action": ACTION_GENERATE_INVITE, "note": NOTE}, ADMIN_CONTEXT)
 
     pending = await invites.list_all()
     assert len(pending) == 1
@@ -156,9 +156,9 @@ async def test_list_users_reports_access_stats_and_cron(
     await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hello"))
     await cron_store.create(make_cron_job("job-1", USER_ID))
     await cron_store.create(replace(make_cron_job("job-2", USER_ID), enabled=False))
-    skill = make_skill(stores)
+    tool = make_tool(stores)
 
-    result = await skill.execute({"action": ACTION_LIST_USERS}, ADMIN_CONTEXT)
+    result = await tool.execute({"action": ACTION_LIST_USERS}, ADMIN_CONTEXT)
 
     assert USER_ID in result
     assert "access=claimed" in result
@@ -175,9 +175,9 @@ async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
     await cron_store.create(make_cron_job("job-2", USER_ID))
     # the user's own pause, predating the revoke: restore must not re-enable it
     await cron_store.create(replace(make_cron_job("job-3", USER_ID), enabled=False))
-    skill = make_skill(stores)
+    tool = make_tool(stores)
 
-    revoked = await skill.execute(
+    revoked = await tool.execute(
         {"action": ACTION_REVOKE_INVITE, "user_id": USER_ID}, ADMIN_CONTEXT
     )
 
@@ -189,7 +189,7 @@ async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
     invite = await invites.get_by_id(invite_id)
     assert invite is not None and invite.status is InviteStatus.REVOKED
 
-    restored = await skill.execute(
+    restored = await tool.execute(
         {"action": ACTION_RESTORE_INVITE, "invite_id": invite_id}, ADMIN_CONTEXT
     )
 
@@ -208,9 +208,9 @@ async def test_revoke_pending_invite_by_id(
 ) -> None:
     invites, _, _, _ = stores
     invite = await invites.create(NOTE)
-    skill = make_skill(stores)
+    tool = make_tool(stores)
 
-    result = await skill.execute(
+    result = await tool.execute(
         {"action": ACTION_REVOKE_INVITE, "invite_id": invite.id}, ADMIN_CONTEXT
     )
 
@@ -222,8 +222,8 @@ async def test_revoke_pending_invite_by_id(
 async def test_revoke_without_target_is_an_error(
     stores: StoresTuple,
 ) -> None:
-    skill = make_skill(stores)
+    tool = make_tool(stores)
 
-    result = await skill.execute({"action": ACTION_REVOKE_INVITE}, ADMIN_CONTEXT)
+    result = await tool.execute({"action": ACTION_REVOKE_INVITE}, ADMIN_CONTEXT)
 
     assert result.startswith("error:")

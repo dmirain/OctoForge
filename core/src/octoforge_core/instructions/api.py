@@ -1,6 +1,6 @@
 """Public boundary of the instructions module.
 
-Everything the rest of the system (agent loop, skills, executors) may know
+Everything the rest of the system (agent loop, tools, executors) may know
 about instructions lives here: the `InstructionService` protocol, the
 `InstructionStore` storage port, the JSON-serializable DTOs and the module
 errors.

@@ -29,9 +29,9 @@ from octoforge_core.agent.runner import (
 )
 from octoforge_core.composition import (
     RunnerOptions,
-    SkillLimits,
-    SkillServices,
-    SkillStores,
+    ToolLimits,
+    ToolServices,
+    ToolStores,
     build_agent_loop,
     build_compactor,
     build_conversation_manager,
@@ -43,7 +43,7 @@ from octoforge_core.composition import (
     build_llm_client,
     build_router,
     build_runner_config,
-    build_skill_registry,
+    build_tool_registry,
 )
 from octoforge_core.config import EmbeddingConfig, LLMConfig
 from octoforge_core.context.api import ContextCompactor, MessageArchive, SummaryStore
@@ -82,17 +82,17 @@ from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.memory.api import MemoryStore
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
-from octoforge_core.skills.base import Skill, SkillContext, SkillSpec
-from octoforge_core.skills.errors import (
-    DuplicateSkillError,
-    SkillArgumentsError,
-    SkillNotFoundError,
-)
-from octoforge_core.skills.registry import SkillRegistry
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.spawner import TaskDeleteOutcome, TaskDeleter, TaskSpawner
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import Tool, ToolContext, ToolSpec
+from octoforge_core.tools.errors import (
+    DuplicateToolError,
+    ToolArgumentsError,
+    ToolNotFoundError,
+)
+from octoforge_core.tools.registry import ToolRegistry
 
 __all__ = [
     "AgentLoop",
@@ -115,7 +115,7 @@ __all__ = [
     "Dialog",
     "DialogNotFoundError",
     "DialogRepository",
-    "DuplicateSkillError",
+    "DuplicateToolError",
     "EmbeddingClient",
     "EmbeddingConfig",
     "ErrorKind",
@@ -150,15 +150,6 @@ __all__ = [
     "RunnerOptions",
     "Scheduler",
     "SearchProvider",
-    "Skill",
-    "SkillArgumentsError",
-    "SkillContext",
-    "SkillLimits",
-    "SkillNotFoundError",
-    "SkillRegistry",
-    "SkillServices",
-    "SkillSpec",
-    "SkillStores",
     "SqlAlchemyTaskStore",
     "SummaryStore",
     "Task",
@@ -170,10 +161,19 @@ __all__ = [
     "TaskStatus",
     "TaskStore",
     "TextDelta",
+    "Tool",
+    "ToolArgumentsError",
     "ToolCall",
     "ToolCallCompleted",
     "ToolCallFailed",
     "ToolCallRequested",
+    "ToolContext",
+    "ToolLimits",
+    "ToolNotFoundError",
+    "ToolRegistry",
+    "ToolServices",
+    "ToolSpec",
+    "ToolStores",
     "TransportError",
     "Usage",
     "bootstrap_schema",
@@ -188,7 +188,7 @@ __all__ = [
     "build_llm_client",
     "build_router",
     "build_runner_config",
-    "build_skill_registry",
+    "build_tool_registry",
     "create_engine",
     "create_session_factory",
     "init_db",

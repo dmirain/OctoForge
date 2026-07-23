@@ -1,7 +1,7 @@
 """Cron job endpoints, scoped by the trusted X-User-Id header.
 
 All parameters arrive as the query string: the primary caller is the agent
-itself through the external_call skill, which renders URLs but cannot send
+itself through the external_call tool, which renders URLs but cannot send
 request bodies. The trusted header stands in until real authentication
 (service tokens) arrives.
 """

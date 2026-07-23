@@ -1,4 +1,4 @@
-"""Tests for the cron pause/resume skills (creation/list/delete live in the task tools)."""
+"""Tests for the cron pause/resume tools (creation/list/delete live in the task tools)."""
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
-from octoforge_core.cron.tools import CronPauseSkill, CronResumeSkill
-from octoforge_core.skills.base import SkillContext
+from octoforge_core.cron.tools import CronPauseTool, CronResumeTool
 from octoforge_core.tasks.models import TaskStatus
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolContext
 
 USER_ID = "alice"
 OTHER_USER_ID = "bob"
@@ -19,11 +19,11 @@ JOB_ID = "job-1"
 
 VALID_SCHEDULE = "0 9 * * *"
 VALID_TIMEZONE = "Europe/Moscow"
-CONTEXT = SkillContext(user_id=USER_ID, channel=CHANNEL, dialog_id=DIALOG_ID)
+CONTEXT = ToolContext(user_id=USER_ID, channel=CHANNEL, dialog_id=DIALOG_ID)
 
 
 class FakeCronStore:
-    """In-memory CronStore; lease methods are irrelevant to the skills."""
+    """In-memory CronStore; lease methods are irrelevant to the tools."""
 
     def __init__(self) -> None:
         self.jobs: dict[str, CronJob] = {}
@@ -126,7 +126,7 @@ async def test_pause_disables_the_job() -> None:
     store = FakeCronStore()
     await store.create(make_job())
 
-    result = await CronPauseSkill(store).execute({"job_id": JOB_ID}, CONTEXT)
+    result = await CronPauseTool(store).execute({"job_id": JOB_ID}, CONTEXT)
 
     assert result.startswith(f"paused cron job {JOB_ID}")
     assert not store.jobs[JOB_ID].enabled
@@ -137,20 +137,20 @@ async def test_resume_enables_the_job_and_recomputes_the_next_fire() -> None:
     past_fire = datetime(2020, 1, 1, tzinfo=UTC)
     await store.create(make_job(enabled=False, next_fire_at=past_fire))
 
-    result = await CronResumeSkill(store).execute({"job_id": JOB_ID}, CONTEXT)
+    result = await CronResumeTool(store).execute({"job_id": JOB_ID}, CONTEXT)
 
     assert result.startswith(f"resumed cron job {JOB_ID}")
     assert store.jobs[JOB_ID].enabled
     assert store.jobs[JOB_ID].next_fire_at > utc_now()
 
 
-@pytest.mark.parametrize("skill_cls", [CronPauseSkill, CronResumeSkill])
+@pytest.mark.parametrize("tool_cls", [CronPauseTool, CronResumeTool])
 async def test_pause_and_resume_refuse_foreign_jobs(
-    skill_cls: type[CronPauseSkill | CronResumeSkill],
+    tool_cls: type[CronPauseTool | CronResumeTool],
 ) -> None:
     store = FakeCronStore()
     await store.create(make_job(user_id=OTHER_USER_ID))
 
-    result = await skill_cls(store).execute({"job_id": JOB_ID}, CONTEXT)
+    result = await tool_cls(store).execute({"job_id": JOB_ID}, CONTEXT)
 
     assert result == "error: cron job not found"

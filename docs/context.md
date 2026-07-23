@@ -196,7 +196,7 @@ instructions/datasets/memory/cron):
 
 - `history_search(query, topic?, date_from?, date_to?, limit?)` — LIKE-подстрока
   по `messages.content` внутри текущего диалога (та же механика, что у
-  `memory_search`; изоляция — только свой dialog_id из `SkillContext`);
+  `memory_search`; изоляция — только свой dialog_id из `ToolContext`);
   опциональный фильтр темы: совпадение по тегам `dialog_summaries` → выдача
   ограничена их seq-диапазонами. Даты — ISO date/datetime (naive читается как
   UTC; верхняя граница date-only покрывает день целиком, а datetime-граница —

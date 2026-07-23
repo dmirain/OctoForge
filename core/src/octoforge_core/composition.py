@@ -22,38 +22,38 @@ from octoforge_core.agent.runner import (
 from octoforge_core.config import LLMConfig
 from octoforge_core.context.api import ContextCompactor, MessageArchive, SummaryStore
 from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
-from octoforge_core.context.tools import HistorySearchSkill
+from octoforge_core.context.tools import HistorySearchTool
 from octoforge_core.cron.api import CronStore, CronWaker, Scheduler
 from octoforge_core.cron.reporter import CronOutcomeReporter
 from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
-from octoforge_core.cron.tools import CronPauseSkill, CronResumeSkill
+from octoforge_core.cron.tools import CronPauseTool, CronResumeTool
 from octoforge_core.datasets.api import DatasetService, DatasetStore
 from octoforge_core.datasets.service import LocalDatasetService
-from octoforge_core.datasets.tools import DataForgetSkill, DataPutSkill, DataQuerySkill
+from octoforge_core.datasets.tools import DataForgetTool, DataPutTool, DataQueryTool
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.instructions.api import InstructionService, InstructionStore
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES, LocalInstructionService
-from octoforge_core.instructions.tools import InstructionSaveSkill, SkillsSearchSkill
+from octoforge_core.instructions.tools import InstructionSaveTool, SkillsSearchTool
 from octoforge_core.llm.embeddings import EmbeddingClient
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.memory.api import MemoryStore
-from octoforge_core.memory.tools import MemoryDeleteSkill, MemorySearchSkill, MemoryStoreSkill
+from octoforge_core.memory.tools import MemoryDeleteTool, MemorySearchTool, MemoryStoreTool
 from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
-from octoforge_core.net.tools import ExternalCallSkill, HttpRequestSkill
+from octoforge_core.net.tools import ExternalCallTool, HttpRequestTool
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
-from octoforge_core.search.tools import WebSearchSkill
-from octoforge_core.skills.registry import SkillRegistry
+from octoforge_core.search.tools import WebSearchTool
 from octoforge_core.tasks.store import TaskStore
-from octoforge_core.tasks.tools import TaskCreateSkill, TaskDeleteSkill, TaskListSkill
+from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool, TaskListTool
+from octoforge_core.tools.registry import ToolRegistry
 
 
 @dataclass(frozen=True, slots=True)
-class SkillLimits:
-    """All skill limit knobs in one place (mapped from the app's settings)."""
+class ToolLimits:
+    """All tool limit knobs in one place (mapped from the app's settings)."""
 
     instructions_top_k: int
     datasets_query_default_limit: int
@@ -65,8 +65,8 @@ class SkillLimits:
 
 
 @dataclass(frozen=True, slots=True)
-class SkillStores:
-    """Store ports the basic skills read and write through."""
+class ToolStores:
+    """Store ports the basic tools read and write through."""
 
     tasks: TaskStore
     cron: CronStore
@@ -76,10 +76,10 @@ class SkillStores:
 
 
 @dataclass(frozen=True, slots=True)
-class SkillServices:
-    """Service ports the knowledge/data skills run over.
+class ToolServices:
+    """Service ports the knowledge/data tools run over.
 
-    `search_provider` is optional: without it the web_search skill is not
+    `search_provider` is optional: without it the web_search tool is not
     registered at all.
     """
 
@@ -143,37 +143,37 @@ def build_external_executor(
     )
 
 
-def build_skill_registry(
+def build_tool_registry(
     outbound_http: httpx.AsyncClient,
     guard: SsrfGuard,
-    stores: SkillStores,
-    services: SkillServices,
-    limits: SkillLimits,
-) -> SkillRegistry:
+    stores: ToolStores,
+    services: ToolServices,
+    limits: ToolLimits,
+) -> ToolRegistry:
     """Build the registry with the full set of code tools.
 
-    All skills are wired to the given ports; the web_search skill is
+    All tools are wired to the given ports; the web_search tool is
     registered only when a search provider is supplied.
     """
-    registry = SkillRegistry()
-    _register_core_skills(registry, outbound_http, guard, stores.tasks, stores.cron)
+    registry = ToolRegistry()
+    _register_core_tools(registry, outbound_http, guard, stores.tasks, stores.cron)
     if services.search_provider is not None:
-        registry.register(WebSearchSkill(provider=services.search_provider))
-    _register_instruction_skills(registry, services, limits)
-    _register_dataset_skills(registry, services.datasets, limits)
-    _register_memory_skills(registry, stores.memory, limits)
-    _register_history_skill(registry, stores.archive, stores.summaries, limits)
+        registry.register(WebSearchTool(provider=services.search_provider))
+    _register_instruction_tools(registry, services, limits)
+    _register_dataset_tools(registry, services.datasets, limits)
+    _register_memory_tools(registry, stores.memory, limits)
+    _register_history_tool(registry, stores.archive, stores.summaries, limits)
     return registry
 
 
 def build_agent_loop(
     llm: LLMClient,
-    registry: SkillRegistry,
+    registry: ToolRegistry,
     *,
     max_iterations: int,
     stream_idle_timeout: float | None = None,
 ) -> AgentLoop:
-    """Build the agent loop over the given LLM client and skill registry."""
+    """Build the agent loop over the given LLM client and tool registry."""
     return AgentLoop(
         llm_client=llm,
         registry=registry,
@@ -255,82 +255,82 @@ def build_cron_scheduler(
     return CronScheduler(store=store, waker=waker, owner=owner, config=config)
 
 
-def _register_core_skills(
-    registry: SkillRegistry,
+def _register_core_tools(
+    registry: ToolRegistry,
     outbound_http: httpx.AsyncClient,
     guard: SsrfGuard,
     task_store: TaskStore,
     cron_store: CronStore,
 ) -> None:
-    """Register the HTTP and deferred-work (task/cron) skills."""
-    registry.register(HttpRequestSkill(http_client=outbound_http, guard=guard))
-    registry.register(TaskCreateSkill(cron_store=cron_store))
-    registry.register(TaskListSkill(store=task_store, cron_store=cron_store))
-    registry.register(TaskDeleteSkill(store=task_store, cron_store=cron_store))
-    registry.register(CronPauseSkill(store=cron_store))
-    registry.register(CronResumeSkill(store=cron_store))
+    """Register the HTTP and deferred-work (task/cron) tools."""
+    registry.register(HttpRequestTool(http_client=outbound_http, guard=guard))
+    registry.register(TaskCreateTool(cron_store=cron_store))
+    registry.register(TaskListTool(store=task_store, cron_store=cron_store))
+    registry.register(TaskDeleteTool(store=task_store, cron_store=cron_store))
+    registry.register(CronPauseTool(store=cron_store))
+    registry.register(CronResumeTool(store=cron_store))
 
 
-def _register_instruction_skills(
-    registry: SkillRegistry,
-    services: SkillServices,
-    limits: SkillLimits,
+def _register_instruction_tools(
+    registry: ToolRegistry,
+    services: ToolServices,
+    limits: ToolLimits,
 ) -> None:
-    """Register the instructions discovery/save and external-call skills."""
+    """Register the instructions discovery/save and external-call tools."""
     registry.register(
-        SkillsSearchSkill(
+        SkillsSearchTool(
             service=services.instructions,
             default_k=limits.instructions_top_k,
             datasets=services.datasets,
         )
     )
-    registry.register(InstructionSaveSkill(service=services.instructions))
-    registry.register(ExternalCallSkill(executor=services.executor))
+    registry.register(InstructionSaveTool(service=services.instructions))
+    registry.register(ExternalCallTool(executor=services.executor))
 
 
-def _register_dataset_skills(
-    registry: SkillRegistry,
+def _register_dataset_tools(
+    registry: ToolRegistry,
     datasets: DatasetService,
-    limits: SkillLimits,
+    limits: ToolLimits,
 ) -> None:
-    """Register the dataset record skills."""
-    registry.register(DataPutSkill(service=datasets))
+    """Register the dataset record tools."""
+    registry.register(DataPutTool(service=datasets))
     registry.register(
-        DataQuerySkill(
+        DataQueryTool(
             service=datasets,
             default_limit=limits.datasets_query_default_limit,
             max_limit=limits.datasets_query_max_limit,
         )
     )
-    registry.register(DataForgetSkill(service=datasets))
+    registry.register(DataForgetTool(service=datasets))
 
 
-def _register_memory_skills(
-    registry: SkillRegistry,
+def _register_memory_tools(
+    registry: ToolRegistry,
     store: MemoryStore,
-    limits: SkillLimits,
+    limits: ToolLimits,
 ) -> None:
-    """Register the memory skills over the shared memory store."""
-    registry.register(MemoryStoreSkill(store=store))
+    """Register the memory tools over the shared memory store."""
+    registry.register(MemoryStoreTool(store=store))
     registry.register(
-        MemorySearchSkill(
+        MemorySearchTool(
             store=store,
             default_limit=limits.memory_search_default_limit,
             max_limit=limits.memory_search_max_limit,
         )
     )
-    registry.register(MemoryDeleteSkill(store=store))
+    registry.register(MemoryDeleteTool(store=store))
 
 
-def _register_history_skill(
-    registry: SkillRegistry,
+def _register_history_tool(
+    registry: ToolRegistry,
     archive: MessageArchive,
     summaries: SummaryStore,
-    limits: SkillLimits,
+    limits: ToolLimits,
 ) -> None:
-    """Register the archive search skill over the archive/summaries read ports."""
+    """Register the archive search tool over the archive/summaries read ports."""
     registry.register(
-        HistorySearchSkill(
+        HistorySearchTool(
             archive=archive,
             summaries=summaries,
             default_limit=limits.history_search_default_limit,

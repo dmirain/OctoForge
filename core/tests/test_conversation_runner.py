@@ -48,14 +48,14 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.registry import SkillRegistry
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.spawner import TaskDeleteOutcome
 from octoforge_core.tasks.store import InMemoryTaskStore, TaskStore
-from octoforge_core.tasks.tools import TaskCreateSkill, TaskDeleteSkill
+from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.registry import ToolRegistry
 
 PROMPT = "test system prompt"
 REPLY = "hello"
@@ -66,7 +66,7 @@ RETRIED_CALLS = 2
 FIRST_CLIENT_KEY = "upd-1"
 SECOND_CLIENT_KEY = "upd-2"
 SECOND_REPLY = "world"
-BLOCKING_SKILL = "blocking"
+BLOCKING_TOOL = "blocking"
 TASK_CREATE_CALL = "task_create"
 CALL_ID = "call-1"
 TASK_RESULT = "42"
@@ -129,7 +129,7 @@ class ScriptedLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.requests.append(list(messages))
         return Completion(message=self._replies.pop(0))
@@ -137,7 +137,7 @@ class ScriptedLLM:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.requests.append(list(messages))
         reply = self._replies.pop(0)
@@ -156,7 +156,7 @@ class UsageLLM(ScriptedLLM):
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.requests.append(list(messages))
         reply = self._replies.pop(0)
@@ -198,14 +198,14 @@ class OverflowLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.stream_calls += 1
         self.requests.append(list(messages))
@@ -225,14 +225,14 @@ class GatedLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.requests.append(list(messages))
         call_number = len(self.requests)
@@ -264,14 +264,14 @@ class BranchLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         if messages and messages[0].content.startswith(BACKGROUND_TASK_PROMPT):
             self.background_requests.append(list(messages))
@@ -295,45 +295,45 @@ class StallingLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         yield LlmTextDelta(text=PARTIAL)
         await self.release.wait()
         yield StreamFinished(message=reply("full"))
 
 
-class BlockingSkill:
-    """Skill stub holding the run open until released."""
+class BlockingTool:
+    """Tool stub holding the run open until released."""
 
     def __init__(self) -> None:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=BLOCKING_SKILL, description="blocks", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=BLOCKING_TOOL, description="blocks", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         self.started.set()
         await self.release.wait()
         return UNBLOCKED_OUTPUT
 
 
-class QuickSkill:
-    """Skill stub completing immediately."""
+class QuickTool:
+    """Tool stub completing immediately."""
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=BLOCKING_SKILL, description="quick", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=BLOCKING_TOOL, description="quick", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         return "ok"
 
 
@@ -341,7 +341,7 @@ def blocking_call() -> ChatMessage:
     return ChatMessage(
         role=MessageRole.ASSISTANT,
         content="",
-        tool_calls=(ToolCall(id=CALL_ID, name=BLOCKING_SKILL, arguments={}),),
+        tool_calls=(ToolCall(id=CALL_ID, name=BLOCKING_TOOL, arguments={}),),
     )
 
 
@@ -376,7 +376,7 @@ class ManagerOptions:
 
 def make_manager(
     llm: LLMClient,
-    registry: SkillRegistry,
+    registry: ToolRegistry,
     session_factory: async_sessionmaker[AsyncSession],
     options: ManagerOptions | None = None,
 ) -> ConversationManager:
@@ -404,15 +404,15 @@ async def get_dialog(session_factory: async_sessionmaker[AsyncSession]) -> Dialo
     return await DialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
 
 
-def blocking_registry(skill: BlockingSkill) -> SkillRegistry:
-    registry = SkillRegistry()
-    registry.register(skill)
+def blocking_registry(tool: BlockingTool) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(tool)
     return registry
 
 
-def quick_registry() -> SkillRegistry:
-    registry = SkillRegistry()
-    registry.register(QuickSkill())
+def quick_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(QuickTool())
     return registry
 
 
@@ -468,7 +468,7 @@ async def wait_for_condition(predicate: Callable[[], bool]) -> None:
 async def test_submit_streams_events_and_updates_narrative(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([reply()]), SkillRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([reply()]), ToolRegistry(), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -496,7 +496,7 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     usage = Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS)
-    manager = make_manager(UsageLLM([reply()], usage), SkillRegistry(), session_factory)
+    manager = make_manager(UsageLLM([reply()], usage), ToolRegistry(), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -522,7 +522,7 @@ async def test_branch_keeps_system_prompt_stable_and_envelopes_last_message(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([reply()])
-    manager = make_manager(llm, SkillRegistry(), session_factory)
+    manager = make_manager(llm, ToolRegistry(), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -546,7 +546,7 @@ async def test_duplicate_client_message_id_is_skipped(
 ) -> None:
     router = FakeRouter()
     llm = ScriptedLLM([reply(), reply(SECOND_REPLY)])
-    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(router=router))
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -571,7 +571,7 @@ async def test_context_overflow_compacts_and_retries_once(
     llm = OverflowLLM(overflows=1)
     compactor = FakeCompactor()
     manager = make_manager(
-        llm, SkillRegistry(), session_factory, ManagerOptions(compactor=compactor)
+        llm, ToolRegistry(), session_factory, ManagerOptions(compactor=compactor)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
@@ -598,7 +598,7 @@ async def test_second_context_overflow_fails_the_run(
     llm = OverflowLLM(overflows=RETRIED_CALLS)
     compactor = FakeCompactor()
     manager = make_manager(
-        llm, SkillRegistry(), session_factory, ManagerOptions(compactor=compactor)
+        llm, ToolRegistry(), session_factory, ManagerOptions(compactor=compactor)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
@@ -619,7 +619,7 @@ async def test_context_overflow_without_compaction_fails_immediately(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = OverflowLLM(overflows=1)  # NoopContextCompactor: compact_now -> False
-    manager = make_manager(llm, SkillRegistry(), session_factory)
+    manager = make_manager(llm, ToolRegistry(), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -637,7 +637,7 @@ async def test_compaction_crash_fails_the_run_and_releases_the_slot(
     llm = OverflowLLM(overflows=1)
     compactor = FakeCompactor(compact_error=RuntimeError("store down"))
     manager = make_manager(
-        llm, SkillRegistry(), session_factory, ManagerOptions(compactor=compactor)
+        llm, ToolRegistry(), session_factory, ManagerOptions(compactor=compactor)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
@@ -663,15 +663,15 @@ async def test_compaction_crash_fails_the_run_and_releases_the_slot(
 async def test_new_question_suspends_foreground_and_starts_new_process(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), reply("second final"), reply("first final")])
-    manager = make_manager(llm, blocking_registry(skill), session_factory)
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("first")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("second")
     events = await collect_completions(queue, 1)
 
@@ -681,7 +681,7 @@ async def test_new_question_suspends_foreground_and_starts_new_process(
     assert len(finished) == 1
     assert finished[0].message.content == "second final"
 
-    skill.release.set()
+    tool.release.set()
     events += await collect_completions(queue, 1)
 
     done = completions(events)
@@ -698,23 +698,23 @@ async def test_new_question_suspends_foreground_and_starts_new_process(
 async def test_inject_steers_the_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), reply("after")])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(skill), session_factory, ManagerOptions(router=router)
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("start")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     router.decide(RouteOp(action=RouteAction.INJECT))
     await runner.submit("extra context")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     await asyncio.sleep(0)
-    skill.release.set()
+    tool.release.set()
     await collect_until(queue, is_completed)
 
     second_request = llm.requests[1]
@@ -729,18 +729,18 @@ async def test_inject_steers_the_foreground(
 async def test_promote_brings_background_process_to_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = GatedLLM()
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(skill), session_factory, ManagerOptions(router=router)
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("first")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("second")
     events = await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
 
@@ -758,7 +758,7 @@ async def test_promote_brings_background_process_to_foreground(
     suspends = [e.payload.title for e in events if isinstance(e.payload, ProcessSuspended)]
     assert suspends == ["second"]
 
-    skill.release.set()
+    tool.release.set()
     llm.release.set()
     events = await collect_completions(queue, 2)
 
@@ -775,18 +775,18 @@ async def test_promote_brings_background_process_to_foreground(
 async def test_router_cancel_stops_the_process(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ScriptedLLM([blocking_call()])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(skill), session_factory, ManagerOptions(router=router)
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("start")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
     def cancel_all(processes: tuple[ProcessInfo, ...], message: str) -> RouteDecision:
         return RouteDecision(
@@ -799,7 +799,7 @@ async def test_router_cancel_stops_the_process(
     await runner.submit("stop it")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     await asyncio.sleep(0)
-    skill.release.set()
+    tool.release.set()
     events = await collect_until(queue, is_completed)
 
     assert any(isinstance(e.payload, Cancelled) for e in events)
@@ -814,9 +814,9 @@ async def test_router_cancel_stops_the_process(
 async def test_cancel_api_cancels_only_the_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), blocking_call(), reply("first final")])
-    manager = make_manager(llm, blocking_registry(skill), session_factory)
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -828,7 +828,7 @@ async def test_cancel_api_cancels_only_the_foreground(
     await runner.cancel()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    skill.release.set()
+    tool.release.set()
     events = await collect_completions(queue, 2)
 
     by_title = {item.title: item.status for item in completions(events)}
@@ -842,21 +842,21 @@ async def test_cancel_api_cancels_only_the_foreground(
 async def test_process_limit_injects_refusal_into_busy_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), reply("after")])
     manager = make_manager(
-        llm, blocking_registry(skill), session_factory, ManagerOptions(max_processes=ONE_PROCESS)
+        llm, blocking_registry(tool), session_factory, ManagerOptions(max_processes=ONE_PROCESS)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("start")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("new question")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_REFUSAL)
     await asyncio.sleep(0)
-    skill.release.set()
+    tool.release.set()
     events = await collect_completions(queue, 1)
 
     assert len(completions(events)) == 1
@@ -881,7 +881,7 @@ async def test_process_limit_starts_report_run_when_foreground_is_free(
     store = InMemoryTaskStore()
     manager = make_manager(
         llm,
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
@@ -917,17 +917,17 @@ async def test_process_limit_starts_report_run_when_foreground_is_free(
 async def test_spawn_task_refuses_over_the_process_limit(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), reply("after")])
     manager = make_manager(
-        llm, blocking_registry(skill), session_factory, ManagerOptions(max_processes=ONE_PROCESS)
+        llm, blocking_registry(tool), session_factory, ManagerOptions(max_processes=ONE_PROCESS)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("start")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
     refusal = await runner.spawn_task("another job", "do it")
 
@@ -935,25 +935,25 @@ async def test_spawn_task_refuses_over_the_process_limit(
     assert "process limit (1)" in refusal
     assert "start" in refusal
 
-    skill.release.set()
+    tool.release.set()
     await collect_until(queue, is_completed)
 
 
-SELF_DELETE_SKILL = "self_delete"
+SELF_DELETE_TOOL = "self_delete"
 
 
-class SelfDeleteSkill:
+class SelfDeleteTool:
     """Routes into the real task_delete flow against the only stored task (itself)."""
 
-    def __init__(self, inner: TaskDeleteSkill, store: TaskStore) -> None:
+    def __init__(self, inner: TaskDeleteTool, store: TaskStore) -> None:
         self._inner = inner
         self._store = store
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(name=SELF_DELETE_SKILL, description="quick", parameters_schema={})
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=SELF_DELETE_TOOL, description="quick", parameters_schema={})
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         (task,) = await self._store.list(context.dialog_id)
         return await self._inner.execute({"task_id": task.id}, context)
 
@@ -962,7 +962,7 @@ def self_delete_call() -> ChatMessage:
     return ChatMessage(
         role=MessageRole.ASSISTANT,
         content="",
-        tool_calls=(ToolCall(id=CALL_ID, name=SELF_DELETE_SKILL, arguments={}),),
+        tool_calls=(ToolCall(id=CALL_ID, name=SELF_DELETE_TOOL, arguments={}),),
     )
 
 
@@ -972,7 +972,7 @@ async def test_delete_task_stops_a_live_background_process(
     llm = BranchLLM(main=[reply("pong")], background=[reply(TASK_RESULT)])
     llm.gate_background = True
     store = InMemoryTaskStore()
-    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -1001,7 +1001,7 @@ async def test_delete_task_stops_a_live_background_process(
 async def test_delete_task_reports_not_running_for_an_unknown_task(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([]), SkillRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
     assert await runner.delete_task("missing") is TaskDeleteOutcome.NOT_RUNNING
@@ -1011,9 +1011,9 @@ async def test_delete_task_from_inside_its_own_process_is_refused(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = InMemoryTaskStore()
-    registry = SkillRegistry()
-    inner = TaskDeleteSkill(store=store, cron_store=SqlAlchemyCronStore(session_factory))
-    registry.register(SelfDeleteSkill(inner, store))
+    registry = ToolRegistry()
+    inner = TaskDeleteTool(store=store, cron_store=SqlAlchemyCronStore(session_factory))
+    registry.register(SelfDeleteTool(inner, store))
     llm = BranchLLM(
         main=[reply("report answer")],
         background=[self_delete_call(), reply(TASK_RESULT)],
@@ -1036,8 +1036,8 @@ async def test_delete_task_from_inside_its_own_process_is_refused(
 async def test_task_create_skill_runs_background_process_and_reports(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    registry = SkillRegistry()
-    registry.register(TaskCreateSkill(cron_store=SqlAlchemyCronStore(session_factory)))
+    registry = ToolRegistry()
+    registry.register(TaskCreateTool(cron_store=SqlAlchemyCronStore(session_factory)))
     llm = BranchLLM(
         main=[task_create_call(), reply("spawn confirmed"), reply("report answer")],
         background=[reply(TASK_RESULT)],
@@ -1076,23 +1076,23 @@ async def test_task_create_skill_runs_background_process_and_reports(
 async def test_task_done_notification_injected_into_busy_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = BranchLLM(main=[blocking_call(), reply("after")], background=[reply(TASK_RESULT)])
     store = InMemoryTaskStore()
     manager = make_manager(
-        llm, blocking_registry(skill), session_factory, ManagerOptions(store=store)
+        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("start")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
     await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
     await wait_for_condition(lambda: any(TASK_RESULT in m.content for m in runner.history()))
     await asyncio.sleep(0)
-    skill.release.set()
+    tool.release.set()
     await collect_completions(queue, 2)
 
     second_request = llm.main_requests[1]
@@ -1105,7 +1105,7 @@ async def test_interrupted_turn_is_salvaged_into_the_narrative(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = StallingLLM()
-    manager = make_manager(llm, SkillRegistry(), session_factory)
+    manager = make_manager(llm, ToolRegistry(), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -1189,7 +1189,7 @@ async def test_wake_runs_cron_tagged_background_process(
 ) -> None:
     llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
     store = InMemoryTaskStore()
-    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -1213,12 +1213,12 @@ async def test_wake_runs_cron_tagged_background_process(
 async def test_wake_over_the_process_limit_publishes_a_system_note(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), reply("after")])
     store = InMemoryTaskStore()
     manager = make_manager(
         llm,
-        blocking_registry(skill),
+        blocking_registry(tool),
         session_factory,
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
@@ -1227,7 +1227,7 @@ async def test_wake_over_the_process_limit_publishes_a_system_note(
 
     await runner.submit("start")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
     delivered = await runner.wake(CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
     assert delivered is False
@@ -1240,7 +1240,7 @@ async def test_wake_over_the_process_limit_publishes_a_system_note(
     assert "start" in note.content
     assert await store.list(runner.dialog_id) == []  # no task was created
 
-    skill.release.set()
+    tool.release.set()
     await collect_until(queue, is_completed)
 
 
@@ -1273,7 +1273,7 @@ async def test_actor_survives_a_failing_command(
     router.handler = handler
     manager = make_manager(
         ScriptedLLM([reply()]),
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(router=router),
     )
@@ -1321,7 +1321,7 @@ async def test_actor_dies_when_a_failing_command_races_its_cancellation(
     router = ConvertingRouter()
     manager = make_manager(
         ScriptedLLM([reply()]),
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(router=router),
     )
@@ -1343,7 +1343,7 @@ async def test_process_slot_released_when_finalize_fails(
     store = FailingFinalizeStore()
     manager = make_manager(
         ScriptedLLM([reply("bg1"), reply("bg2")]),
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
@@ -1380,7 +1380,7 @@ async def test_cron_task_outcome_is_reported_to_the_listener(
     listener = RecordingOutcomeListener()
     manager = make_manager(
         llm,
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(listener=listener),
     )
@@ -1403,7 +1403,7 @@ async def test_plain_task_outcome_is_not_reported(
     listener = RecordingOutcomeListener()
     manager = make_manager(
         llm,
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(listener=listener),
     )
@@ -1423,7 +1423,7 @@ async def test_listener_failure_does_not_break_finalize(
     store = InMemoryTaskStore()
     manager = make_manager(
         llm,
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(store=store, listener=RecordingOutcomeListener(fail=True)),
     )
@@ -1442,12 +1442,12 @@ async def test_listener_failure_does_not_break_finalize(
 async def test_promote_at_the_process_limit_moves_the_process_to_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = GatedLLM()
     router = FakeRouter()
     manager = make_manager(
         llm,
-        blocking_registry(skill),
+        blocking_registry(tool),
         session_factory,
         ManagerOptions(router=router, max_processes=TWO_PROCESSES),
     )
@@ -1456,7 +1456,7 @@ async def test_promote_at_the_process_limit_moves_the_process_to_foreground(
 
     await runner.submit("first")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(skill.started.wait(), timeout=TIMEOUT_SECONDS)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("second")
     events = await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
 
@@ -1474,7 +1474,7 @@ async def test_promote_at_the_process_limit_moves_the_process_to_foreground(
     assert (resumed.process_id, resumed.title) == (first_id, "first")
     assert not any("process limit" in m.content for m in runner.history())
 
-    skill.release.set()
+    tool.release.set()
     llm.release.set()
     events = await collect_completions(queue, 2)
     done = completions(events)
@@ -1490,17 +1490,17 @@ class ToolStallingLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise NotImplementedError
 
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         yield LlmTextDelta(text=PARTIAL)
-        yield ToolCallReady(call=ToolCall(id=CALL_ID, name=BLOCKING_SKILL, arguments={}))
+        yield ToolCallReady(call=ToolCall(id=CALL_ID, name=BLOCKING_TOOL, arguments={}))
         await self.release.wait()
         yield StreamFinished(message=reply("full"))
 
@@ -1508,9 +1508,9 @@ class ToolStallingLLM:
 async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ToolStallingLLM()
-    manager = make_manager(llm, blocking_registry(skill), session_factory)
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -1574,7 +1574,7 @@ async def test_result_row_is_not_deleted_when_the_note_persist_fails(
 ) -> None:
     store = RecordingDeliveryStore()
     llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
-    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     runner._messages = SystemNoteFailingRepository(session_factory)
@@ -1611,7 +1611,7 @@ async def test_concurrent_spawns_do_not_exceed_the_process_limit(
     llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
     manager = make_manager(
         llm,
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
@@ -1664,7 +1664,7 @@ async def test_spawn_during_a_pending_start_new_does_not_exceed_the_limit(
     llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
     manager = make_manager(
         llm,
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(compactor=compactor, max_processes=ONE_PROCESS),
     )
@@ -1690,9 +1690,9 @@ async def test_spawn_during_a_pending_start_new_does_not_exceed_the_limit(
 async def test_stop_cancels_and_awaits_actor_and_pumps(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    skill = BlockingSkill()
+    tool = BlockingTool()
     llm = ToolStallingLLM()
-    manager = make_manager(llm, blocking_registry(skill), session_factory)
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -1702,7 +1702,7 @@ async def test_stop_cancels_and_awaits_actor_and_pumps(
     # the pump is stalled mid-stream: stop must cancel it directly, not hang
     await runner.stop()
     llm.release.set()
-    skill.release.set()
+    tool.release.set()
 
     actor = runner._actor_task
     assert actor is not None
@@ -1716,7 +1716,7 @@ async def test_stop_closes_only_the_own_dialogs_compaction(
     compactor = FakeCompactor()
     manager = make_manager(
         ScriptedLLM([reply()]),
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(compactor=compactor),
     )
@@ -1730,7 +1730,7 @@ async def test_stop_closes_only_the_own_dialogs_compaction(
 async def test_stop_all_stops_and_deregisters_every_runner(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([reply()]), SkillRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([reply()]), ToolRegistry(), session_factory)
     first = await manager.get_or_create_runner(USER_ID, CHANNEL)
     second = await manager.get_or_create_runner("user-2", CHANNEL)
 
@@ -1770,7 +1770,7 @@ async def test_recover_interrupted_fails_orphaned_tasks(
 ) -> None:
     store = InMemoryTaskStore()
     llm = ScriptedLLM([])
-    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog)
     await store.add(task)
@@ -1805,7 +1805,7 @@ async def test_recover_interrupted_reports_only_cron_tagged_orphans(
     listener = RecordingListener()
     manager = make_manager(
         ScriptedLLM([]),
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(store=store, listener=listener),
     )
@@ -1826,7 +1826,7 @@ async def test_recover_interrupted_redelivers_undelivered_results(
 ) -> None:
     store = RecordingDeliveryStore()
     llm = ScriptedLLM([reply("your background result is ready")])
-    manager = make_manager(llm, SkillRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
     await store.add(task)
@@ -1846,7 +1846,7 @@ async def test_recover_interrupted_noop_without_candidates(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([])
-    manager = make_manager(llm, SkillRegistry(), session_factory)
+    manager = make_manager(llm, ToolRegistry(), session_factory)
 
     await manager.recover_interrupted()
 
@@ -1867,7 +1867,7 @@ async def test_recover_interrupted_survives_store_failures(
 ) -> None:
     manager = make_manager(
         ScriptedLLM([]),
-        SkillRegistry(),
+        ToolRegistry(),
         session_factory,
         ManagerOptions(store=SweepFailingStore()),
     )

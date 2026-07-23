@@ -32,12 +32,12 @@ from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
-from octoforge_core.skills.base import SkillContext
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.spawner import TaskDeleteOutcome, TaskDeleter, TaskSpawner
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -299,8 +299,8 @@ class ConversationRunner:
         The store row is removed by the finalization that follows the stop,
         not here: deleting it earlier would crash the finalize/report path.
         The caller must not pass the id of the process it runs in (the pump
-        cannot be awaited from within) — `TaskDeleteSkill` refuses that via
-        `SkillContext.owner_task_id`.
+        cannot be awaited from within) — `TaskDeleteTool` refuses that via
+        `ToolContext.owner_task_id`.
         """
         process = self._processes.get(task_id)
         if process is None:
@@ -659,7 +659,7 @@ class ConversationRunner:
 
     async def _stream_once(self, process: _Process) -> LoopEvent:
         """Run the loop stream, broadcasting events only while it is the foreground."""
-        context = SkillContext(
+        context = ToolContext(
             user_id=self._dialog.user_id,
             channel=self._dialog.channel,
             dialog_id=self._dialog.id,

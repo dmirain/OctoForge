@@ -29,8 +29,8 @@ from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent
 from octoforge_core.llm.usage import Completion, Usage
-from octoforge_core.skills.base import SkillSpec
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolSpec
 
 USER_ID = "user-1"
 CHANNEL = "web"
@@ -110,7 +110,7 @@ class SummarizingLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.requests.append(list(messages))
         return Completion(
@@ -120,7 +120,7 @@ class SummarizingLLM:
     def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         raise NotImplementedError
 
@@ -136,7 +136,7 @@ class GatedSummarizingLLM(SummarizingLLM):
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.calls += 1
         await self.release.wait()
@@ -149,7 +149,7 @@ class FailingLLM(SummarizingLLM):
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise RuntimeError("llm down")
 

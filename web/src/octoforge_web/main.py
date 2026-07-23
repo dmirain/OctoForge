@@ -30,13 +30,13 @@ from octoforge_core import (
     build_llm_client,
     build_router,
     build_runner_config,
-    build_skill_registry,
+    build_tool_registry,
     create_engine,
     create_session_factory,
     init_db,
 )
 from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
-from octoforge_core.composition import RunnerOptions, SkillLimits, SkillServices, SkillStores
+from octoforge_core.composition import RunnerOptions, ToolLimits, ToolServices, ToolStores
 from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
 from octoforge_core.context.compactor import CompactorConfig
 from octoforge_core.context.store import SqlAlchemySummaryStore
@@ -68,7 +68,7 @@ from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
 from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
-from octoforge_web.telegram.admin import AdminAccess, AdminManageSkill
+from octoforge_web.telegram.admin import AdminAccess, AdminManageTool
 from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_web.telegram.invites.models import InviteBase
@@ -141,17 +141,17 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
             memory = SqlAlchemyMemoryStore(session_factory)
             summary_store = SqlAlchemySummaryStore(session_factory)
-            registry = build_skill_registry(
+            registry = build_tool_registry(
                 outbound_http,
                 guard,
-                stores=SkillStores(
+                stores=ToolStores(
                     tasks=task_store,
                     cron=cron_store,
                     memory=memory,
                     archive=summary_store,
                     summaries=summary_store,
                 ),
-                services=SkillServices(
+                services=ToolServices(
                     instructions=instructions,
                     datasets=datasets,
                     executor=build_external_executor(
@@ -162,11 +162,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     ),
                     search_provider=_build_search_provider(settings, outbound_http),
                 ),
-                limits=_skill_limits(settings),
+                limits=_tool_limits(settings),
             )
             if invites is not None and settings.telegram_admin_ids:
                 registry.register(
-                    AdminManageSkill(
+                    AdminManageTool(
                         invites[0],
                         cron_store,
                         messages,
@@ -370,9 +370,9 @@ def _build_search_provider(
     return SerperSearchProvider(http_client=outbound_http, api_key=settings.serper_token)
 
 
-def _skill_limits(settings: Settings) -> SkillLimits:
-    """Map the settings' skill limit fields to the core SkillLimits bundle."""
-    return SkillLimits(
+def _tool_limits(settings: Settings) -> ToolLimits:
+    """Map the settings' tool limit fields to the core ToolLimits bundle."""
+    return ToolLimits(
         instructions_top_k=settings.instructions_top_k,
         datasets_query_default_limit=settings.datasets_query_default_limit,
         datasets_query_max_limit=settings.datasets_query_max_limit,

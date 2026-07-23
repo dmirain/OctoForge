@@ -25,7 +25,7 @@ from octoforge_core.llm.events import (
     ToolCallStarted,
 )
 from octoforge_core.llm.openai import OpenAICompatibleClient
-from octoforge_core.skills.base import SkillSpec
+from octoforge_core.tools.base import ToolSpec
 
 BASE_URL = "https://llm.example.com/v1"
 API_KEY = "secret-key"
@@ -134,7 +134,7 @@ async def test_stream_sends_stream_flag_and_tools() -> None:
         http_client=httpx.AsyncClient(transport=transport, base_url=BASE_URL),
         config=make_config(),
     )
-    tools = [SkillSpec(name=TOOL_NAME, description="d", parameters_schema={"type": "object"})]
+    tools = [ToolSpec(name=TOOL_NAME, description="d", parameters_schema={"type": "object"})]
 
     await collect(client.stream([USER_MESSAGE], tools=tools))
 

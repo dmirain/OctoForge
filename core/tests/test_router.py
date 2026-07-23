@@ -15,7 +15,7 @@ from octoforge_core.agent.router import (
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent
 from octoforge_core.llm.usage import Completion
-from octoforge_core.skills.base import SkillSpec
+from octoforge_core.tools.base import ToolSpec
 
 FG_ID = "p-fg"
 BG_ID = "p-bg"
@@ -55,12 +55,12 @@ class ScriptedLLM:
         self._error = error
         self.complete_calls = 0
         self.last_messages: list[ChatMessage] = []
-        self.last_tools: list[SkillSpec] | None = None
+        self.last_tools: list[ToolSpec] | None = None
 
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.complete_calls += 1
         self.last_messages = list(messages)
@@ -73,7 +73,7 @@ class ScriptedLLM:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         raise NotImplementedError
         yield  # pragma: no cover - makes this an async generator
@@ -85,7 +85,7 @@ class SlowLLM:
     async def complete(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> Completion:
         await asyncio.sleep(SLOW_LLM_DELAY_SECONDS)
         raise AssertionError("should have been cancelled by the router timeout")
@@ -93,7 +93,7 @@ class SlowLLM:
     async def stream(
         self,
         messages: list[ChatMessage],
-        tools: list[SkillSpec] | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         raise NotImplementedError
         yield  # pragma: no cover - makes this an async generator

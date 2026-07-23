@@ -30,11 +30,11 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.retry import RETRY_AFTER_DELAY_CAP_SECONDS
-from octoforge_core.skills.base import SkillContext, SkillSpec
-from octoforge_core.skills.registry import SkillRegistry
+from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.registry import ToolRegistry
 
 BASE_URL = "https://llm.example.com/v1"
-CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
+CTX = ToolContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 RETRY_REASON = "rate_limit"
 RETRY_AFTER_SECONDS = 2.5
 PARSED_RETRY_AFTER = 1.5
@@ -175,7 +175,7 @@ class ScriptedFailureLLM:
         return self._failures.pop(0) if self._failures else None
 
     async def complete(
-        self, messages: list[ChatMessage], tools: list[SkillSpec] | None = None
+        self, messages: list[ChatMessage], tools: list[ToolSpec] | None = None
     ) -> Completion:
         failure = self._next_failure()
         if failure is not None:
@@ -183,7 +183,7 @@ class ScriptedFailureLLM:
         return Completion(message=ChatMessage(role=MessageRole.ASSISTANT, content="ok"))
 
     async def stream(
-        self, messages: list[ChatMessage], tools: list[SkillSpec] | None = None
+        self, messages: list[ChatMessage], tools: list[ToolSpec] | None = None
     ) -> AsyncIterator[StreamEvent]:
         failure = self._next_failure()
         if failure is not None:
@@ -326,7 +326,7 @@ async def test_stream_does_not_retry_payload_errors() -> None:
 async def test_loop_maps_retry_scheduled_into_loop_events() -> None:
     inner = ScriptedFailureLLM([RateLimitError("slow down")])
     client = make_retrying(inner, RecordingSleeper())
-    loop = AgentLoop(llm_client=client, registry=SkillRegistry(), max_iterations=3)
+    loop = AgentLoop(llm_client=client, registry=ToolRegistry(), max_iterations=3)
 
     events = [
         event
@@ -347,7 +347,7 @@ async def test_loop_fails_when_retries_exhausted() -> None:
     failures = [TransportError("x") for _ in range(EXHAUSTED_CALLS)]
     inner = ScriptedFailureLLM(failures)
     client = make_retrying(inner, RecordingSleeper())
-    loop = AgentLoop(llm_client=client, registry=SkillRegistry(), max_iterations=3)
+    loop = AgentLoop(llm_client=client, registry=ToolRegistry(), max_iterations=3)
 
     with pytest.raises(TransportError):
         async for _ in loop.stream(

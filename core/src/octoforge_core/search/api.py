@@ -1,12 +1,12 @@
 """Public boundary of the web-search module.
 
-Everything the rest of the system (skills) may know about web search lives
+Everything the rest of the system (tools) may know about web search lives
 here: the `SearchProvider` port, the transport-neutral DTOs and the module
-error. Providers return plain result lists, so neither the skill nor an
+error. Providers return plain result lists, so neither the tool nor an
 installer-written provider deals with a vendor-specific payload.
 
 The default implementation is `SerperSearchProvider` (serper.dev Google
-API); an installer registers `WebSearchSkill` with its own provider (Bing,
+API); an installer registers `WebSearchTool` with its own provider (Bing,
 Brave, Tavily, ...) in its composition root without touching the core.
 """
 
@@ -36,7 +36,7 @@ class SearchResponse:
 
 
 class SearchProvider(Protocol):
-    """Port the web_search skill searches through."""
+    """Port the web_search tool searches through."""
 
     async def search(self, query: str, num_results: int) -> SearchResponse:
         """Return up to `num_results` hits for the query; raise `SearchError` on failure."""

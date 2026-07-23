@@ -1,4 +1,4 @@
-"""Tests for the http_request basic skill."""
+"""Tests for the http_request basic tool."""
 
 from collections.abc import Callable
 from http import HTTPStatus
@@ -12,16 +12,16 @@ from octoforge_core.net.tools import (
     MAX_RESPONSE_CHARS,
     REQUEST_NAME,
     TRUNCATED_SUFFIX,
-    HttpRequestSkill,
+    HttpRequestTool,
 )
-from octoforge_core.skills.base import SkillContext
-from octoforge_core.skills.errors import SkillArgumentsError
+from octoforge_core.tools.base import ToolContext
+from octoforge_core.tools.errors import ToolArgumentsError
 
 TARGET_URL = "https://api.example.com/data"
 RESPONSE_BODY = "hello body"
 PUBLIC_IP = "93.184.216.34"
 PRIVATE_IP = "10.0.0.1"
-CTX = SkillContext(user_id="user-test", channel="web", dialog_id="dlg-test")
+CTX = ToolContext(user_id="user-test", channel="web", dialog_id="dlg-test")
 
 
 class StubResolver:
@@ -34,19 +34,19 @@ class StubResolver:
         return self._ips
 
 
-def make_skill(
+def make_tool(
     handler: Callable[[httpx.Request], httpx.Response],
     ips: tuple[str, ...] = (PUBLIC_IP,),
-) -> HttpRequestSkill:
+) -> HttpRequestTool:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     guard = SsrfGuard(resolver=StubResolver(ips))
-    return HttpRequestSkill(http_client=client, guard=guard)
+    return HttpRequestTool(http_client=client, guard=guard)
 
 
 def test_spec_advertised_to_llm() -> None:
-    skill = make_skill(lambda request: httpx.Response(HTTPStatus.OK))
+    tool = make_tool(lambda request: httpx.Response(HTTPStatus.OK))
 
-    spec = skill.spec
+    spec = tool.spec
 
     assert spec.name == REQUEST_NAME
     assert spec.parameters_schema["required"] == ["method", "url"]
@@ -59,8 +59,8 @@ async def test_get_request_returns_status_and_body() -> None:
         captured.append(request)
         return httpx.Response(HTTPStatus.OK, text=RESPONSE_BODY)
 
-    skill = make_skill(handler)
-    result = await skill.execute({"method": "GET", "url": TARGET_URL}, CTX)
+    tool = make_tool(handler)
+    result = await tool.execute({"method": "GET", "url": TARGET_URL}, CTX)
 
     assert result == f"HTTP {HTTPStatus.OK}\n{RESPONSE_BODY}"
     assert captured[0].method == "GET"
@@ -74,8 +74,8 @@ async def test_post_request_sends_body_and_headers() -> None:
         captured.append(request)
         return httpx.Response(HTTPStatus.CREATED, text="created")
 
-    skill = make_skill(handler)
-    result = await skill.execute(
+    tool = make_tool(handler)
+    result = await tool.execute(
         {
             "method": "POST",
             "url": TARGET_URL,
@@ -94,8 +94,8 @@ async def test_error_status_returned_not_raised() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(HTTPStatus.NOT_FOUND, text="nope")
 
-    skill = make_skill(handler)
-    result = await skill.execute({"method": "GET", "url": TARGET_URL}, CTX)
+    tool = make_tool(handler)
+    result = await tool.execute({"method": "GET", "url": TARGET_URL}, CTX)
 
     assert result == f"HTTP {HTTPStatus.NOT_FOUND}\nnope"
 
@@ -107,10 +107,10 @@ async def test_ssrf_block_prevents_the_request() -> None:
         captured.append(request)
         return httpx.Response(HTTPStatus.OK)
 
-    skill = make_skill(handler, ips=(PRIVATE_IP,))
+    tool = make_tool(handler, ips=(PRIVATE_IP,))
 
     with pytest.raises(SsrfBlockedError):
-        await skill.execute({"method": "GET", "url": TARGET_URL}, CTX)
+        await tool.execute({"method": "GET", "url": TARGET_URL}, CTX)
     assert captured == []
 
 
@@ -118,8 +118,8 @@ async def test_long_body_is_truncated() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(HTTPStatus.OK, text="x" * (MAX_RESPONSE_CHARS + 10))
 
-    skill = make_skill(handler)
-    result = await skill.execute({"method": "GET", "url": TARGET_URL}, CTX)
+    tool = make_tool(handler)
+    result = await tool.execute({"method": "GET", "url": TARGET_URL}, CTX)
 
     prefix = f"HTTP {HTTPStatus.OK}\n"
     assert result.endswith(TRUNCATED_SUFFIX)
@@ -137,7 +137,7 @@ async def test_long_body_is_truncated() -> None:
     ],
 )
 async def test_invalid_arguments_rejected(arguments: dict[str, object]) -> None:
-    skill = make_skill(lambda request: httpx.Response(HTTPStatus.OK))
+    tool = make_tool(lambda request: httpx.Response(HTTPStatus.OK))
 
-    with pytest.raises(SkillArgumentsError):
-        await skill.execute(arguments, CTX)
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, CTX)

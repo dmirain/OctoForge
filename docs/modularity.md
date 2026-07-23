@@ -40,7 +40,7 @@
 | Instructions/Datasets: хранилище | `InstructionStore`, `DatasetStore` (+`*VectorSearch`) | `.../instructions/api.py`, `.../datasets/api.py` |
 | Промпты ядра | `PromptProvider` | `core/.../agent/prompts.py` |
 | Веб-поиск | `SearchProvider` | `core/.../search/api.py` |
-| Скиллы | `Skill` + `SkillRegistry` | `core/.../skills/base.py` |
+| Скиллы | `Tool` + `ToolRegistry` | `core/.../tools/base.py` |
 | Задачи (bg) | `TaskStore` | `core/.../ports.py` |
 
 Память — эталонный модуль: порт *и есть* граница хранилища, подмена = одна строка в корне.
@@ -98,7 +98,7 @@ Store-порты instructions/datasets повторяют этот паттер�
 
 ### P3 — `SearchProvider`-порт для веб-поиска ✅
 
-**Что было.** `WebSearchSkill` захардкожен на serper.dev (URL, заголовок, парсинг ответа);
+**Что было.** `WebSearchTool` захардкожен на serper.dev (URL, заголовок, парсинг ответа);
 замена поисковика требовала правки ядра.
 
 **Что сделано.**
@@ -109,9 +109,9 @@ Store-порты instructions/datasets повторяют этот паттер�
 - `SerperSearchProvider` (`search/serper.py`) — дефолтная реализация: запрос, парсинг
   answerBox/organic, тексты ошибок прежние («search failed: ConnectError», «search API
   returned HTTP N»).
-- `WebSearchSkill(provider=...)` зависит от порта; форматирование выдачи, клэмп
-  `num_results` (1..10) и срез вывода остаются на скилле. Wiring: `main.py` регистрирует
-  скилл с serper-провайдером при `OF_SERPER_TOKEN`.
+- `WebSearchTool(provider=...)` зависит от порта; форматирование выдачи, клэмп
+  `num_results` (1..10) и срез вывода остаются на туле. Wiring: `main.py` регистрирует
+  тул с serper-провайдером при `OF_SERPER_TOKEN`.
 - Тесты: `test_web_search_skill.py` переписан на fake-провайдер (он же — доказательство
   подмены), `test_serper_provider.py` — HTTP-моки serper.
 
@@ -139,13 +139,13 @@ Store-порты instructions/datasets повторяют этот паттер�
 - Новый модуль `core/.../composition.py` — переиспользуемые builder-функции без зависимости
   от FastAPI / web-Settings / Telegram (только порты, конфиги, примитивы):
   `build_llm_client`, `build_instruction_service`, `build_dataset_service`,
-  `build_external_executor`, `build_skill_registry`, `build_agent_loop`, `build_compactor`,
+  `build_external_executor`, `build_tool_registry`, `build_agent_loop`, `build_compactor`,
   `build_router`, `build_cron_outcome_reporter`, `build_runner_config`,
   `build_conversation_manager`, `build_cron_scheduler` (не создаёт asyncio-таск — старт
   `run_forever()` на вызывающей стороне).
-- Лимиты скилов — frozen-dataclass `SkillLimits` (все поля обязательные); связанные порты
-  сгруппированы в бандлы `SkillStores` (tasks/cron/memory/archive/summaries) и
-  `SkillServices` (instructions/datasets/executor/search_provider), тюнинг раннера — в
+- Лимиты тулов — frozen-dataclass `ToolLimits` (все поля обязательные); связанные порты
+  сгруппированы в бандлы `ToolStores` (tasks/cron/memory/archive/summaries) и
+  `ToolServices` (instructions/datasets/executor/search_provider), тюнинг раннера — в
   `RunnerOptions` (max_processes + опциональный `TaskOutcomeListener`), чтобы не раздувать
   сигнатуры (PLR0913 ≤ 5).
 - `_register_*`-хелперы переехали из `main.py` в `composition.py`; регистрация
@@ -160,7 +160,7 @@ Store-порты instructions/datasets повторяют этот паттер�
 - Публичный API ядра (`octoforge_core/__init__.py`) экспортирует builder'ы, бандлы и все
   порты из таблицы выше (роутер, промпты, память, cron, эмбеддинги/реранкер,
   instructions/datasets, поиск, контекст, TaskSpawner, RunnerConfig, TaskOutcomeListener).
-- Тесты: `core/tests/test_composition.py` (набор скилов, подмена портов через builder'ы,
+- Тесты: `core/tests/test_composition.py` (набор тулов, подмена портов через builder'ы,
   менеджер на SQLite `:memory:`); `web/tests/test_modularity.py` переведён на сборку
   стороннего корня из core-builder'ов.
 
@@ -201,15 +201,15 @@ Store-порты instructions/datasets повторяют этот паттер�
   `test_datasets_store_port.py`, `test_web_search_skill.py` (fake-провайдер),
   `test_router.py` + `test_prompts.py` (кастомный провайдер промптов),
   `test_cron_scheduler.py` (альтернативный движок),
-  `test_composition.py` (builder'ы: набор скилов, подмена `SearchProvider`/
-  `InstructionStore` через `build_skill_registry`, менеджер на SQLite `:memory:`).
+  `test_composition.py` (builder'ы: набор тулов, подмена `SearchProvider`/
+  `InstructionStore` через `build_tool_registry`, менеджер на SQLite `:memory:`).
 - Единичные тесты из нужного проекта: `cd core && ../.venv/bin/pytest ...`,
   `cd web && ../.venv/bin/pytest ...`.
 - Приёмочный сценарий модульности — реализован: `web/tests/test_modularity.py` собирает
   *минимальный сторонний composition root* из core-builder'ов
   (`octoforge_core.composition`), переопределяющий системный+роутерный промпт из файла,
   с fake-`SearchProvider` и in-memory `InstructionStore`, и прогоняет через него диалог
-  (промпты доезжают до LLM, скилы выполняются над подменёнными компонентами) — подмена без
+  (промпты доезжают до LLM, тулы выполняются над подменёнными компонентами) — подмена без
   копирования `runtime()`.
 - E2E-дым: `make run` (chat UI на http://127.0.0.1:8000) и `make run-telegram` — дефолтная
   сборка не сломана.

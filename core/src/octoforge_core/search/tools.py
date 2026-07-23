@@ -3,7 +3,7 @@
 from typing import Any
 
 from octoforge_core.search.api import SearchError, SearchProvider, SearchResponse
-from octoforge_core.skills.base import SkillContext, SkillSpec
+from octoforge_core.tools.base import ToolContext, ToolSpec
 
 DEFAULT_NUM_RESULTS = 5
 MAX_NUM_RESULTS = 10
@@ -11,8 +11,8 @@ MAX_OUTPUT_CHARS = 4000
 TRUNCATED_SUFFIX = "\n...[truncated]"
 NO_RESULTS_MESSAGE = "no results"
 
-SKILL_NAME = "web_search"
-SKILL_DESCRIPTION = "Search the web; returns titles, links and snippets."
+TOOL_NAME = "web_search"
+TOOL_DESCRIPTION = "Search the web; returns titles, links and snippets."
 PARAMETERS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -26,21 +26,21 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
 }
 
 
-class WebSearchSkill:
+class WebSearchTool:
     """Runs a web search through the provider port and formats the top results."""
 
     def __init__(self, provider: SearchProvider) -> None:
         self._provider = provider
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
-            name=SKILL_NAME,
-            description=SKILL_DESCRIPTION,
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=TOOL_NAME,
+            description=TOOL_DESCRIPTION,
             parameters_schema=PARAMETERS_SCHEMA,
         )
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         query = str(arguments["query"])
         num_results = _num_results(arguments.get("num_results"))
         try:

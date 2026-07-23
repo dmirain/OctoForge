@@ -28,7 +28,7 @@ class TaskDeleter(Protocol):
         """Stop the task's process; the finalization that follows removes its row.
 
         Callers must not pass the id of the very task they run in (the pump
-        cannot be awaited from within); `TaskDeleteSkill` refuses that case
-        via `SkillContext.owner_task_id`.
+        cannot be awaited from within); `TaskDeleteTool` refuses that case
+        via `ToolContext.owner_task_id`.
         """
         ...

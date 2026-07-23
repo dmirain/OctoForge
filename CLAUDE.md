@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-OctoForge is a multi-user LLM agent: skills as executable Jinja templates, knowledge stored in the DB, background tasks with notifications. Two surfaces: a web chat UI and a Telegram bot.
+OctoForge is a multi-user LLM agent: tools as executable Jinja templates, knowledge stored in the DB, background tasks with notifications. Two surfaces: a web chat UI and a Telegram bot.
 
 The living design doc is `docs/design.md` and code conventions are `AGENTS.md` — **both in Russian**. Read them before non-trivial work; this file is the English quick-start on top of them.
 
@@ -40,13 +40,13 @@ The dialog is an actor, not a request/response handler:
 
 - `ConversationRunner` owns one dialog's **narrative** (user messages + process finals + system notifications — only this is persisted) and its **processes** (foreground/background, in-memory).
 - `ConversationManager` maps `(user_id, channel)` → runner (get-or-create). Isolation is by that pair.
-- `AgentLoop.stream(history, control, context) -> AsyncIterator[LoopEvent]` is the loop as an event stream: tokens, skill calls, final, cancellation. `LoopControl` carries message injections + cancellation that preserves the partial answer.
+- `AgentLoop.stream(history, control, context) -> AsyncIterator[LoopEvent]` is the loop as an event stream: tokens, tool calls, final, cancellation. `LoopControl` carries message injections + cancellation that preserves the partial answer.
 - **LLM router** (`agent/router.py`): a one-shot `route(ops)` tool classifies each incoming message into ops (INJECT / START_NEW / CANCEL / PROMOTE). A deterministic guardrail strips START_NEW from any batch that also has INJECT (an injection must not spin the question into the background). Process count is capped by `OF_MAX_PROCESSES`.
-- Background tasks are background processes: `task_create` / `task_list` / `task_delete` skills. A task row lives only while in flight — delivery (or stopping) deletes it; the result stays in the narrative.
+- Background tasks are background processes: `task_create` / `task_list` / `task_delete` tools. A task row lives only while in flight — delivery (or stopping) deletes it; the result stays in the narrative.
 
-### Skills
+### Tools
 
-`Skill` / `SkillSpec` / `SkillContext` / `SkillRegistry` (no origin kinds — `SkillOrigin` was removed). The `skills/` package is framework only; tool implementations live in their domain modules (`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`, `tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`) and are registered in the composition root. Notable ones: `http_request`, `external_call` (over DB endpoint-records, behind the `SsrfGuard`), `skills_search` / `instruction_save`, `data_put` / `data_query` / `data_forget`, `memory_store` / `memory_search` / `memory_delete`, `task_create` / `task_list` / `task_delete` (one surface for background tasks and cron jobs — `task_create` with a `schedule` creates the cron job), `cron_pause` / `cron_resume`, `web_search` (serper.dev, only when `OF_SERPER_TOKEN` is set).
+`Tool` / `ToolSpec` / `ToolContext` / `ToolRegistry` (no origin kinds — `SkillOrigin` was removed). The `tools/` package is framework only; tool implementations live in their domain modules (`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`, `tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`) and are registered in the composition root. Notable ones: `http_request`, `external_call` (over DB endpoint-records, behind the `SsrfGuard`), `skills_search` / `instruction_save`, `data_put` / `data_query` / `data_forget`, `memory_store` / `memory_search` / `memory_delete`, `task_create` / `task_list` / `task_delete` (one surface for background tasks and cron jobs — `task_create` with a `schedule` creates the cron job), `cron_pause` / `cron_resume`, `web_search` (serper.dev, only when `OF_SERPER_TOKEN` is set).
 
 ### Self-contained domain modules
 

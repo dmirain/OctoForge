@@ -2,7 +2,7 @@
 
 Registered only when the Telegram adapter is enabled and admin ids are
 configured, and visible only to those admins (the `visible_to` opt-in of
-`SkillRegistry.specs(context)`); the authorization check in `execute()` is the
+`ToolRegistry.specs(context)`); the authorization check in `execute()` is the
 second, defense-in-depth barrier against a direct call.
 """
 
@@ -16,7 +16,7 @@ from octoforge_core.db.repositories import (
     MessageStats,
 )
 from octoforge_core.domain import Dialog
-from octoforge_core.skills.base import SkillContext, SkillSpec
+from octoforge_core.tools.base import ToolContext, ToolSpec
 
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, USER_ID_PREFIX, TelegramClient
 from octoforge_web.telegram.invites.api import (
@@ -78,7 +78,7 @@ class AdminAccess:
     telegram: TelegramClient | None = None
 
 
-class AdminManageSkill:
+class AdminManageTool:
     """Manages Telegram access: invite codes, user list, revoke/restore."""
 
     def __init__(
@@ -96,8 +96,8 @@ class AdminManageSkill:
         self._access = access
 
     @property
-    def spec(self) -> SkillSpec:
-        return SkillSpec(
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
             name=NAME,
             description=(
                 "Administer Telegram bot access: list users with usage stats, generate "
@@ -107,11 +107,11 @@ class AdminManageSkill:
             parameters_schema=SCHEMA,
         )
 
-    def visible_to(self, context: SkillContext) -> bool:
+    def visible_to(self, context: ToolContext) -> bool:
         """Expose the tool to the LLM only when the caller is a Telegram admin."""
         return self._is_admin(context)
 
-    async def execute(self, arguments: dict[str, Any], context: SkillContext) -> str:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         if not self._is_admin(context):
             return NOT_AUTHORIZED_MESSAGE
         action = str(arguments["action"])
@@ -125,7 +125,7 @@ class AdminManageSkill:
             return await self._restore(arguments)
         return f"error: unknown action {action!r}"
 
-    def _is_admin(self, context: SkillContext) -> bool:
+    def _is_admin(self, context: ToolContext) -> bool:
         if context.channel != TELEGRAM_CHANNEL:
             return False
         numeric_id = chat_id_from_user_id(context.user_id)

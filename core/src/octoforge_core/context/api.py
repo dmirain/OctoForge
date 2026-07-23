@@ -1,6 +1,6 @@
 """Public boundary of the context module.
 
-Everything the rest of the system (the dialog actor, skills, the composition
+Everything the rest of the system (the dialog actor, tools, the composition
 root) may know about context compaction lives here: the `ContextCompactor`
 port, the `SummaryStore` port (compressed segments of the history), the
 `MessageArchive` port (read access to the full message log) and the

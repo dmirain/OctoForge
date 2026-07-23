@@ -23,8 +23,8 @@ from octoforge_core.net.external import (
 )
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tool_spec import parse_tool_spec
-from octoforge_core.net.tools import ExternalCallSkill
-from octoforge_core.skills.base import SkillContext
+from octoforge_core.net.tools import ExternalCallTool
+from octoforge_core.tools.base import ToolContext
 
 PUBLIC_IP = "93.184.216.34"
 PRIVATE_IP = "10.0.0.1"
@@ -413,10 +413,10 @@ async def test_static_auth_value_is_sent_unchanged_even_with_a_user() -> None:
 async def test_skill_passes_the_context_user_id_to_the_executor() -> None:
     captured: list[httpx.Request] = []
     executor = make_self_executor(captured)
-    skill = ExternalCallSkill(executor=executor)
-    context = SkillContext(user_id=USER_A, channel="web", dialog_id="dialog-1")
+    tool = ExternalCallTool(executor=executor)
+    context = ToolContext(user_id=USER_A, channel="web", dialog_id="dialog-1")
 
-    output = await skill.execute({"name": SELF_TOOL_NAME, "params": {}}, context)
+    output = await tool.execute({"name": SELF_TOOL_NAME, "params": {}}, context)
 
     assert output.startswith(f"HTTP {HTTPStatus.OK}")
     assert captured[0].headers[USER_ID_HEADER] == USER_A

@@ -1,10 +1,10 @@
-"""Tests for the web_search skill over a fake SearchProvider (port substitution)."""
+"""Tests for the web_search tool over a fake SearchProvider (port substitution)."""
 
 from octoforge_core.search.api import SearchError, SearchResponse, SearchResult
-from octoforge_core.search.tools import WebSearchSkill
-from octoforge_core.skills.base import SkillContext
+from octoforge_core.search.tools import WebSearchTool
+from octoforge_core.tools.base import ToolContext
 
-CONTEXT = SkillContext(user_id="alice", channel="telegram", dialog_id="dialog-1")
+CONTEXT = ToolContext(user_id="alice", channel="telegram", dialog_id="dialog-1")
 MAX_OUTPUT_WITH_SUFFIX = 4000 + 20
 QUERY = "meaning of life"
 NUM_DEFAULT = 5
@@ -35,14 +35,14 @@ class FakeSearchProvider:
         return self._response
 
 
-def make_skill(provider: FakeSearchProvider) -> WebSearchSkill:
-    return WebSearchSkill(provider=provider)
+def make_tool(provider: FakeSearchProvider) -> WebSearchTool:
+    return WebSearchTool(provider=provider)
 
 
 async def test_results_are_formatted_with_positions_and_snippets() -> None:
     provider = FakeSearchProvider(response=SearchResponse(results=(FIRST, SECOND), answer=ANSWER))
 
-    result = await make_skill(provider).execute({"query": QUERY}, CONTEXT)
+    result = await make_tool(provider).execute({"query": QUERY}, CONTEXT)
 
     assert result.startswith(f"Answer box: {ANSWER}")
     assert "1. First\nhttps://first.example\nalpha" in result
@@ -52,18 +52,18 @@ async def test_results_are_formatted_with_positions_and_snippets() -> None:
 
 async def test_num_results_is_clamped_before_reaching_the_provider() -> None:
     provider = FakeSearchProvider()
-    skill = make_skill(provider)
+    tool = make_tool(provider)
 
-    await skill.execute({"query": "q", "num_results": 0}, CONTEXT)
-    await skill.execute({"query": "q", "num_results": 99}, CONTEXT)
-    await skill.execute({"query": "q", "num_results": True}, CONTEXT)
-    await skill.execute({"query": "q", "num_results": 3}, CONTEXT)
+    await tool.execute({"query": "q", "num_results": 0}, CONTEXT)
+    await tool.execute({"query": "q", "num_results": 99}, CONTEXT)
+    await tool.execute({"query": "q", "num_results": True}, CONTEXT)
+    await tool.execute({"query": "q", "num_results": 3}, CONTEXT)
 
     assert [num for _, num in provider.calls] == [NUM_MIN, NUM_MAX, NUM_DEFAULT, 3]
 
 
 async def test_empty_answer_is_reported() -> None:
-    result = await make_skill(FakeSearchProvider()).execute({"query": "q"}, CONTEXT)
+    result = await make_tool(FakeSearchProvider()).execute({"query": "q"}, CONTEXT)
 
     assert result == "no results"
 
@@ -71,7 +71,7 @@ async def test_empty_answer_is_reported() -> None:
 async def test_search_error_is_an_error_string() -> None:
     provider = FakeSearchProvider(error=SearchError("search API returned HTTP 403"))
 
-    result = await make_skill(provider).execute({"query": "q"}, CONTEXT)
+    result = await make_tool(provider).execute({"query": "q"}, CONTEXT)
 
     assert result == "error: search API returned HTTP 403"
 
@@ -86,7 +86,7 @@ async def test_long_output_is_truncated() -> None:
         )
     )
 
-    result = await make_skill(provider).execute({"query": "q"}, CONTEXT)
+    result = await make_tool(provider).execute({"query": "q"}, CONTEXT)
 
     assert len(result) <= MAX_OUTPUT_WITH_SUFFIX
     assert result.endswith("\n...[truncated]")

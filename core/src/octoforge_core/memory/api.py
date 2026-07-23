@@ -1,6 +1,6 @@
 """Public boundary of the memory module.
 
-Everything the rest of the system (skills, executors) may know about memories
+Everything the rest of the system (tools, executors) may know about memories
 lives here: the `MemoryStore` protocol, the JSON-serializable DTO and the
 module error.
 

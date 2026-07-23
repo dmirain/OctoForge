@@ -8,7 +8,7 @@ from typing import Protocol
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, PromptProvider
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.ports import LLMClient
-from octoforge_core.skills.base import SkillSpec
+from octoforge_core.tools.base import ToolSpec
 
 
 class RouteAction(StrEnum):
@@ -70,7 +70,7 @@ class MessageRouter(Protocol):
 
 
 ROUTE_TOOL_NAME = "route"
-ROUTE_TOOL_SPEC = SkillSpec(
+ROUTE_TOOL_SPEC = ToolSpec(
     name=ROUTE_TOOL_NAME,
     description="Route the user message to the dialog processes.",
     parameters_schema={
