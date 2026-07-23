@@ -33,6 +33,7 @@ VALID_TIMEZONE = "Europe/Moscow"
 RESTART_ERROR = "interrupted by restart"
 EXPECTED_TWO_JOBS = 2
 RETRY_TWO = 2
+PROMPT_WORDS_BEYOND_PREVIEW = 50
 
 
 class FakeSpawner:
@@ -293,9 +294,36 @@ async def test_task_list_shows_tasks_and_jobs_in_two_sections() -> None:
     tasks_section, jobs_section = output.split("\n\n")
     assert tasks_section.startswith("background tasks:")
     assert "a" in tasks_section and "foreign" not in tasks_section
+    assert f"prompt: {PROMPT_CONTENT!r}" in tasks_section
     assert jobs_section.startswith("scheduled jobs:")
     assert "job-1" in jobs_section and "job-2" not in jobs_section
     assert "[enabled]" in jobs_section
+    assert "prompt: 'good morning'" in jobs_section
+
+
+async def test_task_list_truncates_long_prompts() -> None:
+    long_prompt = "word " * PROMPT_WORDS_BEYOND_PREVIEW
+    store = InMemoryTaskStore()
+    await store.add(make_task(input={"title": "t", "prompt": long_prompt}))
+    cron = FakeCronStore()
+    await cron.create(make_cron_job(prompt=long_prompt))
+    tool = TaskListTool(store=store, cron_store=cron)
+
+    output = await tool.execute({}, CTX)
+
+    tasks_section, jobs_section = output.split("\n\n")
+    assert "…" in tasks_section and "…" in jobs_section
+    assert long_prompt not in output
+
+
+async def test_task_list_skips_a_missing_task_prompt() -> None:
+    store = InMemoryTaskStore()
+    await store.add(make_task(input={"title": "t"}))
+    tool = TaskListTool(store=store, cron_store=FakeCronStore())
+
+    output = await tool.execute({}, CTX)
+
+    assert "prompt:" not in output.split("\n\n")[0]
 
 
 async def test_task_list_reports_empty_sections() -> None:

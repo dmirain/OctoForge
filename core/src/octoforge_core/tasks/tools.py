@@ -21,6 +21,7 @@ from octoforge_core.cron.tools import (
     CronJobDraft,
     create_job,
     format_job,
+    prompt_preview,
 )
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskStatus
@@ -53,7 +54,8 @@ LIST_NAME = "task_list"
 LIST_DESCRIPTION = (
     "List your deferred work: background tasks of this dialog (running or awaiting "
     "result delivery — finished tasks disappear, their results stay in the "
-    "conversation) and your scheduled cron jobs with next fire times."
+    "conversation) and your scheduled cron jobs with next fire times. Both include "
+    "a preview of the prompt the work runs with."
 )
 LIST_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 NO_WORK_MESSAGE = "no tasks or scheduled jobs"
@@ -210,6 +212,9 @@ def _non_empty_string(raw: object, argument: str) -> str:
 
 def _format_task(task: Task) -> str:
     line = f"{task.id} [{task.status.value}] {task.title}"
+    prompt = task.input.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        line += f" — prompt: {prompt_preview(prompt)!r}"
     if task.result is not None:
         line += f" -> {task.result}"
     if task.error is not None:

@@ -28,6 +28,7 @@ NO_JOBS_MESSAGE = "no cron jobs"
 JOB_NOT_FOUND_MESSAGE = "error: cron job not found"
 DELETED_MESSAGE = "deleted cron job {job_id}"
 DUPLICATE_MESSAGE = "already exists: cron job {job_id}"
+PROMPT_PREVIEW_CHARS = 200
 
 TITLE_PARAM: dict[str, Any] = {
     "type": "string",
@@ -190,6 +191,7 @@ def format_job(job: CronJob) -> str:
         f"{job.id} [{state}] {job.title!r} — {job.schedule} ({job.timezone}), "
         f"next fire at {job.next_fire_at.isoformat()}"
     )
+    line += f", prompt: {prompt_preview(job.prompt)!r}"
     if job.one_shot:
         line += ", one-shot"
     if job.last_fire_at is not None:
@@ -201,3 +203,11 @@ def format_job(job: CronJob) -> str:
     if job.retry_count > 0:
         line += f", retry #{job.retry_count}"
     return line
+
+
+def prompt_preview(text: str) -> str:
+    """One-line prompt preview, truncated to PROMPT_PREVIEW_CHARS with an ellipsis."""
+    one_line = " ".join(text.split())
+    if len(one_line) <= PROMPT_PREVIEW_CHARS:
+        return one_line
+    return one_line[:PROMPT_PREVIEW_CHARS] + "…"
