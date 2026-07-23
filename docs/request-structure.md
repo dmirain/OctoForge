@@ -31,7 +31,7 @@
 | Порядок | Часть | Тип(ы) сообщений | Состав | Размер | ~Токены |
 |---|---|---|---|---|---|
 | 0 (отдельное поле) | Тулы, 17 шт. | не сообщение — поле `tools` | JSON-спеки task×3, cron×2, memory×3, data×3, history_search, web_search, http_request, external_call, skills_search, instruction_save | 10 533 chars | ~2 630 |
-| 1 | Системный промпт | `system` (всегда первый) | `DEFAULT_SYSTEM_PROMPT` (5 мета-правил), байт-стабильный | ~950 chars | ~240 |
+| 1 | Системный промпт | `system` (всегда первый) | `DEFAULT_SYSTEM_PROMPT` (5 мета-правил), байт-стабильный | ~940 chars | ~235 |
 | 2 | Блок тем | `system` (одно сообщение, опционально) | одно rolling-саммари диалога: `[seq N-M] (topics: ...) текст` | 0, константный (merge) | — |
 | 3 | Горячий хвост | `user` / `assistant` / `tool` + `system`-заметки | дословная переписка `seq > max(seq_to)`: сообщения пользователя, финалы и промежуточные ответы модели (с `tool_calls`), результаты тулов (с `tool_call_id`) | ≤ 12 000 chars (`OF_CONTEXT_HOT_MAX_CHARS`) | ≤ ~3 000 |
 | 3а | Служебные заметки | `system` | `INTERRUPTED_NOTE` (71 char), уведомления «фоновая задача завершена» | десятки–сотни chars | — |

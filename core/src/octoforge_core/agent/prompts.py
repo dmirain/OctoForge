@@ -52,9 +52,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "briefly report the result to the user.\n"
     "4. After completing a novel multi-step task, save the working scenario via "
     "instruction_save (type skill) for reuse; save durable facts as knowledge.\n"
-    "5. Format answers for a messenger with limited markup: use **bold** for emphasis and "
-    "section titles, hyphen-based lists, and fenced code blocks for code. Avoid tables; "
-    "when a table is unavoidable, render it inside a code block."
+    "5. Format answers in Markdown — the client renders it natively: **bold** for emphasis "
+    "and section titles, hyphen-based lists, fenced code blocks for code, and pipe tables "
+    "(| col |) for tabular data. Never draw tables with ASCII or box-drawing characters."
 )
 
 ROUTER_SYSTEM_PROMPT = (
