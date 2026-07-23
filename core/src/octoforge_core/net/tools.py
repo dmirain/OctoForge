@@ -23,7 +23,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 CALL_NAME = "external_call"
 CALL_DESCRIPTION = (
     "Execute an external call described by an endpoint instruction from the store. "
-    "Use skills_search to discover available endpoints, then call them by name "
+    "Use instruction_search to discover available endpoints, then call them by name "
     "with the params declared in the endpoint record."
 )
 

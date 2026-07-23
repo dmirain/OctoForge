@@ -1,4 +1,4 @@
-"""Tests for the dataset runtime tools and the merged skills_search."""
+"""Tests for the dataset runtime tools and the merged instruction_search."""
 
 import json
 from collections.abc import AsyncIterator
@@ -29,7 +29,7 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.instructions.tools import (
     NO_HITS_MESSAGE,
-    SkillsSearchTool,
+    InstructionSearchTool,
 )
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
@@ -376,7 +376,7 @@ async def test_forget_invalid_arguments_rejected(
         await tool.execute(arguments, CTX)
 
 
-# --- skills_search with datasets --------------------------------------
+# --- instruction_search with datasets --------------------------------------
 
 HIT = SearchHit(
     instruction=Instruction(
@@ -426,11 +426,18 @@ class FakeInstructionService:
     def __init__(self, hits: list[SearchHit] | None = None) -> None:
         self.hits = hits or []
 
-    async def search(self, query: str, k: int) -> list[SearchHit]:
+    async def search(
+        self,
+        user_id: str,
+        query: str,
+        k: int,
+        kind: InstructionType | None = None,
+    ) -> list[SearchHit]:
         return self.hits
 
     async def save(
         self,
+        user_id: str,
         kind: InstructionType,
         title: str,
         content: str,
@@ -438,7 +445,12 @@ class FakeInstructionService:
     ) -> Instruction:
         raise NotImplementedError
 
-    async def get_by_name(self, name: str, kind: InstructionType | None = None) -> Instruction:
+    async def get_by_name(
+        self,
+        name: str,
+        kind: InstructionType | None = None,
+        user_id: str | None = None,
+    ) -> Instruction:
         raise NotImplementedError
 
 
@@ -492,7 +504,7 @@ class FakeDatasetService:
 
 async def test_search_instructions_block_precedes_datasets() -> None:
     datasets = FakeDatasetService(hits=[DATASET_HIT])
-    tool = SkillsSearchTool(
+    tool = InstructionSearchTool(
         service=FakeInstructionService(hits=[HIT]),
         default_k=DEFAULT_K,
         datasets=datasets,
@@ -504,18 +516,19 @@ async def test_search_instructions_block_precedes_datasets() -> None:
     # higher dataset cosine), datasets after; no scores in the output
     lines = output.splitlines()
     assert lines[0] == "1. [knowledge] nutrition facts"
-    assert lines[1] == "   tags: food"
-    assert lines[2] == "kcal tables"
-    assert lines[3] == f"2. [dataset] {FOOD_DATASET}"
-    assert lines[4] == "   fields: item, kcal"
-    assert lines[5] == f"   {FOOD_DESCRIPTION}"
+    assert lines[1] == "   id: id-1"
+    assert lines[2] == "   tags: food"
+    assert lines[3] == "kcal tables"
+    assert lines[4] == f"2. [dataset] {FOOD_DATASET}"
+    assert lines[5] == "   fields: item, kcal"
+    assert lines[6] == f"   {FOOD_DESCRIPTION}"
     assert "score" not in output
     assert datasets.search_calls == [(CTX.user_id, "food", DEFAULT_K)]
 
 
 async def test_search_dataset_hits_only() -> None:
     datasets = FakeDatasetService(hits=[DATASET_HIT])
-    tool = SkillsSearchTool(
+    tool = InstructionSearchTool(
         service=FakeInstructionService(),
         default_k=DEFAULT_K,
         datasets=datasets,
@@ -527,6 +540,6 @@ async def test_search_dataset_hits_only() -> None:
 
 
 async def test_search_without_datasets_service_unchanged() -> None:
-    tool = SkillsSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     assert await tool.execute({"query": "nothing"}, CTX) == NO_HITS_MESSAGE

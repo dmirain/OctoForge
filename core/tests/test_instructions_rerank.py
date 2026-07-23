@@ -22,6 +22,7 @@ TITLE_B = "beta fact"
 TITLE_C = "gamma fact"
 CONTENT = "content"
 RERANK_CANDIDATES = 2
+USER_ID = "user-test"
 EXPECTED_PAIRS = 2
 
 V_EXACT = (1.0, 0.0)
@@ -135,11 +136,11 @@ async def test_service_reranks_cosine_shortlist(
     )
     for title, vector in ((TITLE_A, V_EXACT), (TITLE_B, V_CLOSE), (TITLE_C, V_FAR)):
         embedder.vectors[f"{title}\n{CONTENT}"] = vector
-        await service.save(InstructionType.KNOWLEDGE, title, CONTENT)
+        await service.save(USER_ID, InstructionType.KNOWLEDGE, title, CONTENT)
 
     # Cosine puts TITLE_A first and TITLE_C out of the shortlist; the reranker
     # flips the two shortlisted hits.
-    hits = await service.search(QUERY, k=2)
+    hits = await service.search(USER_ID, QUERY, k=2)
 
     assert [hit.instruction.title for hit in hits] == [TITLE_B, TITLE_A]
     assert [hit.score for hit in hits] == [SCORE_HIGH, SCORE_LOW]
@@ -156,9 +157,9 @@ async def test_service_without_reranker_keeps_cosine_order(
     service = LocalInstructionService(SqlAlchemyInstructionStore(session_factory), embedder)
     for title, vector in ((TITLE_A, V_EXACT), (TITLE_B, V_CLOSE)):
         embedder.vectors[f"{title}\n{CONTENT}"] = vector
-        await service.save(InstructionType.KNOWLEDGE, title, CONTENT)
+        await service.save(USER_ID, InstructionType.KNOWLEDGE, title, CONTENT)
 
-    hits = await service.search(QUERY, k=1)
+    hits = await service.search(USER_ID, QUERY, k=1)
 
     assert [hit.instruction.title for hit in hits] == [TITLE_A]
 
@@ -183,10 +184,10 @@ async def test_service_falls_back_to_cosine_when_the_reranker_fails(
     )
     for title, vector in ((TITLE_A, V_EXACT), (TITLE_B, V_CLOSE), (TITLE_C, V_FAR)):
         embedder.vectors[f"{title}\n{CONTENT}"] = vector
-        await service.save(InstructionType.KNOWLEDGE, title, CONTENT)
+        await service.save(USER_ID, InstructionType.KNOWLEDGE, title, CONTENT)
 
     # The failure must not propagate: search degrades to the cosine shortlist.
-    hits = await service.search(QUERY, k=2)
+    hits = await service.search(USER_ID, QUERY, k=2)
 
     assert [hit.instruction.title for hit in hits] == [TITLE_A, TITLE_B]
     assert hits[0].score > hits[1].score  # cosine scores, not cross-encoder logits

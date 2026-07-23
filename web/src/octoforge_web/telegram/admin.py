@@ -6,6 +6,7 @@ configured, and visible only to those admins (the `visible_to` opt-in of
 second, defense-in-depth barrier against a direct call.
 """
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,11 @@ from octoforge_core.db.repositories import (
     MessageStats,
 )
 from octoforge_core.domain import Dialog
+from octoforge_core.instructions.api import (
+    InstructionNotFoundError,
+    InstructionService,
+    SearchHit,
+)
 from octoforge_core.tools.base import ToolContext, ToolSpec
 
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, USER_ID_PREFIX, TelegramClient
@@ -35,6 +41,11 @@ ACTION_LIST_USERS = "list_users"
 ACTION_GENERATE_INVITE = "generate_invite"
 ACTION_REVOKE_INVITE = "revoke_invite"
 ACTION_RESTORE_INVITE = "restore_invite"
+ACTION_SEARCH_INSTRUCTIONS = "search_instructions"
+ACTION_PUBLISH_INSTRUCTION = "publish_instruction"
+MAX_INSTRUCTION_RESULTS = 10
+INSTRUCTION_SNIPPET_CHARS = 120
+PUBLISH_NOT_FOUND_MESSAGE = "error: instruction not found (give the id from search_instructions)"
 
 SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -46,6 +57,8 @@ SCHEMA: dict[str, Any] = {
                 ACTION_GENERATE_INVITE,
                 ACTION_REVOKE_INVITE,
                 ACTION_RESTORE_INVITE,
+                ACTION_SEARCH_INSTRUCTIONS,
+                ACTION_PUBLISH_INSTRUCTION,
             ],
             "description": "What to do",
         },
@@ -63,6 +76,14 @@ SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "Target invite id for revoke_invite/restore_invite",
         },
+        "query": {
+            "type": "string",
+            "description": "Free-text query for search_instructions (all users' records)",
+        },
+        "id": {
+            "type": "string",
+            "description": "Instruction id for publish_instruction (from search_instructions)",
+        },
     },
     "required": ["action"],
 }
@@ -78,31 +99,48 @@ class AdminAccess:
     telegram: TelegramClient | None = None
 
 
-class AdminManageTool:
-    """Manages Telegram access: invite codes, user list, revoke/restore."""
+@dataclass(frozen=True, slots=True)
+class AdminStores:
+    """Backends the admin console reads and writes through."""
 
-    def __init__(
-        self,
-        invites: InviteStore,
-        cron_store: CronStore,
-        messages: MessageRepository,
-        dialogs: DialogRepository,
-        access: AdminAccess,
-    ) -> None:
-        self._invites = invites
-        self._cron = cron_store
-        self._messages = messages
-        self._dialogs = dialogs
+    invites: InviteStore
+    cron_store: CronStore
+    messages: MessageRepository
+    dialogs: DialogRepository
+    instructions: InstructionService
+
+
+ActionHandler = Callable[[dict[str, Any]], Awaitable[str]]
+
+
+class AdminManageTool:
+    """Manages Telegram access: invite codes, user list, revoke/restore, publishing."""
+
+    def __init__(self, stores: AdminStores, access: AdminAccess) -> None:
+        self._invites = stores.invites
+        self._cron = stores.cron_store
+        self._messages = stores.messages
+        self._dialogs = stores.dialogs
+        self._instructions = stores.instructions
         self._access = access
+        self._handlers: dict[str, ActionHandler] = {
+            ACTION_LIST_USERS: self._list_users,
+            ACTION_GENERATE_INVITE: self._generate_invite,
+            ACTION_REVOKE_INVITE: self._revoke,
+            ACTION_RESTORE_INVITE: self._restore,
+            ACTION_SEARCH_INSTRUCTIONS: self._search_instructions,
+            ACTION_PUBLISH_INSTRUCTION: self._publish_instruction,
+        }
 
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name=NAME,
             description=(
-                "Administer Telegram bot access: list users with usage stats, generate "
+                "Administer the Telegram bot: list users with usage stats, generate "
                 "an invite code, revoke a user's access (disables their cron jobs, "
-                "reversible) or restore it back. Admins only."
+                "reversible) or restore it back; search instructions across all users "
+                "and publish one by id (makes it visible to everyone). Admins only."
             ),
             parameters_schema=SCHEMA,
         )
@@ -114,16 +152,10 @@ class AdminManageTool:
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         if not self._is_admin(context):
             return NOT_AUTHORIZED_MESSAGE
-        action = str(arguments["action"])
-        if action == ACTION_LIST_USERS:
-            return await self._list_users()
-        if action == ACTION_GENERATE_INVITE:
-            return await self._generate_invite(str(arguments.get("note") or ""))
-        if action == ACTION_REVOKE_INVITE:
-            return await self._revoke(arguments)
-        if action == ACTION_RESTORE_INVITE:
-            return await self._restore(arguments)
-        return f"error: unknown action {action!r}"
+        handler = self._handlers.get(str(arguments["action"]))
+        if handler is None:
+            return f"error: unknown action {arguments['action']!r}"
+        return await handler(arguments)
 
     def _is_admin(self, context: ToolContext) -> bool:
         if context.channel != TELEGRAM_CHANNEL:
@@ -131,7 +163,7 @@ class AdminManageTool:
         numeric_id = chat_id_from_user_id(context.user_id)
         return numeric_id is not None and numeric_id in self._access.admin_ids
 
-    async def _list_users(self) -> str:
+    async def _list_users(self, arguments: dict[str, Any]) -> str:
         invites = await self._invites.list_all()
         stats = {
             entry.user_id: entry
@@ -174,8 +206,8 @@ class AdminManageTool:
             f"last_active={last_active}, cron={enabled_jobs}/{len(jobs)} enabled"
         )
 
-    async def _generate_invite(self, note: str) -> str:
-        invite = await self._invites.create(note)
+    async def _generate_invite(self, arguments: dict[str, Any]) -> str:
+        invite = await self._invites.create(str(arguments.get("note") or ""))
         return (
             f"invite created: {invite.code}\n"
             f"share it; the user activates it with /start {invite.code}"
@@ -220,6 +252,27 @@ class AdminManageTool:
             f"re-enabled cron jobs: {reenabled}"
         )
 
+    async def _search_instructions(self, arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("query") or "").strip()
+        if not query:
+            return "error: query is required"
+        hits = await self._instructions.search_all(query, MAX_INSTRUCTION_RESULTS)
+        if not hits:
+            return "no instructions found"
+        lines = [f"instructions matching {query!r} (all owners):"]
+        lines.extend(_instruction_line(index, hit) for index, hit in enumerate(hits, start=1))
+        return "\n".join(lines)
+
+    async def _publish_instruction(self, arguments: dict[str, Any]) -> str:
+        instruction_id = str(arguments.get("id") or "").strip()
+        if not instruction_id:
+            return "error: id is required"
+        try:
+            instruction = await self._instructions.publish(instruction_id)
+        except InstructionNotFoundError:
+            return PUBLISH_NOT_FOUND_MESSAGE
+        return f"published: [{instruction.type.value}] {instruction.title}"
+
     async def _find_invite(self, arguments: dict[str, Any]) -> Invite | None:
         invite_id = arguments.get("invite_id")
         if invite_id:
@@ -235,6 +288,18 @@ class AdminManageTool:
         chat_id = chat_id_from_user_id(invite.claimed_by)
         if chat_id is not None:
             await self._access.telegram.send_message(chat_id, REVOKED_NOTICE_TEXT)
+
+
+def _instruction_line(index: int, hit: SearchHit) -> str:
+    """One search result line for the admin console: id, owner, type, title, snippet."""
+    instruction = hit.instruction
+    owner = instruction.owner_id or "public"
+    snippet = instruction.content.replace("\n", " ")[:INSTRUCTION_SNIPPET_CHARS]
+    return (
+        f"{index}. [{instruction.type.value}] {instruction.title}\n"
+        f"   id: {instruction.id} — owner: {owner}\n"
+        f"   {snippet}"
+    )
 
 
 def _normalize_user_id(raw: str) -> str:

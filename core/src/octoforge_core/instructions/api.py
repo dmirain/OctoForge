@@ -49,7 +49,10 @@ class Instruction:
     The embedding is intentionally not part of the DTO: it is a local
     implementation detail of the search engine. `system` marks records owned
     by the declarative system registry: they are upserted/deleted by the
-    startup sync only, never by agent-facing save/delete.
+    startup sync only, never by agent-facing save/delete. `owner_id` is the
+    record's author (set from the caller's session); None marks a public
+    record visible to everyone — new records are private and only the
+    admin-facing `publish` makes them public.
     """
 
     id: str
@@ -63,6 +66,7 @@ class Instruction:
     created_at: datetime
     updated_at: datetime
     system: bool = False
+    owner_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +87,12 @@ class EmbeddedInstruction:
 
 @dataclass(frozen=True, slots=True)
 class InstructionDraft:
-    """Upsert input of the store: record fields, the embedding and the ownership flag."""
+    """Upsert input of the store: record fields, the embedding and the ownership.
+
+    `owner_id` None creates/updates the public (or system) record identified
+    by (kind, title); a user id scopes the upsert to that owner's private
+    record, so two users may hold private records with the same title.
+    """
 
     kind: InstructionType
     title: str
@@ -91,6 +100,7 @@ class InstructionDraft:
     tags: tuple[str, ...]
     embedding: tuple[float, ...]
     system: bool = False
+    owner_id: str | None = None
 
 
 class InstructionStore(Protocol):
@@ -107,17 +117,31 @@ class InstructionStore(Protocol):
     async def upsert(self, draft: InstructionDraft) -> Instruction:
         """Create the record or replace content/tags/embedding, bumping the version.
 
-        The update path also rewrites the `system` flag (registry adoption);
-        the agent-facing protection of system records lives in the service.
+        The upsert target is (kind, title, owner_id). The update path also
+        rewrites the `system` flag (registry adoption); the agent-facing
+        protection of system records lives in the service.
         """
         ...
 
-    async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
-        """Return the record by title (oldest first when types collide), or None."""
+    async def get_by_title(
+        self,
+        title: str,
+        kind: InstructionType | None,
+        owner_id: str | None = None,
+    ) -> Instruction | None:
+        """Return the record by (title, kind, owner), oldest first on collisions.
+
+        `owner_id` None targets the public record; private lookups pass the
+        owning user id. Returns None when nothing matches.
+        """
         ...
 
-    async def list_with_embeddings(self) -> list[EmbeddedInstruction]:
-        """Return every record with its embedding (brute-force search input)."""
+    async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
+        """Return records visible to `user_id` with their embeddings.
+
+        Visibility: public records plus the user's own private ones.
+        `user_id` None returns the whole table (internal/admin surface).
+        """
         ...
 
     async def list_system(self) -> list[Instruction]:
@@ -128,8 +152,24 @@ class InstructionStore(Protocol):
         """Increment usage_count of the given records (search hits proved useful)."""
         ...
 
+    async def delete_by_id(self, instruction_id: str, owner_id: str) -> bool:
+        """Delete the owner's private record by id; return True when removed.
+
+        Public records (owner_id NULL) never match: publishing and deleting
+        them is an admin surface, not this owner-scoped path.
+        """
+        ...
+
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
-        """Delete the record identified by (kind, title); return True when removed."""
+        """Delete the public/system record (kind, title); registry sync only.
+
+        Never matches private records. Agent-facing deletion goes through
+        `delete_by_id` instead.
+        """
+        ...
+
+    async def publish(self, instruction_id: str) -> Instruction | None:
+        """Make the record public (owner_id -> NULL); None when the id is unknown."""
         ...
 
 
@@ -147,8 +187,13 @@ class InstructionVectorSearch(Protocol):
         self,
         query_embedding: tuple[float, ...],
         limit: int,
+        user_id: str | None,
     ) -> list[EmbeddedInstruction]:
-        """Return up to `limit` records closest to the query embedding, best first."""
+        """Return up to `limit` visible records closest to the query, best first.
+
+        Same visibility rule as `list_with_embeddings`: public plus the user's
+        own records; `user_id` None searches the whole table.
+        """
         ...
 
 
@@ -160,42 +205,82 @@ class InstructionService(Protocol):
     The implementation is chosen in the composition root.
     """
 
-    async def search(self, query: str, k: int) -> list[SearchHit]:
+    async def search(
+        self,
+        user_id: str,
+        query: str,
+        k: int,
+        kind: InstructionType | None = None,
+    ) -> list[SearchHit]:
         """Return the top-k instructions relevant to the query, best first.
 
+        Only records visible to `user_id` (public plus their own) take part;
+        `kind` narrows the search to one instruction type before ranking.
         Documented side effect: implementations bump `usage_count` of the
         returned hits — search is the moment an instruction proves useful.
         """
         ...
 
+    async def search_all(
+        self,
+        query: str,
+        k: int,
+        kind: InstructionType | None = None,
+    ) -> list[SearchHit]:
+        """Search the whole table with no visibility filter (admin surface).
+
+        Not for agent-facing tools: the admin console uses it to discover
+        private records by their ids before publishing them.
+        """
+        ...
+
     async def save(
         self,
+        user_id: str,
         kind: InstructionType,
         title: str,
         content: str,
         tags: tuple[str, ...] = (),
     ) -> Instruction:
-        """Create or replace the instruction identified by (kind, title).
+        """Create or replace the caller's private record identified by (kind, title).
 
-        Upsert: an existing record gets its content/tags replaced, its version
-        bumped and its embedding recomputed; usage/success counters survive.
-        Raises `SystemInstructionError` when the existing record is system.
+        The owner always comes from the caller's session, never from tool
+        arguments. A public record with the same (kind, title) is left alone —
+        the save creates a private copy shadowing it for the owner. An existing
+        private record gets its content/tags replaced, its version bumped and
+        its embedding recomputed; usage/success counters survive.
+        Raises `SystemInstructionError` when a system record holds the title.
         """
         ...
 
-    async def get_by_name(self, name: str, kind: InstructionType | None = None) -> Instruction:
+    async def get_by_name(
+        self,
+        name: str,
+        kind: InstructionType | None = None,
+        user_id: str | None = None,
+    ) -> Instruction:
         """Return the instruction titled `name`, optionally narrowed by type.
 
-        When several types share the title and `kind` is None, the oldest
-        record wins. Raises `InstructionNotFoundError` when nothing matches.
+        With `user_id` given, only records visible to that user take part
+        (their own plus public); without it, only public records. When several
+        candidates share the title, the oldest record wins. Raises
+        `InstructionNotFoundError` when nothing matches.
         """
         ...
 
-    async def delete(self, name: str, kind: InstructionType) -> None:
-        """Delete the instruction identified by (kind, title).
+    async def delete(self, user_id: str, instruction_id: str) -> None:
+        """Delete the caller's private record by id.
 
-        Raises `InstructionNotFoundError` when nothing matches and
-        `SystemInstructionError` when the record is system.
+        Raises `InstructionNotFoundError` when no own record matches the id —
+        a public or someone else's record looks the same as a missing one to
+        the agent-facing caller (publishing is the admin surface).
+        """
+        ...
+
+    async def publish(self, instruction_id: str) -> Instruction:
+        """Make the record public (owner -> None); admin surface, not an agent tool.
+
+        Raises `InstructionNotFoundError` when the id is unknown.
         """
         ...
 

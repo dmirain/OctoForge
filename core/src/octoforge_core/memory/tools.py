@@ -8,9 +8,11 @@ from octoforge_core.tools.errors import ToolArgumentsError
 
 STORE_NAME = "memory_store"
 STORE_DESCRIPTION = (
-    "Store a durable memory under a key (upsert: an existing key of the same scope is "
-    "replaced). Scope 'user' (default) is visible to this user on every surface; scope "
-    "'global' is visible to all users — use it sparingly, for facts shared by everyone."
+    "Store a personal note or a durable fact about the user (birthdays, relatives, "
+    'preferences — e.g. "my wife\'s birthday is March 5") under a key (upsert: an '
+    "existing key of the same scope is replaced). Scope 'user' (default) is visible "
+    "to this user on every surface; scope 'global' is visible to all users — use it "
+    "sparingly, for facts shared by everyone."
 )
 STORED_TEMPLATE = "memory stored (scope={scope}, key={key}, created={created})"
 STORE_SCHEMA: dict[str, Any] = {

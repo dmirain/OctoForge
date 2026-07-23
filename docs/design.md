@@ -60,8 +60,9 @@ core/                          # библиотека octoforge-core — дом�
                                #   ProcessInfo/ProcessPlace, LLMRouter (one-shot tool call, таймаут, фолбэк)
       prompts.py               # порты промптов: PromptProvider (Protocol) + StaticPromptProvider
                                #   поверх вшитых DEFAULT_SYSTEM_PROMPT (мета-правила: answer-first,
-                               #   skills_search на непокрытый интент, instruction_save, формат
-                               #   мессенджера) и ROUTER_SYSTEM_PROMPT (роутинг процессов);
+                               #   instruction_search на непокрытый интент, сохранение по
+                               #   аудитории (сценарий/память/knowledge), формат markdown)
+                               #   и ROUTER_SYSTEM_PROMPT (роутинг процессов);
                                #   имена SYSTEM/ROUTER_PROMPT_NAME
       runner.py                # ConversationRunner (актор: нарратив + процессы fg/bg, bound
                                #   TaskSpawner, wake для крон-выстрелов, порт
@@ -107,7 +108,8 @@ core/                          # библиотека octoforge-core — дом�
                                #   (store инъектируется; vector-capable store → search_by_vector)
       registry.py              # SystemSkill + CORE_SYSTEM_SKILLS (8 системных сценариев)
                                #   + sync_system_registry (синк системной части стора при старте)
-      tools.py                 # skills_search (полные сценарии в выдаче) + instruction_save
+      tools.py                 # instruction_search (полные сценарии + id в выдаче, фильтр type),
+                               #   instruction_save (приватные записи), instruction_delete (по id)
     datasets/                  # обособленный модуль датасетов (per-user трекеры, этап C)
       api.py                   # граница модуля: DatasetService (Protocol), Dataset, DatasetRecord,
                                #   DatasetSchema/FieldType, DatasetHit, ошибки модуля,
@@ -377,15 +379,16 @@ CANCEL/PROMOTE). Пустой пакет — passthrough (актор тракт�
 
 Текст вшитого `DEFAULT_SYSTEM_PROMPT` — только мета-правила: отвечать «сначала суть,
 потом детали» (прерывание полезно); не импровизировать применение тулов — следовать
-сценариям из контекста, а на непокрытый интент сначала вызвать `skills_search`; при
+сценариям из контекста, а на непокрытый интент сначала вызвать `instruction_search`; при
 system-уведомлении о фоновой задаче — коротко сообщить результат; после нового
-многошагового сценария — сохранить его через `instruction_save`; разметка ответов —
-markdown (`**bold**` для акцентов и заголовков, списки дефисом, код в fenced-блоках,
-табличные данные — pipe-таблицами, ASCII/псевдографика запрещена): клиент рендерит её
-нативно (Telegram — rich-апгрейдом финала, см. выше). Пер-туловая методика
-(крон, фон, память, датасеты, история, веб, внешние вызовы) живёт в системных
+многошагового сценария — сохранить его через `instruction_save`, а факты разводить по
+аудитории (персональные — в память, общеполезные — в knowledge, трекеры — в датасеты);
+разметка ответов — markdown (`**bold**` для акцентов и заголовков, списки дефисом,
+код в fenced-блоках, табличные данные — pipe-таблицами, ASCII/псевдографика запрещена):
+клиент рендерит её нативно (Telegram — rich-апгрейдом финала, см. выше). Пер-туловая
+методика (крон, фон, память, датасеты, история, веб, внешние вызовы) живёт в системных
 сценариях реестра (`instructions/registry.py`, см. [instructions.md](instructions.md))
-и попадает в контекст поиском (`skills_search` на каждый непокрытый интент).
+и попадает в контекст поиском (`instruction_search` на каждый непокрытый интент).
 
 ### Стриминг LLM (`llm/openai.py`)
 
@@ -415,7 +418,7 @@ provider_internal, transport; остальные фатальны. Однора�
 (эмбеддинги, реранкер) ретраят транзиентные классы через хелпер `retry_transient` —
 одна дополнительная попытка с минимальной фиксированной задержкой
 (`SHORT_RETRY_MAX_RETRIES`/`SHORT_RETRY_DELAY_SECONDS`): транзиентный 429 эндпоинта
-эмбеддингов не должен валить `skills_search`, но и сталлить поиск нельзя.
+эмбеддингов не должен валить `instruction_search`, но и сталлить поиск нельзя.
 Ленивая загрузка локальных моделей (bi-encoder, cross-encoder) — под
 `threading.Lock`: конкурентные первые вызовы из worker-потоков не грузят модель дважды.
 
@@ -521,10 +524,10 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
 v3 — тул; переименование кода отложено). Реализации живут в доменных модулях
 (`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`,
 `tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`):
-`http_request`, `task_create`, `task_list`, `task_delete`, `skills_search`,
-`instruction_save`, `external_call`, `data_put`, `data_query`, `data_forget`,
-`memory_store`, `memory_search`, `memory_delete`, `cron_pause`, `cron_resume`,
-`web_search`, `history_search`.
+`http_request`, `task_create`, `task_list`, `task_delete`, `instruction_search`,
+`instruction_save`, `instruction_delete`, `external_call`, `data_put`, `data_query`,
+`data_forget`, `memory_store`, `memory_search`, `memory_delete`, `cron_pause`,
+`cron_resume`, `web_search`, `history_search`.
 Подключаются в composition root. Имена тулов — с подчёркиваниями, не с точками:
 точки в function-name несовместимы с OpenAI tool-calling (зафиксированное решение).
 `SkillOrigin` упразднён: `ToolRegistry` хранит тулы под уникальными именами
@@ -570,7 +573,9 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
 Реализация:
 
 - **Модуль `instructions/`** — самодостаточный: хранит, ищет и ранжирует записи трёх типов.
-  Граница — `api.py` (Protocol `InstructionService`: `search`/`save`/`get_by_name`, DTO
+  Граница — `api.py` (Protocol `InstructionService`: `search`/`search_all`/`save`/
+  `get_by_name`/`delete`/`publish` + системная грань `save_system`/`list_system`/
+  `delete_system`, DTO
   JSON-совместимые под будущую HTTP-границу; **порт хранилища `InstructionStore`** — CRUD +
   `list_with_embeddings` — и runtime-checkable capability `InstructionVectorSearch` для
   сторов с поиском на своей стороне, напр. pgvector). Локальная реализация
@@ -589,10 +594,20 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   реализует `InstructionVectorSearch`, сервис делегирует ему выбор кандидатов
   (`search_by_vector`) вместо полного скана таблицы; буст и реранк остаются на сервисе.
   `search` инкрементирует `usage_count` возвращённых хитов.
+  **Владельцы и видимость (v4, 2026-07-23)**: у записи есть `owner_id` (NULL =
+  публичная); `save` всегда создаёт приватную запись с владельцем из сессии
+  (`ToolContext.user_id`, не из аргументов тула), `search(user_id, query, k, kind?)`
+  ранжирует только публичные и свои (фильтр `kind` до ранжирования), `delete(user_id, id)`
+  — только свои (чужая/публичная = NotFound), поверх публичной записи сохранение создаёт
+  личную копию-затенение; публикация — админская поверхность `publish(id)` (owner → NULL)
+  + `search_all` (без фильтра видимости); уникальность `(type, title, owner_id)` +
+  частичный индекс на публичные `(type, title)`; `get_by_name` видит свои+публичные
+  (своя копия первая), исполнитель endpoint'ов ходит с user_id — приватный эндпоинт
+  чужака не исполняется.
   Системная часть стора — декларативный реестр (`CORE_SYSTEM_SKILLS` core + прикладные
   пакеты установщика, у web — `WEB_SYSTEM_SKILLS` с погодным примером): синк
   `sync_system_registry` в lifespan upsert'ит записи как `system=true` (усыновляя
-  легаси-записи) и удаляет системные записи, исчезнувшие из реестра; пользовательские
+  публичные легаси-записи) и удаляет системные записи, исчезнувшие из реестра; пользовательские
   записи (`system=false`) не трогает. Неизменная системная запись (совпали content и
   tags) пропускается без переэмбеддинга и бампа версии — повторный старт не жжёт
   платные вызовы HTTP-бэкенда; гонка find-then-insert двух инстансов на одной SQLite
@@ -612,10 +627,12 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `ExternalCallExecutor` и в туле `http_request` (там тоже `follow_redirects=False` —
   поведение не изменилось, httpx и раньше не следовал редиректам по умолчанию). Известное
   ограничение TOCTOU/DNS-rebinding задокументировано в docstring гварда.
-- **Рантайм-тулы** — тонкие адаптеры (`instructions/tools.py`): `skills_search(query, k?)`
-  (k по умолчанию — `OF_INSTRUCTIONS_TOP_K`; ответ — полные сценарии, без сниппетов),
-  `instruction_save(type, title, content, tags?)` (системные записи защищены:
-  `SystemInstructionError`), `external_call(name, params?)` (`net/tools.py`).
+- **Рантайм-тулы** — тонкие адаптеры (`instructions/tools.py`): `instruction_search(query, k?, type?)`
+  (k по умолчанию — `OF_INSTRUCTIONS_TOP_K`; ответ — полные сценарии + id записей,
+  без сниппетов; `type` сужает поиск до одного вида),
+  `instruction_save(type, title, content, tags?)` (приватная запись владельца из сессии;
+  системные записи защищены: `SystemInstructionError`),
+  `instruction_delete(id)` (только свои записи), `external_call(name, params?)` (`net/tools.py`).
 
 ## Датасеты пользовательских данных (этап C)
 
@@ -646,7 +663,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `data_query(dataset, equals?, date_from?, date_to?, limit?)` (date-only = весь день
   UTC; лимиты `OF_DATASETS_QUERY_DEFAULT_LIMIT`/`OF_DATASETS_QUERY_MAX_LIMIT`),
   `data_forget(dataset)` (явный каскад DELETE записей, ответ — счётчик).
-- **Дескрипторы в `skills_search`**: тулу передан `DatasetService` (опциональный
+- **Дескрипторы в `instruction_search`**: тулу передан `DatasetService` (опциональный
   параметр конструктора), хиты обоих фасадов сливаются по убыванию score; датасеты
   форматируются как `[dataset] <name>` со сниппетом description + списком полей.
 
@@ -812,7 +829,10 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   вежливый отказ без создания бриджа. Гейт (и админский тул) активируется только при непустом списке админов —
   иначе поверхность открыта, как раньше.
 - **Админский тул** (`telegram/admin.py`): тул `admin_manage` (действия
-  `list_users`/`generate_invite`/`revoke_invite`/`restore_invite`) регистрируется
+  `list_users`/`generate_invite`/`revoke_invite`/`restore_invite` +
+  `search_instructions`/`publish_instruction` — поиск инструкций по всем
+  пользователям (`InstructionService.search_all`, выдача с id/owner) и публикация
+  записи по id (`publish`, owner → NULL: становится видна всем)) регистрируется
   только при включённом Telegram и непустых админах. Отзыв обратим: инвайт
   переводится в REVOKED (поллер блокирует новые сообщения), крон-задачи пользователя
   выключаются (не удаляются) с запоминанием id в записи инвайта — `restore_invite`
@@ -987,8 +1007,8 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   до 500
 - `core/tests/test_cron_tools.py` — тулы `cron_pause`/`cron_resume` (owner-изоляция,
   resume пересчитывает `next_fire_at` от now)
-- `core/tests/test_instruction_tools.py` — адаптеры `skills_search`/`instruction_save`/
-  `external_call` (валидация аргументов + happy path на фейках)
+- `core/tests/test_instruction_tools.py` — адаптеры `instruction_search`/`instruction_save`/
+  `instruction_delete`/`external_call` (валидация аргументов + happy path на фейках)
 - `core/tests/test_datasets.py` — контрактный набор фасада DatasetService на `:memory:`
   (create/get, дубликат имени, одно имя у разных owner'ов, изоляция, query: equals с
   тип-чувствительностью/диапазон дат/limit, delete каскадом со счётчиком, search с
@@ -998,7 +1018,7 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
 - `core/tests/test_data_tools.py` — `data_put` (создание со schema+description, отказ без
   них, запись в существующий, нарушения схемы текстом), `data_query` (JSON-строки, фильтры,
   лимиты, date-only границы, not-found текстом), `data_forget` (счётчик, not-found),
-  `skills_search` с datasets (merged-выдача с `[dataset]`)
+  `instruction_search` с datasets (merged-выдача с `[dataset]`)
 - `core/tests/test_memory.py` — контрактный набор порта MemoryStore на `:memory:` (put
   create/upsert с сохранением id и бампом updated_at, get, изоляция owner'ов, глобальный
   скоуп виден всем, повторный put глобального ключа без дублей, delete, search: подстрока

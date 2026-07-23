@@ -7,6 +7,10 @@ the process, an installer can substitute a pgvector/vector-DB store
 When a reranker is configured, the cosine shortlist is re-scored by a
 cross-encoder (the b2e two-stage pattern); a reranker failure degrades
 gracefully to the cosine shortlist.
+
+Visibility: agent-facing search sees public records plus the caller's own
+private ones; new records are always private to their author, and only the
+admin-facing `publish` makes a record public.
 """
 
 import logging
@@ -50,11 +54,36 @@ class LocalInstructionService:
         self._reranker = reranker
         self._rerank_candidates = rerank_candidates
 
-    async def search(self, query: str, k: int) -> list[SearchHit]:
+    async def search(
+        self,
+        user_id: str,
+        query: str,
+        k: int,
+        kind: InstructionType | None = None,
+    ) -> list[SearchHit]:
+        """Rank the records visible to `user_id`; `kind` filters before ranking."""
+        return await self._search(user_id, query, k, kind)
+
+    async def search_all(
+        self,
+        query: str,
+        k: int,
+        kind: InstructionType | None = None,
+    ) -> list[SearchHit]:
+        """Rank the whole table with no visibility filter (admin surface)."""
+        return await self._search(None, query, k, kind)
+
+    async def _search(
+        self,
+        user_id: str | None,
+        query: str,
+        k: int,
+        kind: InstructionType | None,
+    ) -> list[SearchHit]:
         """Embed the query, rank the candidates by cosine and bump usage of the hits.
 
         Candidates come from the store: vector-capable stores run the search
-        on their side, the rest hand over the whole table for brute-force
+        on their side, the rest hand over the visible rows for brute-force
         cosine. With a reranker configured, the cosine stage returns a
         shortlist of `rerank_candidates` which the cross-encoder re-scores
         down to top-k.
@@ -62,7 +91,11 @@ class LocalInstructionService:
         if not query.strip() or k <= 0:
             return []
         (query_embedding,) = await self._embedder.embed((query,))
-        candidates = await self._candidates(query_embedding, k)
+        candidates = await self._candidates(query_embedding, k, user_id)
+        if kind is not None:
+            candidates = [
+                candidate for candidate in candidates if candidate.instruction.type is kind
+            ]
         shortlist = rank(candidates, query, query_embedding, self._shortlist_size(k))
         hits = await self._apply_reranker(query, shortlist, k)
         await self._store.bump_usage(tuple(hit.instruction.id for hit in hits))
@@ -70,17 +103,29 @@ class LocalInstructionService:
 
     async def save(
         self,
+        user_id: str,
         kind: InstructionType,
         title: str,
         content: str,
         tags: tuple[str, ...] = (),
     ) -> Instruction:
-        """Embed title + content and upsert the record (version bump on replace).
+        """Upsert the caller's private record (version bump on replace).
 
-        Agent-facing: refuses to overwrite a system (registry-owned) record.
+        Agent-facing: refuses to overwrite a system (registry-owned) record,
+        and a public record with the same title is left alone — the save
+        creates the owner's private copy.
         """
         await self._ensure_not_system(kind, title)
-        return await self._upsert(kind, title, content, tags, system=False)
+        draft = InstructionDraft(
+            kind=kind,
+            title=title,
+            content=content,
+            tags=tags,
+            embedding=await self._embed(title, content),
+            system=False,
+            owner_id=user_id,
+        )
+        return await self._store.upsert(draft)
 
     async def save_system(
         self,
@@ -89,11 +134,12 @@ class LocalInstructionService:
         content: str,
         tags: tuple[str, ...] = (),
     ) -> Instruction:
-        """Upsert a system record; a (kind, title) match is adopted as system.
+        """Upsert a system record; a public (kind, title) match is adopted as system.
 
         An unchanged system record is returned as-is: re-embedding identical
         title+content on every startup registry sync is a wasted (paid with
-        an HTTP backend) call.
+        an HTTP backend) call. Private records with the same title are not
+        touched — the registry only ever adopts public rows.
         """
         existing = await self._store.get_by_title(title, kind)
         if (
@@ -103,11 +149,29 @@ class LocalInstructionService:
             and existing.tags == tags
         ):
             return existing
-        return await self._upsert(kind, title, content, tags, system=True)
+        draft = InstructionDraft(
+            kind=kind,
+            title=title,
+            content=content,
+            tags=tags,
+            embedding=await self._embed(title, content),
+            system=True,
+            owner_id=None,
+        )
+        return await self._store.upsert(draft)
 
-    async def get_by_name(self, name: str, kind: InstructionType | None = None) -> Instruction:
-        """Return the record by title, optionally narrowed by type."""
-        instruction = await self._store.get_by_title(name, kind)
+    async def get_by_name(
+        self,
+        name: str,
+        kind: InstructionType | None = None,
+        user_id: str | None = None,
+    ) -> Instruction:
+        """Return the record by title: the caller's own copy first, then public."""
+        instruction = None
+        if user_id is not None:
+            instruction = await self._store.get_by_title(name, kind, owner_id=user_id)
+        if instruction is None:
+            instruction = await self._store.get_by_title(name, kind)
         if instruction is None:
             raise InstructionNotFoundError(name)
         return instruction
@@ -116,41 +180,26 @@ class LocalInstructionService:
         """Return every system (registry-owned) record."""
         return await self._store.list_system()
 
-    async def delete(self, name: str, kind: InstructionType) -> None:
-        """Delete the record; raise InstructionNotFoundError when absent.
+    async def delete(self, user_id: str, instruction_id: str) -> None:
+        """Delete the caller's own record by id; anything else is a NotFound."""
+        if not await self._store.delete_by_id(instruction_id, user_id):
+            raise InstructionNotFoundError(instruction_id)
 
-        Agent-facing: refuses to delete a system (registry-owned) record.
-        """
-        existing = await self._store.get_by_title(name, kind)
-        if existing is None:
-            raise InstructionNotFoundError(name)
-        if existing.system:
-            raise SystemInstructionError(SYSTEM_RECORD_MESSAGE.format(title=name))
-        await self._store.delete_by_title(name, kind)
+    async def publish(self, instruction_id: str) -> Instruction:
+        """Make the record public; admin surface, not an agent tool."""
+        instruction = await self._store.publish(instruction_id)
+        if instruction is None:
+            raise InstructionNotFoundError(instruction_id)
+        return instruction
 
     async def delete_system(self, name: str, kind: InstructionType) -> None:
-        """Delete a record regardless of the system flag (registry sync only)."""
+        """Delete a public/system record regardless of the flag (registry sync only)."""
         if not await self._store.delete_by_title(name, kind):
             raise InstructionNotFoundError(name)
 
-    async def _upsert(
-        self,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...],
-        system: bool,
-    ) -> Instruction:
+    async def _embed(self, title: str, content: str) -> tuple[float, ...]:
         (embedding,) = await self._embedder.embed((_embedded_text(title, content),))
-        draft = InstructionDraft(
-            kind=kind,
-            title=title,
-            content=content,
-            tags=tags,
-            embedding=embedding,
-            system=system,
-        )
-        return await self._store.upsert(draft)
+        return embedding
 
     async def _ensure_not_system(self, kind: InstructionType, title: str) -> None:
         existing = await self._store.get_by_title(title, kind)
@@ -164,11 +213,14 @@ class LocalInstructionService:
         self,
         query_embedding: tuple[float, ...],
         k: int,
+        user_id: str | None,
     ) -> list[EmbeddedInstruction]:
         """Fetch the ranking input: vector search on the store side when supported."""
         if isinstance(self._store, InstructionVectorSearch):
-            return await self._store.search_by_vector(query_embedding, self._shortlist_size(k))
-        return await self._store.list_with_embeddings()
+            return await self._store.search_by_vector(
+                query_embedding, self._shortlist_size(k), user_id
+            )
+        return await self._store.list_with_embeddings(user_id)
 
     async def _apply_reranker(
         self,

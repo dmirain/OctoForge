@@ -49,7 +49,7 @@ OctoForge строится вокруг другой идеи:
                         /                                 \
          LLMClient (OpenAI-совм., SSE)         ToolRegistry — базовые тулы:
                                                http_request, task_create/list/delete,
-                                               cron_pause/resume, skills_search,
+                                               cron_pause/resume, instruction_search,
                                                instruction_save, external_call,
                                                data_*, memory_*, web_search
                                          |

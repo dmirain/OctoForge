@@ -10,7 +10,7 @@ implemented — this store ranks brute-force in the process.
 import uuid
 from typing import Any, cast
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import ColumnElement, delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -36,7 +36,7 @@ class SqlAlchemyInstructionStore:
     async def upsert(self, draft: InstructionDraft) -> Instruction:
         """Create the record or replace content/tags/embedding, bumping the version."""
         async with self._session_factory() as session:
-            row = await self._find_row(session, draft.kind, draft.title)
+            row = await self._find_row(session, draft.kind, draft.title, draft.owner_id)
             if row is not None:
                 return await self._update_row(session, row, draft)
             try:
@@ -46,7 +46,7 @@ class SqlAlchemyInstructionStore:
                 # (e.g. web + standalone syncing the registry at startup over
                 # one SQLite file): redo as an update of the winner's row
                 await session.rollback()
-                winner = await self._find_row(session, draft.kind, draft.title)
+                winner = await self._find_row(session, draft.kind, draft.title, draft.owner_id)
                 if winner is None:  # the concurrent transaction rolled back too
                     raise
                 return await self._update_row(session, winner, draft)
@@ -61,6 +61,7 @@ class SqlAlchemyInstructionStore:
             tags=list(draft.tags),
             version=FIRST_VERSION,
             system=draft.system,
+            owner_id=draft.owner_id,
         )
         session.add(row)
         await session.commit()
@@ -81,20 +82,33 @@ class SqlAlchemyInstructionStore:
         await session.commit()
         return _to_instruction(row)
 
-    async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
-        """Return the record by title (oldest first when types collide), or None."""
+    async def get_by_title(
+        self,
+        title: str,
+        kind: InstructionType | None,
+        owner_id: str | None = None,
+    ) -> Instruction | None:
+        """Return the record by (title, kind, owner), oldest first on collisions."""
         async with self._session_factory() as session:
-            statement = select(InstructionRow).where(InstructionRow.title == title)
+            statement = select(InstructionRow).where(
+                InstructionRow.title == title,
+                _owner_clause(owner_id),
+            )
             if kind is not None:
                 statement = statement.where(InstructionRow.type == kind.value)
             statement = statement.order_by(InstructionRow.created_at, InstructionRow.id).limit(1)
             row = (await session.scalars(statement)).first()
             return None if row is None else _to_instruction(row)
 
-    async def list_with_embeddings(self) -> list[EmbeddedInstruction]:
-        """Return every record with its embedding (brute-force search input)."""
+    async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
+        """Return records visible to `user_id` (None = the whole table)."""
         async with self._session_factory() as session:
-            rows = (await session.scalars(select(InstructionRow).order_by(InstructionRow.id))).all()
+            statement = select(InstructionRow).order_by(InstructionRow.id)
+            if user_id is not None:
+                statement = statement.where(
+                    InstructionRow.owner_id.is_(None) | (InstructionRow.owner_id == user_id)
+                )
+            rows = (await session.scalars(statement)).all()
             return [
                 EmbeddedInstruction(
                     instruction=_to_instruction(row),
@@ -126,12 +140,36 @@ class SqlAlchemyInstructionStore:
             )
             await session.commit()
 
+    async def delete_by_id(self, instruction_id: str, owner_id: str) -> bool:
+        """Delete the owner's private record by id; return True when removed."""
+        async with self._session_factory() as session:
+            statement = delete(InstructionRow).where(
+                InstructionRow.id == instruction_id,
+                InstructionRow.owner_id == owner_id,
+            )
+            # DML executes into a CursorResult at runtime; narrow for rowcount.
+            result = cast(CursorResult[Any], await session.execute(statement))
+            await session.commit()
+            return result.rowcount > 0
+
+    async def publish(self, instruction_id: str) -> Instruction | None:
+        """Make the record public (owner_id -> NULL); None when the id is unknown."""
+        async with self._session_factory() as session:
+            row = await session.get(InstructionRow, instruction_id)
+            if row is None:
+                return None
+            row.owner_id = None
+            row.updated_at = utc_now()
+            await session.commit()
+            return _to_instruction(row)
+
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
-        """Delete the record identified by (kind, title); return True when removed."""
+        """Delete the public/system record (kind, title); registry sync only."""
         async with self._session_factory() as session:
             statement = delete(InstructionRow).where(
                 InstructionRow.type == kind.value,
                 InstructionRow.title == title,
+                InstructionRow.owner_id.is_(None),
             )
             # DML executes into a CursorResult at runtime; narrow for rowcount.
             result = cast(CursorResult[Any], await session.execute(statement))
@@ -143,14 +181,23 @@ class SqlAlchemyInstructionStore:
         session: AsyncSession,
         kind: InstructionType,
         title: str,
+        owner_id: str | None,
     ) -> InstructionRow | None:
         result = await session.scalars(
             select(InstructionRow).where(
                 InstructionRow.type == kind.value,
                 InstructionRow.title == title,
+                _owner_clause(owner_id),
             )
         )
         return result.first()
+
+
+def _owner_clause(owner_id: str | None) -> ColumnElement[bool]:
+    """Match the owner column exactly, where None means the public record."""
+    if owner_id is None:
+        return InstructionRow.owner_id.is_(None)
+    return InstructionRow.owner_id == owner_id
 
 
 def _to_instruction(row: InstructionRow) -> Instruction:
@@ -166,4 +213,5 @@ def _to_instruction(row: InstructionRow) -> Instruction:
         created_at=row.created_at,
         updated_at=row.updated_at,
         system=row.system,
+        owner_id=row.owner_id,
     )

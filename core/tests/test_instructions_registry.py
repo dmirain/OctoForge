@@ -23,6 +23,7 @@ FIRST_VERSION = 1
 SECOND_VERSION = 2
 CORE_SKILLS_COUNT = 7
 TWO_ENTRIES = 2
+USER_ID = "user-test"
 
 ENTRY_ALPHA = SystemSkill(
     kind=InstructionType.SKILL,
@@ -96,8 +97,10 @@ async def test_sync_creates_system_records(service: InstructionService) -> None:
 
 async def test_sync_adopts_a_legacy_user_record(service: InstructionService) -> None:
     legacy = await service.save(
-        InstructionType.SKILL, ENTRY_ALPHA.title, "legacy scenario", ("legacy",)
+        USER_ID, InstructionType.SKILL, ENTRY_ALPHA.title, "legacy scenario", ("legacy",)
     )
+    # rows written before ownership existed migrate to public; only those are adopted
+    await service.publish(legacy.id)
 
     await sync_system_registry(service, (ENTRY_ALPHA,))
 
@@ -121,17 +124,18 @@ async def test_sync_deletes_system_records_missing_from_the_registry(
 
 
 async def test_sync_never_touches_user_records(service: InstructionService) -> None:
-    await service.save(InstructionType.SKILL, "my scenario", "user content", ("mine",))
+    await service.save(USER_ID, InstructionType.SKILL, "my scenario", "user content", ("mine",))
 
     await sync_system_registry(service, (ENTRY_ALPHA,))
 
-    user_record = await service.get_by_name("my scenario", InstructionType.SKILL)
+    user_record = await service.get_by_name("my scenario", InstructionType.SKILL, USER_ID)
     assert user_record.system is False
     assert user_record.content == "user content"
     assert user_record.version == FIRST_VERSION
     # the second sync must not delete it either (only system records are pruned)
     await sync_system_registry(service, (ENTRY_BETA,))
-    assert (await service.get_by_name("my scenario", InstructionType.SKILL)).system is False
+    my_record = await service.get_by_name("my scenario", InstructionType.SKILL, USER_ID)
+    assert my_record.system is False
 
 
 async def test_resync_with_unchanged_registry_skips_embedding() -> None:

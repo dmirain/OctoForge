@@ -10,17 +10,24 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
+from octoforge_core.instructions.api import InstructionService, InstructionType
+from octoforge_core.instructions.local import LocalInstructionService
+from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.tools.base import ToolContext
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.telegram.admin import (
     ACTION_GENERATE_INVITE,
     ACTION_LIST_USERS,
+    ACTION_PUBLISH_INSTRUCTION,
     ACTION_RESTORE_INVITE,
     ACTION_REVOKE_INVITE,
+    ACTION_SEARCH_INSTRUCTIONS,
     NOT_AUTHORIZED_MESSAGE,
+    PUBLISH_NOT_FOUND_MESSAGE,
     AdminAccess,
     AdminManageTool,
+    AdminStores,
 )
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL
 from octoforge_web.telegram.invites.api import InviteStatus
@@ -40,7 +47,20 @@ ADMIN_CONTEXT = ToolContext(user_id=ADMIN_USER_ID, channel=TELEGRAM_CHANNEL, dia
 USER_CONTEXT = ToolContext(user_id=USER_ID, channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID)
 WEB_ADMIN_CONTEXT = ToolContext(user_id=ADMIN_USER_ID, channel="web", dialog_id=DIALOG_ID)
 
-StoresTuple = tuple[SqlAlchemyInviteStore, SqlAlchemyCronStore, MessageRepository, DialogRepository]
+StoresTuple = tuple[
+    SqlAlchemyInviteStore,
+    SqlAlchemyCronStore,
+    MessageRepository,
+    DialogRepository,
+    InstructionService,
+]
+
+
+class LenientEmbedder:
+    """EmbeddingClient stub returning the same vector for every text."""
+
+    async def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        return tuple((1.0, 0.0) for _ in texts)
 
 
 @pytest.fixture
@@ -57,6 +77,7 @@ async def stores() -> AsyncIterator[StoresTuple]:
         SqlAlchemyCronStore(core_sessions),
         MessageRepository(core_sessions),
         DialogRepository(core_sessions),
+        LocalInstructionService(SqlAlchemyInstructionStore(core_sessions), LenientEmbedder()),
     )
     await core_engine.dispose()
     await telegram_engine.dispose()
@@ -65,9 +86,16 @@ async def stores() -> AsyncIterator[StoresTuple]:
 def make_tool(
     stores: StoresTuple,
 ) -> AdminManageTool:
-    invites, cron_store, messages, dialogs = stores
+    invites, cron_store, messages, dialogs, instructions = stores
     access = AdminAccess(admin_ids=frozenset({ADMIN_TELEGRAM_ID}))
-    return AdminManageTool(invites, cron_store, messages, dialogs, access)
+    backends = AdminStores(
+        invites=invites,
+        cron_store=cron_store,
+        messages=messages,
+        dialogs=dialogs,
+        instructions=instructions,
+    )
+    return AdminManageTool(backends, access)
 
 
 def make_cron_job(job_id: str, user_id: str, enabled: bool = True) -> CronJob:
@@ -96,7 +124,7 @@ async def claim_invite(
     stores: StoresTuple,
     user_id: str = USER_ID,
 ) -> str:
-    invites, _, _, _ = stores
+    invites = stores[0]
     invite = await invites.create(NOTE)
     claimed = await invites.claim(invite.code, user_id)
     return claimed.id
@@ -135,7 +163,7 @@ async def test_visible_to_only_for_telegram_admins(
 async def test_generate_invite_returns_the_code(
     stores: StoresTuple,
 ) -> None:
-    invites, _, _, _ = stores
+    invites = stores[0]
     tool = make_tool(stores)
 
     result = await tool.execute({"action": ACTION_GENERATE_INVITE, "note": NOTE}, ADMIN_CONTEXT)
@@ -150,7 +178,7 @@ async def test_generate_invite_returns_the_code(
 async def test_list_users_reports_access_stats_and_cron(
     stores: StoresTuple,
 ) -> None:
-    _, cron_store, messages, dialogs = stores
+    _, cron_store, messages, dialogs, _ = stores
     await claim_invite(stores)
     dialog = await dialogs.get_or_create(USER_ID, TELEGRAM_CHANNEL)
     await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hello"))
@@ -169,7 +197,7 @@ async def test_list_users_reports_access_stats_and_cron(
 async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
     stores: StoresTuple,
 ) -> None:
-    invites, cron_store, _, _ = stores
+    invites, cron_store = stores[0], stores[1]
     invite_id = await claim_invite(stores)
     await cron_store.create(make_cron_job("job-1", USER_ID))
     await cron_store.create(make_cron_job("job-2", USER_ID))
@@ -206,7 +234,7 @@ async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
 async def test_revoke_pending_invite_by_id(
     stores: StoresTuple,
 ) -> None:
-    invites, _, _, _ = stores
+    invites = stores[0]
     invite = await invites.create(NOTE)
     tool = make_tool(stores)
 
@@ -225,5 +253,68 @@ async def test_revoke_without_target_is_an_error(
     tool = make_tool(stores)
 
     result = await tool.execute({"action": ACTION_REVOKE_INVITE}, ADMIN_CONTEXT)
+
+    assert result.startswith("error:")
+
+
+async def test_search_instructions_finds_records_of_everyone(
+    stores: StoresTuple,
+) -> None:
+    _, _, _, _, instructions = stores
+    await instructions.save(USER_ID, InstructionType.SKILL, "weather scenario", "call wttr.in")
+    tool = make_tool(stores)
+
+    result = await tool.execute(
+        {"action": ACTION_SEARCH_INSTRUCTIONS, "query": "weather"}, ADMIN_CONTEXT
+    )
+
+    assert "[skill] weather scenario" in result
+    assert f"owner: {USER_ID}" in result
+    assert "id: " in result
+
+
+async def test_search_instructions_requires_a_query(
+    stores: StoresTuple,
+) -> None:
+    tool = make_tool(stores)
+
+    result = await tool.execute({"action": ACTION_SEARCH_INSTRUCTIONS}, ADMIN_CONTEXT)
+
+    assert result.startswith("error:")
+
+
+async def test_publish_instruction_makes_a_private_record_public(
+    stores: StoresTuple,
+) -> None:
+    _, _, _, _, instructions = stores
+    saved = await instructions.save(USER_ID, InstructionType.SKILL, "weather scenario", "steps")
+    tool = make_tool(stores)
+
+    result = await tool.execute(
+        {"action": ACTION_PUBLISH_INSTRUCTION, "id": saved.id}, ADMIN_CONTEXT
+    )
+
+    assert result == "published: [skill] weather scenario"
+    assert (await instructions.get_by_name("weather scenario")).owner_id is None
+
+
+async def test_publish_instruction_reports_an_unknown_id(
+    stores: StoresTuple,
+) -> None:
+    tool = make_tool(stores)
+
+    result = await tool.execute(
+        {"action": ACTION_PUBLISH_INSTRUCTION, "id": "missing"}, ADMIN_CONTEXT
+    )
+
+    assert result == PUBLISH_NOT_FOUND_MESSAGE
+
+
+async def test_publish_instruction_requires_an_id(
+    stores: StoresTuple,
+) -> None:
+    tool = make_tool(stores)
+
+    result = await tool.execute({"action": ACTION_PUBLISH_INSTRUCTION}, ADMIN_CONTEXT)
 
     assert result.startswith("error:")

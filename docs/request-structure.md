@@ -30,7 +30,7 @@
 
 | Порядок | Часть | Тип(ы) сообщений | Состав | Размер | ~Токены |
 |---|---|---|---|---|---|
-| 0 (отдельное поле) | Тулы, 17 шт. | не сообщение — поле `tools` | JSON-спеки task×3, cron×2, memory×3, data×3, history_search, web_search, http_request, external_call, skills_search, instruction_save | 10 533 chars | ~2 630 |
+| 0 (отдельное поле) | Тулы, 18 шт. | не сообщение — поле `tools` | JSON-спеки task×3, cron×2, memory×3, data×3, history_search, web_search, http_request, external_call, instruction_search, instruction_save, instruction_delete | ~11 500 chars | ~2 900 |
 | 1 | Системный промпт | `system` (всегда первый) | `DEFAULT_SYSTEM_PROMPT` (5 мета-правил), байт-стабильный | ~940 chars | ~235 |
 | 2 | Блок тем | `system` (одно сообщение, опционально) | одно rolling-саммари диалога: `[seq N-M] (topics: ...) текст` | 0, константный (merge) | — |
 | 3 | Горячий хвост | `user` / `assistant` / `tool` + `system`-заметки | дословная переписка `seq > max(seq_to)`: сообщения пользователя, финалы и промежуточные ответы модели (с `tool_calls`), результаты тулов (с `tool_call_id`) | ≤ 12 000 chars (`OF_CONTEXT_HOT_MAX_CHARS`) | ≤ ~3 000 |
@@ -38,8 +38,9 @@
 | 4 | Trail / репорт-надж / инъекции | `user` | входящее сообщение процесса; `REPORT_NUDGE` в репорт-прогоне; инъекции роутера через `LoopControl` | — | — |
 | 4а | Конверт даты | префикс последнего сообщения | `[Current date and time: … (UTC)]\n` — только в ветке, нарратив/персист чистые | ~40 chars | ~10 |
 
-Самые тяжёлые тулы: `task_create` ~295 ток, `history_search` ~270 ток, `data_put` ~245 ток,
-`data_query` ~220 ток, `memory_store` ~190 ток; мелкие (`task_list` ~85, `cron_pause` ~75).
+Самые тяжёлые тулы: `task_create` ~295 ток, `history_search` ~270 ток, `instruction_save`
+~255 ток, `data_put` ~245 ток, `instruction_search` ~240 ток, `data_query` ~220 ток,
+`memory_store` ~190 ток; мелкие (`instruction_delete` ~80, `task_list` ~85, `cron_pause` ~75).
 
 ## Итоги
 

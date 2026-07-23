@@ -57,7 +57,7 @@ Delete with memory_delete only on the user's explicit request."""
 
 USER_DATASETS_CONTENT = """\
 Scenario: remember and track structured data for the user (food, weight, habits...).
-1. Find the dataset via skills_search; if none fits, create it implicitly with
+1. Find the dataset via instruction_search; if none fits, create it implicitly with
    data_put by declaring a JSON schema for the record.
 2. Write records with data_put; read and build reports with data_query (equality
    filters, date ranges, limit).
@@ -86,7 +86,7 @@ refused, report the refusal honestly instead of retrying variations."""
 
 SKILL_AUTHORING_CONTENT = """\
 Scenario: find and author skill scenarios.
-1. For every intent in the user's message call skills_search with a single
+1. For every intent in the user's message call instruction_search with a single
    free-text query: phrase it as the normalized intent (remind, schedule,
    report, track, lookup, save, call-api) plus the entity type (reminder,
    recurring-report, user-data, weather, history, web-fact), e.g.
@@ -95,7 +95,7 @@ Scenario: find and author skill scenarios.
    tools correctly.
 2. After completing a novel multi-step task, save the working scenario with
    instruction_save (type skill): clear steps, naming every tool the scenario uses.
-   Save durable facts as type knowledge.
+   Save durable facts useful to everyone as type knowledge.
 3. Search before saving: update the existing scenario instead of creating a duplicate."""
 
 CORE_SYSTEM_SKILLS: tuple[SystemSkill, ...] = (

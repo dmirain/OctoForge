@@ -20,8 +20,10 @@ from octoforge_core.tools.errors import ToolArgumentsError
 
 PUT_NAME = "data_put"
 PUT_DESCRIPTION = (
-    "Write a record into one of the user's datasets (food/weight/habit trackers and "
-    "the like). If the dataset does not exist yet it is created on the fly — then "
+    "Write a record into one of the user's datasets — structured list-like data the "
+    "user tracks over time (food/weight/habit trackers and the like; e.g. today's "
+    "intake 'k2000 p100 f60 c120' goes to a food-log dataset with numeric fields). "
+    "If the dataset does not exist yet it is created on the fly — then "
     "'schema' ({'fields': [{'name', 'type', 'required?'}]}) and 'description' are "
     "required. The record is validated against the dataset schema."
 )

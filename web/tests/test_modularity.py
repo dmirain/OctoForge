@@ -102,7 +102,7 @@ class InMemoryInstructionStore:
     """InstructionStore implementation keeping records in a dict (no SQL)."""
 
     def __init__(self) -> None:
-        self.records: dict[tuple[str, str], Instruction] = {}
+        self.records: dict[tuple[str, str, str | None], Instruction] = {}
         self.embeddings: dict[str, tuple[float, ...]] = {}
 
     async def upsert(self, draft: InstructionDraft) -> Instruction:
@@ -119,28 +119,69 @@ class InMemoryInstructionStore:
             created_at=now,
             updated_at=now,
             system=draft.system,
+            owner_id=draft.owner_id,
         )
-        self.records[(draft.kind.value, draft.title)] = record
+        self.records[(draft.kind.value, draft.title, draft.owner_id)] = record
         self.embeddings[record.id] = draft.embedding
         return record
 
-    async def get_by_title(self, title: str, kind: InstructionType | None) -> Instruction | None:
-        return self.records.get((kind.value if kind is not None else "", title)) or next(
-            (record for record in self.records.values() if record.title == title),
+    async def get_by_title(
+        self,
+        title: str,
+        kind: InstructionType | None,
+        owner_id: str | None = None,
+    ) -> Instruction | None:
+        return self.records.get((kind.value if kind is not None else "", title, owner_id)) or next(
+            (
+                record
+                for record in self.records.values()
+                if record.title == title and record.owner_id == owner_id
+            ),
             None,
         )
 
-    async def list_with_embeddings(self) -> list[EmbeddedInstruction]:
+    async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
         return [
             EmbeddedInstruction(instruction=record, embedding=self.embeddings[record.id])
             for record in self.records.values()
+            if user_id is None or record.owner_id is None or record.owner_id == user_id
         ]
 
     async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
         pass
 
+    async def delete_by_id(self, instruction_id: str, owner_id: str) -> bool:
+        for key, record in list(self.records.items()):
+            if record.id == instruction_id and record.owner_id == owner_id:
+                del self.records[key]
+                return True
+        return False
+
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
-        return self.records.pop((kind.value, title), None) is not None
+        return self.records.pop((kind.value, title, None), None) is not None
+
+    async def publish(self, instruction_id: str) -> Instruction | None:
+        for key, record in list(self.records.items()):
+            if record.id != instruction_id:
+                continue
+            del self.records[key]
+            published = Instruction(
+                id=record.id,
+                type=record.type,
+                title=record.title,
+                content=record.content,
+                tags=record.tags,
+                version=record.version,
+                usage_count=record.usage_count,
+                success_count=record.success_count,
+                created_at=record.created_at,
+                updated_at=utc_now(),
+                system=record.system,
+                owner_id=None,
+            )
+            self.records[(record.type.value, record.title, None)] = published
+            return published
+        return None
 
     async def list_system(self) -> list[Instruction]:
         return [record for record in self.records.values() if record.system]
@@ -168,7 +209,7 @@ class RootLLM:
     complete() serves the router (always inject); stream() drives the dialog:
     the first call waits on a gate (so the second user message meets an active
     process and exercises the router), then asks for web_search, then for
-    skills_search, then finishes with the final reply.
+    instruction_search, then finishes with the final reply.
     """
 
     def __init__(self) -> None:
@@ -208,7 +249,7 @@ class RootLLM:
             yield StreamFinished(message=_tool_call("call-search", "web_search", SEARCH_QUERY))
         elif call_number == SECOND_CALL:
             yield StreamFinished(
-                message=_tool_call("call-instructions", "skills_search", SAVED_TITLE)
+                message=_tool_call("call-instructions", "instruction_search", SAVED_TITLE)
             )
         else:
             yield LlmTextDelta(text=FINAL_REPLY)
@@ -348,7 +389,7 @@ async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     tmp_path: Path,
 ) -> None:
     root = build_third_party_root(session_factory, http_client, tmp_path)
-    await root.instructions.save(InstructionType.SKILL, SAVED_TITLE, SAVED_CONTENT)
+    await root.instructions.save(USER_ID, InstructionType.SKILL, SAVED_TITLE, SAVED_CONTENT)
     runner = await root.manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 

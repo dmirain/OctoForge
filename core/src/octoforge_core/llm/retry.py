@@ -35,7 +35,7 @@ RETRY_AFTER_DELAY_CAP_SECONDS = 300.0
 
 # Short retry for the secondary HTTP backends (embeddings, reranker): one
 # extra attempt with a minimal fixed delay — a transient 429 during
-# skills_search should not fail the search, but it must not stall it either.
+# instruction_search should not fail the search, but it must not stall it either.
 SHORT_RETRY_MAX_RETRIES = 1
 SHORT_RETRY_DELAY_SECONDS = 0.5
 

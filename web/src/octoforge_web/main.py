@@ -68,7 +68,7 @@ from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
 from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
-from octoforge_web.telegram.admin import AdminAccess, AdminManageTool
+from octoforge_web.telegram.admin import AdminAccess, AdminManageTool, AdminStores
 from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_web.telegram.invites.models import InviteBase
@@ -167,10 +167,13 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             if invites is not None and settings.telegram_admin_ids:
                 registry.register(
                     AdminManageTool(
-                        invites[0],
-                        cron_store,
-                        messages,
-                        dialogs,
+                        AdminStores(
+                            invites=invites[0],
+                            cron_store=cron_store,
+                            messages=messages,
+                            dialogs=dialogs,
+                            instructions=instructions,
+                        ),
                         AdminAccess(
                             admin_ids=frozenset(settings.telegram_admin_ids),
                             telegram=TelegramBotClient(

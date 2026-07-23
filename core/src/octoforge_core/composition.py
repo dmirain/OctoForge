@@ -33,7 +33,11 @@ from octoforge_core.datasets.tools import DataForgetTool, DataPutTool, DataQuery
 from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.instructions.api import InstructionService, InstructionStore
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES, LocalInstructionService
-from octoforge_core.instructions.tools import InstructionSaveTool, SkillsSearchTool
+from octoforge_core.instructions.tools import (
+    InstructionDeleteTool,
+    InstructionSaveTool,
+    InstructionSearchTool,
+)
 from octoforge_core.llm.embeddings import EmbeddingClient
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.reranker import RerankerClient
@@ -276,15 +280,16 @@ def _register_instruction_tools(
     services: ToolServices,
     limits: ToolLimits,
 ) -> None:
-    """Register the instructions discovery/save and external-call tools."""
+    """Register the instructions search/save/delete and external-call tools."""
     registry.register(
-        SkillsSearchTool(
+        InstructionSearchTool(
             service=services.instructions,
             default_k=limits.instructions_top_k,
             datasets=services.datasets,
         )
     )
     registry.register(InstructionSaveTool(service=services.instructions))
+    registry.register(InstructionDeleteTool(service=services.instructions))
     registry.register(ExternalCallTool(executor=services.executor))
 
 

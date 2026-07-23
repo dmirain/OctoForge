@@ -35,7 +35,7 @@ def test_static_provider_raises_for_an_unknown_name() -> None:
 
 
 def test_system_prompt_holds_meta_rules_only() -> None:
-    assert "skills_search" in DEFAULT_SYSTEM_PROMPT
+    assert "instruction_search" in DEFAULT_SYSTEM_PROMPT
     assert "instruction_save" in DEFAULT_SYSTEM_PROMPT
     assert "finished background task" in DEFAULT_SYSTEM_PROMPT
     assert "pipe tables" in DEFAULT_SYSTEM_PROMPT

@@ -14,13 +14,16 @@ from octoforge_core.instructions.api import (
     SearchHit,
 )
 from octoforge_core.instructions.tools import (
+    DELETE_NAME,
     MAX_K,
     MAX_OUTPUT_CHARS,
     NO_HITS_MESSAGE,
+    NOT_FOUND_MESSAGE,
     SAVE_NAME,
     SEARCH_NAME,
+    InstructionDeleteTool,
     InstructionSaveTool,
-    SkillsSearchTool,
+    InstructionSearchTool,
 )
 from octoforge_core.net.external import ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
@@ -55,30 +58,60 @@ HIT = SearchHit(
 
 
 class FakeInstructionService:
-    """InstructionService stub with scripted hits and a recorded save."""
+    """InstructionService stub with scripted hits and recorded calls."""
 
     def __init__(self, hits: list[SearchHit] | None = None) -> None:
         self.hits = hits or []
-        self.search_calls: list[tuple[str, int]] = []
-        self.saved: list[tuple[InstructionType, str, str, tuple[str, ...]]] = []
+        self.search_calls: list[tuple[str, str, int, InstructionType | None]] = []
+        self.saved: list[tuple[str, InstructionType, str, str, tuple[str, ...]]] = []
+        self.deleted: list[tuple[str, str]] = []
         self.save_result: Instruction | None = None
+        self.delete_missing = False
 
-    async def search(self, query: str, k: int) -> list[SearchHit]:
-        self.search_calls.append((query, k))
+    async def search(
+        self,
+        user_id: str,
+        query: str,
+        k: int,
+        kind: InstructionType | None = None,
+    ) -> list[SearchHit]:
+        self.search_calls.append((user_id, query, k, kind))
         return self.hits
+
+    async def search_all(
+        self,
+        query: str,
+        k: int,
+        kind: InstructionType | None = None,
+    ) -> list[SearchHit]:
+        raise NotImplementedError
 
     async def save(
         self,
+        user_id: str,
         kind: InstructionType,
         title: str,
         content: str,
         tags: tuple[str, ...] = (),
     ) -> Instruction:
-        self.saved.append((kind, title, content, tags))
+        self.saved.append((user_id, kind, title, content, tags))
         assert self.save_result is not None
         return self.save_result
 
-    async def get_by_name(self, name: str, kind: InstructionType | None = None) -> Instruction:
+    async def get_by_name(
+        self,
+        name: str,
+        kind: InstructionType | None = None,
+        user_id: str | None = None,
+    ) -> Instruction:
+        raise NotImplementedError
+
+    async def delete(self, user_id: str, instruction_id: str) -> None:
+        self.deleted.append((user_id, instruction_id))
+        if self.delete_missing:
+            raise InstructionNotFoundError(instruction_id)
+
+    async def publish(self, instruction_id: str) -> Instruction:
         raise NotImplementedError
 
 
@@ -134,7 +167,12 @@ class _ToolServingService(FakeInstructionService):
         super().__init__()
         self._records = records
 
-    async def get_by_name(self, name: str, kind: InstructionType | None = None) -> Instruction:
+    async def get_by_name(
+        self,
+        name: str,
+        kind: InstructionType | None = None,
+        user_id: str | None = None,
+    ) -> Instruction:
         if name not in self._records:
             raise InstructionNotFoundError(name)
         return Instruction(
@@ -151,11 +189,11 @@ class _ToolServingService(FakeInstructionService):
         )
 
 
-# --- skills_search ---------------------------------------------------
+# --- instruction_search ---------------------------------------------------
 
 
 def test_search_skill_spec() -> None:
-    tool = SkillsSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     assert tool.spec.name == SEARCH_NAME
     assert tool.spec.parameters_schema["required"] == ["query"]
@@ -163,16 +201,26 @@ def test_search_skill_spec() -> None:
 
 async def test_search_skill_formats_hits() -> None:
     service = FakeInstructionService(hits=[HIT])
-    tool = SkillsSearchTool(service=service, default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=service, default_k=DEFAULT_K)
 
     output = await tool.execute({"query": "weather"}, CTX)
 
-    assert service.search_calls == [("weather", DEFAULT_K)]
+    assert service.search_calls == [("user-test", "weather", DEFAULT_K, None)]
     assert "[endpoint]" in output
     assert TOOL_NAME in output
+    assert "id: id-1" in output  # ids are shown: instruction_delete targets them
     assert "http, weather" in output
     assert "score" not in output  # scores are omitted: rerank logits are uninformative
     assert "url_template" in output  # full content
+
+
+async def test_search_passes_the_type_filter() -> None:
+    service = FakeInstructionService(hits=[HIT])
+    tool = InstructionSearchTool(service=service, default_k=DEFAULT_K)
+
+    await tool.execute({"query": "weather", "type": "endpoint"}, CTX)
+
+    assert service.search_calls == [("user-test", "weather", DEFAULT_K, InstructionType.ENDPOINT)]
 
 
 async def test_search_skill_returns_full_content_without_truncation() -> None:
@@ -192,7 +240,7 @@ async def test_search_skill_returns_full_content_without_truncation() -> None:
         ),
         score=0.5,
     )
-    tool = SkillsSearchTool(service=FakeInstructionService(hits=[hit]), default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=FakeInstructionService(hits=[hit]), default_k=DEFAULT_K)
 
     output = await tool.execute({"query": "scenario"}, CTX)
 
@@ -203,16 +251,19 @@ async def test_search_skill_returns_full_content_without_truncation() -> None:
 
 async def test_search_skill_explicit_k_overrides_default() -> None:
     service = FakeInstructionService()
-    tool = SkillsSearchTool(service=service, default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=service, default_k=DEFAULT_K)
 
     await tool.execute({"query": "q", "k": CUSTOM_K}, CTX)
     await tool.execute({"query": "q", "k": MAX_K}, CTX)
 
-    assert service.search_calls == [("q", CUSTOM_K), ("q", MAX_K)]
+    assert service.search_calls == [
+        ("user-test", "q", CUSTOM_K, None),
+        ("user-test", "q", MAX_K, None),
+    ]
 
 
 async def test_search_skill_no_hits_message() -> None:
-    tool = SkillsSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     output = await tool.execute({"query": "nothing"}, CTX)
 
@@ -243,7 +294,7 @@ async def test_search_caps_the_merged_list_at_k() -> None:
     # the stub ignores k and hands back more hits than requested: the merged
     # list (instructions + datasets) must still be capped at k entries
     hits = [make_hit(f"scenario {index}") for index in range(CUSTOM_K + 1)]
-    tool = SkillsSearchTool(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
 
     output = await tool.execute({"query": "q", "k": CUSTOM_K}, CTX)
 
@@ -255,7 +306,7 @@ async def test_search_caps_the_merged_list_at_k() -> None:
 async def test_search_truncates_long_output_with_a_note() -> None:
     big_content = "x" * MAX_OUTPUT_CHARS
     hits = [make_hit("first", big_content), make_hit("second", big_content)]
-    tool = SkillsSearchTool(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=FakeInstructionService(hits=hits), default_k=DEFAULT_K)
 
     output = await tool.execute({"query": "q", "k": 2}, CTX)
 
@@ -276,10 +327,11 @@ async def test_search_truncates_long_output_with_a_note() -> None:
         {"query": "q", "k": "3"},
         {"query": "q", "k": 0},
         {"query": "q", "k": MAX_K + 1},
+        {"query": "q", "type": "dataset"},
     ],
 )
 async def test_search_skill_invalid_arguments_rejected(arguments: dict[str, object]) -> None:
-    tool = SkillsSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
+    tool = InstructionSearchTool(service=FakeInstructionService(), default_k=DEFAULT_K)
 
     with pytest.raises(ToolArgumentsError):
         await tool.execute(arguments, CTX)
@@ -310,7 +362,9 @@ async def test_save_skill_saves_and_confirms_version() -> None:
         CTX,
     )
 
-    assert service.saved == [(InstructionType.SKILL, "new scenario", "do X then Y", ("x",))]
+    assert service.saved == [
+        ("user-test", InstructionType.SKILL, "new scenario", "do X then Y", ("x",))
+    ]
     assert "skill" in output
     assert "new scenario" in output
     assert f"version {SAVED_VERSION}" in output
@@ -323,7 +377,7 @@ async def test_save_skill_defaults_tags_to_empty() -> None:
 
     await tool.execute({"type": "knowledge", "title": "t", "content": "c"}, CTX)
 
-    assert service.saved[0][3] == ()
+    assert service.saved[0][4] == ()
 
 
 @pytest.mark.parametrize(
@@ -340,6 +394,44 @@ async def test_save_skill_defaults_tags_to_empty() -> None:
 )
 async def test_save_skill_invalid_arguments_rejected(arguments: dict[str, object]) -> None:
     tool = InstructionSaveTool(service=FakeInstructionService())
+
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute(arguments, CTX)
+
+
+# --- instruction_delete ----------------------------------------------------
+
+
+def test_delete_spec() -> None:
+    tool = InstructionDeleteTool(service=FakeInstructionService())
+
+    assert tool.spec.name == DELETE_NAME
+    assert tool.spec.parameters_schema["required"] == ["id"]
+
+
+async def test_delete_removes_the_own_record() -> None:
+    service = FakeInstructionService()
+    tool = InstructionDeleteTool(service=service)
+
+    output = await tool.execute({"id": "id-1"}, CTX)
+
+    assert service.deleted == [("user-test", "id-1")]
+    assert output == "instruction deleted"
+
+
+async def test_delete_reports_a_missing_or_foreign_record() -> None:
+    service = FakeInstructionService()
+    service.delete_missing = True
+    tool = InstructionDeleteTool(service=service)
+
+    output = await tool.execute({"id": "id-foreign"}, CTX)
+
+    assert output == NOT_FOUND_MESSAGE
+
+
+@pytest.mark.parametrize("arguments", [{}, {"id": ""}, {"id": "   "}, {"id": 42}])
+async def test_delete_invalid_arguments_rejected(arguments: dict[str, object]) -> None:
+    tool = InstructionDeleteTool(service=FakeInstructionService())
 
     with pytest.raises(ToolArgumentsError):
         await tool.execute(arguments, CTX)

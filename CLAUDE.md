@@ -46,14 +46,14 @@ The dialog is an actor, not a request/response handler:
 
 ### Tools
 
-`Tool` / `ToolSpec` / `ToolContext` / `ToolRegistry` (no origin kinds — `SkillOrigin` was removed). The `tools/` package is framework only; tool implementations live in their domain modules (`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`, `tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`) and are registered in the composition root. Notable ones: `http_request`, `external_call` (over DB endpoint-records, behind the `SsrfGuard`), `skills_search` / `instruction_save`, `data_put` / `data_query` / `data_forget`, `memory_store` / `memory_search` / `memory_delete`, `task_create` / `task_list` / `task_delete` (one surface for background tasks and cron jobs — `task_create` with a `schedule` creates the cron job), `cron_pause` / `cron_resume`, `web_search` (serper.dev, only when `OF_SERPER_TOKEN` is set).
+`Tool` / `ToolSpec` / `ToolContext` / `ToolRegistry` (no origin kinds — `SkillOrigin` was removed). The `tools/` package is framework only; tool implementations live in their domain modules (`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`, `tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`) and are registered in the composition root. Notable ones: `http_request`, `external_call` (over DB endpoint-records, behind the `SsrfGuard`), `instruction_search` / `instruction_save`, `data_put` / `data_query` / `data_forget`, `memory_store` / `memory_search` / `memory_delete`, `task_create` / `task_list` / `task_delete` (one surface for background tasks and cron jobs — `task_create` with a `schedule` creates the cron job), `cron_pause` / `cron_resume`, `web_search` (serper.dev, only when `OF_SERPER_TOKEN` is set).
 
 ### Self-contained domain modules
 
 Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQL-backed implementation:
 
 - `instructions/` — knowledge/skill/endpoint records in the `instructions` table; cosine ranking + exact-title boost + optional cross-encoder rerank of the shortlist. The system-owned slice (`system` flag) is a declarative registry (`CORE_SYSTEM_SKILLS` in core, `WEB_SYSTEM_SKILLS` in web) synced at startup; agent-facing save/delete refuse system records.
-- `datasets/` — user data (`datasets` / `dataset_records`), JSON-schema validation, owner isolation at the SQL level; descriptors also feed `skills_search`.
+- `datasets/` — user data (`datasets` / `dataset_records`), JSON-schema validation, owner isolation at the SQL level; descriptors also feed `instruction_search`.
 - `memory/` — key/value memories, `user_id` NULL = global scope, LIKE search over "own + global".
 - `cron/` — `CronScheduler` asyncio loop with CAS lease (`lease_ttl`), coalescing missed fires; a fire calls `ConversationManager.wake` → a background process. See `docs/cron.md`.
 

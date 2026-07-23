@@ -72,8 +72,15 @@ class FakeInstructionService:
 
     def __init__(self, records: dict[str, str]) -> None:
         self._records = records
+        self.get_by_name_calls: list[tuple[str, InstructionType | None, str | None]] = []
 
-    async def get_by_name(self, name: str, kind: InstructionType | None = None) -> Instruction:
+    async def get_by_name(
+        self,
+        name: str,
+        kind: InstructionType | None = None,
+        user_id: str | None = None,
+    ) -> Instruction:
+        self.get_by_name_calls.append((name, kind, user_id))
         if name not in self._records:
             raise InstructionNotFoundError(name)
         return Instruction(
@@ -89,11 +96,18 @@ class FakeInstructionService:
             updated_at=CREATED_AT,
         )
 
-    async def search(self, query: str, k: int) -> list[SearchHit]:
+    async def search(
+        self,
+        user_id: str,
+        query: str,
+        k: int,
+        kind: InstructionType | None = None,
+    ) -> list[SearchHit]:
         raise NotImplementedError
 
     async def save(
         self,
+        user_id: str,
         kind: InstructionType,
         title: str,
         content: str,
@@ -260,6 +274,19 @@ async def test_unknown_tool_name_raises_not_found() -> None:
 
     with pytest.raises(InstructionNotFoundError):
         await executor.execute("no_such_tool", {})
+
+
+async def test_executor_passes_the_user_id_to_the_service_lookup() -> None:
+    service = FakeInstructionService({TOOL_NAME: WEATHER_TOOL_CONTENT})
+    executor = ExternalCallExecutor(
+        service=service,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(ok_handler())),
+        guard=SsrfGuard(resolver=StubResolver((PUBLIC_IP,))),
+    )
+
+    await executor.execute(TOOL_NAME, {"city": "London"}, user_id="user-test")
+
+    assert service.get_by_name_calls == [(TOOL_NAME, InstructionType.ENDPOINT, "user-test")]
 
 
 async def test_invalid_tool_content_raises_spec_error() -> None:

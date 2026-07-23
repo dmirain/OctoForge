@@ -69,8 +69,14 @@ class ExternalCallExecutor:
         params: dict[str, str],
         user_id: str | None = None,
     ) -> ExternalCallResult:
-        """Run the endpoint call `name` with validated params and return status + body."""
-        instruction = await self._service.get_by_name(name, InstructionType.ENDPOINT)
+        """Run the endpoint call `name` with validated params and return status + body.
+
+        Only endpoints visible to `user_id` resolve (the caller's own private
+        records plus public ones); without a user id only public endpoints do.
+        """
+        instruction = await self._service.get_by_name(
+            name, InstructionType.ENDPOINT, user_id=user_id
+        )
         spec = parse_tool_spec(instruction.content)
         validated = _validate_params(spec, params)
         url = _render_url(spec, validated)

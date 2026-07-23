@@ -1,17 +1,25 @@
-"""Tools of the instructions module: store search and scenario authoring."""
+"""Tools of the instructions module: store search, authoring and deletion."""
 
 from typing import Any
 
 from octoforge_core.datasets.api import DatasetHit, DatasetService
-from octoforge_core.instructions.api import InstructionService, InstructionType, SearchHit
+from octoforge_core.instructions.api import (
+    InstructionNotFoundError,
+    InstructionService,
+    InstructionType,
+    SearchHit,
+)
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
 
-SEARCH_NAME = "skills_search"
+SEARCH_NAME = "instruction_search"
 SEARCH_DESCRIPTION = (
-    "Search the instructions store and the user's datasets for relevant skill "
-    "scenarios, knowledge, endpoints and dataset descriptors. "
-    "Returns the top-k records with type, title, tags and full content: "
+    "Search the instructions store and the user's datasets for relevant records: "
+    "knowledge (facts worth sharing with everyone), skill scenarios (how-to guides "
+    "for non-obvious multi-step tasks), endpoint descriptions (API call contracts "
+    "executed by external_call) and dataset descriptors. "
+    "Pass 'type' to search one instruction kind only. "
+    "Returns the top-k records with id, type, title, tags and full content: "
     "instructions first, dataset descriptors after them. "
     "Call it for any user intent not covered by the scenarios already in your context."
 )
@@ -30,15 +38,25 @@ SEARCH_SCHEMA: dict[str, Any] = {
             "type": "integer",
             "description": f"How many hits to return (1..{MAX_K})",
         },
+        "type": {
+            "type": "string",
+            "enum": [kind.value for kind in InstructionType],
+            "description": "Optional instruction kind filter: knowledge, skill or endpoint",
+        },
     },
     "required": ["query"],
 }
 
 SAVE_NAME = "instruction_save"
 SAVE_DESCRIPTION = (
-    "Create or update an instruction in the store: a durable fact (knowledge), "
-    "an action scenario (skill) or an endpoint description (endpoint). "
-    "Existing (type, title) records are replaced with a bumped version."
+    "Create or update one of your instructions: "
+    "knowledge — a durable fact useful to everyone (saved as your private record; "
+    "an admin can publish it later), "
+    "skill — a how-to scenario for a task that is not solvable upfront "
+    "(e.g. to get the weather, call the weather endpoint via external_call), "
+    "endpoint — an API request contract executed by external_call (like an MCP tool). "
+    "The record belongs to you: only you can see and delete it. "
+    "Existing (type, title) records of yours are replaced with a bumped version."
 )
 SAVED_TEMPLATE = "instruction saved: [{kind}] {title} (version {version})"
 SAVE_SCHEMA: dict[str, Any] = {
@@ -60,8 +78,23 @@ SAVE_SCHEMA: dict[str, Any] = {
     "required": ["type", "title", "content"],
 }
 
+DELETE_NAME = "instruction_delete"
+DELETE_DESCRIPTION = (
+    "Delete one of your instructions by its id (ids come from instruction_search "
+    "results). Only your own records can be deleted."
+)
+DELETED_MESSAGE = "instruction deleted"
+NOT_FOUND_MESSAGE = "instruction not found (only your own records can be deleted)"
+DELETE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "description": "Instruction id from instruction_search"},
+    },
+    "required": ["id"],
+}
 
-class SkillsSearchTool:
+
+class InstructionSearchTool:
     """Thin adapter over the InstructionService facade (and, optionally, DatasetService)."""
 
     def __init__(
@@ -95,7 +128,8 @@ class SkillsSearchTool:
         if not isinstance(query, str) or not query.strip():
             raise ToolArgumentsError("query must be a non-empty string")
         k = self._parse_k(arguments.get("k"))
-        hits = await self._service.search(query, k)
+        kind = _parse_optional_kind(arguments.get("type"))
+        hits = await self._service.search(context.user_id, query, k, kind)
         bodies = [_instruction_body(hit) for hit in hits]
         if self._datasets is not None:
             dataset_hits = await self._datasets.search(context.user_id, query, k)
@@ -129,7 +163,7 @@ class InstructionSaveTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        """Validate arguments, upsert the instruction and confirm with the version."""
+        """Validate arguments, upsert the caller's record and confirm the version."""
         kind = _parse_kind(arguments.get("type"))
         title = arguments.get("title")
         if not isinstance(title, str) or not title.strip():
@@ -138,12 +172,38 @@ class InstructionSaveTool:
         if not isinstance(content, str) or not content.strip():
             raise ToolArgumentsError("content must be a non-empty string")
         tags = _parse_tags(arguments.get("tags"))
-        instruction = await self._service.save(kind, title, content, tags)
+        instruction = await self._service.save(context.user_id, kind, title, content, tags)
         return SAVED_TEMPLATE.format(
             kind=instruction.type.value,
             title=instruction.title,
             version=instruction.version,
         )
+
+
+class InstructionDeleteTool:
+    """Deletes the caller's own instruction by id (ids come from search results)."""
+
+    def __init__(self, service: InstructionService) -> None:
+        self._service = service
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=DELETE_NAME,
+            description=DELETE_DESCRIPTION,
+            parameters_schema=DELETE_SCHEMA,
+        )
+
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        """Validate the id and delete the record when it belongs to the caller."""
+        instruction_id = arguments.get("id")
+        if not isinstance(instruction_id, str) or not instruction_id.strip():
+            raise ToolArgumentsError("id must be a non-empty string")
+        try:
+            await self._service.delete(context.user_id, instruction_id)
+        except InstructionNotFoundError:
+            return NOT_FOUND_MESSAGE
+        return DELETED_MESSAGE
 
 
 def _render(bodies: list[str]) -> str:
@@ -174,6 +234,7 @@ def _instruction_body(hit: SearchHit) -> str:
     return "\n".join(
         [
             f"[{instruction.type.value}] {instruction.title}",
+            f"   id: {instruction.id}",
             f"   tags: {', '.join(instruction.tags) if instruction.tags else '-'}",
             instruction.content,
         ]
@@ -203,6 +264,12 @@ def _parse_kind(raw: object) -> InstructionType:
         return InstructionType(str(raw))
     except ValueError as exc:
         raise ToolArgumentsError(f"unsupported instruction type: {raw!r}") from exc
+
+
+def _parse_optional_kind(raw: object) -> InstructionType | None:
+    if raw is None:
+        return None
+    return _parse_kind(raw)
 
 
 def _parse_tags(raw: object) -> tuple[str, ...]:
