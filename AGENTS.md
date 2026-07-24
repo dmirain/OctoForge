@@ -49,6 +49,19 @@ OctoForge is a multi-user LLM agent: Python, FastAPI, SQLAlchemy (async, SQLite)
 
 ruff/mypy/pytest configs live in `core/pyproject.toml` and `web/pyproject.toml` respectively.
 
+### Runtime reference (for agents/scripts)
+
+Take these from here, don't guess:
+
+| What | Value |
+|---|---|
+| Web/API port | `8000` (`make run`, uvicorn) |
+| Liveness | `GET /health` |
+| Readiness (checks the DB) | `GET /health/ready` |
+| API docs | `GET /docs` (Swagger UI), schema at `/openapi.json` — FastAPI defaults, not overridden |
+| Telegram bot | no HTTP port — long-polling only (`make run-telegram`) |
+| Logs | stdout/stderr only (`logging.basicConfig`, no file handler) — redirect yourself if backgrounding, e.g. `make run > /tmp/octoforge.log 2>&1 &` |
+
 ## Code conventions
 
 Mandatory across all project code:
@@ -74,8 +87,11 @@ Mandatory across all project code:
 - **Documentation updates ship with the code.** Every change to logic, and every new idea, is written into `docs/design.md` (and into this file too, whenever conventions, structure, or commands change) in the same change.
 - **`AGENTS.md` and `CLAUDE.md` stay in sync.** Whenever one gets a conventions/structure/commands/language update, apply the same update to the other before considering the change done.
 - **Plan before touching subtle areas.** Changes to `agent/router.py`, `agent/runner.py`, `cron/`, or `context/` (compaction) have non-obvious invariants (branch reconstruction, watermarks, the pull model) — use plan mode first. A one-file, obviously-scoped fix doesn't need it.
-- **Definition of done.** A change isn't done until `make check` passes — run it and show the output, don't just assert success.
+- **Parallelize once the plan is set.** Tests and the matching `docs/design.md` update don't have to wait for the implementation to land. Once a plan fixes the interfaces and behavior, write the tests, the docs update, and the implementation in parallel instead of serializing them.
+- **Definition of done.** A change isn't done until `make check` passes — run it yourself and show the output, don't just assert success, and don't take a subagent's summary of its own work as confirmation — look at the actual diff or output.
+- **Mocked tests aren't proof of behavior.** `make check` mocks the LLM and HTTP (convention 6) — a green run doesn't prove the agent loop, SSE stream, or Telegram bridge actually works end to end. For changes touching `agent/loop.py`, SSE delivery, or `telegram/`, also exercise it live (`make run` plus a real message, or the `/verify` skill) and look at the raw output, not just an assertion that it should work.
 - **Get a second opinion before shipping.** For a non-trivial diff, run a review pass (e.g. `/code-review`) in a fresh context in addition to `make check` — a green test suite doesn't catch every logic gap.
+- **Choose subagent capability by task, don't default to the strongest.** A **fast** tier for mechanical grep/exploration on a known pattern; a **standard** tier for implementation, tests, review, and most exploration; a **heavy** tier only for genuinely hard architectural tradeoffs or arbitrating conflicting reviews. Note which tier you used when reporting back. (Deliberately tool-agnostic here — this file isn't Claude-specific; see `CLAUDE.md` for the concrete model names in this harness.)
 - **On compaction, keep the essentials.** When a long session gets compacted, always preserve the list of modified files, any `OF_*` env vars or migration ids touched, and the last `make check` result.
 
 ## Tooling

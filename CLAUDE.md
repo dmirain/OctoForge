@@ -27,6 +27,19 @@ cd web  && ../.venv/bin/pytest tests/test_dialog_api.py
 
 Config is `.env` (see `.env.example`); all vars are prefixed `OF_`.
 
+### Runtime reference (for agents/scripts)
+
+Take these from here, don't guess:
+
+| What | Value |
+|---|---|
+| Web/API port | `8000` (`make run`, uvicorn) |
+| Liveness | `GET /health` |
+| Readiness (checks the DB) | `GET /health/ready` |
+| API docs | `GET /docs` (Swagger UI), schema at `/openapi.json` — FastAPI defaults, not overridden |
+| Telegram bot | no HTTP port — long-polling only (`make run-telegram`) |
+| Logs | stdout/stderr only (`logging.basicConfig`, no file handler) — redirect yourself if backgrounding, e.g. `make run > /tmp/octoforge.log 2>&1 &` |
+
 ## Architecture
 
 **Monorepo of two independent Python projects**, each with its own `pyproject.toml`, deps and tests:
@@ -80,6 +93,9 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 - **Git mutations only with explicit permission** — ask before every `commit`/`push`/etc.
 - **Migrations are append-only**: a `PreToolUse` hook (`.claude/settings.json`) blocks edits to any Alembic migration file already committed to git HEAD. Add a new migration file instead of editing an old one.
 - **Plan before touching subtle areas**: changes to `agent/router.py`, `agent/runner.py`, `cron/`, or `context/` (compaction) have non-obvious invariants (branch reconstruction, watermarks, the pull model) — use plan mode first. A one-file, obviously-scoped fix doesn't need it.
-- **Definition of done**: a change isn't done until `make check` passes — run it and show the output, don't just assert success.
+- **Parallelize once the plan is set**: tests and the matching `docs/design.md` update don't have to wait for the implementation to land. Once a plan fixes the interfaces and behavior, write (or delegate to parallel subagents) the tests, the docs update, and the implementation at the same time instead of serializing them.
+- **Definition of done**: a change isn't done until `make check` passes — run it yourself and show the output, don't just assert success, and don't take a subagent's summary of its own work as confirmation — look at the actual diff or output.
+- **Mocked tests aren't proof of behavior**: `make check` mocks the LLM and HTTP (rule above) — a green run doesn't prove the agent loop, SSE stream, or Telegram bridge actually works end to end. For changes touching `agent/loop.py`, SSE delivery, or `telegram/`, also exercise it live (`make run` plus a real message, or the `/verify` skill) and look at the raw output, not just an assertion that it should work.
 - **Get a second opinion before shipping**: for a non-trivial diff, run a review pass (e.g. `/code-review`) in a fresh context in addition to `make check` — a green test suite doesn't catch every logic gap.
+- **Choose subagent models by task, don't default**: `haiku` for mechanical grep/exploration on a known pattern; `sonnet` for implementation, tests, review, and most exploration; `opus`/`fable` only for genuinely hard architectural tradeoffs or arbitrating conflicting reviews. Name the model in the subagent's description and note it when reporting back.
 - **On compaction, keep the essentials**: when a long session gets compacted, always preserve the list of modified files, any `OF_*` env vars or migration ids touched, and the last `make check` result.
