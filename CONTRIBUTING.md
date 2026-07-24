@@ -1,6 +1,6 @@
 # Contributing to OctoForge
 
-Thanks for taking a look. OctoForge is currently a solo-maintained project, so the process here is intentionally light.
+Thanks for taking a look. OctoForge is currently a solo-maintained project, so the process here is intentionally light. Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md) — the short version is: be respectful.
 
 ## Reporting bugs or suggesting ideas
 
