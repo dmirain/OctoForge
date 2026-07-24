@@ -11,7 +11,6 @@ from octoforge_core.agent.events import (
     Finished,
     IterationStarted,
     ProcessCompleted,
-    ProcessResumed,
     ProcessSuspended,
     TextDelta,
     ToolCallCompleted,
@@ -70,10 +69,6 @@ PAYLOAD_CASES: list[tuple[LoopEvent, dict[str, object]]] = [
     (
         ProcessSuspended(process_id=PROCESS_ID, title=TITLE),
         {"type": "process_suspended", "process_id": PROCESS_ID, "title": TITLE},
-    ),
-    (
-        ProcessResumed(process_id=PROCESS_ID, title=TITLE),
-        {"type": "process_resumed", "process_id": PROCESS_ID, "title": TITLE},
     ),
     (
         ProcessCompleted(process_id=PROCESS_ID, title=TITLE, status=STATUS),

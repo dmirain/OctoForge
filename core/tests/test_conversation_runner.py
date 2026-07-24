@@ -15,7 +15,6 @@ from octoforge_core.agent.events import (
     Failed,
     Finished,
     ProcessCompleted,
-    ProcessResumed,
     ProcessSuspended,
     TextDelta,
     ToolCallRequested,
@@ -555,7 +554,9 @@ async def test_submit_streams_events_and_updates_narrative(
     # every process is task-backed: the answer task links the final message
     task = await single_task(store, runner.dialog_id)
     assert task.kind is TaskKind.ANSWER
-    assert task.input == {"prompt": "hi"}
+    source_message = runner.history()[0]
+    assert source_message.id is not None  # captured from the persist
+    assert task.input == {"prompt": "hi", "source_message_id": source_message.id}
     assert task.status is TaskStatus.DONE
     # the foreground stream was the delivery: the actor stamps it asynchronously
     await wait_for_condition(lambda: task.delivered_at is not None)
@@ -819,7 +820,10 @@ async def test_unseen_message_is_requeued_at_finalize(
 ) -> None:
     llm = GatedLLM()
     router = FakeRouter()
-    manager = make_manager(llm, quick_registry(), session_factory, ManagerOptions(router=router))
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        llm, quick_registry(), session_factory, ManagerOptions(router=router, store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -843,16 +847,25 @@ async def test_unseen_message_is_requeued_at_finalize(
         "first final",
         "after",
     ]
+    # the re-routed answer task links to its source message (the id rides the
+    # narrative copy captured at submit)
+    tasks = {task.title: task for task in await store.list(runner.dialog_id)}
+    rerouted = tasks["extra context"]
+    source_message = runner.history()[1]
+    assert source_message.id is not None
+    assert rerouted.input["source_message_id"] == source_message.id
 
 
-async def test_promote_brings_background_process_to_foreground(
+async def test_bring_back_starts_a_new_answer_process(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tool = BlockingTool()
-    llm = GatedLLM()
-    router = FakeRouter()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM(
+        [blocking_call(), reply("second final"), reply("bring-back answer"), reply("first final")]
+    )
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
@@ -861,36 +874,33 @@ async def test_promote_brings_background_process_to_foreground(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("second")
-    events = await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
-
-    suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
-    assert [(item.title) for item in suspended] == ["first"]
-    first_id = suspended[0].process_id
-
-    router.decide(RouteOp(action=RouteAction.PROMOTE, target_id=first_id))
+    events = await collect_completions(queue, 1)
     await runner.submit("bring back the first one")
-    events = await collect_until(queue, lambda e: isinstance(e.payload, ProcessResumed))
+    events += await collect_completions(queue, 1)
 
-    resumed = events[-1].payload
-    assert isinstance(resumed, ProcessResumed)
-    assert (resumed.process_id, resumed.title) == (first_id, "first")
-    suspends = [e.payload.title for e in events if isinstance(e.payload, ProcessSuspended)]
-    assert suspends == ["second"]
+    # there is no promote route: a "bring back" request is a plain START_NEW —
+    # the fresh foreground process sees the whole narrative, including the
+    # suspended task's question and the other answer
+    suspended = [e.payload.title for e in events if isinstance(e.payload, ProcessSuspended)]
+    assert suspended == ["first"]  # "second" already finished when "bring back" arrived
+    bring_back_request = llm.requests[2]
+    assert [m.content for m in bring_back_request[1:-1]] == ["first", "second", "second final"]
+    assert "bring back the first one" in bring_back_request[-1].content
 
     tool.release.set()
-    llm.release.set()
-    events = await collect_completions(queue, 2)
     events += await collect_until(queue, is_delivered("first final"))
 
     done = completions(events)
-    assert {item.title for item in done} == {"first", "second"}
-    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    # "after" streamed live as the promoted foreground; "first final" came via the outbox
-    assert {item.message.content for item in finished} == {"after", "first final"}
-    contents = [m.content for m in runner.history()]
-    assert contents[:3] == ["first", "second", "bring back the first one"]
-    assert "first final" in contents
-    assert "after" in contents
+    assert {item.title for item in done} == {"first", "second", "bring back the first one"}
+    assert all(item.status == TaskStatus.DONE.value for item in done)
+    assert [m.content for m in runner.history()] == [
+        "first",
+        "second",
+        "second final",
+        "bring back the first one",
+        "bring-back answer",
+        "first final",
+    ]
 
 
 async def test_router_cancel_stops_the_process(
@@ -1367,6 +1377,8 @@ async def test_narrative_is_rebuilt_after_manager_restart(
     restored = await restarted.get_or_create_runner(USER_ID, CHANNEL)
 
     assert [m.content for m in restored.history()] == ["start", "after"]
+    # the DB load feeds row ids back into the narrative (source_message_id linkage)
+    assert all(m.id is not None for m in restored.history())
 
 
 CRON_JOB_ID = "cron-job-1"
@@ -1573,48 +1585,6 @@ async def test_listener_failure_does_not_break_finalize(
     assert task.status is TaskStatus.DONE
     assert task.delivered_at is not None
     assert [m.content for m in runner.history()] == [TASK_RESULT]
-
-
-async def test_promote_at_the_process_limit_moves_the_process_to_foreground(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    tool = BlockingTool()
-    llm = GatedLLM()
-    router = FakeRouter()
-    manager = make_manager(
-        llm,
-        blocking_registry(tool),
-        session_factory,
-        ManagerOptions(router=router, max_processes=TWO_PROCESSES),
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("first")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")
-    events = await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
-
-    suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
-    assert [(item.title) for item in suspended] == ["first"]
-    first_id = suspended[0].process_id
-
-    # both process slots are taken; promotion moves a process, it does not create one
-    router.decide(RouteOp(action=RouteAction.PROMOTE, target_id=first_id))
-    await runner.submit("bring back the first one")
-    events = await collect_until(queue, lambda e: isinstance(e.payload, ProcessResumed))
-
-    resumed = events[-1].payload
-    assert isinstance(resumed, ProcessResumed)
-    assert (resumed.process_id, resumed.title) == (first_id, "first")
-    assert not any("process limit" in m.content for m in runner.history())
-
-    tool.release.set()
-    llm.release.set()
-    events = await collect_completions(queue, 2)
-    done = completions(events)
-    assert {item.title for item in done} == {"first", "second"}
 
 
 async def test_actor_survives_a_failing_command(

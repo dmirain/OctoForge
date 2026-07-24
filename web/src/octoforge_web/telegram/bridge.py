@@ -13,7 +13,6 @@ from octoforge_core.agent.events import (
     Failed,
     Finished,
     LoopEvent,
-    ProcessResumed,
     ProcessSuspended,
     RetryScheduled,
     TextDelta,
@@ -40,7 +39,6 @@ RunnerProvider = Callable[[str, str], Awaitable[ConversationRunner]]
 TOOL_LINE_TEMPLATE = "⚙️ {name}"
 TOOL_FAIL_LINE_TEMPLATE = "⚠️ {name}: {error}"
 SUSPENDED_LINE_TEMPLATE = "⏸️ «{title}» ушёл в фон"
-RESUMED_LINE_TEMPLATE = "▶️ «{title}» снова активен"
 CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
 RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
@@ -226,8 +224,6 @@ def _status_line(event: LoopEvent) -> str | None:
         return TOOL_FAIL_LINE_TEMPLATE.format(name=event.call.name, error=event.error)
     if isinstance(event, ProcessSuspended):
         return SUSPENDED_LINE_TEMPLATE.format(title=event.title)
-    if isinstance(event, ProcessResumed):
-        return RESUMED_LINE_TEMPLATE.format(title=event.title)
     if isinstance(event, RetryScheduled):
         return RETRY_LINE_TEMPLATE.format(
             reason=event.reason, attempt=event.attempt, delay=event.delay_seconds

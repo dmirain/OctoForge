@@ -90,14 +90,6 @@ class ProcessSuspended:
 
 
 @dataclass(frozen=True, slots=True)
-class ProcessResumed:
-    """Actor marker: a background process became the foreground."""
-
-    process_id: str
-    title: str
-
-
-@dataclass(frozen=True, slots=True)
 class ProcessCompleted:
     """Actor marker: a process reached a terminal status (TaskStatus values)."""
 
@@ -118,6 +110,5 @@ LoopEvent = (
     | Failed
     | RetryScheduled
     | ProcessSuspended
-    | ProcessResumed
     | ProcessCompleted
 )

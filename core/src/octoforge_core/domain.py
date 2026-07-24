@@ -1,6 +1,6 @@
 """Domain objects for chat and dialogs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -30,7 +30,10 @@ class ChatMessage:
 
     `task_id` links an assistant message to the background task that produced
     it (NULL for plain narrative messages); it is persisted metadata, not part
-    of the LLM-facing payload.
+    of the LLM-facing payload. `id` is the persisted row id, filled in by the
+    store on load and by the actor right after persisting — pure database
+    metadata, excluded from equality so constructed and loaded messages
+    compare equal.
     """
 
     role: MessageRole
@@ -38,6 +41,7 @@ class ChatMessage:
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
     task_id: str | None = None
+    id: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

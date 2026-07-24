@@ -201,6 +201,21 @@ async def test_messages_get_monotonic_seq_and_order(
     assert all(row.created_at.tzinfo == UTC for row in rows)
 
 
+async def test_append_returns_and_round_trips_the_row_id(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    message_id = await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
+
+    (stored,) = await messages.list(dialog.id)
+    assert stored.id == message_id
+    # the row id is pure DB metadata: excluded from equality
+    assert stored == ChatMessage(role=MessageRole.USER, content="one")
+
+
 async def test_append_pair_writes_both_messages_in_one_transaction() -> None:
     engine = create_engine(MEMORY_DATABASE_URL)
     await init_db(engine)

@@ -101,8 +101,8 @@ class MessageRepository:
         message: ChatMessage,
         usage: Usage | None = None,
         client_message_id: str | None = None,
-    ) -> None:
-        """Append a message assigning it the next seq within the dialog.
+    ) -> str:
+        """Append a message assigning it the next seq within the dialog; return the row id.
 
         The seq is computed from the current max inside the INSERT statement;
         two concurrent writers (the actor and a process pump, each on its own
@@ -115,6 +115,7 @@ class MessageRepository:
         duplicates (raised on the final attempt, not silently retried away).
         """
         for attempt in range(MESSAGE_SEQ_RETRY_ATTEMPTS):
+            row_id = uuid.uuid4().hex
             async with self._session_factory() as session:
                 next_seq = (
                     select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
@@ -123,7 +124,7 @@ class MessageRepository:
                 )
                 await session.execute(
                     insert(MessageRow).values(
-                        id=uuid.uuid4().hex,
+                        id=row_id,
                         dialog_id=dialog_id,
                         seq=next_seq,
                         role=message.role.value,
@@ -146,7 +147,8 @@ class MessageRepository:
                     if attempt == MESSAGE_SEQ_RETRY_ATTEMPTS - 1:
                         raise
                     continue
-                return
+                return row_id
+        raise AssertionError("unreachable: the final attempt either returns or raises")
 
     async def append_pair(
         self,
@@ -347,6 +349,7 @@ def _to_chat_message(row: MessageRow) -> ChatMessage:
         tool_calls=_tool_calls_from_json(row.tool_calls),
         tool_call_id=row.tool_call_id,
         task_id=row.task_id,
+        id=row.id,
     )
 
 

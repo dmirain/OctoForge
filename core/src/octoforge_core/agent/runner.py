@@ -26,7 +26,6 @@ from octoforge_core.agent.events import (
     IterationStarted,
     LoopEvent,
     ProcessCompleted,
-    ProcessResumed,
     ProcessSuspended,
     TextDelta,
 )
@@ -410,6 +409,7 @@ class ConversationRunner:
         *,
         kind: TaskKind,
         cron_job_id: str | None,
+        source_message_id: str | None = None,
     ) -> Task:
         """Create and store the task backing a new process."""
         task_input: dict[str, Any] = {"prompt": prompt}
@@ -418,6 +418,9 @@ class ConversationRunner:
         if cron_job_id is not None:
             task_input["cron_job_id"] = cron_job_id
             task_input["fired_at"] = utc_now().isoformat()
+        if kind is TaskKind.ANSWER:
+            # the parent linkage of an answer task: the user message it answers
+            task_input["source_message_id"] = source_message_id
         task = Task(
             dialog_id=self._dialog.id,
             user_id=self._dialog.user_id,
@@ -508,7 +511,10 @@ class ConversationRunner:
                     command.client_message_id,
                 )
                 return
-            await self._persist(message, client_message_id=command.client_message_id)
+            message_id = await self._persist(message, client_message_id=command.client_message_id)
+            # the routed/narrative copy carries its row id: an answer task
+            # created from this message links back via source_message_id
+            message = replace(message, id=message_id)
             self._narrative.append(message)
             index = len(self._narrative) - 1
         decision = await self._router.route(self._snapshot(), message.content, self._max_processes)
@@ -648,11 +654,9 @@ class ConversationRunner:
                 await self._apply_inject(message, cancelled, index)
             elif op.action is RouteAction.START_NEW:
                 await self._apply_start_new(message, cancelled, index)
-            elif op.action is RouteAction.PROMOTE:
-                self._apply_promote(op.target_id)
         if not inject and index is not None:
             # a package without inject is fully handled here: start_new covers
-            # the message itself, bare cancel/promote packages are pure commands
+            # the message itself, bare cancel packages are pure commands
             self._covered_indices.add(index)
 
     async def _apply_inject(
@@ -678,22 +682,9 @@ class ConversationRunner:
     ) -> None:
         async with self._spawn_lock:
             if not self._exceeds_limit(cancelled):
-                await self._start_new(
-                    title=message.content[:TITLE_MAX_LENGTH],
-                    content=message.content,
-                    index=index,
-                )
+                await self._start_new(message, index)
                 return
         await self._reject_for_limit(message)
-
-    def _apply_promote(self, target_id: str | None) -> None:
-        target = self._processes.get(target_id) if target_id is not None else None
-        if target is None or target.id == self._foreground_id:
-            return  # only an active background process can be promoted
-        # promotion only moves an existing process, so the process limit does not apply
-        self._suspend_foreground()
-        self._foreground_id = target.id
-        self._broadcast(ProcessResumed(process_id=target.id, title=target.title))
 
     def _exceeds_limit(self, cancelled: set[str]) -> bool:
         """Whether a NEW process would exceed the limit, counting pending cancellations."""
@@ -708,16 +699,15 @@ class ConversationRunner:
         )
         await self._deliver_notice(notice)
 
-    async def _start_new(
-        self,
-        title: str,
-        content: str,
-        index: int | None,
-    ) -> None:
+    async def _start_new(self, message: ChatMessage, index: int | None) -> None:
         """Start the foreground answer process of a narrative user message."""
         self._suspend_foreground()
         task = await self._prepare_process_task(
-            title, content, kind=TaskKind.ANSWER, cron_job_id=None
+            message.content[:TITLE_MAX_LENGTH],
+            message.content,
+            kind=TaskKind.ANSWER,
+            cron_job_id=None,
+            source_message_id=message.id,
         )
         narrative = await self._assemble_narrative()
         process = self._create_process(
@@ -991,8 +981,9 @@ class ConversationRunner:
         message: ChatMessage,
         usage: Usage | None = None,
         client_message_id: str | None = None,
-    ) -> None:
-        await self._messages.append(
+    ) -> str:
+        """Persist a narrative message; return its row id."""
+        return await self._messages.append(
             self._dialog.id, message, usage=usage, client_message_id=client_message_id
         )
 

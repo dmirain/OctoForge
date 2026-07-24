@@ -40,9 +40,9 @@ The dialog is an actor, not a request/response handler:
 
 - `ConversationRunner` owns one dialog's **narrative** (user messages + process finals + system notifications — only this is persisted) and its **processes** (foreground/background, in-memory).
 - `ConversationManager` maps `(user_id, channel)` → runner (get-or-create). Isolation is by that pair.
-- `AgentLoop.stream(history, control, context) -> AsyncIterator[LoopEvent]` is the loop as an event stream: tokens, tool calls, final, cancellation. `LoopControl` carries message injections + cancellation that preserves the partial answer.
-- **LLM router** (`agent/router.py`): a one-shot `route(ops)` tool classifies each incoming message into ops (INJECT / START_NEW / CANCEL / PROMOTE). A deterministic guardrail strips START_NEW from any batch that also has INJECT (an injection must not spin the question into the background). Process count is capped by `OF_MAX_PROCESSES`.
-- Background tasks are background processes: `task_create` / `task_list` / `task_delete` tools. A task row lives only while in flight — delivery (or stopping) deletes it; the result stays in the narrative.
+- `AgentLoop.stream(history, control, context) -> AsyncIterator[LoopEvent]` is the loop as an event stream: tokens, tool calls, final, cancellation. `LoopControl` is a cancellation flag (the pull model replaced message injection: branches re-sync from the narrative at every iteration).
+- **LLM router** (`agent/router.py`): a one-shot `route(ops)` tool classifies each incoming message into ops (INJECT / START_NEW / CANCEL). A deterministic guardrail strips START_NEW from any batch that also has INJECT (an injection must not spin the question into the background). Process count is capped by `OF_MAX_PROCESSES`.
+- Background tasks are background processes: `task_create` / `task_list` / `task_delete` tools. Every process is backed by a task row (ANSWER or RUN); rows are kept forever (terminal states included), and result delivery is tracked by `delivered_at`.
 
 ### Tools
 

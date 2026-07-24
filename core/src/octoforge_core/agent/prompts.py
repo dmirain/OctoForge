@@ -75,10 +75,10 @@ ROUTER_SYSTEM_PROMPT = (
     "3. Never combine inject and start_new in one package: an injected message "
     "stays in the current run and must not also spawn a background process.\n"
     "4. Cancel a process only on an explicit user request -> ops: [cancel(target_id)].\n"
-    "5. 'Bring back task X' -> ops: [promote(target_id)].\n"
+    "5. 'Bring back task X' or continuing an earlier topic -> ops: [start_new]: "
+    "a fresh process sees the full conversation and picks the topic up.\n"
     "6. 'Stop everything' -> one cancel op per active process, optionally followed "
     "by start_new.\n"
     "7. Respect the limit: active processes minus your cancel ops plus one must not "
-    "exceed the limit, otherwise do not emit start_new (promote only moves an "
-    "existing process and is not limited)."
+    "exceed the limit, otherwise do not emit start_new."
 )

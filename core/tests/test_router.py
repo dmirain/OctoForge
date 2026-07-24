@@ -131,7 +131,6 @@ async def test_ops_are_parsed_from_the_route_tool_call() -> None:
         reply=route_reply(
             [
                 {"action": "cancel", "target_id": BG_ID},
-                {"action": "promote", "target_id": BG_ID},
                 {"action": "start_new", "target_id": None},
             ]
         )
@@ -142,7 +141,6 @@ async def test_ops_are_parsed_from_the_route_tool_call() -> None:
 
     assert decision.ops == (
         RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),
-        RouteOp(action=RouteAction.PROMOTE, target_id=BG_ID),
         RouteOp(action=RouteAction.START_NEW),
     )
 
@@ -263,7 +261,8 @@ async def test_invalid_ops_are_dropped() -> None:
                 {"action": "inject", "target_id": FG_ID},
                 {"action": "start_new", "target_id": BG_ID},
                 {"action": "cancel", "target_id": None},
-                {"action": "promote", "target_id": UNKNOWN_ID},
+                # a stale "promote" op (removed route) is dropped like any unknown action
+                {"action": "promote", "target_id": BG_ID},
                 {"action": "cancel", "target_id": BG_ID},
                 "not-an-object",
             ]

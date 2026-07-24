@@ -17,12 +17,11 @@ class RouteAction(StrEnum):
     INJECT = "inject"
     START_NEW = "start_new"
     CANCEL = "cancel"
-    PROMOTE = "promote"
 
 
 @dataclass(frozen=True, slots=True)
 class RouteOp:
-    """One routing operation; CANCEL/PROMOTE require a target process id."""
+    """One routing operation; CANCEL requires a target process id."""
 
     action: RouteAction
     target_id: str | None = None
@@ -88,7 +87,7 @@ ROUTE_TOOL_SPEC = ToolSpec(
                         },
                         "target_id": {
                             "type": ["string", "null"],
-                            "description": "Target process id for cancel/promote; null otherwise.",
+                            "description": "Target process id for cancel; null otherwise.",
                         },
                     },
                     "required": ["action", "target_id"],
