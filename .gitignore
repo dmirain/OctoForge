@@ -10,5 +10,6 @@ dist/
 octoforge.db
 telegram.db
 *.bak
+backups/
 OctoForgeBotToken.txt
 logs/
