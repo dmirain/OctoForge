@@ -71,6 +71,6 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 - **Full typing** (ruff `ANN` + mypy strict); bare `Any` in annotations is banned (ANN401). Data travels as domain objects/enums (`StrEnum`), not dicts — dicts only at the JSON boundary.
 - **Complexity limits** are enforced (`C901` ≤ 10, `PLR0915` ≤ 50 statements, `PLR0911` ≤ 6 returns): split functions, don't disable the rule.
 - **Tests ship with the change** (pytest + pytest-asyncio; mock LLM/HTTP).
-- **Language rule**: user-facing text and all docs (`docs/`, `README.md`, `AGENTS.md`) are **Russian**; commit messages, docstrings and code comments are **English**.
+- **Language rule**: user-facing text and all docs (`docs/`, `AGENTS.md`) are **Russian**; commit messages, docstrings and code comments are **English**. Exception: `README.md` and anything it links to are **English**, written for a mass GitHub audience — it's the project's public storefront, not internal documentation.
 - **Docs update with code**: any logic change is also written into `docs/design.md` in the same change.
 - **Git mutations only with explicit permission** — ask before every `commit`/`push`/etc.

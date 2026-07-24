@@ -1,131 +1,106 @@
 # OctoForge
 
-Мультипользовательский LLM-агент с саморасширяемыми знаниями: скилы и знания хранятся
-в БД, агент умеет уводить работу в фон и по расписанию, а ядро оформлено как библиотека,
-которую можно встроить куда угодно.
+**A multi-user LLM agent that grows at runtime — no redeploys, no rebuilds.**
 
-## Мотивация
+[![CI](https://github.com/dmirain/OctoForge/actions/workflows/ci.yml/badge.svg)](https://github.com/dmirain/OctoForge/actions/workflows/ci.yml)
+[![License: BUSL--1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![mypy strict](https://img.shields.io/badge/mypy-strict-informational)
+![ruff](https://img.shields.io/badge/lint-ruff-informational)
 
-Обычно агент — это код с зашитыми инструментами: новая возможность = новый деплой.
-OctoForge строится вокруг другой идеи:
+Most agent frameworks bake tools and prompts straight into source code: every new capability means a new deploy. OctoForge flips that around — skills, knowledge, HTTP endpoint descriptors, user datasets, and memory all live in the database and are found by embedding search at request time. The agent teaches itself new tricks and remembers what it learns, without anyone touching a line of Python.
 
-- **Агент растёт в рантайме.** Знания, скилы, HTTP-тулы, датасеты и память живут
-  в БД (SQLite, async SQLAlchemy) и ищутся по эмбеддингам.
-  Агент сам сохраняет новые инструкции и записи — без изменения кода.
-- **Длинная работа не блокирует диалог.** Процессная модель: задачи уходят в фон
-  с уведомлением о результате, периодические задания выполняет встроенный
-  крон-планировщик, входящие сообщения разруливает LLM-роутер (инъекция в текущий
-  прогон / новый процесс / отмена).
-- **Одно ядро — много поверхностей.** Веб-чат и Telegram-бот работают на одном
-  движке диалогов; ядро (`octoforge-core`) не зависит от FastAPI и встраивается
-  как обычная Python-библиотека.
+## Why
 
-По духу это аналог openclaw, но со знаниями в БД вместо файлов.
+- 🧠 **The agent grows itself.** Knowledge, skills, HTTP tool descriptors, user datasets, and memories are just rows in SQLite (async SQLAlchemy), ranked by embedding similarity plus an optional cross-encoder rerank. The agent saves new instructions on its own — ship it once, let it accumulate capability over time.
+- 🔀 **Long jobs don't block the conversation.** Every dialog is an actor with its own foreground/background processes. Work can be pushed to the background with a notification on completion, an LLM router classifies each incoming message (inject into the running process / start a new one / cancel / promote to foreground), and a built-in cron scheduler wakes dialogs on a schedule — using the exact same task machinery.
+- 🐙 **One core, many surfaces.** A web chat UI and a Telegram bot run on the same conversation engine. The core (`octoforge-core`) never imports FastAPI — it's a plain, typed Python library you can embed anywhere.
 
-## Архитектура
+## How it works
 
-Монорепо из двух независимых Python-проектов (у каждого свой `pyproject.toml`,
-зависимости и тесты):
-
-- `core/` — библиотека `octoforge-core`: домен, порты-Protocol, агентная петля,
-  процессная модель, тулы, модули instructions/datasets/memory/cron, клиенты LLM
-  и эмбеддингов, персист. **Не импортирует FastAPI.**
-- `web/` — приложение `octoforge-web`: тонкий адаптер — FastAPI-обёртка (REST + SSE),
-  чат-UI, Telegram-адаптер, composition root (`web/src/octoforge_web/main.py`,
-  функция `runtime()` — общая для web и standalone-режимов).
-
-Поток сообщения:
-
-```
- Поверхности     web UI + HTTP API (FastAPI)       Telegram-бот (long poll)
-                        \                             /
-                         ConversationManager — runner на (user_id, channel)
-                                         |
-                           ConversationRunner — актор диалога:
-                           нарратив (персистится в SQLite) + процессы (fg/bg, в памяти)
-                                         |
-                     AgentLoop.stream() — поток событий: токены, вызовы тулов,
-                     финал, отмена; LoopControl — инъекции и отмена прогона
-                        /                                 \
-         LLMClient (OpenAI-совм., SSE)         ToolRegistry — базовые тулы:
-                                               http_request, task_create/list/delete,
-                                               cron_pause/resume, instruction_search,
-                                               instruction_save, external_call,
-                                               data_*, memory_*, web_search
-                                         |
-    instructions · datasets · memory · cron · tasks — SQL-модули ядра (SQLite)
+```mermaid
+flowchart TB
+    subgraph Surfaces
+        WEB["Web chat UI\n(REST + SSE)"]
+        TG["Telegram bot\n(long-poll)"]
+    end
+    WEB --> CM
+    TG --> CM
+    CM["ConversationManager\none runner per (user_id, channel)"] --> CR
+    CR["ConversationRunner\ndialog actor: narrative (persisted in SQLite)\n+ processes (fg/bg, in memory)"] --> AL
+    AL["AgentLoop.stream()\ntokens · tool calls · final · cancellation"] --> LLM["LLM client"]
+    AL --> TOOLS["ToolRegistry"]
+    TOOLS --> DB[("instructions · datasets\nmemory · cron · tasks")]
 ```
 
-Ключевые точки расширения — порты-Protocol: `LLMClient`, `EmbeddingClient` (локальный
-sentence-transformers или OpenAI-совместимый эндпоинт), `RerankerClient`,
-`MessageRouter`, `PromptProvider`, `CronStore`/`CronWaker`, `TaskStore`/`TaskSpawner`.
-Реализации собираются снаружи через DI в composition root — ядро ничего не создаёт
-внутри себя.
+Every extension point is a `Protocol` port — `LLMClient`, `EmbeddingClient` (local sentence-transformers or an OpenAI-compatible endpoint), `RerankerClient`, `MessageRouter`, `PromptProvider`, `CronStore`/`CronWaker`, `TaskStore`/`TaskSpawner` — wired together in a single composition root. The core never constructs its own dependencies; you assemble the object graph and hand it in.
 
-## Быстрое развёртывание
+## Quickstart
 
-Требования: Python ≥ 3.11. Для локальных эмбеддингов — доступ к Hugging Face
-(модели кэшируются в `~/.cache/huggingface`).
+Requires Python ≥ 3.11. (Local embeddings need Hugging Face access — models are cached in `~/.cache/huggingface`.)
 
 ```bash
-make install          # создать .venv и поставить оба проекта (editable, с dev-зависимостями)
-cp .env.example .env  # заполнить OF_LLM_API_KEY (и при желании OF_LLM_BASE_URL / OF_LLM_MODEL)
-make run              # uvicorn с автоперезагрузкой
+make install          # create .venv, install both projects editable with dev deps
+cp .env.example .env  # fill in OF_LLM_API_KEY (any OpenAI-compatible endpoint)
+make run              # uvicorn with autoreload
 ```
 
-Открыть http://127.0.0.1:8000 — чат-UI со стримом ответов. Поле «Как вас зовут?»
-задаёт `user_id` (аутентификации пока нет — это доверенная строка).
+Open http://127.0.0.1:8000 — a streaming chat UI. The "What's your name?" field sets `user_id` (there's no real auth yet — it's a trusted string).
 
-Telegram-бот (опционально): задать `OF_TELEGRAM_BOT_TOKEN` в `.env` — бот поднимется
-вместе с web. Либо отдельно, без HTTP API и открытого порта (только исходящие
-соединения, long polling):
+Telegram bot (optional): set `OF_TELEGRAM_BOT_TOKEN` in `.env` and it starts alongside the web app. Or run it standalone with no HTTP port opened at all — outbound long-polling only:
 
 ```bash
-make run-telegram     # python -m octoforge_web.telegram
+make run-telegram
 ```
 
-Для прода: запускайте `uvicorn octoforge_web.main:app` без `--reload` одним процессом
-(SQLite — один писатель), следите за `/health` (liveness) и `/health/ready`
-(readiness, проверяет БД).
+For production: run `uvicorn octoforge_web.main:app` without `--reload`, as a single process (SQLite has exactly one writer), and watch `/health` (liveness) and `/health/ready` (readiness — checks the database).
 
-### Конфигурация
+### Configuration
 
-Полный список с комментариями — в [.env.example](.env.example). Основное:
+Full list with comments in [.env.example](.env.example). The essentials:
 
-| Переменная | Назначение |
+| Variable | Purpose |
 |---|---|
-| `OF_LLM_BASE_URL` / `OF_LLM_API_KEY` / `OF_LLM_MODEL` | OpenAI-совместимый LLM-эндпоинт (подойдёт и локальный ollama) |
-| `OF_DATABASE_URL` | async SQLAlchemy URL, по умолчанию `sqlite+aiosqlite:///./octoforge.db` |
-| `OF_EMBEDDING_BACKEND` | `local` (sentence-transformers в процессе) или `openai` (HTTP-эндпоинт) |
-| `OF_TELEGRAM_BOT_TOKEN` | токен бота от @BotFather; пусто = адаптер выключен |
-| `OF_SERPER_TOKEN` | поиск в вебе через serper.dev; пусто = тул `web_search` выключен |
-| `OF_MAX_PROCESSES` / `OF_ROUTER_TIMEOUT_SECONDS` | лимит процессов на диалог / таймаут LLM-роутера |
-| `OF_SYSTEM_PROMPT_SOURCE` / `OF_ROUTER_PROMPT_SOURCE` | переопределение промптов из файлов (`file:`, перечитывается на каждый ход) |
+| `OF_LLM_BASE_URL` / `OF_LLM_API_KEY` / `OF_LLM_MODEL` | OpenAI-compatible LLM endpoint (a local Ollama works too) |
+| `OF_DATABASE_URL` | async SQLAlchemy URL, defaults to `sqlite+aiosqlite:///./octoforge.db` |
+| `OF_EMBEDDING_BACKEND` | `local` (in-process sentence-transformers) or `openai` (HTTP endpoint) |
+| `OF_TELEGRAM_BOT_TOKEN` | bot token from @BotFather; empty disables the adapter |
+| `OF_SERPER_TOKEN` | web search via serper.dev; empty disables the `web_search` tool |
+| `OF_MAX_PROCESSES` / `OF_ROUTER_TIMEOUT_SECONDS` | processes-per-dialog cap / router LLM timeout |
+| `OF_SYSTEM_PROMPT_SOURCE` / `OF_ROUTER_PROMPT_SOURCE` | override prompts from files (`file:`, re-read on every turn) |
 
-Без рабочего бэкенда эмбеддингов приложение стартует (сидирование инструкций
-пропускается), но поиск/сохранение инструкций и создание датасетов недоступны.
+Without a working embedding backend the app still starts (instruction seeding is skipped), but instruction search/save and dataset search become unavailable.
 
-## Использование как библиотека
+## What the agent can do out of the box
 
-`octoforge-core` — самостоятельный пакет без веб-зависимостей (httpx, SQLAlchemy,
-Alembic, croniter, sentence-transformers; помечен `py.typed`):
+The built-in tool surface (`ToolRegistry`), wired up in the composition root:
+
+| Tool | Does |
+|---|---|
+| `http_request` | Arbitrary outbound HTTP call |
+| `external_call` | Calls a saved, DB-backed endpoint descriptor, behind an SSRF guard |
+| `instruction_search` / `instruction_save` | Finds and saves knowledge, skills, and endpoint descriptors by embedding similarity |
+| `data_put` / `data_query` / `data_forget` | User datasets, validated against a JSON schema |
+| `memory_store` / `memory_search` / `memory_delete` | Key/value memory, per-user or global |
+| `task_create` / `task_list` / `task_delete` | Background work — the same surface also creates cron jobs (just pass a `schedule`) |
+| `cron_pause` / `cron_resume` | Control a scheduled job |
+| `web_search` | Web search via serper.dev (requires `OF_SERPER_TOKEN`) |
+
+## Using it as a library
+
+`octoforge-core` is a standalone package with no web dependencies (httpx, SQLAlchemy, Alembic, croniter, sentence-transformers; ships `py.typed`):
 
 ```bash
-pip install -e core        # из корня репозитория; FastAPI не потребуется
+pip install -e core   # from the repo root; no FastAPI required
 ```
 
-Уровни встраивания — на выбор:
+Pick your depth of embedding:
 
-- **`AgentLoop`** — минимум: событийная петля «LLM ↔ тулы» без БД и диалогов.
-  Нужны только `LLMClient` и `ToolRegistry`.
-- **`ConversationManager`** — полноценные диалоги: персист в SQLite, фон/форграунд
-  процессы, LLM-роутер, подписка на события. Пример ниже.
-- **Полный набор** — добавить модули (instructions, datasets, memory, cron) и базовые
-  тулы по образцу composition root'а — `runtime()` в
-  [web/src/octoforge_web/main.py](web/src/octoforge_web/main.py) — это эталонная
-  сборка всех зависимостей ядра.
+- **`AgentLoop`** alone — the bare "LLM ↔ tools" event loop, no database, no dialogs. Needs only an `LLMClient` and a `ToolRegistry`.
+- **`ConversationManager`** — full dialogs: SQLite persistence, foreground/background processes, the LLM router, event subscriptions. Example below.
+- **The full stack** — add the domain modules (instructions, datasets, memory, cron) and the built-in tools, following the composition root in [`web/src/octoforge_web/main.py`](web/src/octoforge_web/main.py) (the `runtime()` function) — that's the reference wiring for every core dependency.
 
-Минимальный диалог с персистом (CLI-поверхность за ~50 строк):
+A minimal, persisted dialog in about 50 lines:
 
 ```python
 import asyncio
@@ -157,7 +132,7 @@ BASE_URL = "https://api.openai.com/v1"
 
 async def main() -> None:
     engine = create_engine("sqlite+aiosqlite:///./agent.db")
-    await init_db(engine)  # в продуктовом коде — bootstrap_schema(engine) (Alembic)
+    await init_db(engine)  # in production, use bootstrap_schema(engine) (Alembic) instead
     session_factory = create_session_factory(engine)
     try:
         async with httpx.AsyncClient(base_url=BASE_URL) as http:
@@ -165,14 +140,14 @@ async def main() -> None:
                 http_client=http,
                 config=LLMConfig(api_key="sk-...", model="gpt-4o-mini"),
             )
-            prompts = StaticPromptProvider()  # встроенные промпты; свои — через порт
+            prompts = StaticPromptProvider()  # built-in prompts; bring your own via the port
             manager = ConversationManager(
                 config=RunnerConfig(
                     loop=AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=10),
                     prompts=prompts,
                     router=LLMRouter(llm, timeout_seconds=10.0, prompts=prompts),
                     max_processes=5,
-                    compactor=NoopContextCompactor(),  # без сжатия истории
+                    compactor=NoopContextCompactor(),  # no history compaction
                 ),
                 dialogs=DialogRepository(session_factory),
                 messages=MessageRepository(session_factory),
@@ -180,8 +155,8 @@ async def main() -> None:
             )
 
             runner = await manager.get_or_create_runner("user-1", "cli")
-            events = runner.subscribe()  # подписка — ДО submit, иначе события потеряются
-            await runner.submit("Привет! Что ты умеешь?")
+            events = runner.subscribe()  # subscribe BEFORE submit, or events get lost
+            await runner.submit("Hi! What can you do?")
             while True:
                 event = await events.get()
                 if isinstance(event, TextDelta):
@@ -189,7 +164,7 @@ async def main() -> None:
                 elif isinstance(event, Finished):
                     break
                 elif isinstance(event, Failed):
-                    print(f"\nОшибка: {event.error}")
+                    print(f"\nError: {event.error}")
                     break
             await runner.stop()
     finally:
@@ -199,32 +174,22 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Замечания к примеру:
+Notes on the example:
 
-- С пустым `ToolRegistry` агент отвечает только текстом. Скилы регистрируются по одному
-  (`registry.register(HttpRequestTool(...))` и т.д.) — полный набор
-  смотрите в `runtime()`; эмбеддинги нужны только скилам инструкций и датасетов.
-- Диалог переживает рестарт: нарратив перечитывается из БД при
-  `get_or_create_runner` (процессы — в памяти и не переживают).
-- Крон-планировщик — отдельный asyncio-цикл `CronScheduler` поверх `CronStore`;
-  выстрел доставляется через порт `CronWaker` (в процессе — `ManagerCronWaker(manager)`).
+- With an empty `ToolRegistry` the agent answers with text only — tools are registered one at a time (`registry.register(HttpRequestTool(...))`, etc.); see `runtime()` for the full set. Embeddings are only needed by the instruction and dataset tools.
+- A dialog survives a restart: the narrative is reloaded from the database on `get_or_create_runner` (processes are in-memory and don't survive).
+- The cron scheduler is a separate asyncio loop (`CronScheduler`) on top of `CronStore`; a fire is delivered through the `CronWaker` port (in-process: `ManagerCronWaker(manager)`).
 
-## Разработка
+## Development
 
 ```bash
-make check  # ruff (lint + format) → mypy --strict → pytest для обоих проектов
+make check   # ruff (lint + format) → mypy --strict → pytest, for both projects
 ```
 
-Отдельно: `make lint`, `make typecheck`, `make test`, `make format`.
+Individually: `make lint`, `make typecheck`, `make test`, `make format`.
 
-## Документация
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-- [docs/design.md](docs/design.md) — живой дизайн-документ: концепция, петля, процессная модель, API.
-- [docs/plan.md](docs/plan.md) — дорожная карта этапов A–G (выполнена) и что за рамками.
-- [docs/roadmap.md](docs/roadmap.md) — консолидированный бэклог доработок.
-- [docs/process-model.md](docs/process-model.md), [docs/cron.md](docs/cron.md),
-  [docs/instructions.md](docs/instructions.md), [docs/data-store.md](docs/data-store.md),
-  [docs/dialogs.md](docs/dialogs.md) — углублённые темы.
-- [docs/prompt-caching.md](docs/prompt-caching.md) — как работает KV-cache префикса у LLM-провайдеров
-  и как строить контекст для максимального попадания в кеш.
-- [AGENTS.md](AGENTS.md) — конвенции кода и правила workflow.
+## License
+
+[Business Source License 1.1](LICENSE) © [Dmitry Prokofyev (dmirain)](https://github.com/dmirain)
