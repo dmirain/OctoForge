@@ -2,11 +2,11 @@
 
 `task_create` covers both immediate background work (no `schedule`) and cron
 jobs (with `schedule`); `task_list` shows both in two sections; `task_delete`
-removes either. The two stores stay separate — only the tool surface is
-unified; the schedule path delegates to the cron domain (`create_job`).
+stops a task or removes a cron job. The two stores stay separate — only the
+tool surface is unified; the schedule path delegates to the cron domain
+(`create_job`).
 """
 
-from contextlib import suppress
 from typing import Any
 
 from octoforge_core.cron.api import CronJobNotFoundError, CronStore
@@ -24,7 +24,8 @@ from octoforge_core.cron.tools import (
     prompt_preview,
 )
 from octoforge_core.tasks.errors import TaskNotFoundError
-from octoforge_core.tasks.models import Task, TaskStatus
+from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.spawner import TaskDeleteOutcome
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
@@ -53,21 +54,23 @@ CREATE_SCHEMA: dict[str, Any] = {
 LIST_NAME = "task_list"
 LIST_DESCRIPTION = (
     "List your deferred work: background tasks of this dialog (running or awaiting "
-    "result delivery — finished tasks disappear, their results stay in the "
-    "conversation) and your scheduled cron jobs with next fire times. Both include "
-    "a preview of the prompt the work runs with."
+    "result delivery — delivered results stay in the conversation) and your "
+    "scheduled cron jobs with next fire times. Both include a preview of the "
+    "prompt the work runs with."
 )
 LIST_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 NO_WORK_MESSAGE = "no tasks or scheduled jobs"
 NO_TASKS_MESSAGE = "no tasks"
 TASKS_SECTION = "background tasks:"
 JOBS_SECTION = "scheduled jobs:"
+_ACTIVE_STATUSES = (TaskStatus.PENDING, TaskStatus.RUNNING)
+_DELIVERABLE_STATUSES = (TaskStatus.DONE, TaskStatus.FAILED)
 
 DELETE_NAME = "task_delete"
 DELETE_DESCRIPTION = (
-    "Delete a background task or a cron job by id (as reported by task_list). "
-    "A running task is stopped first, then removed; a scheduled job is removed "
-    "so it never fires again."
+    "Stop a background task or delete a cron job by id (as reported by task_list). "
+    "A running task is stopped and stays in the history as cancelled; a scheduled "
+    "job is removed so it never fires again."
 )
 DELETE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -79,7 +82,7 @@ DELETE_SCHEMA: dict[str, Any] = {
     },
     "required": ["task_id"],
 }
-DELETED_TASK_MESSAGE = "deleted task {task_id}"
+STOPPED_TASK_MESSAGE = "stopped task {task_id}"
 NOT_FOUND_MESSAGE = "error: no task or cron job with this id"
 SELF_DELETE_MESSAGE = "error: a running task cannot delete itself"
 NO_SPAWNER_MESSAGE = "task spawning is not available in this context"
@@ -142,7 +145,8 @@ class TaskListTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        tasks = await self._store.list(context.dialog_id)
+        all_tasks = await self._store.list(context.dialog_id)
+        tasks = [task for task in all_tasks if _is_visible(task)]
         jobs = await self._cron_store.list_for_user(context.user_id)
         if not tasks and not jobs:
             return NO_WORK_MESSAGE
@@ -152,7 +156,7 @@ class TaskListTool:
 
 
 class TaskDeleteTool:
-    """Deletes a background task (stopping it first when live) or a cron job."""
+    """Stops a background task (the row is kept as cancelled) or deletes a cron job."""
 
     def __init__(self, store: TaskStore, cron_store: CronStore) -> None:
         self._store = store
@@ -170,7 +174,7 @@ class TaskDeleteTool:
         task_id = _non_empty_string(arguments.get("task_id"), "task_id")
         task = await self._find_task(task_id, context.dialog_id)
         if task is not None:
-            return await self._delete_task(task, context)
+            return await self._stop_task(task, context)
         return await self._delete_cron_job(task_id, context)
 
     async def _find_task(self, task_id: str, dialog_id: str) -> Task | None:
@@ -183,18 +187,19 @@ class TaskDeleteTool:
             return None
         return task
 
-    async def _delete_task(self, task: Task, context: ToolContext) -> str:
+    async def _stop_task(self, task: Task, context: ToolContext) -> str:
         if task.id == context.owner_task_id:
             return SELF_DELETE_MESSAGE
-        if (
-            task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
-            and context.task_deleter is not None
-        ):
-            await context.task_deleter.delete(task.id)
-        # the stopped process's finalization may have removed the row already
-        with suppress(TaskNotFoundError):
-            await self._store.delete(task.id)
-        return DELETED_TASK_MESSAGE.format(task_id=task.id)
+        if task.status in _ACTIVE_STATUSES:
+            stopped = False
+            if context.task_deleter is not None:
+                outcome = await context.task_deleter.delete(task.id)
+                stopped = outcome is TaskDeleteOutcome.DELETED
+            if not stopped:
+                # no live process (orphaned row or no deleter): cancel directly,
+                # a stopped process is marked CANCELLED by its finalization instead
+                await self._store.mark_cancelled(task)
+        return STOPPED_TASK_MESSAGE.format(task_id=task.id)
 
     async def _delete_cron_job(self, job_id: str, context: ToolContext) -> str:
         try:
@@ -208,6 +213,19 @@ def _non_empty_string(raw: object, argument: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise ToolArgumentsError(f"{argument} must be a non-empty string")
     return raw
+
+
+def _is_visible(task: Task) -> bool:
+    """Whether the task belongs in `task_list`: active or awaiting delivery.
+
+    Answer-kind tasks are internal mechanics, and rows are kept forever now —
+    delivered terminal tasks are history, not work in flight.
+    """
+    if task.kind is not TaskKind.RUN:
+        return False
+    if task.status in _ACTIVE_STATUSES:
+        return True
+    return task.status in _DELIVERABLE_STATUSES and task.delivered_at is None
 
 
 def _format_task(task: Task) -> str:

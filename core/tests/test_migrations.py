@@ -155,3 +155,61 @@ async def test_bootstrap_renames_tool_type_and_adds_system_flag(tmp_path: Path) 
         await engine.dispose()
     assert row == ("endpoint", 0)
     assert "system" in columns
+
+
+def _table_columns(connection: Connection, table: str) -> set[str]:
+    return {column["name"] for column in inspect(connection).get_columns(table)}
+
+
+def _index_names(connection: Connection, table: str) -> set[str]:
+    return {index["name"] for index in inspect(connection).get_indexes(table)}
+
+
+async def test_bootstrap_adds_task_link_and_delivery_columns(tmp_path: Path) -> None:
+    engine = create_engine(_database_url(tmp_path))
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(_legacy_baseline_schema)
+        await bootstrap_schema(engine)  # stamp at baseline, then apply later migrations
+        async with engine.connect() as connection:
+            message_columns = await connection.run_sync(_table_columns, "messages")
+            message_indexes = await connection.run_sync(_index_names, "messages")
+            task_columns = await connection.run_sync(_table_columns, "tasks")
+    finally:
+        await engine.dispose()
+    assert "task_id" in message_columns
+    assert "ix_messages_task_id" in message_indexes
+    assert "delivered_at" in task_columns
+
+
+def _downgrade_one_step(connection: Connection) -> None:
+    command.downgrade(_alembic_config(connection), "-1")
+
+
+def _upgrade_to_head(connection: Connection) -> None:
+    command.upgrade(_alembic_config(connection), "head")
+
+
+async def test_task_link_and_delivery_migration_downgrades(tmp_path: Path) -> None:
+    engine = create_engine(_database_url(tmp_path))
+    try:
+        await bootstrap_schema(engine)
+        async with engine.begin() as connection:
+            await connection.run_sync(_downgrade_one_step)
+        async with engine.connect() as connection:
+            message_columns = await connection.run_sync(_table_columns, "messages")
+            message_indexes = await connection.run_sync(_index_names, "messages")
+            task_columns = await connection.run_sync(_table_columns, "tasks")
+        assert "task_id" not in message_columns
+        assert "ix_messages_task_id" not in message_indexes
+        assert "delivered_at" not in task_columns
+        # the downgrade is reversible: upgrading again restores the columns
+        async with engine.begin() as connection:
+            await connection.run_sync(_upgrade_to_head)
+        async with engine.connect() as connection:
+            message_columns = await connection.run_sync(_table_columns, "messages")
+            task_columns = await connection.run_sync(_table_columns, "tasks")
+        assert "task_id" in message_columns
+        assert "delivered_at" in task_columns
+    finally:
+        await engine.dispose()

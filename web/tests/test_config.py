@@ -13,8 +13,6 @@ from octoforge_web.config import (
     DEFAULT_CRON_LEASE_TTL_SECONDS,
     DEFAULT_CRON_POLL_INTERVAL_SECONDS,
     DEFAULT_CRON_REPLAY_LIMIT,
-    DEFAULT_CRON_RETRY_BACKOFF_SECONDS,
-    DEFAULT_CRON_RETRY_LIMIT,
     DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT,
     DEFAULT_DATASETS_QUERY_MAX_LIMIT,
     DEFAULT_EMBEDDING_BASE_URL,
@@ -43,8 +41,6 @@ CUSTOM_SELF_BASE_URL = "http://10.0.0.5:9000"
 CUSTOM_CRON_POLL_INTERVAL = 2.5
 CUSTOM_CRON_LEASE_TTL = 120.0
 CUSTOM_CRON_REPLAY_LIMIT = 3
-CUSTOM_CRON_RETRY_LIMIT = 5
-CUSTOM_CRON_RETRY_BACKOFF = 30.0
 CUSTOM_BATCH_SIZE = 32
 CUSTOM_RERANK_CANDIDATES = 15
 CUSTOM_TELEGRAM_TOKEN = "123:abc"
@@ -79,8 +75,6 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "OF_CRON_POLL_INTERVAL_SECONDS",
         "OF_CRON_LEASE_TTL_SECONDS",
         "OF_CRON_REPLAY_LIMIT",
-        "OF_CRON_RETRY_LIMIT",
-        "OF_CRON_RETRY_BACKOFF_SECONDS",
         "OF_TELEGRAM_BOT_TOKEN",
         "OF_TELEGRAM_POLL_TIMEOUT_SECONDS",
         "OF_TELEGRAM_EDIT_THROTTLE_SECONDS",
@@ -104,8 +98,6 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.cron_poll_interval_seconds == DEFAULT_CRON_POLL_INTERVAL_SECONDS
     assert settings.cron_lease_ttl_seconds == DEFAULT_CRON_LEASE_TTL_SECONDS
     assert settings.cron_replay_limit == DEFAULT_CRON_REPLAY_LIMIT
-    assert settings.cron_retry_limit == DEFAULT_CRON_RETRY_LIMIT
-    assert settings.cron_retry_backoff_seconds == DEFAULT_CRON_RETRY_BACKOFF_SECONDS
     assert settings.telegram_bot_token == ""
     assert settings.telegram_poll_timeout_seconds == DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
     assert settings.telegram_edit_throttle_seconds == DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
@@ -167,8 +159,6 @@ def test_cron_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OF_CRON_POLL_INTERVAL_SECONDS", str(CUSTOM_CRON_POLL_INTERVAL))
     monkeypatch.setenv("OF_CRON_LEASE_TTL_SECONDS", str(CUSTOM_CRON_LEASE_TTL))
     monkeypatch.setenv("OF_CRON_REPLAY_LIMIT", str(CUSTOM_CRON_REPLAY_LIMIT))
-    monkeypatch.setenv("OF_CRON_RETRY_LIMIT", str(CUSTOM_CRON_RETRY_LIMIT))
-    monkeypatch.setenv("OF_CRON_RETRY_BACKOFF_SECONDS", str(CUSTOM_CRON_RETRY_BACKOFF))
 
     settings = Settings()
 
@@ -176,8 +166,6 @@ def test_cron_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.cron_poll_interval_seconds == CUSTOM_CRON_POLL_INTERVAL
     assert settings.cron_lease_ttl_seconds == CUSTOM_CRON_LEASE_TTL
     assert settings.cron_replay_limit == CUSTOM_CRON_REPLAY_LIMIT
-    assert settings.cron_retry_limit == CUSTOM_CRON_RETRY_LIMIT
-    assert settings.cron_retry_backoff_seconds == CUSTOM_CRON_RETRY_BACKOFF
 
 
 def test_telegram_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

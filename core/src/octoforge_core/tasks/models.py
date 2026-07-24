@@ -10,9 +10,14 @@ from octoforge_core.time import utc_now
 
 
 class TaskKind(StrEnum):
-    """Kinds of background work."""
+    """Kinds of background work.
+
+    RUN is user-visible deferred work; ANSWER is the internal mechanics of
+    answering a user message (hidden from the task tools).
+    """
 
     RUN = "run"
+    ANSWER = "answer"
 
 
 class TaskStatus(StrEnum):
@@ -42,3 +47,4 @@ class Task:
     created_at: datetime = field(default_factory=utc_now)
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    delivered_at: datetime | None = None

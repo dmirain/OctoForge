@@ -232,5 +232,6 @@ def _status_line(event: LoopEvent) -> str | None:
         return RETRY_LINE_TEMPLATE.format(
             reason=event.reason, attempt=event.attempt, delay=event.delay_seconds
         )
-    # ProcessCompleted is not rendered: completions already arrive as report-run text.
+    # ProcessCompleted is not rendered: completions arrive as directly delivered
+    # assistant messages (foreground stream or broker outbox delivery).
     return None

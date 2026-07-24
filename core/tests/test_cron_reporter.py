@@ -1,4 +1,4 @@
-"""Tests for CronOutcomeReporter: retry policy, one-shot deletion, edge cases."""
+"""Tests for CronOutcomeReporter: outcome recording and one-shot deletion."""
 
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -11,21 +11,15 @@ from octoforge_core.cron.reporter import CronOutcomeReporter
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
-from octoforge_core.time import utc_now
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 USER_A = "alice"
 CHANNEL = "web"
 DIALOG_ID = "dialog-1"
 JOB_ID = "job-1"
-RETRY_LIMIT = 3
-BACKOFF_BASE_SECONDS = 60.0
-RETRY_ONE = 1
-RETRY_TWO = 2
 ERROR_TEXT = "iteration limit reached"
 LONG_ERROR_LEN = 1000
 TRUNCATED_ERROR_LEN = 500
-BACKOFF_SLACK_SECONDS = 10.0
 
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 NEXT_SLOT = NOW + timedelta(days=1)
@@ -75,15 +69,13 @@ async def store() -> AsyncIterator[SqlAlchemyCronStore]:
 
 
 def make_reporter(store: SqlAlchemyCronStore) -> CronOutcomeReporter:
-    return CronOutcomeReporter(
-        store,
-        retry_limit=RETRY_LIMIT,
-        backoff_base_seconds=BACKOFF_BASE_SECONDS,
-    )
+    return CronOutcomeReporter(store)
 
 
-async def test_done_resets_the_retry_streak(store: SqlAlchemyCronStore) -> None:
-    await store.create(make_job(retry_count=RETRY_TWO))
+async def test_done_is_recorded_without_touching_the_schedule(
+    store: SqlAlchemyCronStore,
+) -> None:
+    await store.create(make_job())
 
     await make_reporter(store).report_outcome(make_task(), TaskStatus.DONE)
 
@@ -103,44 +95,34 @@ async def test_done_deletes_a_one_shot_job(store: SqlAlchemyCronStore) -> None:
         await store.get(JOB_ID)
 
 
-async def test_failed_within_budget_reschedules_with_backoff(
-    store: SqlAlchemyCronStore,
-) -> None:
-    await store.create(make_job(retry_count=RETRY_ONE))
-    before = utc_now()
+async def test_failed_is_recorded_without_a_retry(store: SqlAlchemyCronStore) -> None:
+    await store.create(make_job())
 
     await make_reporter(store).report_outcome(make_task(error=ERROR_TEXT), TaskStatus.FAILED)
 
     updated = await store.get(JOB_ID)
     assert updated.last_status is TaskStatus.FAILED
     assert updated.last_error == ERROR_TEXT
-    assert updated.retry_count == RETRY_TWO
-    # backoff = base * 2**streak_before = 60 * 2 = 120 seconds from now
-    expected = before + timedelta(seconds=2 * BACKOFF_BASE_SECONDS)
-    assert abs((updated.next_fire_at - expected).total_seconds()) < BACKOFF_SLACK_SECONDS
+    assert updated.retry_count == 0
+    assert updated.next_fire_at == NEXT_SLOT  # no retry: the schedule slot stays
 
 
-async def test_failed_at_the_limit_keeps_the_schedule_and_resets(
-    store: SqlAlchemyCronStore,
-) -> None:
-    await store.create(make_job(retry_count=RETRY_LIMIT))
+async def test_failed_deletes_a_one_shot_job(store: SqlAlchemyCronStore) -> None:
+    await store.create(make_job(one_shot=True))
 
     await make_reporter(store).report_outcome(make_task(error=ERROR_TEXT), TaskStatus.FAILED)
 
-    updated = await store.get(JOB_ID)
-    assert updated.last_status is TaskStatus.FAILED
-    assert updated.retry_count == 0  # fresh budget for the next schedule slot
-    assert updated.next_fire_at == NEXT_SLOT
+    with pytest.raises(CronJobNotFoundError):
+        await store.get(JOB_ID)
 
 
-async def test_cancelled_is_recorded_without_a_retry(store: SqlAlchemyCronStore) -> None:
-    await store.create(make_job())
+async def test_cancelled_keeps_a_one_shot_job(store: SqlAlchemyCronStore) -> None:
+    await store.create(make_job(one_shot=True))
 
     await make_reporter(store).report_outcome(make_task(), TaskStatus.CANCELLED)
 
-    updated = await store.get(JOB_ID)
+    updated = await store.get(JOB_ID)  # cancelled is recorded, not an attempt
     assert updated.last_status is TaskStatus.CANCELLED
-    assert updated.retry_count == 0
     assert updated.next_fire_at == NEXT_SLOT
 
 

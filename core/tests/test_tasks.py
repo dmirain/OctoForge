@@ -1,6 +1,5 @@
 """Tests for deferred work: the task store and the unified task tools."""
 
-from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import timedelta
 
@@ -30,7 +29,6 @@ REFUSAL_TEXT = "cannot spawn: process limit (5) reached"
 TITLE = "research"
 VALID_SCHEDULE = "0 9 * * *"
 VALID_TIMEZONE = "Europe/Moscow"
-RESTART_ERROR = "interrupted by restart"
 EXPECTED_TWO_JOBS = 2
 RETRY_TWO = 2
 PROMPT_WORDS_BEYOND_PREVIEW = 50
@@ -49,21 +47,14 @@ class FakeSpawner:
 
 
 class FakeDeleter:
-    """TaskDeleter stub with a programmed outcome and an optional side effect."""
+    """TaskDeleter stub with a programmed outcome."""
 
-    def __init__(
-        self,
-        outcome: TaskDeleteOutcome = TaskDeleteOutcome.DELETED,
-        on_delete: Callable[[str], Awaitable[None]] | None = None,
-    ) -> None:
+    def __init__(self, outcome: TaskDeleteOutcome = TaskDeleteOutcome.DELETED) -> None:
         self.outcome = outcome
-        self.on_delete = on_delete
         self.calls: list[str] = []
 
     async def delete(self, task_id: str) -> TaskDeleteOutcome:
         self.calls.append(task_id)
-        if self.on_delete is not None:
-            await self.on_delete(task_id)
         return self.outcome
 
 
@@ -301,6 +292,38 @@ async def test_task_list_shows_tasks_and_jobs_in_two_sections() -> None:
     assert "prompt: 'good morning'" in jobs_section
 
 
+async def test_task_list_hides_answer_kind_tasks() -> None:
+    store = InMemoryTaskStore()
+    await store.add(make_task(title="visible"))
+    await store.add(make_task(title="internal", kind=TaskKind.ANSWER))
+    tool = TaskListTool(store=store, cron_store=FakeCronStore())
+
+    output = await tool.execute({}, CTX)
+
+    tasks_section = output.split("\n\n")[0]
+    assert "visible" in tasks_section
+    assert "internal" not in tasks_section
+
+
+async def test_task_list_hides_finished_history() -> None:
+    store = InMemoryTaskStore()
+    await store.add(make_task(title="alpha", status=TaskStatus.RUNNING))
+    await store.add(make_task(title="bravo", status=TaskStatus.DONE, result="r"))
+    await store.add(
+        make_task(title="charlie", status=TaskStatus.DONE, result="r", delivered_at=utc_now())
+    )
+    await store.add(make_task(title="delta", status=TaskStatus.CANCELLED))
+    tool = TaskListTool(store=store, cron_store=FakeCronStore())
+
+    output = await tool.execute({}, CTX)
+
+    tasks_section = output.split("\n\n")[0]
+    assert "alpha" in tasks_section
+    assert "bravo" in tasks_section
+    assert "charlie" not in tasks_section
+    assert "delta" not in tasks_section
+
+
 async def test_task_list_truncates_long_prompts() -> None:
     long_prompt = "word " * PROMPT_WORDS_BEYOND_PREVIEW
     store = InMemoryTaskStore()
@@ -364,7 +387,7 @@ async def test_task_list_shows_the_last_run_and_retry_streak() -> None:
 # --- task_delete ------------------------------------------------------------
 
 
-async def test_task_delete_removes_a_terminal_task() -> None:
+async def test_task_delete_keeps_a_terminal_task_row() -> None:
     store = InMemoryTaskStore()
     task = make_task(status=TaskStatus.DONE, result="ok")
     await store.add(task)
@@ -372,9 +395,8 @@ async def test_task_delete_removes_a_terminal_task() -> None:
 
     output = await tool.execute({"task_id": task.id}, CTX)
 
-    assert output == f"deleted task {task.id}"
-    with pytest.raises(TaskNotFoundError):
-        await store.get(task.id)
+    assert output == f"stopped task {task.id}"
+    assert (await store.get(task.id)).status is TaskStatus.DONE
 
 
 async def test_task_delete_stops_a_running_task_via_the_deleter() -> None:
@@ -386,22 +408,10 @@ async def test_task_delete_stops_a_running_task_via_the_deleter() -> None:
 
     output = await tool.execute({"task_id": task.id}, ctx_with(deleter=deleter))
 
-    assert output == f"deleted task {task.id}"
+    assert output == f"stopped task {task.id}"
     assert deleter.calls == [task.id]
-    with pytest.raises(TaskNotFoundError):
-        await store.get(task.id)
-
-
-async def test_task_delete_tolerates_a_row_removed_by_the_finalization() -> None:
-    store = InMemoryTaskStore()
-    task = make_task(status=TaskStatus.RUNNING)
-    await store.add(task)
-    deleter = FakeDeleter(on_delete=store.delete)
-    tool = TaskDeleteTool(store=store, cron_store=FakeCronStore())
-
-    output = await tool.execute({"task_id": task.id}, ctx_with(deleter=deleter))
-
-    assert output == f"deleted task {task.id}"
+    # the stopped process's finalization marks the row CANCELLED; the tool keeps it
+    assert (await store.get(task.id)).status is TaskStatus.RUNNING
 
 
 async def test_task_delete_refuses_self_deletion_from_inside_the_task() -> None:
@@ -420,7 +430,7 @@ async def test_task_delete_refuses_self_deletion_from_inside_the_task() -> None:
     assert (await store.get(task.id)).status is TaskStatus.RUNNING
 
 
-async def test_task_delete_removes_an_orphaned_running_row() -> None:
+async def test_task_delete_cancels_an_orphaned_running_row() -> None:
     store = InMemoryTaskStore()
     task = make_task(status=TaskStatus.RUNNING)
     await store.add(task)
@@ -429,9 +439,20 @@ async def test_task_delete_removes_an_orphaned_running_row() -> None:
 
     output = await tool.execute({"task_id": task.id}, ctx_with(deleter=deleter))
 
-    assert output == f"deleted task {task.id}"
-    with pytest.raises(TaskNotFoundError):
-        await store.get(task.id)
+    assert output == f"stopped task {task.id}"
+    assert (await store.get(task.id)).status is TaskStatus.CANCELLED
+
+
+async def test_task_delete_cancels_a_running_row_without_a_deleter() -> None:
+    store = InMemoryTaskStore()
+    task = make_task(status=TaskStatus.RUNNING)
+    await store.add(task)
+    tool = TaskDeleteTool(store=store, cron_store=FakeCronStore())
+
+    output = await tool.execute({"task_id": task.id}, CTX)
+
+    assert output == f"stopped task {task.id}"
+    assert (await store.get(task.id)).status is TaskStatus.CANCELLED
 
 
 async def test_task_delete_scopes_tasks_to_the_dialog() -> None:
@@ -497,7 +518,7 @@ async def test_store_delete_unknown_task_raises() -> None:
         await store.delete("missing")
 
 
-async def test_fail_orphaned_fails_only_pending_and_running() -> None:
+async def test_list_orphaned_returns_pending_and_running_without_mutation() -> None:
     store = InMemoryTaskStore()
     pending = make_task(title="pending")
     running = make_task(title="running", status=TaskStatus.RUNNING)
@@ -506,34 +527,51 @@ async def test_fail_orphaned_fails_only_pending_and_running() -> None:
     for task in (pending, running, done, cancelled):
         await store.add(task)
 
-    orphaned = await store.fail_orphaned(RESTART_ERROR)
+    orphaned = await store.list_orphaned()
 
     assert {task.id for task in orphaned} == {pending.id, running.id}
-    for task in (pending, running):
-        stored = await store.get(task.id)
-        assert stored.status is TaskStatus.FAILED
-        assert stored.error == RESTART_ERROR
-        assert stored.finished_at is not None
-        assert stored.finished_at.tzinfo is not None
-    assert (await store.get(done.id)).status is TaskStatus.DONE
-    assert (await store.get(cancelled.id)).status is TaskStatus.CANCELLED
+    # read-only: the sweep must not mutate the tasks it returns
+    assert (await store.get(pending.id)).status is TaskStatus.PENDING
+    assert (await store.get(running.id)).status is TaskStatus.RUNNING
 
 
-async def test_fail_orphaned_without_candidates_returns_empty() -> None:
+async def test_list_orphaned_without_candidates_returns_empty() -> None:
     store = InMemoryTaskStore()
     await store.add(make_task(status=TaskStatus.DONE))
 
-    assert await store.fail_orphaned(RESTART_ERROR) == []
+    assert await store.list_orphaned() == []
 
 
-async def test_list_undelivered_returns_finished_rows_only() -> None:
+async def test_list_undelivered_returns_terminal_tasks_without_delivery_stamp() -> None:
     store = InMemoryTaskStore()
     done = make_task(title="done", status=TaskStatus.DONE)
     failed = make_task(title="failed", status=TaskStatus.FAILED)
+    delivered = make_task(title="delivered", status=TaskStatus.DONE)
     running = make_task(title="running", status=TaskStatus.RUNNING)
-    for task in (done, failed, running):
+    for task in (done, failed, delivered, running):
         await store.add(task)
+    await store.mark_delivered(delivered.id)
 
     undelivered = await store.list_undelivered()
 
     assert {task.id for task in undelivered} == {done.id, failed.id}
+
+
+async def test_mark_delivered_stamps_the_task() -> None:
+    store = InMemoryTaskStore()
+    task = make_task(status=TaskStatus.DONE)
+    await store.add(task)
+
+    await store.mark_delivered(task.id)
+
+    stored = await store.get(task.id)
+    assert stored.delivered_at is not None
+    assert stored.delivered_at.tzinfo is not None
+    assert await store.list_undelivered() == []
+
+
+async def test_mark_delivered_unknown_task_raises() -> None:
+    store = InMemoryTaskStore()
+
+    with pytest.raises(TaskNotFoundError):
+        await store.mark_delivered("missing")

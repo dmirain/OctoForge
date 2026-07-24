@@ -201,7 +201,7 @@ class AgentLoop:
         control: LoopControl,
         context: ToolContext,
     ) -> AsyncIterator[LoopEvent]:
-        """Run the loop, yielding events; new messages are appended to history."""
+        """Run the loop, yielding events; the run's own messages are appended to history."""
         return self._run(history, control, context)
 
     async def _run(
@@ -212,8 +212,9 @@ class AgentLoop:
     ) -> AsyncIterator[LoopEvent]:
         specs = self._registry.specs(context)
         for index in range(self._max_iterations):
+            # the runner re-syncs the narrative part of the history on this
+            # event (pull model), before the next LLM call reads it
             yield IterationStarted(index=index)
-            history.extend(control.drain())
             if control.is_cancelled:
                 yield Cancelled()
                 return

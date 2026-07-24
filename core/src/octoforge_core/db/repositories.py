@@ -133,6 +133,7 @@ class MessageRepository:
                         client_message_id=client_message_id,
                         prompt_tokens=usage.prompt_tokens if usage is not None else None,
                         completion_tokens=usage.completion_tokens if usage is not None else None,
+                        task_id=message.task_id,
                     )
                 )
                 dialog = await session.get(DialogRow, dialog_id)
@@ -181,6 +182,7 @@ class MessageRepository:
                             content=message.content,
                             tool_calls=_tool_calls_to_json(message.tool_calls),
                             tool_call_id=message.tool_call_id,
+                            task_id=message.task_id,
                         )
                     )
                 dialog = await session.get(DialogRow, dialog_id)
@@ -273,6 +275,11 @@ class SqlAlchemyTaskStore:
         task.finished_at = utc_now()
         await self._update(task)
 
+    async def mark_cancelled(self, task: Task) -> None:
+        task.status = TaskStatus.CANCELLED
+        task.finished_at = utc_now()
+        await self._update(task)
+
     async def delete(self, task_id: str) -> None:
         async with self._session_factory() as session:
             row = await session.get(TaskRow, task_id)
@@ -281,29 +288,34 @@ class SqlAlchemyTaskStore:
             await session.delete(row)
             await session.commit()
 
-    async def fail_orphaned(self, error: str) -> TaskList:
+    async def list_orphaned(self) -> TaskList:
         async with self._session_factory() as session:
             result = await session.scalars(
-                select(TaskRow).where(
-                    TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value))
-                )
+                select(TaskRow)
+                .where(TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value)))
+                .order_by(TaskRow.created_at)
             )
-            rows = list(result.all())
-            for row in rows:
-                row.status = TaskStatus.FAILED.value
-                row.error = error
-                row.finished_at = utc_now()
-            await session.commit()
-            return [_to_task(row) for row in rows]
+            return [_to_task(row) for row in result.all()]
 
     async def list_undelivered(self) -> TaskList:
         async with self._session_factory() as session:
             result = await session.scalars(
                 select(TaskRow)
-                .where(TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)))
+                .where(
+                    TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)),
+                    TaskRow.delivered_at.is_(None),
+                )
                 .order_by(TaskRow.created_at)
             )
             return [_to_task(row) for row in result.all()]
+
+    async def mark_delivered(self, task_id: str) -> None:
+        async with self._session_factory() as session:
+            row = await session.get(TaskRow, task_id)
+            if row is None:
+                raise TaskNotFoundError(task_id)
+            row.delivered_at = utc_now()
+            await session.commit()
 
     async def _update(self, task: Task) -> None:
         async with self._session_factory() as session:
@@ -334,6 +346,7 @@ def _to_chat_message(row: MessageRow) -> ChatMessage:
         content=row.content,
         tool_calls=_tool_calls_from_json(row.tool_calls),
         tool_call_id=row.tool_call_id,
+        task_id=row.task_id,
     )
 
 
@@ -367,6 +380,7 @@ def _to_task_row(task: Task) -> TaskRow:
         created_at=task.created_at,
         started_at=task.started_at,
         finished_at=task.finished_at,
+        delivered_at=task.delivered_at,
     )
 
 
@@ -385,4 +399,5 @@ def _to_task(row: TaskRow) -> Task:
         created_at=row.created_at,
         started_at=row.started_at,
         finished_at=row.finished_at,
+        delivered_at=row.delivered_at,
     )

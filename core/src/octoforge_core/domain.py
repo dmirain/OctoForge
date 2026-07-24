@@ -26,12 +26,18 @@ class ToolCall:
 
 @dataclass(frozen=True, slots=True)
 class ChatMessage:
-    """A single chat message."""
+    """A single chat message.
+
+    `task_id` links an assistant message to the background task that produced
+    it (NULL for plain narrative messages); it is persisted metadata, not part
+    of the LLM-facing payload.
+    """
 
     role: MessageRole
     content: str
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
+    task_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

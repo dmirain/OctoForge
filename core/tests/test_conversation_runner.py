@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
     Cancelled,
     Failed,
@@ -29,8 +30,7 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
-    REPORT_NUDGE,
-    TASK_INTERRUPTED_TEMPLATE,
+    RESTART_LIMIT_ERROR,
     ConversationEvent,
     ConversationManager,
     RunnerConfig,
@@ -48,7 +48,6 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient
-from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.spawner import TaskDeleteOutcome
 from octoforge_core.tasks.store import InMemoryTaskStore, TaskStore
@@ -73,6 +72,7 @@ TASK_RESULT = "42"
 TASK_TITLE = "research"
 TASK_PROMPT = "solve 2+2"
 UNBLOCKED_OUTPUT = "unblocked"
+PROVIDER_ERROR_MESSAGE = "provider down"
 TIMEOUT_SECONDS = 2.0
 POLL_SECONDS = 0.01
 MAX_ITERATIONS = 3
@@ -286,6 +286,29 @@ class BranchLLM:
         yield StreamFinished(message=reply)
 
 
+class FailingTaskLLM:
+    """LLMClient stub failing background-task streams with a provider error."""
+
+    def __init__(self) -> None:
+        self.background_requests: list[list[ChatMessage]] = []
+
+    async def complete(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec] | None = None,
+    ) -> Completion:
+        raise NotImplementedError
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.background_requests.append(list(messages))
+        raise RuntimeError(PROVIDER_ERROR_MESSAGE)
+        yield  # the raise above is the point; the yield keeps the generator shape
+
+
 class StallingLLM:
     """LLMClient stub emitting partial text and stalling until released."""
 
@@ -305,6 +328,30 @@ class StallingLLM:
         tools: list[ToolSpec] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         yield LlmTextDelta(text=PARTIAL)
+        await self.release.wait()
+        yield StreamFinished(message=reply("full"))
+
+
+class ToolStallingLLM:
+    """LLMClient stub emitting partial text plus a tool call, then stalling."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec] | None = None,
+    ) -> Completion:
+        raise NotImplementedError
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        yield LlmTextDelta(text=PARTIAL)
+        yield ToolCallReady(call=ToolCall(id=CALL_ID, name=BLOCKING_TOOL, arguments={}))
         await self.release.wait()
         yield StreamFinished(message=reply("full"))
 
@@ -404,6 +451,12 @@ async def get_dialog(session_factory: async_sessionmaker[AsyncSession]) -> Dialo
     return await DialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
 
 
+async def single_task(store: TaskStore, dialog_id: str) -> Task:
+    """Return the only stored task of the dialog."""
+    (task,) = await store.list(dialog_id)
+    return task
+
+
 def blocking_registry(tool: BlockingTool) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(tool)
@@ -416,12 +469,17 @@ def quick_registry() -> ToolRegistry:
     return registry
 
 
-def is_terminal(event: ConversationEvent) -> bool:
-    return isinstance(event.payload, (Finished, Failed, Cancelled))
-
-
 def is_completed(event: ConversationEvent) -> bool:
     return isinstance(event.payload, ProcessCompleted)
+
+
+def is_delivered(content: str) -> Callable[[ConversationEvent], bool]:
+    """Predicate matching a Finished event with the given content (a delivery)."""
+
+    def _matches(event: ConversationEvent) -> bool:
+        return isinstance(event.payload, Finished) and event.payload.message.content == content
+
+    return _matches
 
 
 async def next_event(queue: asyncio.Queue[ConversationEvent]) -> ConversationEvent:
@@ -465,10 +523,20 @@ async def wait_for_condition(predicate: Callable[[], bool]) -> None:
     await asyncio.wait_for(_wait(), timeout=TIMEOUT_SECONDS)
 
 
+def test_loop_control_has_no_inject_channel() -> None:
+    control = LoopControl()
+    assert not hasattr(control, "inject")
+    assert not hasattr(control, "drain")
+    assert control.is_cancelled is False
+
+
 async def test_submit_streams_events_and_updates_narrative(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([reply()]), ToolRegistry(), session_factory)
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        ScriptedLLM([reply()]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -484,9 +552,17 @@ async def test_submit_streams_events_and_updates_narrative(
     assert [(item.title, item.status) for item in done] == [("hi", TaskStatus.DONE.value)]
     seqs = [event.seq for event in events]
     assert seqs == sorted(seqs)
+    # every process is task-backed: the answer task links the final message
+    task = await single_task(store, runner.dialog_id)
+    assert task.kind is TaskKind.ANSWER
+    assert task.input == {"prompt": "hi"}
+    assert task.status is TaskStatus.DONE
+    # the foreground stream was the delivery: the actor stamps it asynchronously
+    await wait_for_condition(lambda: task.delivered_at is not None)
+    assert runner._pending_deliveries == []  # nothing left in the outbox
     assert runner.history() == [
         ChatMessage(role=MessageRole.USER, content="hi"),
-        reply(),
+        replace(reply(), task_id=task.id),
     ]
     dialog = await get_dialog(session_factory)
     assert await MessageRepository(session_factory).list(dialog.id) == runner.history()
@@ -496,7 +572,10 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     usage = Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS)
-    manager = make_manager(UsageLLM([reply()], usage), ToolRegistry(), session_factory)
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        UsageLLM([reply()], usage), ToolRegistry(), session_factory, ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -505,6 +584,7 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
 
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
     assert finished[0].usage == usage
+    task = await single_task(store, runner.dialog_id)
     dialog = await get_dialog(session_factory)
     async with session_factory() as session:
         rows = (
@@ -516,6 +596,7 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
     assert assistant.role == MessageRole.ASSISTANT.value
     assert assistant.prompt_tokens == PROMPT_TOKENS
     assert assistant.completion_tokens == COMPLETION_TOKENS
+    assert assistant.task_id == task.id
 
 
 async def test_branch_keeps_system_prompt_stable_and_envelopes_last_message(
@@ -557,12 +638,7 @@ async def test_duplicate_client_message_id_is_skipped(
     await collect_until(queue, is_completed)
 
     assert len(router.calls) == RETRIED_CALLS  # the duplicate never reached the router
-    assert runner.history() == [
-        ChatMessage(role=MessageRole.USER, content="hi"),
-        reply(),
-        ChatMessage(role=MessageRole.USER, content="again"),
-        reply(SECOND_REPLY),
-    ]
+    assert [m.content for m in runner.history()] == ["hi", REPLY, "again", SECOND_REPLY]
 
 
 async def test_context_overflow_compacts_and_retries_once(
@@ -660,12 +736,15 @@ async def test_compaction_crash_fails_the_run_and_releases_the_slot(
     assert finished[0].message.content == REPLY
 
 
-async def test_new_question_suspends_foreground_and_starts_new_process(
+async def test_suspended_process_final_is_delivered_whole_after_the_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tool = BlockingTool()
+    store = InMemoryTaskStore()
     llm = ScriptedLLM([blocking_call(), reply("second final"), reply("first final")])
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -678,24 +757,30 @@ async def test_new_question_suspends_foreground_and_starts_new_process(
     suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
     assert [(item.title) for item in suspended] == ["first"]
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert len(finished) == 1
-    assert finished[0].message.content == "second final"
+    assert [item.message.content for item in finished] == ["second final"]
 
     tool.release.set()
-    events += await collect_completions(queue, 1)
+    events += await collect_until(queue, is_delivered("first final"))
 
+    # the suspended process finished in the background: its final arrives whole
+    # (TextDelta + Finished) after the foreground's events
+    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
+    assert deltas == ["second final", "first final"]
     done = completions(events)
     assert {item.title for item in done} == {"first", "second"}
     assert all(item.status == TaskStatus.DONE.value for item in done)
-    assert runner.history() == [
-        ChatMessage(role=MessageRole.USER, content="first"),
-        ChatMessage(role=MessageRole.USER, content="second"),
-        reply("second final"),
-        reply("first final"),
-    ]
+    tasks = await store.list(runner.dialog_id)
+    assert {task.title for task in tasks} == {"first", "second"}
+    assert all(task.status is TaskStatus.DONE for task in tasks)
+    assert all(task.delivered_at is not None for task in tasks)
+    assert runner._pending_deliveries == []
+    history = runner.history()
+    assert [m.content for m in history] == ["first", "second", "second final", "first final"]
+    task_ids = {task.id for task in tasks}
+    assert all(m.task_id in task_ids for m in history if m.role is MessageRole.ASSISTANT)
 
 
-async def test_inject_steers_the_foreground(
+async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tool = BlockingTool()
@@ -713,16 +798,50 @@ async def test_inject_steers_the_foreground(
     router.decide(RouteOp(action=RouteAction.INJECT))
     await runner.submit("extra context")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
-    await asyncio.sleep(0)
+    assert len(llm.requests) == 1  # INJECT is a no-op: no new run, no push channel
     tool.release.set()
     await collect_until(queue, is_completed)
 
+    # the running process re-synced its branch: the message arrived at iteration 2
     second_request = llm.requests[1]
-    assert any(m.role is MessageRole.USER and m.content == "extra context" for m in second_request)
-    assert runner.history() == [
-        ChatMessage(role=MessageRole.USER, content="start"),
-        ChatMessage(role=MessageRole.USER, content="extra context"),
-        reply("after"),
+    contents = [m.content for m in second_request]
+    assert any(m.role is MessageRole.USER and "extra context" in m.content for m in second_request)
+    assert contents.index("start") < next(
+        i for i, content in enumerate(contents) if "extra context" in content
+    )
+    # a message the process did sync is not re-routed at finalize: one process only
+    assert len(llm.requests) == RETRIED_CALLS
+    assert [m.content for m in runner.history()] == ["start", "extra context", "after"]
+
+
+async def test_unseen_message_is_requeued_at_finalize(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = GatedLLM()
+    router = FakeRouter()
+    manager = make_manager(llm, quick_registry(), session_factory, ManagerOptions(router=router))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("start")
+    await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
+
+    # the message lands after the process's last sync: the run finishes without it
+    router.decide(RouteOp(action=RouteAction.INJECT))
+    await runner.submit("extra context")
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+    llm.release.set()
+    await collect_completions(queue, 2)
+
+    # the watermark re-routes it: a new answer task picks it up
+    assert len(llm.requests) == EXPECTED_LLM_CALLS
+    third_request = llm.requests[2]
+    assert any(m.role is MessageRole.USER and m.content == "extra context" for m in third_request)
+    assert [m.content for m in runner.history()] == [
+        "start",
+        "extra context",
+        "first final",
+        "after",
     ]
 
 
@@ -761,11 +880,13 @@ async def test_promote_brings_background_process_to_foreground(
     tool.release.set()
     llm.release.set()
     events = await collect_completions(queue, 2)
+    events += await collect_until(queue, is_delivered("first final"))
 
     done = completions(events)
     assert {item.title for item in done} == {"first", "second"}
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert [item.message.content for item in finished] == ["after"]
+    # "after" streamed live as the promoted foreground; "first final" came via the outbox
+    assert {item.message.content for item in finished} == {"after", "first final"}
     contents = [m.content for m in runner.history()]
     assert contents[:3] == ["first", "second", "bring back the first one"]
     assert "first final" in contents
@@ -776,10 +897,14 @@ async def test_router_cancel_stops_the_process(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tool = BlockingTool()
+    store = InMemoryTaskStore()
     llm = ScriptedLLM([blocking_call()])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
@@ -798,25 +923,30 @@ async def test_router_cancel_stops_the_process(
     router.handler = cancel_all
     await runner.submit("stop it")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
-    await asyncio.sleep(0)
     tool.release.set()
     events = await collect_until(queue, is_completed)
 
     assert any(isinstance(e.payload, Cancelled) for e in events)
     done = completions(events)
     assert [(item.title, item.status) for item in done] == [("start", TaskStatus.CANCELLED.value)]
+    # a cancel-routed message is a command, not a question: no re-queue, no answer
     assert runner.history() == [
         ChatMessage(role=MessageRole.USER, content="start"),
         ChatMessage(role=MessageRole.USER, content="stop it"),
     ]
+    task = await single_task(store, runner.dialog_id)
+    assert task.status is TaskStatus.CANCELLED
 
 
 async def test_cancel_api_cancels_only_the_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tool = BlockingTool()
+    store = InMemoryTaskStore()
     llm = ScriptedLLM([blocking_call(), blocking_call(), reply("first final")])
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -826,20 +956,23 @@ async def test_cancel_api_cancels_only_the_foreground(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
 
     await runner.cancel()
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
     tool.release.set()
     events = await collect_completions(queue, 2)
+    events += await collect_until(queue, is_delivered("first final"))
 
     by_title = {item.title: item.status for item in completions(events)}
     assert by_title == {"second": TaskStatus.CANCELLED.value, "first": TaskStatus.DONE.value}
     assert any(isinstance(e.payload, Cancelled) for e in events)
-    assert not any(isinstance(e.payload, Finished) for e in events)
-    contents = [m.content for m in runner.history()]
-    assert "first final" in contents
+    # the cancelled process delivers nothing; the background one comes via the outbox
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert [item.message.content for item in finished] == ["first final"]
+    tasks = {task.title: task for task in await store.list(runner.dialog_id)}
+    assert tasks["second"].status is TaskStatus.CANCELLED  # the row is kept
+    assert tasks["first"].status is TaskStatus.DONE
+    assert [m.content for m in runner.history()] == ["first", "second", "first final"]
 
 
-async def test_process_limit_injects_refusal_into_busy_foreground(
+async def test_process_limit_delivers_a_canned_notice_without_an_llm_run(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tool = BlockingTool()
@@ -855,28 +988,26 @@ async def test_process_limit_injects_refusal_into_busy_foreground(
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("new question")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_REFUSAL)
-    await asyncio.sleep(0)
+    assert len(llm.requests) == 1  # the notice needs no LLM run
     tool.release.set()
     events = await collect_completions(queue, 1)
+    events += await collect_until(queue, is_delivered(runner.history()[2].content))
 
-    assert len(completions(events)) == 1
-    refusal = runner.history()[2]
-    assert refusal.role is MessageRole.SYSTEM
-    assert "process limit (1)" in refusal.content
-    assert "start" in refusal.content
-    second_request = llm.requests[1]
-    assert any(
-        m.role is MessageRole.SYSTEM and "process limit" in m.content for m in second_request
-    )
+    assert len(completions(events)) == 1  # no new process was started for the question
+    notice = runner.history()[2]
+    assert notice.role is MessageRole.ASSISTANT
+    assert "process limit (1)" in notice.content
+    assert "start" in notice.content
+    # the queued notice is delivered once the foreground is free
+    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
+    assert deltas == ["after", notice.content]
+    assert len(llm.requests) == RETRIED_CALLS  # still no extra run
 
 
-async def test_process_limit_starts_report_run_when_foreground_is_free(
+async def test_process_limit_notice_flushes_immediately_when_foreground_is_free(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    llm = BranchLLM(
-        main=[reply("report answer"), reply("bg reported")],
-        background=[reply(TASK_RESULT)],
-    )
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
     llm.gate_background = True
     store = InMemoryTaskStore()
     manager = make_manager(
@@ -892,26 +1023,25 @@ async def test_process_limit_starts_report_run_when_foreground_is_free(
     assert TASK_TITLE in spawned or "task" in spawned
 
     await runner.submit("new question")
-    events = await collect_completions(queue, 1)
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+    events = await collect_until(queue, is_delivered(runner.history()[1].content))
 
-    refusal = runner.history()[1]
-    assert refusal.role is MessageRole.SYSTEM
-    assert "process limit (1)" in refusal.content
-    assert TASK_TITLE in refusal.content
+    # the slot is taken by the background task: a canned notice, no report run
+    notice = runner.history()[1]
+    assert notice.role is MessageRole.ASSISTANT
+    assert "process limit (1)" in notice.content
+    assert TASK_TITLE in notice.content
+    assert llm.main_requests == []
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert [item.message.content for item in finished] == ["report answer"]
-    report_branch = llm.main_requests[-1]
-    assert report_branch[-2].content == refusal.content
-    assert report_branch[-1].role is MessageRole.USER
-    assert report_branch[-1].content.endswith(REPORT_NUDGE)  # date envelope + nudge
+    assert [item.message.content for item in finished] == [notice.content]
 
     llm.background_release.set()
-    events = await collect_completions(queue, 2)
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
 
-    # the delivered result deletes its task row; the history keeps the content
-    assert await store.list(runner.dialog_id) == []
-    contents = [m.content for m in runner.history()]
-    assert any(TASK_RESULT in content for content in contents)
+    task = await single_task(store, runner.dialog_id)
+    assert task.status is TaskStatus.DONE
+    assert task.delivered_at is not None
+    assert runner._pending_deliveries == []
 
 
 async def test_spawn_task_refuses_over_the_process_limit(
@@ -989,13 +1119,15 @@ async def test_delete_task_stops_a_live_background_process(
     assert [(item.title, item.status) for item in completions(events)] == [
         (TASK_TITLE, TaskStatus.CANCELLED.value)
     ]
-    # the stopped task's row is gone and nothing is delivered for it
-    assert await store.list(runner.dialog_id) == []
+    # the stopped task's row is kept as CANCELLED and nothing is delivered
+    row = await single_task(store, runner.dialog_id)
+    assert row.status is TaskStatus.CANCELLED
+    assert runner._pending_deliveries == []
 
-    # the actor survived the deleted-row termination notice
+    # the actor survived the cancelled task's termination notice
     await runner.submit("ping")
     await collect_completions(queue, 1)
-    assert runner.history()[-1] == reply("pong")
+    assert runner.history()[-1].content == "pong"
 
 
 async def test_delete_task_reports_not_running_for_an_unknown_task(
@@ -1015,7 +1147,7 @@ async def test_delete_task_from_inside_its_own_process_is_refused(
     inner = TaskDeleteTool(store=store, cron_store=SqlAlchemyCronStore(session_factory))
     registry.register(SelfDeleteTool(inner, store))
     llm = BranchLLM(
-        main=[reply("report answer")],
+        main=[],
         background=[self_delete_call(), reply(TASK_RESULT)],
     )
     manager = make_manager(llm, registry, session_factory, ManagerOptions(store=store))
@@ -1023,23 +1155,25 @@ async def test_delete_task_from_inside_its_own_process_is_refused(
     queue = runner.subscribe()
 
     await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
-    events = await collect_completions(queue, 2)
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
 
     # the self-deletion was refused: the task ran to completion and was delivered
     by_title = {item.title: item.status for item in completions(events)}
     assert by_title[TASK_TITLE] == TaskStatus.DONE.value
-    assert await store.list(runner.dialog_id) == []
-    contents = [m.content for m in runner.history()]
-    assert any(TASK_RESULT in content for content in contents)
+    task = await single_task(store, runner.dialog_id)
+    assert task.status is TaskStatus.DONE
+    assert task.delivered_at is not None
+    assert [m.content for m in runner.history()] == [TASK_RESULT]
+    assert runner.history()[0].task_id == task.id
 
 
-async def test_task_create_skill_runs_background_process_and_reports(
+async def test_task_create_tool_runs_background_process_and_delivers(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     registry = ToolRegistry()
     registry.register(TaskCreateTool(cron_store=SqlAlchemyCronStore(session_factory)))
     llm = BranchLLM(
-        main=[task_create_call(), reply("spawn confirmed"), reply("report answer")],
+        main=[task_create_call(), reply("spawn confirmed")],
         background=[reply(TASK_RESULT)],
     )
     llm.gate_background = True
@@ -1049,31 +1183,30 @@ async def test_task_create_skill_runs_background_process_and_reports(
     queue = runner.subscribe()
 
     await runner.submit("do it in the background")
-    await collect_completions(queue, 1)
+    events = await collect_completions(queue, 1)
     llm.background_release.set()
-    events = await collect_completions(queue, 2)
+    events += await collect_until(queue, is_delivered(TASK_RESULT))
 
-    # the result is delivered and its row deleted; the content stays in the history
-    assert await store.list(runner.dialog_id) == []
-
-    notification = runner.history()[-2]
-    assert notification.role is MessageRole.SYSTEM
-    assert TASK_TITLE in notification.content
-    assert TASK_RESULT in notification.content
-    assert runner.history()[-1] == reply("report answer")
-
+    # the result is delivered verbatim; no report run rephrases it
+    assert [m.content for m in runner.history()] == [
+        "do it in the background",
+        "spawn confirmed",
+        TASK_RESULT,
+    ]
+    tasks = {task.kind: task for task in await store.list(runner.dialog_id)}
+    assert tasks[TaskKind.RUN].status is TaskStatus.DONE
+    assert tasks[TaskKind.RUN].delivered_at is not None
+    assert runner.history()[-1].task_id == tasks[TaskKind.RUN].id
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert [item.message.content for item in finished] == ["report answer"]
-    report_request = llm.main_requests[-1]
-    assert report_request[-1].role is MessageRole.USER
-    assert report_request[-1].content.endswith(REPORT_NUDGE)  # date envelope + nudge
+    assert [item.message.content for item in finished] == ["spawn confirmed", TASK_RESULT]
+    assert len(llm.main_requests) == RETRIED_CALLS  # the tool iteration and the final answer
     background_request = llm.background_requests[0]
     assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
     assert background_request[1].role is MessageRole.USER
     assert background_request[1].content.endswith(TASK_PROMPT)  # date envelope + prompt
 
 
-async def test_task_done_notification_injected_into_busy_foreground(
+async def test_background_delivery_waits_for_a_busy_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tool = BlockingTool()
@@ -1090,73 +1223,133 @@ async def test_task_done_notification_injected_into_busy_foreground(
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
     await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
-    await wait_for_condition(lambda: any(TASK_RESULT in m.content for m in runner.history()))
-    await asyncio.sleep(0)
-    tool.release.set()
-    await collect_completions(queue, 2)
+    (task,) = [t for t in await store.list(runner.dialog_id) if t.kind is TaskKind.RUN]
+    await wait_for_condition(lambda: task.status is TaskStatus.DONE)
+    # the foreground is busy: the finished result waits in the outbox, unstamped
+    assert task.delivered_at is None
+    assert len(runner._pending_deliveries) == 1
 
+    tool.release.set()
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
+
+    # delivered whole, after the foreground's own stream events
+    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
+    assert deltas == ["after", TASK_RESULT]
+    assert task.delivered_at is not None
+    assert runner._pending_deliveries == []
+    # the foreground pulled the background final into its next iteration
     second_request = llm.main_requests[1]
-    assert any(m.role is MessageRole.SYSTEM and TASK_RESULT in m.content for m in second_request)
-    # the delivered result deletes its task row
-    assert await store.list(runner.dialog_id) == []
+    assert any(TASK_RESULT in m.content for m in second_request)
+
+
+class FailingMarkDeliveredStore(InMemoryTaskStore):
+    """Task store whose first mark_delivered raises, to exercise the flush retry."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next = True
+
+    async def mark_delivered(self, task_id: str) -> None:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("store down")
+        await super().mark_delivered(task_id)
+
+
+async def test_delivery_is_retried_when_marking_delivered_fails(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = FailingMarkDeliveredStore()
+    llm = BranchLLM(main=[reply("pong")], background=[reply(TASK_RESULT)])
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
+    # the broadcast happened, but the stamp failed: the delivery stays queued
+    (task,) = await store.list(runner.dialog_id)
+    assert task.status is TaskStatus.DONE
+    assert task.delivered_at is None
+    assert len(runner._pending_deliveries) == 1
+
+    # the next flush (any termination with a free foreground) retries it
+    await runner.submit("ping")
+    events += await collect_until(
+        queue, lambda e: isinstance(e.payload, TextDelta) and e.payload.text == TASK_RESULT
+    )
+
+    assert task.delivered_at is not None
+    assert runner._pending_deliveries == []
+    # the retry re-sends the events: the transport may see a duplicate
+    result_deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)].count(
+        TASK_RESULT
+    )
+    assert result_deltas == RETRIED_CALLS
 
 
 async def test_interrupted_turn_is_salvaged_into_the_narrative(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = StallingLLM()
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    store = InMemoryTaskStore()
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await runner.submit("work")
     await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
     await runner.cancel()
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
     llm.release.set()
     events = await collect_until(queue, is_completed)
 
     assert any(isinstance(e.payload, Cancelled) for e in events)
     done = completions(events)
     assert [item.status for item in done] == [TaskStatus.CANCELLED.value]
-    assert runner.history() == [
-        ChatMessage(role=MessageRole.USER, content="work"),
-        ChatMessage(role=MessageRole.ASSISTANT, content=PARTIAL),
-        ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE),
+    history = runner.history()
+    assert [message.role for message in history] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.SYSTEM,
     ]
+    assert history[1].content == PARTIAL
+    assert history[2].content == INTERRUPTED_NOTE
+    task = await single_task(store, runner.dialog_id)
+    assert task.status is TaskStatus.CANCELLED  # the row is kept, nothing delivered
+    assert history[1].task_id == task.id
     dialog = await get_dialog(session_factory)
-    assert await MessageRepository(session_factory).list(dialog.id) == runner.history()
+    assert await MessageRepository(session_factory).list(dialog.id) == history
 
 
-async def test_injection_at_run_end_gets_own_process(
+async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    llm = GatedLLM()
-    router = FakeRouter()
-    manager = make_manager(llm, quick_registry(), session_factory, ManagerOptions(router=router))
+    tool = BlockingTool()
+    llm = ToolStallingLLM()
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
-    await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
-
-    router.decide(RouteOp(action=RouteAction.INJECT))
-    await runner.submit("extra context")
-    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
-    await asyncio.sleep(0)
+    await runner.submit("work")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await runner.cancel()
     llm.release.set()
-    await collect_completions(queue, 2)
+    tool.release.set()
+    events = await collect_until(queue, is_completed)
 
-    assert len(llm.requests) == EXPECTED_LLM_CALLS
-    third_request = llm.requests[2]
-    assert any(m.role is MessageRole.USER and m.content == "extra context" for m in third_request)
-    assert runner.history() == [
-        ChatMessage(role=MessageRole.USER, content="start"),
-        ChatMessage(role=MessageRole.USER, content="extra context"),
-        reply("first final"),
-        reply("after"),
+    assert any(isinstance(e.payload, Cancelled) for e in events)
+    done = completions(events)
+    assert [item.status for item in done] == [TaskStatus.CANCELLED.value]
+    history = runner.history()
+    assert [message.role for message in history] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.SYSTEM,
     ]
+    assert history[1].content == PARTIAL  # salvaged despite the trailing tool reply
+    assert history[2].content == INTERRUPTED_NOTE
+    dialog = await get_dialog(session_factory)
+    assert await MessageRepository(session_factory).list(dialog.id) == history
 
 
 async def test_narrative_is_rebuilt_after_manager_restart(
@@ -1173,10 +1366,7 @@ async def test_narrative_is_rebuilt_after_manager_restart(
     restarted = make_manager(ScriptedLLM([]), quick_registry(), session_factory)
     restored = await restarted.get_or_create_runner(USER_ID, CHANNEL)
 
-    assert restored.history() == [
-        ChatMessage(role=MessageRole.USER, content="start"),
-        reply("after"),
-    ]
+    assert [m.content for m in restored.history()] == ["start", "after"]
 
 
 CRON_JOB_ID = "cron-job-1"
@@ -1187,7 +1377,7 @@ CRON_PROMPT = "prepare the daily report"
 async def test_wake_runs_cron_tagged_background_process(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
     store = InMemoryTaskStore()
     manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -1195,22 +1385,79 @@ async def test_wake_runs_cron_tagged_background_process(
 
     delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
     assert delivered is True
-    await collect_completions(queue, 2)
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
 
-    # the delivered result deletes its row; the notification keeps the content
-    assert await store.list(runner.dialog_id) == []
-    notification = runner.history()[-2]
-    assert notification.role is MessageRole.SYSTEM
-    assert CRON_TITLE in notification.content
-    assert TASK_RESULT in notification.content
-    assert runner.history()[-1] == reply("report answer")
+    # exactly one delivered message, with the verbatim result and the task link
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert len(finished) == 1
+    task = await single_task(store, runner.dialog_id)
+    assert finished[0].message == ChatMessage(
+        role=MessageRole.ASSISTANT, content=TASK_RESULT, task_id=task.id
+    )
+    assert task.status is TaskStatus.DONE
+    assert task.delivered_at is not None
+    assert task.input["cron_job_id"] == CRON_JOB_ID
+    assert isinstance(task.input["fired_at"], str)  # the parent linkage timestamp
+    assert runner.history() == [finished[0].message]
+    assert runner._pending_deliveries == []
+    assert llm.main_requests == []  # no report run
     background_request = llm.background_requests[0]
     assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
     assert background_request[1].role is MessageRole.USER
     assert background_request[1].content.endswith(CRON_PROMPT)  # date envelope + prompt
 
 
-async def test_wake_over_the_process_limit_publishes_a_system_note(
+async def test_wake_delivers_a_failed_event_for_a_failed_cron_task(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = FailingTaskLLM()
+    store = InMemoryTaskStore()
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    assert delivered is True
+    events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
+
+    failed = [e.payload for e in events if isinstance(e.payload, Failed)]
+    assert len(failed) == 1
+    assert PROVIDER_ERROR_MESSAGE in failed[0].error
+    task = await single_task(store, runner.dialog_id)
+    assert task.status is TaskStatus.FAILED
+    assert PROVIDER_ERROR_MESSAGE in (task.error or "")
+    assert task.delivered_at is not None
+    assert runner.history() == []  # a failure leaves no message in the history
+
+
+async def test_two_cron_results_are_delivered_separately(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[], background=[reply("report one"), reply("report two")])
+    store = InMemoryTaskStore()
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.wake(USER_ID, CHANNEL, "first job", CRON_PROMPT, CRON_JOB_ID)
+    await manager.wake(USER_ID, CHANNEL, "second job", CRON_PROMPT, "cron-job-2")
+    events = await collect_completions(queue, 2)
+    events += await collect_until(queue, is_delivered("report two"))
+
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert {item.message.content for item in finished} == {"report one", "report two"}
+    tasks = await store.list(runner.dialog_id)
+    assert {task.title for task in tasks} == {"first job", "second job"}
+    assert all(task.status is TaskStatus.DONE for task in tasks)
+    assert all(task.delivered_at is not None for task in tasks)
+    # one task = one message, each linked to its producer
+    by_task = {task.id: task for task in tasks}
+    history = runner.history()
+    assert {message.content for message in history} == {"report one", "report two"}
+    assert all(message.task_id in by_task for message in history)
+
+
+async def test_wake_over_the_process_limit_publishes_a_canned_notice(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tool = BlockingTool()
@@ -1232,30 +1479,142 @@ async def test_wake_over_the_process_limit_publishes_a_system_note(
     delivered = await runner.wake(CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
     assert delivered is False
 
-    await wait_for_condition(lambda: any("could not start" in m.content for m in runner.history()))
     note = runner.history()[-1]
-    assert note.role is MessageRole.SYSTEM
+    assert note.role is MessageRole.ASSISTANT
     assert f"Cron job '{CRON_TITLE}' could not start" in note.content
     assert "process limit (1)" in note.content
     assert "start" in note.content
-    assert await store.list(runner.dialog_id) == []  # no task was created
+    # no RUN task was created for the refused cron firing (the answer task of
+    # the foreground question is the only row)
+    assert [task for task in await store.list(runner.dialog_id) if task.kind is TaskKind.RUN] == []
 
     tool.release.set()
-    await collect_until(queue, is_completed)
+    events = await collect_until(queue, is_delivered(note.content))
+    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
+    assert deltas == ["after", note.content]  # flushed once the foreground is free
+    assert len(llm.requests) == RETRIED_CALLS  # the notice needed no LLM run
 
 
-class FailingFinalizeStore(InMemoryTaskStore):
-    """Task store whose first mark_done raises, to exercise finalize failure."""
+class RecordingOutcomeListener:
+    """TaskOutcomeListener stub recording (task, status) pairs; can be told to fail."""
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.fail_next_mark_done = True
+    def __init__(self, fail: bool = False) -> None:
+        self.calls: list[tuple[Task, TaskStatus]] = []
+        self.fail = fail
 
-    async def mark_done(self, task: Task, result: str) -> None:
-        if self.fail_next_mark_done:
-            self.fail_next_mark_done = False
-            raise RuntimeError("store unavailable")
-        await super().mark_done(task, result)
+    async def report_outcome(self, task: Task, status: TaskStatus) -> None:
+        if self.fail:
+            raise RuntimeError("listener boom")
+        self.calls.append((task, status))
+
+
+async def test_cron_task_outcome_is_reported_to_the_listener(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
+    listener = RecordingOutcomeListener()
+    manager = make_manager(
+        llm,
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(listener=listener),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    await collect_completions(queue, 1)
+
+    (reported,) = listener.calls
+    task, status = reported
+    assert status is TaskStatus.DONE
+    assert task.input["cron_job_id"] == CRON_JOB_ID
+
+
+async def test_plain_task_outcome_is_not_reported(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
+    listener = RecordingOutcomeListener()
+    manager = make_manager(
+        llm,
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(listener=listener),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
+    await collect_completions(queue, 1)
+
+    assert listener.calls == []  # no cron_job_id in the task input
+
+
+async def test_listener_failure_does_not_break_finalize(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        llm,
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(store=store, listener=RecordingOutcomeListener(fail=True)),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    await collect_until(queue, is_delivered(TASK_RESULT))
+
+    # finalize and delivery completed despite the listener failure
+    task = await single_task(store, runner.dialog_id)
+    assert task.status is TaskStatus.DONE
+    assert task.delivered_at is not None
+    assert [m.content for m in runner.history()] == [TASK_RESULT]
+
+
+async def test_promote_at_the_process_limit_moves_the_process_to_foreground(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tool = BlockingTool()
+    llm = GatedLLM()
+    router = FakeRouter()
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(router=router, max_processes=TWO_PROCESSES),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit("second")
+    events = await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
+
+    suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
+    assert [(item.title) for item in suspended] == ["first"]
+    first_id = suspended[0].process_id
+
+    # both process slots are taken; promotion moves a process, it does not create one
+    router.decide(RouteOp(action=RouteAction.PROMOTE, target_id=first_id))
+    await runner.submit("bring back the first one")
+    events = await collect_until(queue, lambda e: isinstance(e.payload, ProcessResumed))
+
+    resumed = events[-1].payload
+    assert isinstance(resumed, ProcessResumed)
+    assert (resumed.process_id, resumed.title) == (first_id, "first")
+    assert not any("process limit" in m.content for m in runner.history())
+
+    tool.release.set()
+    llm.release.set()
+    events = await collect_completions(queue, 2)
+    done = completions(events)
+    assert {item.title for item in done} == {"first", "second"}
 
 
 async def test_actor_survives_a_failing_command(
@@ -1337,6 +1696,20 @@ async def test_actor_dies_when_a_failing_command_races_its_cancellation(
     assert actor.cancelled()
 
 
+class FailingFinalizeStore(InMemoryTaskStore):
+    """Task store whose first mark_done raises, to exercise finalize failure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_mark_done = True
+
+    async def mark_done(self, task: Task, result: str) -> None:
+        if self.fail_next_mark_done:
+            self.fail_next_mark_done = False
+            raise RuntimeError("store unavailable")
+        await super().mark_done(task, result)
+
+
 async def test_process_slot_released_when_finalize_fails(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -1360,236 +1733,6 @@ async def test_process_slot_released_when_finalize_fails(
     await collect_completions(queue, 1)
 
 
-class RecordingOutcomeListener:
-    """TaskOutcomeListener stub recording (task, status) pairs; can be told to fail."""
-
-    def __init__(self, fail: bool = False) -> None:
-        self.calls: list[tuple[Task, TaskStatus]] = []
-        self.fail = fail
-
-    async def report_outcome(self, task: Task, status: TaskStatus) -> None:
-        if self.fail:
-            raise RuntimeError("listener boom")
-        self.calls.append((task, status))
-
-
-async def test_cron_task_outcome_is_reported_to_the_listener(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
-    listener = RecordingOutcomeListener()
-    manager = make_manager(
-        llm,
-        ToolRegistry(),
-        session_factory,
-        ManagerOptions(listener=listener),
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
-    await collect_completions(queue, 2)
-
-    (reported,) = listener.calls
-    task, status = reported
-    assert status is TaskStatus.DONE
-    assert task.input["cron_job_id"] == CRON_JOB_ID
-
-
-async def test_plain_task_outcome_is_not_reported(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    llm = BranchLLM(main=[reply("main answer")], background=[reply(TASK_RESULT)])
-    listener = RecordingOutcomeListener()
-    manager = make_manager(
-        llm,
-        ToolRegistry(),
-        session_factory,
-        ManagerOptions(listener=listener),
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
-    await collect_completions(queue, 1)
-
-    assert listener.calls == []  # no cron_job_id in the task input
-
-
-async def test_listener_failure_does_not_break_finalize(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
-    store = InMemoryTaskStore()
-    manager = make_manager(
-        llm,
-        ToolRegistry(),
-        session_factory,
-        ManagerOptions(store=store, listener=RecordingOutcomeListener(fail=True)),
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
-    await collect_completions(queue, 2)
-
-    # finalize and delivery completed despite the listener failure
-    assert await store.list(runner.dialog_id) == []
-    contents = [m.content for m in runner.history()]
-    assert any(TASK_RESULT in content for content in contents)
-
-
-async def test_promote_at_the_process_limit_moves_the_process_to_foreground(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    tool = BlockingTool()
-    llm = GatedLLM()
-    router = FakeRouter()
-    manager = make_manager(
-        llm,
-        blocking_registry(tool),
-        session_factory,
-        ManagerOptions(router=router, max_processes=TWO_PROCESSES),
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("first")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")
-    events = await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
-
-    suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
-    assert [(item.title) for item in suspended] == ["first"]
-    first_id = suspended[0].process_id
-
-    # both process slots are taken; promotion moves a process, it does not create one
-    router.decide(RouteOp(action=RouteAction.PROMOTE, target_id=first_id))
-    await runner.submit("bring back the first one")
-    events = await collect_until(queue, lambda e: isinstance(e.payload, ProcessResumed))
-
-    resumed = events[-1].payload
-    assert isinstance(resumed, ProcessResumed)
-    assert (resumed.process_id, resumed.title) == (first_id, "first")
-    assert not any("process limit" in m.content for m in runner.history())
-
-    tool.release.set()
-    llm.release.set()
-    events = await collect_completions(queue, 2)
-    done = completions(events)
-    assert {item.title for item in done} == {"first", "second"}
-
-
-class ToolStallingLLM:
-    """LLMClient stub emitting partial text plus a tool call, then stalling."""
-
-    def __init__(self) -> None:
-        self.release = asyncio.Event()
-
-    async def complete(
-        self,
-        messages: list[ChatMessage],
-        tools: list[ToolSpec] | None = None,
-    ) -> Completion:
-        raise NotImplementedError
-
-    async def stream(
-        self,
-        messages: list[ChatMessage],
-        tools: list[ToolSpec] | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        yield LlmTextDelta(text=PARTIAL)
-        yield ToolCallReady(call=ToolCall(id=CALL_ID, name=BLOCKING_TOOL, arguments={}))
-        await self.release.wait()
-        yield StreamFinished(message=reply("full"))
-
-
-async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    tool = BlockingTool()
-    llm = ToolStallingLLM()
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("work")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await runner.cancel()
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    llm.release.set()
-    events = await collect_until(queue, is_completed)
-
-    assert any(isinstance(e.payload, Cancelled) for e in events)
-    done = completions(events)
-    assert [item.status for item in done] == [TaskStatus.CANCELLED.value]
-    history = runner.history()
-    assert [message.role for message in history] == [
-        MessageRole.USER,
-        MessageRole.ASSISTANT,
-        MessageRole.SYSTEM,
-    ]
-    assert history[1].content == PARTIAL  # salvaged despite the trailing tool reply
-    assert history[2].content == INTERRUPTED_NOTE
-    dialog = await get_dialog(session_factory)
-    assert await MessageRepository(session_factory).list(dialog.id) == history
-
-
-class RecordingDeliveryStore(InMemoryTaskStore):
-    """Task store recording delete calls (delivery deletes the row)."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.deleted: list[str] = []
-
-    async def delete(self, task_id: str) -> None:
-        self.deleted.append(task_id)
-        await super().delete(task_id)
-
-
-class SystemNoteFailingRepository(MessageRepository):
-    """Message repository failing to persist SYSTEM messages only."""
-
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        super().__init__(session_factory)
-        self.failed_attempts = 0
-
-    async def append(
-        self,
-        dialog_id: str,
-        message: ChatMessage,
-        usage: Usage | None = None,
-        client_message_id: str | None = None,
-    ) -> None:
-        if message.role is MessageRole.SYSTEM:
-            self.failed_attempts += 1
-            raise RuntimeError("store down")
-        await super().append(dialog_id, message, usage=usage, client_message_id=client_message_id)
-
-
-async def test_result_row_is_not_deleted_when_the_note_persist_fails(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    store = RecordingDeliveryStore()
-    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-    runner._messages = SystemNoteFailingRepository(session_factory)
-
-    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
-    await collect_completions(queue, 1)
-    failing = runner._messages
-    assert isinstance(failing, SystemNoteFailingRepository)
-    await wait_for_condition(lambda: failing.failed_attempts > 0)
-
-    (task,) = await store.list(runner.dialog_id)
-    assert task.status is TaskStatus.DONE
-    assert store.deleted == []  # the delivery itself failed, the row must survive
-
-
 class GatedTaskStore(InMemoryTaskStore):
     """Task store pausing `add` until released, to force a spawn race."""
 
@@ -1608,7 +1751,7 @@ async def test_concurrent_spawns_do_not_exceed_the_process_limit(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = GatedTaskStore()
-    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
     manager = make_manager(
         llm,
         ToolRegistry(),
@@ -1635,7 +1778,7 @@ async def test_concurrent_spawns_do_not_exceed_the_process_limit(
     # the loser is refused before storing anything under the spawn lock
     assert [task.status for task in tasks] == [TaskStatus.RUNNING]
 
-    await collect_completions(queue, 2)  # background result + the report run
+    await collect_completions(queue, 1)
 
 
 class GatedCompactor:
@@ -1661,7 +1804,7 @@ async def test_spawn_during_a_pending_start_new_does_not_exceed_the_limit(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     compactor = GatedCompactor()
-    llm = BranchLLM(main=[reply("report answer")], background=[reply(TASK_RESULT)])
+    llm = BranchLLM(main=[reply("answer")], background=[])
     manager = make_manager(
         llm,
         ToolRegistry(),
@@ -1765,46 +1908,76 @@ def orphaned_task(dialog: Dialog, cron_job_id: str | None = None, **overrides: o
     return replace(task, **overrides) if overrides else task
 
 
-async def test_recover_interrupted_fails_orphaned_tasks(
+async def test_recover_interrupted_restarts_orphaned_run_tasks(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = InMemoryTaskStore()
-    llm = ScriptedLLM([])
+    llm = ScriptedLLM([reply(TASK_RESULT)])
     manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog)
     await store.add(task)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
 
     await manager.recover_interrupted()
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
 
-    # the interruption is recorded in the narrative and the row is deleted
-    with pytest.raises(TaskNotFoundError):
-        await store.get(task.id)
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    history = runner.history()
-    assert [message.role for message in history] == [MessageRole.SYSTEM]
-    assert history[0].content == TASK_INTERRUPTED_TEMPLATE.format(title=TASK_TITLE)
-    # a passive note must not start a report run
-    assert llm.requests == []
-
-
-class RecordingListener:
-    """TaskOutcomeListener stub recording report calls."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, TaskStatus]] = []
-
-    async def report_outcome(self, task: Task, status: TaskStatus) -> None:
-        self.calls.append((task.id, status))
+    assert task.status is TaskStatus.DONE  # the restarted process finished it
+    assert task.delivered_at is not None
+    # queue-mode: the process never became the foreground — the completion
+    # marker precedes the delivered events (a foreground would stream first)
+    done = completions(events)
+    assert [(item.title, item.status) for item in done] == [(TASK_TITLE, TaskStatus.DONE.value)]
+    assert isinstance(events[-1].payload, Finished)
+    assert runner._foreground_id is None
+    # the RUN restart branch is self-contained: background prompt + task prompt
+    request = llm.requests[0]
+    assert request[0].content == BACKGROUND_TASK_PROMPT
+    assert request[1].role is MessageRole.USER
+    assert request[1].content.endswith(TASK_PROMPT)
 
 
-async def test_recover_interrupted_reports_only_cron_tagged_orphans(
+async def test_recover_interrupted_restarts_orphaned_answer_tasks(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = InMemoryTaskStore()
-    listener = RecordingListener()
+    llm = ScriptedLLM([reply("re-answer")])
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    dialog = await get_dialog(session_factory)
+    # the question lives in the narrative, persisted before the crash
+    await MessageRepository(session_factory).append(
+        dialog.id, ChatMessage(role=MessageRole.USER, content="unanswered question")
+    )
+    task = orphaned_task(
+        dialog,
+        kind=TaskKind.ANSWER,
+        title="unanswered question",
+        input={"prompt": "unanswered question"},
+    )
+    await store.add(task)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.recover_interrupted()
+    await collect_until(queue, is_delivered("re-answer"))
+
+    assert task.status is TaskStatus.DONE
+    # the ANSWER restart branch re-attaches to the narrative: system + snapshot
+    request = llm.requests[0]
+    assert request[0] == ChatMessage(role=MessageRole.SYSTEM, content=PROMPT)
+    assert request[1].role is MessageRole.USER
+    assert request[1].content.endswith("unanswered question")
+
+
+async def test_recover_interrupted_reports_cron_outcome_after_the_restart(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    listener = RecordingOutcomeListener()
+    llm = ScriptedLLM([reply("one"), reply("two")])
     manager = make_manager(
-        ScriptedLLM([]),
+        llm,
         ToolRegistry(),
         session_factory,
         ManagerOptions(store=store, listener=listener),
@@ -1814,32 +1987,83 @@ async def test_recover_interrupted_reports_only_cron_tagged_orphans(
     plain_task = orphaned_task(dialog)
     for task in (cron_task, plain_task):
         await store.add(task)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
 
     await manager.recover_interrupted()
+    await collect_completions(queue, 2)
 
-    assert listener.calls == [(cron_task.id, TaskStatus.FAILED)]
-    assert await store.list(dialog.id) == []
+    # the restarted tasks report through the normal finalize path: only the
+    # cron-tagged one reaches the listener
+    assert [(task.id, status) for task, status in listener.calls] == [
+        (cron_task.id, TaskStatus.DONE)
+    ]
 
 
 async def test_recover_interrupted_redelivers_undelivered_results(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    store = RecordingDeliveryStore()
-    llm = ScriptedLLM([reply("your background result is ready")])
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([])
     manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
     await store.add(task)
-    # the row survived: the previous instance died before delivering the result
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
     await manager.recover_interrupted()
-    await collect_completions(queue, 1)  # the report run reacting to the note
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
 
-    assert store.deleted == [task.id]  # delivered, then the row is gone
-    contents = [message.content for message in runner.history()]
-    assert any(TASK_RESULT in content for content in contents)
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert finished[0].message == ChatMessage(
+        role=MessageRole.ASSISTANT, content=TASK_RESULT, task_id=task.id
+    )
+    assert task.delivered_at is not None
+    assert llm.requests == []  # redelivery needs no LLM run
+
+
+async def test_recover_interrupted_redelivers_undelivered_failures(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+    )
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog, status=TaskStatus.FAILED, error=PROVIDER_ERROR_MESSAGE)
+    await store.add(task)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.recover_interrupted()
+    events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
+
+    failed = [e.payload for e in events if isinstance(e.payload, Failed)]
+    assert failed[0].error == PROVIDER_ERROR_MESSAGE
+    assert task.delivered_at is not None
+    assert runner.history() == []
+
+
+async def test_recover_interrupted_skips_already_delivered_results(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([])
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
+    task.delivered_at = utc_now()
+    await store.add(task)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.recover_interrupted()
+    await asyncio.sleep(POLL_SECONDS * 5)  # give the actor a chance to misbehave
+
+    assert queue.empty()  # delivered already: no events, no LLM calls
+    assert llm.requests == []
+    assert runner.history() == []
 
 
 async def test_recover_interrupted_noop_without_candidates(
@@ -1858,7 +2082,7 @@ async def test_recover_interrupted_noop_without_candidates(
 class SweepFailingStore(InMemoryTaskStore):
     """Task store failing the orphaned sweep (database outage at startup)."""
 
-    async def fail_orphaned(self, error: str) -> list[Task]:
+    async def list_orphaned(self) -> list[Task]:
         raise RuntimeError("database down")
 
 
@@ -1873,3 +2097,62 @@ async def test_recover_interrupted_survives_store_failures(
     )
 
     await manager.recover_interrupted()  # a recovery failure must not take the app down
+
+
+async def test_restart_task_over_the_limit_fails_the_task_and_delivers(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tool = BlockingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call(), reply("after")])
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(store=store, max_processes=ONE_PROCESS),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("start")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog)
+    await store.add(task)
+    await runner.restart_task(task)  # the single slot is taken
+
+    assert task.status is TaskStatus.FAILED
+    assert task.error == RESTART_LIMIT_ERROR
+
+    tool.release.set()
+    events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
+
+    failed = [e.payload for e in events if isinstance(e.payload, Failed)]
+    assert any(item.error == RESTART_LIMIT_ERROR for item in failed)
+    assert task.delivered_at is not None
+
+
+async def test_request_result_delivery_is_idempotent(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+    )
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
+    await store.add(task)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    runner.request_result_delivery(task.id)
+    runner.request_result_delivery(task.id)  # a repeated sweep must not duplicate
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
+    await asyncio.sleep(POLL_SECONDS * 5)
+
+    assert task.delivered_at is not None
+    assert queue.empty()
+    delivered = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert len(delivered) == 1

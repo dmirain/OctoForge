@@ -39,7 +39,6 @@ FINAL_CONTENT = "done"
 CALL_ID = "call-1"
 FAILURE_MESSAGE = "boom"
 TIMEOUT_CLASS_NAME = "TimeoutError"
-INJECTED_CONTENT = "extra context"
 SLOW_NAME = "slow_skill"
 FAST_NAME = "fast_skill"
 SLOW_CALL_ID = "call-slow"
@@ -140,21 +139,6 @@ class EmptyFailingTool:
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         raise TimeoutError
-
-
-class InjectingTool:
-    """Tool stub injecting a message into the running loop."""
-
-    def __init__(self, control: LoopControl) -> None:
-        self._control = control
-
-    @property
-    def spec(self) -> ToolSpec:
-        return ToolSpec(name=TOOL_NAME, description="injecting stub", parameters_schema={})
-
-    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        self._control.inject(ChatMessage(role=MessageRole.USER, content=INJECTED_CONTENT))
-        return TOOL_OUTPUT
 
 
 class EagerLLM:
@@ -355,21 +339,6 @@ async def test_tool_call_flow_events_and_history() -> None:
     assert len(tool_messages) == 1
     assert tool_messages[0].tool_call_id == CALL_ID
     assert llm.requests[1][-1] == tool_messages[0]
-
-
-async def test_injected_message_reaches_next_iteration() -> None:
-    control = LoopControl()
-    llm = ScriptedLLM([assistant_with_call(), final_reply()])
-    loop = AgentLoop(
-        llm_client=llm,
-        registry=make_registry(InjectingTool(control)),
-        max_iterations=3,
-    )
-
-    await collect(loop.stream([user_message()], control, CTX))
-
-    second_request = llm.requests[1]
-    assert any(m.role is MessageRole.USER and m.content == INJECTED_CONTENT for m in second_request)
 
 
 async def test_cancel_mid_stream_keeps_partial_message() -> None:

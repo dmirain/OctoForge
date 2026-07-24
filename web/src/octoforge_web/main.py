@@ -213,11 +213,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     ),
                     options=RunnerOptions(
                         max_processes=settings.max_processes,
-                        task_outcome_listener=build_cron_outcome_reporter(
-                            cron_store,
-                            retry_limit=settings.cron_retry_limit,
-                            backoff_base_seconds=settings.cron_retry_backoff_seconds,
-                        ),
+                        task_outcome_listener=build_cron_outcome_reporter(cron_store),
                     ),
                 ),
                 dialogs=dialogs,
@@ -225,8 +221,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 tasks=task_store,
             )
             # Sweep before the scheduler and surfaces start: orphaned tasks
-            # are failed (cron-tagged ones get a bounded retry) and persisted
-            # results that never reached their dialog are redelivered.
+            # are restarted as background processes and persisted results
+            # that never reached their dialog are redelivered.
             await manager.recover_interrupted()
             scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
             telegram = _start_telegram(

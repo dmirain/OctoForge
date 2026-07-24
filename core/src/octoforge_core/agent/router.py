@@ -120,6 +120,10 @@ class LLMRouter:
         max_processes: int,
     ) -> RouteDecision:
         """Route the message; fall back to a deterministic decision on LLM trouble."""
+        if not processes:
+            # No active processes: the decision is trivially START_NEW (the
+            # runner maps an empty package to it), so the LLM call is skipped.
+            return RouteDecision()
         try:
             completion = await asyncio.wait_for(
                 self._llm.complete(

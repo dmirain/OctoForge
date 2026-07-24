@@ -40,8 +40,6 @@ DEFAULT_SELF_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CRON_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_CRON_LEASE_TTL_SECONDS = 60.0
 DEFAULT_CRON_REPLAY_LIMIT = 5
-DEFAULT_CRON_RETRY_LIMIT = 3
-DEFAULT_CRON_RETRY_BACKOFF_SECONDS = 60.0
 DEFAULT_RERANKER_MODEL = ""
 DEFAULT_RERANKER_API_URL = "https://api.siliconflow.cn/v1/rerank"
 DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
@@ -103,8 +101,6 @@ class Settings(BaseSettings):
     cron_poll_interval_seconds: float = DEFAULT_CRON_POLL_INTERVAL_SECONDS
     cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
     cron_replay_limit: int = DEFAULT_CRON_REPLAY_LIMIT
-    cron_retry_limit: int = DEFAULT_CRON_RETRY_LIMIT
-    cron_retry_backoff_seconds: float = DEFAULT_CRON_RETRY_BACKOFF_SECONDS
     telegram_bot_token: str = ""
     telegram_poll_timeout_seconds: float = DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
     telegram_edit_throttle_seconds: float = DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS

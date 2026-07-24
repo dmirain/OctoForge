@@ -267,6 +267,32 @@ async def test_message_usage_round_trip(
     assert rows[1].completion_tokens is None
 
 
+async def test_message_task_id_round_trip(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    await messages.append(
+        dialog.id,
+        ChatMessage(role=MessageRole.ASSISTANT, content="task answer", task_id="task-1"),
+    )
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="plain"))
+
+    stored = await messages.list(dialog.id)
+    assert stored[0].task_id == "task-1"
+    assert stored[1].task_id is None
+    async with session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(MessageRow).where(MessageRow.dialog_id == dialog.id).order_by(MessageRow.seq)
+            )
+        ).all()
+    assert rows[0].task_id == "task-1"
+    assert rows[1].task_id is None
+
+
 async def test_client_message_id_dedup_round_trip(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -483,7 +509,7 @@ async def test_mark_failed_sets_error(session_factory: async_sessionmaker[AsyncS
     assert stored.finished_at is not None
 
 
-async def test_fail_orphaned_fails_only_pending_and_running(
+async def test_list_orphaned_returns_pending_and_running_without_mutation(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
@@ -494,39 +520,59 @@ async def test_fail_orphaned_fails_only_pending_and_running(
     for task in (pending, running, done, cancelled):
         await store.add(task)
 
-    orphaned = await store.fail_orphaned(TASK_ERROR)
+    orphaned = await store.list_orphaned()
 
     assert {task.id for task in orphaned} == {pending.id, running.id}
-    assert all(task.status is TaskStatus.FAILED for task in orphaned)
-    for task in (pending, running):
-        stored = await store.get(task.id)
-        assert stored.status is TaskStatus.FAILED
-        assert stored.error == TASK_ERROR
-        assert stored.finished_at is not None
-        assert stored.finished_at.tzinfo == UTC
-    assert (await store.get(done.id)).status is TaskStatus.DONE
-    assert (await store.get(cancelled.id)).status is TaskStatus.CANCELLED
+    # read-only: the sweep must not mutate the rows it returns
+    assert (await store.get(pending.id)).status is TaskStatus.PENDING
+    assert (await store.get(running.id)).status is TaskStatus.RUNNING
 
 
-async def test_fail_orphaned_without_candidates_returns_empty(
+async def test_list_orphaned_without_candidates_returns_empty(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     await store.add(make_task(status=TaskStatus.DONE))
 
-    assert await store.fail_orphaned(TASK_ERROR) == []
+    assert await store.list_orphaned() == []
 
 
-async def test_list_undelivered_returns_finished_rows_only(
+async def test_list_undelivered_returns_terminal_rows_without_delivery_stamp(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     done = make_task(title="done", status=TaskStatus.DONE)
     failed = make_task(title="failed", status=TaskStatus.FAILED)
+    delivered = make_task(title="delivered", status=TaskStatus.DONE)
     running = make_task(title="running", status=TaskStatus.RUNNING)
-    for task in (done, failed, running):
+    for task in (done, failed, delivered, running):
         await store.add(task)
+    await store.mark_delivered(delivered.id)
 
     undelivered = await store.list_undelivered()
 
     assert {task.id for task in undelivered} == {done.id, failed.id}
+
+
+async def test_mark_delivered_stamps_the_task(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    task = make_task(status=TaskStatus.DONE)
+    await store.add(task)
+
+    await store.mark_delivered(task.id)
+
+    stored = await store.get(task.id)
+    assert stored.delivered_at is not None
+    assert stored.delivered_at.tzinfo == UTC
+    assert await store.list_undelivered() == []
+
+
+async def test_mark_delivered_unknown_task_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+
+    with pytest.raises(TaskNotFoundError):
+        await store.mark_delivered("missing")

@@ -13,19 +13,19 @@ class TaskSpawner(Protocol):
 
 
 class TaskDeleteOutcome(StrEnum):
-    """Result of a dialog-bound task deletion."""
+    """Result of a dialog-bound task stop request."""
 
-    # a live process was stopped; its finalization removes the store row
+    # a live process was stopped; its finalization marks the row CANCELLED
     DELETED = "deleted"
-    # no live process exists (terminal or orphaned row); the caller deletes it
+    # no live process exists (terminal or orphaned row); the caller cancels it
     NOT_RUNNING = "not_running"
 
 
 class TaskDeleter(Protocol):
-    """Stops a live task process of the current dialog so the task can be deleted."""
+    """Stops a live task process of the current dialog so it reaches a terminal state."""
 
     async def delete(self, task_id: str) -> TaskDeleteOutcome:
-        """Stop the task's process; the finalization that follows removes its row.
+        """Stop the task's process; the finalization that follows marks the row CANCELLED.
 
         Callers must not pass the id of the very task they run in (the pump
         cannot be awaited from within); `TaskDeleteTool` refuses that case

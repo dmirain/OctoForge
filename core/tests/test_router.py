@@ -107,21 +107,21 @@ def make_router(llm: ScriptedLLM | SlowLLM) -> LLMRouter:
     )
 
 
-async def test_empty_snapshot_still_calls_the_llm() -> None:
+async def test_empty_snapshot_skips_the_llm() -> None:
     llm = ScriptedLLM(reply=plain_reply())
     router = make_router(llm)
 
     decision = await router.route((), MESSAGE, MAX_PROCESSES)
 
     assert decision.ops == ()
-    assert llm.complete_calls == 1  # the router decides on the first message too
+    assert llm.complete_calls == 0  # no active processes: trivially START_NEW
 
 
 async def test_fallback_decision_has_no_ops() -> None:
     llm = ScriptedLLM(error=RuntimeError("llm down"))
     router = make_router(llm)
 
-    decision = await router.route((), MESSAGE, MAX_PROCESSES)
+    decision = await router.route((background(),), MESSAGE, MAX_PROCESSES)
 
     assert decision.ops == ()
 

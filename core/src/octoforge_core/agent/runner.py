@@ -1,10 +1,21 @@
-"""Per-dialog actor: owns the narrative and the processes answering user questions."""
+"""Per-dialog actor: owns the narrative, the task processes and result delivery.
+
+The actor is a message broker. Every process is backed by a task row
+(ANSWER for user questions, RUN for deferred/cron work). A process branch
+is `[system] + narrative snapshot + private working suffix`: instead of an
+inject channel, the branch re-syncs its narrative part from the actor's
+narrative at every iteration boundary (the pull model), so a message lands
+in the narrative exactly once and every running process sees it. Finished
+tasks are delivered through the outbox (`_pending_deliveries`): foreground
+(streamed) tasks are only stamped delivered, background ones are broadcast
+as a whole (TextDelta + Finished / Failed) once the foreground is free.
+There is no report run — delivery never involves an LLM call.
+"""
 
 import asyncio
 import logging
-import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from octoforge_core.agent.control import LoopControl
@@ -12,10 +23,12 @@ from octoforge_core.agent.events import (
     Cancelled,
     Failed,
     Finished,
+    IterationStarted,
     LoopEvent,
     ProcessCompleted,
     ProcessResumed,
     ProcessSuspended,
+    TextDelta,
 )
 from octoforge_core.agent.loop import AgentLoop, format_error
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, PromptProvider
@@ -43,29 +56,20 @@ logger = logging.getLogger(__name__)
 
 SUBSCRIBER_QUEUE_SIZE = 100
 TITLE_MAX_LENGTH = 60
-REPORT_TITLE = "report"
-REPORT_NUDGE = (
-    "The system notification above is new: briefly report it to the user "
-    "in the user's language, then stop."
-)
-TASK_DONE_TEMPLATE = (
-    "Background task '{title}' has finished with status {status}.\nResult:\n{result}"
-)
-LIMIT_REFUSAL_TEMPLATE = (
-    "The user asked: '{message}' — but the process limit ({limit}) is reached and the "
-    "request was not started. Propose cancelling one of the active processes: {titles}."
-)
 SPAWN_REFUSAL_TEMPLATE = (
     "cannot spawn: process limit ({limit}) reached; active: {titles} — ask the user what to cancel"
 )
-CRON_LIMIT_NOTE_TEMPLATE = (
-    "Cron job '{title}' could not start: process limit ({limit}) reached; active: {titles}"
+PROCESS_LIMIT_NOTICE_TEMPLATE = (
+    "I could not start handling '{message}': the process limit ({limit}) is reached. "
+    "Active processes: {titles}. Cancel one of them or wait for it to finish."
+)
+CRON_LIMIT_NOTICE_TEMPLATE = (
+    "Cron job '{title}' could not start: the process limit ({limit}) is reached. "
+    "Active processes: {titles}."
 )
 SPAWNED_TEMPLATE = "task {task_id} spawned"
-RESTART_INTERRUPT_ERROR = "interrupted by restart"
-TASK_INTERRUPTED_TEMPLATE = (
-    "Background task '{title}' was interrupted by a service restart and marked as failed."
-)
+RESTART_LIMIT_ERROR = "could not resume after the service restart: process limit reached"
+DEFAULT_TASK_ERROR = "unknown error"
 BACKGROUND_TASK_PROMPT = (
     "You are solving a background task. User message is the task. "
     "Produce the final answer as the result."
@@ -123,6 +127,7 @@ class _Submit:
     message: ChatMessage
     recorded: bool = False
     client_message_id: str | None = None
+    narrative_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +137,24 @@ class _Cancel:
 
 @dataclass(frozen=True, slots=True)
 class _ProcessTerminated:
+    """A process (or a recovery sweep) asking the actor to deliver a task outcome.
+
+    `terminal` is the live run's Finished/Failed event (None for cancellations
+    and recovery redeliveries — the stored task status decides then);
+    `streamed` tells whether the process was the foreground at termination,
+    i.e. the user already watched its outcome live.
+    """
+
+    task_id: str
+    terminal: Finished | Failed | None = None
+    streamed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Delivery:
+    """Events of one finished task awaiting transport delivery."""
+
+    events: tuple[LoopEvent, ...]
     task_id: str | None
 
 
@@ -140,20 +163,25 @@ _Command = _Submit | _Cancel | _ProcessTerminated
 
 @dataclass(slots=True)
 class _Process:
-    """One question being processed: its own loop run and history branch."""
+    """One task being processed: its own loop run and history branch.
+
+    Pull-model bookkeeping (narrative-built branches only): `synced_len` is
+    the branch length right after the last narrative sync — everything past
+    it is the private working suffix (assistant/tool messages of the run)
+    that survives every re-sync; `watermark` is the narrative length at that
+    sync. `narrative_built=False` marks self-contained branches (RUN tasks)
+    that never sync.
+    """
 
     id: str
     title: str
-    task_id: str | None
+    task_id: str
     control: LoopControl
     branch: list[ChatMessage]
     pump: asyncio.Task[None] | None = None
-    # Branch layout for the reactive-compaction rebuild: the head (system
-    # prompt) and the trail survive, the narrative between them is re-assembled
-    # after compaction. head_len=0 marks branches not built from the narrative
-    # (background tasks) — they are not rebuilt.
-    head_len: int = 0
-    trail: ChatMessage | None = None
+    narrative_built: bool = False
+    synced_len: int = 0
+    watermark: int = 0
     overflow_retried: bool = False
 
 
@@ -178,7 +206,7 @@ class RunnerConfig:
 
 
 class ConversationRunner:
-    """Actor owning a dialog's narrative, processes and subscribers."""
+    """Actor owning a dialog's narrative, processes, deliveries and subscribers."""
 
     def __init__(
         self,
@@ -200,10 +228,16 @@ class ConversationRunner:
         self._narrative = history
         self._processes: dict[str, _Process] = {}
         self._foreground_id: str | None = None
+        self._pending_deliveries: list[_Delivery] = []
+        # narrative indices of user messages that need no (further) answer:
+        # an answer task was created from them, or they were pure commands
+        self._covered_indices: set[int] = set()
         # serializes the limit-check → process-create sequence between the
         # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
         # which run in pump/scheduler tasks outside the actor's inbox
         self._spawn_lock = asyncio.Lock()
+        # serializes outbox flushes between the actor and wake()/restart_task()
+        self._flush_lock = asyncio.Lock()
         self._spawner: TaskSpawner = _DialogTaskSpawner(self)
         self._deleter: TaskDeleter = _DialogTaskDeleter(self)
         self._inbox: asyncio.Queue[_Command] = asyncio.Queue()
@@ -271,36 +305,39 @@ class ConversationRunner:
         async with self._spawn_lock:
             if len(self._processes) >= self._max_processes:
                 return self._spawn_refusal()
-            task = await self._prepare_process_task(title, prompt, cron_job_id=None)
-            self._start_process(task, title, prompt)
+            task = await self._prepare_process_task(
+                title, prompt, kind=TaskKind.RUN, cron_job_id=None
+            )
+            self._start_process(task)
         return SPAWNED_TEMPLATE.format(task_id=task.id)
 
     async def wake(self, title: str, prompt: str, cron_job_id: str) -> bool:
         """Start a cron-fired background process tagged with its cron job id.
 
-        Unlike `spawn_task`, hitting the process limit publishes a system note
-        (the delayed impossibility notification) instead of returning a text.
-        Returns whether the process was actually started, so the caller (the
-        scheduler) can tell a real delivery from a limit-skip and avoid
-        advancing the job's schedule on a skip.
+        Unlike `spawn_task`, hitting the process limit publishes a canned
+        broker notice (the delayed impossibility notification) instead of
+        returning a text. Returns whether the process was actually started,
+        so the caller (the scheduler) can tell a real delivery from a
+        limit-skip and avoid advancing the job's schedule on a skip.
         """
         async with self._spawn_lock:
             over_limit = len(self._processes) >= self._max_processes
             if not over_limit:
-                task = await self._prepare_process_task(title, prompt, cron_job_id=cron_job_id)
-                self._start_process(task, title, prompt)
+                task = await self._prepare_process_task(
+                    title, prompt, kind=TaskKind.RUN, cron_job_id=cron_job_id
+                )
+                self._start_process(task)
         if over_limit:
             await self._publish_cron_limit_note(title)
         return not over_limit
 
     async def delete_task(self, task_id: str) -> TaskDeleteOutcome:
-        """Stop a live task process so the task can be deleted.
+        """Stop a live task process so it reaches a terminal state.
 
-        The store row is removed by the finalization that follows the stop,
-        not here: deleting it earlier would crash the finalize/report path.
-        The caller must not pass the id of the process it runs in (the pump
-        cannot be awaited from within) — `TaskDeleteTool` refuses that via
-        `ToolContext.owner_task_id`.
+        The finalization that follows the stop marks the row CANCELLED (task
+        rows are kept forever). The caller must not pass the id of the
+        process it runs in (the pump cannot be awaited from within) —
+        `TaskDeleteTool` refuses that via `ToolContext.owner_task_id`.
         """
         process = self._processes.get(task_id)
         if process is None:
@@ -310,33 +347,83 @@ class ConversationRunner:
             await process.pump
         return TaskDeleteOutcome.DELETED
 
+    async def restart_task(self, task: Task) -> None:
+        """Restart a task orphaned by a service restart (always queue-mode).
+
+        RUN branches are self-contained (system prompt + task prompt);
+        ANSWER branches re-attach to the narrative (the question lives
+        there). Over the process limit the task is failed instead and the
+        failure is queued for delivery.
+        """
+        async with self._spawn_lock:
+            if len(self._processes) < self._max_processes:
+                await self._start_orphaned(task)
+                return
+        await self._tasks.mark_failed(task, RESTART_LIMIT_ERROR)
+        self._pending_deliveries.append(
+            _Delivery(events=(Failed(error=RESTART_LIMIT_ERROR),), task_id=task.id)
+        )
+        await self._flush_if_free()
+
+    async def _start_orphaned(self, task: Task) -> None:
+        """Start the replacement background process of an orphaned task."""
+        if task.kind is TaskKind.ANSWER:
+            narrative = await self._assemble_narrative()
+            process = self._create_process(
+                task=task,
+                branch=[self._system_message(), *narrative],
+                narrative_built=True,
+            )
+            process.synced_len = len(process.branch)
+            process.watermark = len(self._narrative)
+        else:
+            self._start_process(task)
+
     def _spawn_refusal(self) -> str:
         return SPAWN_REFUSAL_TEMPLATE.format(
             limit=self._max_processes, titles=self._active_titles()
         )
 
     async def _publish_cron_limit_note(self, title: str) -> None:
-        note = CRON_LIMIT_NOTE_TEMPLATE.format(
+        notice = CRON_LIMIT_NOTICE_TEMPLATE.format(
             title=title, limit=self._max_processes, titles=self._active_titles()
         )
-        await self._publish_system_note(note)
+        await self._deliver_notice(notice)
+
+    async def _deliver_notice(self, content: str) -> None:
+        """Persist a canned broker notice as an assistant message and queue it."""
+        notice = ChatMessage(role=MessageRole.ASSISTANT, content=content)
+        await self._persist(notice)
+        self._narrative.append(notice)
+        self._pending_deliveries.append(
+            _Delivery(
+                events=(TextDelta(text=content), Finished(message=notice)),
+                task_id=None,
+            )
+        )
+        await self._flush_if_free()
 
     async def _prepare_process_task(
         self,
         title: str,
         prompt: str,
+        *,
+        kind: TaskKind,
         cron_job_id: str | None,
     ) -> Task:
-        """Create and store the RUN task; the process is started by `_start_process`."""
-        task_input: dict[str, Any] = {"title": title, "prompt": prompt}
+        """Create and store the task backing a new process."""
+        task_input: dict[str, Any] = {"prompt": prompt}
+        if kind is TaskKind.RUN:
+            task_input["title"] = title
         if cron_job_id is not None:
             task_input["cron_job_id"] = cron_job_id
+            task_input["fired_at"] = utc_now().isoformat()
         task = Task(
             dialog_id=self._dialog.id,
             user_id=self._dialog.user_id,
             channel=self._dialog.channel,
             title=title,
-            kind=TaskKind.RUN,
+            kind=kind,
             input=task_input,
             status=TaskStatus.RUNNING,
             started_at=utc_now(),
@@ -344,16 +431,21 @@ class ConversationRunner:
         await self._tasks.add(task)
         return task
 
-    def _start_process(self, task: Task, title: str, prompt: str) -> None:
-        """Start the background process of an already-stored task."""
+    def _start_process(self, task: Task) -> None:
+        """Start the background process of an already-stored RUN task."""
+        prompt = task.input.get("prompt")
         self._create_process(
-            process_id=task.id,
-            title=title,
-            task_id=task.id,
+            task=task,
             branch=[
                 ChatMessage(role=MessageRole.SYSTEM, content=BACKGROUND_TASK_PROMPT),
-                _with_date_envelope(ChatMessage(role=MessageRole.USER, content=prompt)),
+                _with_date_envelope(
+                    ChatMessage(
+                        role=MessageRole.USER,
+                        content=prompt if isinstance(prompt, str) else task.title,
+                    )
+                ),
             ],
+            narrative_built=False,
         )
 
     def subscribe(self) -> asyncio.Queue[ConversationEvent]:
@@ -407,6 +499,7 @@ class ConversationRunner:
 
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
+        index = command.narrative_index
         if not command.recorded:
             if await self._is_duplicate(command.client_message_id):
                 logger.info(
@@ -417,8 +510,9 @@ class ConversationRunner:
                 return
             await self._persist(message, client_message_id=command.client_message_id)
             self._narrative.append(message)
+            index = len(self._narrative) - 1
         decision = await self._router.route(self._snapshot(), message.content, self._max_processes)
-        await self._apply_decision(message, decision)
+        await self._apply_decision(message, decision, index)
 
     async def _is_duplicate(self, client_message_id: str | None) -> bool:
         """Whether a submit with this idempotency key was already recorded."""
@@ -432,18 +526,98 @@ class ConversationRunner:
             foreground.control.cancel()
 
     async def _handle_terminated(self, command: _ProcessTerminated) -> None:
-        """Deliver a finished task result to the dialog exactly once."""
-        if command.task_id is None:
-            return
+        """Queue the delivery of a terminated task; flush when the foreground is free.
+
+        A live process arrives with its terminal event (`streamed` tells
+        whether the user already saw it); a recovery redelivery arrives with
+        no terminal and rebuilds the delivery from the stored task.
+        Cancellations and user-deleted rows deliver nothing.
+        """
         try:
             task = await self._tasks.get(command.task_id)
         except TaskNotFoundError:
-            return  # a stopped task deletes its row at finalize; nothing to deliver
-        if task.status not in (TaskStatus.DONE, TaskStatus.FAILED):
-            return
-        # deliver first, delete afterwards: a persist failure must not lose the result
-        await self._publish_system_note(self._format_task_done(task))
-        await self._tasks.delete(task.id)
+            return  # the user deleted the row (task_delete); nothing to deliver
+        if command.terminal is None:
+            self._enqueue_redelivery(task)
+        elif command.streamed:
+            await self._mark_streamed_delivered(task)
+        else:
+            self._enqueue_terminal(command.terminal, task)
+        await self._flush_if_free()
+
+    def _enqueue_redelivery(self, task: Task) -> None:
+        """Queue the stored outcome of a finished task for delivery (recovery path)."""
+        if task.delivered_at is not None:
+            return  # delivered already: redelivery is idempotent
+        if task.status is TaskStatus.DONE:
+            content = task.result or ""
+            self._pending_deliveries.append(
+                _Delivery(
+                    events=(
+                        TextDelta(text=content),
+                        Finished(
+                            message=ChatMessage(
+                                role=MessageRole.ASSISTANT, content=content, task_id=task.id
+                            )
+                        ),
+                    ),
+                    task_id=task.id,
+                )
+            )
+        elif task.status is TaskStatus.FAILED:
+            self._pending_deliveries.append(
+                _Delivery(
+                    events=(Failed(error=task.error or DEFAULT_TASK_ERROR),),
+                    task_id=task.id,
+                )
+            )
+
+    def _enqueue_terminal(self, terminal: Finished | Failed, task: Task) -> None:
+        """Queue a finished background process's outcome for delivery."""
+        if isinstance(terminal, Finished):
+            message = replace(terminal.message, task_id=task.id)
+            self._pending_deliveries.append(
+                _Delivery(
+                    events=(
+                        TextDelta(text=message.content),
+                        Finished(message=message, usage=terminal.usage),
+                    ),
+                    task_id=task.id,
+                )
+            )
+        else:
+            self._pending_deliveries.append(
+                _Delivery(events=(Failed(error=terminal.error),), task_id=task.id)
+            )
+
+    async def _mark_streamed_delivered(self, task: Task) -> None:
+        """Stamp a foreground task as delivered: the user watched it stream live."""
+        if task.status in (TaskStatus.DONE, TaskStatus.FAILED):
+            with suppress(TaskNotFoundError):  # a racing task_delete may drop the row
+                await self._tasks.mark_delivered(task.id)
+
+    async def _flush_if_free(self) -> None:
+        if self._foreground() is None:
+            await self._flush_deliveries()
+
+    async def _flush_deliveries(self) -> None:
+        """Broadcast queued deliveries, stamping each task delivered only after sending.
+
+        A store failure mid-flush keeps the remaining deliveries queued (the
+        already-broadcast one included): the next flush re-sends it — a
+        duplicate in the transport is the accepted price of never losing a
+        result.
+        """
+        async with self._flush_lock:
+            while self._pending_deliveries:
+                delivery = self._pending_deliveries[0]
+                for event in delivery.events:
+                    self._broadcast(event)
+                if delivery.task_id is not None:
+                    # a racing task_delete must not wedge the outbox behind it
+                    with suppress(TaskNotFoundError):
+                        await self._tasks.mark_delivered(delivery.task_id)
+                self._pending_deliveries.pop(0)
 
     def _snapshot(self) -> tuple[ProcessInfo, ...]:
         return tuple(
@@ -459,39 +633,56 @@ class ConversationRunner:
             for process in self._processes.values()
         )
 
-    async def _apply_decision(self, message: ChatMessage, decision: RouteDecision) -> None:
+    async def _apply_decision(
+        self, message: ChatMessage, decision: RouteDecision, index: int | None
+    ) -> None:
         ops = decision.ops or (RouteOp(action=RouteAction.START_NEW),)
         cancelled: set[str] = set()
+        inject = False
         for op in ops:
             if op.action is RouteAction.CANCEL:
                 if op.target_id is not None and self._cancel_process(op.target_id):
                     cancelled.add(op.target_id)
             elif op.action is RouteAction.INJECT:
-                await self._apply_inject(message, cancelled)
+                inject = True
+                await self._apply_inject(message, cancelled, index)
             elif op.action is RouteAction.START_NEW:
-                await self._apply_start_new(message, cancelled)
+                await self._apply_start_new(message, cancelled, index)
             elif op.action is RouteAction.PROMOTE:
                 self._apply_promote(op.target_id)
+        if not inject and index is not None:
+            # a package without inject is fully handled here: start_new covers
+            # the message itself, bare cancel/promote packages are pure commands
+            self._covered_indices.add(index)
 
     async def _apply_inject(
         self,
         message: ChatMessage,
         cancelled: set[str],
+        index: int | None,
     ) -> None:
-        foreground = self._foreground()
-        if foreground is not None:
-            foreground.control.inject(message)
+        """No-op for process control: the message already lives in the narrative.
+
+        A running process picks it up at its next iteration sync; without a
+        foreground the message needs its own process (fallback start).
+        """
+        if self._foreground() is not None:
             return
-        await self._apply_start_new(message, cancelled)
+        await self._apply_start_new(message, cancelled, index)
 
     async def _apply_start_new(
         self,
         message: ChatMessage,
         cancelled: set[str],
+        index: int | None,
     ) -> None:
         async with self._spawn_lock:
             if not self._exceeds_limit(cancelled):
-                await self._start_new(title=message.content[:TITLE_MAX_LENGTH])
+                await self._start_new(
+                    title=message.content[:TITLE_MAX_LENGTH],
+                    content=message.content,
+                    index=index,
+                )
                 return
         await self._reject_for_limit(message)
 
@@ -509,52 +700,46 @@ class ConversationRunner:
         return len(self._processes) - len(cancelled) + 1 > self._max_processes
 
     async def _reject_for_limit(self, message: ChatMessage) -> None:
-        note = LIMIT_REFUSAL_TEMPLATE.format(
+        """Deliver the canned process-limit notice for a refused user message."""
+        notice = PROCESS_LIMIT_NOTICE_TEMPLATE.format(
             message=message.content,
             limit=self._max_processes,
             titles=self._active_titles(),
         )
-        await self._publish_system_note(note)
+        await self._deliver_notice(notice)
 
     async def _start_new(
         self,
         title: str,
-        trail: ChatMessage | None = None,
+        content: str,
+        index: int | None,
     ) -> None:
-        """Start a foreground process over the compacted narrative, suspending the old one."""
+        """Start the foreground answer process of a narrative user message."""
         self._suspend_foreground()
-        narrative = await self._compactor.assemble(self._dialog, self._narrative)
-        branch = [
-            ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME)),
-            *narrative,
-            *([trail] if trail is not None else []),
-        ]
-        if len(branch) > 1:
-            branch[-1] = _with_date_envelope(branch[-1])
+        task = await self._prepare_process_task(
+            title, content, kind=TaskKind.ANSWER, cron_job_id=None
+        )
+        narrative = await self._assemble_narrative()
         process = self._create_process(
-            process_id=uuid.uuid4().hex,
-            title=title,
-            task_id=None,
-            branch=branch,
+            task=task,
+            branch=[self._system_message(), *narrative],
+            narrative_built=True,
         )
-        process.head_len = 1
-        process.trail = trail
+        process.synced_len = len(process.branch)
+        process.watermark = len(self._narrative)
         self._foreground_id = process.id
+        if index is not None:
+            self._covered_indices.add(index)
 
-    async def _start_report_run(self) -> None:
-        """Start a foreground run reacting to the latest narrative note (fg is free).
+    def _system_message(self) -> ChatMessage:
+        return ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME))
 
-        A trailing system note leaves some models without anything to answer
-        to (they reason but emit no content), so the run ends with a user-role
-        nudge asking for the report.
-
-        Privileged on purpose: no process-limit check and no spawn lock — the
-        note it reacts to must be reported even at the process limit.
-        """
-        await self._start_new(
-            title=REPORT_TITLE,
-            trail=ChatMessage(role=MessageRole.USER, content=REPORT_NUDGE),
-        )
+    async def _assemble_narrative(self) -> list[ChatMessage]:
+        """Assemble the narrative part of a branch, date-enveloping its tail copy."""
+        narrative = await self._compactor.assemble(self._dialog, self._narrative)
+        if narrative:
+            narrative[-1] = _with_date_envelope(narrative[-1])
+        return narrative
 
     def _suspend_foreground(self) -> None:
         foreground = self._foreground()
@@ -573,17 +758,17 @@ class ConversationRunner:
     def _create_process(
         self,
         *,
-        process_id: str,
-        title: str,
-        task_id: str | None,
+        task: Task,
         branch: list[ChatMessage],
+        narrative_built: bool,
     ) -> _Process:
         process = _Process(
-            id=process_id,
-            title=title,
-            task_id=task_id,
+            id=task.id,
+            title=task.title,
+            task_id=task.id,
             control=LoopControl(),
             branch=branch,
+            narrative_built=narrative_built,
         )
         process.pump = asyncio.create_task(self._pump_process(process))
         self._processes[process.id] = process
@@ -597,6 +782,7 @@ class ConversationRunner:
         signalled so the slot is never leaked.
         """
         status = TaskStatus.FAILED
+        terminal: LoopEvent = Cancelled()  # a cancelled pump (shutdown) has no terminal
         try:
             try:
                 terminal = await self._stream_terminal(process)
@@ -614,7 +800,7 @@ class ConversationRunner:
                     "process finalize failed: dialog=%s process=%s", self._dialog.id, process.id
                 )
         finally:
-            self._terminate_process(process, status)
+            self._terminate_process(process, status, terminal)
 
     async def _stream_terminal(self, process: _Process) -> LoopEvent:
         """Run the loop stream, compacting reactively once on a context overflow.
@@ -627,7 +813,7 @@ class ConversationRunner:
             try:
                 return await self._stream_once(process)
             except ContextOverflowError as exc:
-                if process.overflow_retried or process.head_len == 0:
+                if process.overflow_retried or not process.narrative_built:
                     return self._fail_run(process, format_error(exc))
                 process.overflow_retried = True
                 logger.info(
@@ -637,18 +823,26 @@ class ConversationRunner:
                 )
                 if not await self._compactor.compact_now(self._dialog):
                     return self._fail_run(process, format_error(exc))
-                await self._rebuild_branch(process)
+                await self._sync_branch(process, force=True)
 
-    async def _rebuild_branch(self, process: _Process) -> None:
-        """Re-assemble the narrative part of the branch after a compaction."""
-        narrative = await self._compactor.assemble(self._dialog, self._narrative)
-        process.branch[:] = [
-            *process.branch[: process.head_len],
-            *narrative,
-            *([process.trail] if process.trail is not None else []),
-        ]
-        if len(process.branch) > process.head_len:
-            process.branch[-1] = _with_date_envelope(process.branch[-1])
+    async def _sync_branch(self, process: _Process, *, force: bool = False) -> None:
+        """Re-assemble the narrative part of the branch, keeping the private suffix.
+
+        Runs at every iteration boundary for narrative-built processes (the
+        pull model): messages appended to the narrative since the last sync —
+        user messages, finals of other tasks, broker notes — become visible
+        to the run. An unchanged narrative leaves the branch byte-identical
+        (prefix cache), unless the sync is `force`d (reactive compaction).
+        """
+        if not process.narrative_built:
+            return
+        if not force and len(self._narrative) == process.watermark:
+            return
+        narrative = await self._assemble_narrative()
+        private = process.branch[process.synced_len :]
+        process.branch[:] = [self._system_message(), *narrative, *private]
+        process.synced_len = 1 + len(narrative)
+        process.watermark = len(self._narrative)
 
     def _fail_run(self, process: _Process, error: str) -> LoopEvent:
         """Broadcast and return a Failed terminal for the process."""
@@ -670,6 +864,10 @@ class ConversationRunner:
         terminal: LoopEvent = Failed(error="loop ended without a terminal event")
         try:
             async for event in self._loop.stream(process.branch, process.control, context):
+                if isinstance(event, IterationStarted):
+                    # pull model: re-sync the narrative part of the branch
+                    # before the loop's next LLM call reads it
+                    await self._sync_branch(process)
                 if self._foreground_id == process.id:
                     self._broadcast(event)
                 if isinstance(event, (Finished, Cancelled, Failed)):
@@ -685,44 +883,62 @@ class ConversationRunner:
                 self._broadcast(terminal)
         return terminal
 
-    def _terminate_process(self, process: _Process, status: TaskStatus) -> None:
-        """Remove the process, announce completion and requeue any drained injections."""
+    def _terminate_process(
+        self, process: _Process, status: TaskStatus, terminal: LoopEvent
+    ) -> None:
+        """Remove the process, announce completion and hand the outcome to the actor."""
+        streamed = self._foreground_id == process.id
         self._remove_process(process)
         self._broadcast(
             ProcessCompleted(process_id=process.id, title=process.title, status=status.value)
         )
-        self._inbox.put_nowait(_ProcessTerminated(task_id=process.task_id))
-        for leftover in process.control.drain():
-            self._inbox.put_nowait(_Submit(leftover, recorded=True))
+        self._inbox.put_nowait(
+            _ProcessTerminated(
+                task_id=process.task_id,
+                terminal=terminal if isinstance(terminal, (Finished, Failed)) else None,
+                streamed=streamed,
+            )
+        )
+        self._requeue_unanswered(process)
+
+    def _requeue_unanswered(self, process: _Process) -> None:
+        """Re-submit user messages the process finished without seeing.
+
+        The watermark tracks the narrative length at the process's last sync;
+        newer user messages without an answer task of their own go back
+        through routing, so no user message is left unanswered (this replaces
+        the inject channel's drain-requeue).
+        """
+        if not process.narrative_built:
+            return
+        for index in range(process.watermark, len(self._narrative)):
+            message = self._narrative[index]
+            if message.role is MessageRole.USER and index not in self._covered_indices:
+                self._inbox.put_nowait(_Submit(message, recorded=True, narrative_index=index))
 
     async def _finalize(self, process: _Process, terminal: LoopEvent) -> TaskStatus:
         """Fold the run outcome into the narrative and the task store."""
+        task = await self._tasks.get(process.task_id)
         if isinstance(terminal, Finished):
-            await self._persist(terminal.message, usage=terminal.usage)
-            self._narrative.append(terminal.message)
-            await self._resolve_task(process, result=terminal.message.content)
+            message = replace(terminal.message, task_id=process.task_id)
+            await self._persist(message, usage=terminal.usage)
+            self._narrative.append(message)
+            await self._tasks.mark_done(task, message.content)
             status = TaskStatus.DONE
         elif isinstance(terminal, Failed):
-            await self._fail_task(process, terminal.error)
+            await self._tasks.mark_failed(task, terminal.error)
             status = TaskStatus.FAILED
         else:
             await self._salvage_interrupted_turn(process)
+            await self._tasks.mark_cancelled(task)
             status = TaskStatus.CANCELLED
-        await self._report_outcome(process, status)
-        if status is TaskStatus.CANCELLED and process.task_id is not None:
-            # a stopped task leaves no row: the outcome is already reported and
-            # a cancelled result is never delivered to the dialog
-            with suppress(TaskNotFoundError):
-                await self._tasks.delete(process.task_id)
+        await self._report_outcome(task, status)
         return status
 
-    async def _report_outcome(self, process: _Process, status: TaskStatus) -> None:
+    async def _report_outcome(self, task: Task, status: TaskStatus) -> None:
         """Tell the outcome listener about a finished cron-tagged task, if any."""
         listener = self._task_outcome_listener
-        if listener is None or process.task_id is None:
-            return
-        task = await self._tasks.get(process.task_id)
-        if "cron_job_id" not in task.input:
+        if listener is None or "cron_job_id" not in task.input:
             return
         try:
             await listener.report_outcome(task, status)
@@ -731,31 +947,21 @@ class ConversationRunner:
                 "task outcome report failed: dialog=%s task=%s", self._dialog.id, task.id
             )
 
-    async def _resolve_task(self, process: _Process, result: str) -> None:
-        if process.task_id is None:
-            return
-        task = await self._tasks.get(process.task_id)
-        await self._tasks.mark_done(task, result)
-
-    async def _fail_task(self, process: _Process, error: str) -> None:
-        if process.task_id is None:
-            return
-        task = await self._tasks.get(process.task_id)
-        await self._tasks.mark_failed(task, error)
-
     async def _salvage_interrupted_turn(self, process: _Process) -> None:
         """Keep a cancelled run's partial answer in the narrative, flagged as incomplete.
 
+        Only the run's own messages (the private suffix) are salvageable.
         The pair is persisted atomically: the note must never be orphaned nor
         observed without the message it annotates (the compactor's tail
         snapshot relies on the pair being indivisible).
         """
-        last = _latest_assistant_with_content(process.branch)
+        last = _latest_assistant_with_content(process.branch[process.synced_len :])
         if last is None:
             return
+        salvaged = replace(last, task_id=process.task_id)
         note = ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE)
-        await self._messages.append_pair(self._dialog.id, last, note)
-        self._narrative.extend((last, note))
+        await self._messages.append_pair(self._dialog.id, salvaged, note)
+        self._narrative.extend((salvaged, note))
 
     def _remove_process(self, process: _Process) -> None:
         self._processes.pop(process.id, None)
@@ -770,36 +976,15 @@ class ConversationRunner:
     def _active_titles(self) -> str:
         return ", ".join(process.title for process in self._processes.values())
 
-    async def record_system_note(self, content: str) -> ChatMessage:
-        """Persist a system note in the narrative without routing it.
-
-        A passive note (like INTERRUPTED_NOTE): the agent sees it in the
-        history, but it neither injects into a live process nor starts a
-        report run — used for recovery facts that need no immediate answer.
-        Returns the recorded note.
-        """
-        note = ChatMessage(role=MessageRole.SYSTEM, content=content)
-        await self._persist(note)
-        self._narrative.append(note)
-        return note
-
     def request_result_delivery(self, task_id: str) -> None:
-        """Enqueue delivery of a finished task result via the exactly-once path.
+        """Enqueue delivery of a finished task result via the outbox path.
 
         Used by startup recovery: the same command the pump enqueues when a
-        live process terminates, so redelivery shares the status checks and
-        the note/report-run semantics of `_handle_terminated`.
+        live process terminates, with no terminal event — the handler then
+        rebuilds the delivery from the stored task (and skips it when it was
+        delivered already, so redelivery is idempotent).
         """
         self._inbox.put_nowait(_ProcessTerminated(task_id=task_id))
-
-    async def _publish_system_note(self, content: str) -> None:
-        """Record a system note in the narrative and route it: inject or report run."""
-        note = await self.record_system_note(content)
-        foreground = self._foreground()
-        if foreground is not None:
-            foreground.control.inject(note)
-        else:
-            await self._start_report_run()
 
     async def _persist(
         self,
@@ -829,11 +1014,6 @@ class ConversationRunner:
                     self._seq,
                     self._dropped_events,
                 )
-
-    @staticmethod
-    def _format_task_done(task: Task) -> str:
-        result = task.result if task.result is not None else f"error: {task.error}"
-        return TASK_DONE_TEMPLATE.format(title=task.title, status=task.status.value, result=result)
 
 
 class _DialogTaskSpawner:
@@ -911,7 +1091,7 @@ class ConversationManager:
         return await runner.wake(title, prompt, cron_job_id)
 
     async def recover_interrupted(self) -> None:
-        """Fail orphaned tasks and redeliver undelivered results after a restart.
+        """Restart orphaned tasks and redeliver undelivered results after a restart.
 
         Processes live in memory, so a restart strands PENDING/RUNNING tasks
         forever and loses results persisted but not yet delivered. The sweep
@@ -919,17 +1099,19 @@ class ConversationManager:
         never raises: a recovery failure must not take the app down — every
         operation is idempotent and simply retried on the next restart.
         """
-        orphaned = await self._fail_orphaned()
+        orphaned = await self._list_orphaned()
         for task in orphaned:
-            await self._recover_orphaned(task)
+            await self._restart_orphaned(task)
         undelivered = await self._list_undelivered()
         for task in undelivered:
             await self._redeliver_undelivered(task)
-        logger.info("startup recovery: orphaned=%s redelivered=%s", len(orphaned), len(undelivered))
+        logger.info(
+            "startup recovery: restarted=%s redelivered=%s", len(orphaned), len(undelivered)
+        )
 
-    async def _fail_orphaned(self) -> list[Task]:
+    async def _list_orphaned(self) -> list[Task]:
         try:
-            return await self._tasks.fail_orphaned(RESTART_INTERRUPT_ERROR)
+            return await self._tasks.list_orphaned()
         except Exception:
             logger.exception("orphaned task sweep failed")
             return []
@@ -941,30 +1123,13 @@ class ConversationManager:
             logger.exception("undelivered task sweep failed")
             return []
 
-    async def _recover_orphaned(self, task: Task) -> None:
-        """Record the interruption in the narrative and report the cron outcome."""
+    async def _restart_orphaned(self, task: Task) -> None:
+        """Restart one orphaned task as a background process of its dialog."""
         try:
             runner = await self.get_or_create_runner(task.user_id, task.channel)
-            await runner.record_system_note(TASK_INTERRUPTED_TEMPLATE.format(title=task.title))
-            await self._report_orphaned_outcome(task)
-            await self._tasks.delete(task.id)
+            await runner.restart_task(task)
         except Exception:
-            logger.exception("orphaned task recovery failed: task=%s", task.id)
-
-    async def _report_orphaned_outcome(self, task: Task) -> None:
-        """Route an orphaned cron-fired task through the outcome listener.
-
-        Without this an interrupted one-shot job is lost without a trace (its
-        next_fire_at was already advanced past all occurrences); the reporter
-        applies the standard FAILED policy — last_error plus a bounded retry.
-        """
-        listener = self._config.task_outcome_listener
-        if listener is None or "cron_job_id" not in task.input:
-            return
-        try:
-            await listener.report_outcome(task, TaskStatus.FAILED)
-        except Exception:
-            logger.exception("orphaned cron outcome report failed: task=%s", task.id)
+            logger.exception("orphaned task restart failed: task=%s", task.id)
 
     async def _redeliver_undelivered(self, task: Task) -> None:
         """Redeliver a persisted-but-undelivered result via the standard path."""

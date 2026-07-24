@@ -245,11 +245,13 @@ async def test_post_message_deduplicates_client_message_id(
             await asyncio.sleep(POLL_SECONDS)
 
     await asyncio.wait_for(_history_complete(), timeout=EVENTS_TIMEOUT_SECONDS)
-    assert runner.history() == [
-        ChatMessage(role=MessageRole.USER, content="one"),
-        reply(),
-        ChatMessage(role=MessageRole.USER, content="two"),
-        reply(),
+    # assistant messages carry the producing task's id since the broker refactor;
+    # the dedup contract is about contents and order
+    assert [message.content for message in runner.history()] == [
+        "one",
+        REPLY_CONTENT,
+        "two",
+        REPLY_CONTENT,
     ]
 
 

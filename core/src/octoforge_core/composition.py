@@ -206,18 +206,9 @@ def build_router(
     return LLMRouter(llm, timeout_seconds=timeout_seconds, prompts=prompts)
 
 
-def build_cron_outcome_reporter(
-    store: CronStore,
-    *,
-    retry_limit: int,
-    backoff_base_seconds: float,
-) -> TaskOutcomeListener:
+def build_cron_outcome_reporter(store: CronStore) -> TaskOutcomeListener:
     """Build the listener folding fired cron-process outcomes back into the store."""
-    return CronOutcomeReporter(
-        store,
-        retry_limit=retry_limit,
-        backoff_base_seconds=backoff_base_seconds,
-    )
+    return CronOutcomeReporter(store)
 
 
 def build_runner_config(

@@ -87,7 +87,7 @@ WAIT_TIMEOUT_SECONDS = 2.0
 POLL_SECONDS = 0.01
 FIRST_CALL = 1
 SECOND_CALL = 2
-ROUTER_CALLS_TWO = 2
+ROUTER_CALLS_ONE = 1
 FIRST_VERSION = 1
 
 
@@ -396,8 +396,9 @@ async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     await runner.submit(FIRST_QUESTION)
     await wait_until(lambda: len(root.llm.stream_requests) == 1)
     await runner.submit(SECOND_QUESTION)
-    # the router runs on every message: first question, then second
-    await wait_until(lambda: len(root.llm.complete_requests) == ROUTER_CALLS_TWO)
+    # no LLM router call for the first message (no active processes); the
+    # second message routes over the first question's process
+    await wait_until(lambda: len(root.llm.complete_requests) == ROUTER_CALLS_ONE)
     root.llm.first_stream_gate.set()
     events = await collect_until_terminal(queue)
 
@@ -405,12 +406,11 @@ async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     first_system = root.llm.stream_requests[0][0]
     assert first_system.role is MessageRole.SYSTEM
     assert first_system.content.startswith(CUSTOM_SYSTEM_PROMPT)
-    # the router prompt came from the installer's file too (first message routes too)
-    first_router_system, first_router_user = root.llm.complete_requests[0]
-    assert "CUSTOM ROUTER PROMPT FROM FILE" in first_router_system.content
-    assert first_router_user == ChatMessage(role=MessageRole.USER, content=FIRST_QUESTION)
-    # the second router call lists the first question's process in its system message
-    router_system = root.llm.complete_requests[1][0]
+    # the router prompt came from the installer's file too; its only call is
+    # for the second message and lists the first question's process
+    router_system, router_user = root.llm.complete_requests[0]
+    assert "CUSTOM ROUTER PROMPT FROM FILE" in router_system.content
+    assert router_user == ChatMessage(role=MessageRole.USER, content=SECOND_QUESTION)
     assert router_system.role is MessageRole.SYSTEM
     assert FIRST_QUESTION in router_system.content
     # the tools ran over the substituted provider and instruction store

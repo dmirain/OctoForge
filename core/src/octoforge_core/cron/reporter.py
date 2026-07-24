@@ -2,16 +2,14 @@
 
 Implements the generic `TaskOutcomeListener` port from `agent/runner.py`: the
 actor reports the terminal status of every cron-tagged task, and this adapter
-applies the cron policy — retry with exponential backoff on failure, delete
-one-shot reminders after the first success, keep the schedule otherwise.
+applies the cron policy — record the outcome, delete one-shot reminders after
+their single attempt (success or failure), keep the schedule otherwise.
 """
 
 import logging
-from datetime import datetime, timedelta
 
-from octoforge_core.cron.api import CronJob, CronJobNotFoundError, CronStore
+from octoforge_core.cron.api import CronJobNotFoundError, CronStore
 from octoforge_core.tasks.models import Task, TaskStatus
-from octoforge_core.time import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -20,24 +18,18 @@ CRON_JOB_ID_INPUT_KEY = "cron_job_id"
 
 
 class CronOutcomeReporter:
-    """TaskOutcomeListener recording fire outcomes and scheduling retries.
+    """TaskOutcomeListener recording fire outcomes without retries.
 
-    Policy: DONE resets the retry streak (and deletes a one-shot job); FAILED
-    within the retry budget reschedules the job to `now + base * 2**streak`
-    (the streak grows per retry); FAILED exhausted records the failure and the
-    job continues on its regular schedule with a fresh budget; CANCELLED is
-    recorded without a retry (the user cancelled on purpose).
+    Policy: DONE deletes a one-shot job (and resets the retry streak of a
+    recurring one); FAILED is recorded as `last_status`/`last_error` and also
+    deletes a one-shot job — one shot means one attempt, the job keeps its
+    regular schedule otherwise; CANCELLED is recorded the same way (the user
+    cancelled on purpose). No outcome ever reschedules a job (`retry_at` is
+    always None).
     """
 
-    def __init__(
-        self,
-        store: CronStore,
-        retry_limit: int,
-        backoff_base_seconds: float,
-    ) -> None:
+    def __init__(self, store: CronStore) -> None:
         self._store = store
-        self._retry_limit = retry_limit
-        self._backoff_base_seconds = backoff_base_seconds
 
     async def report_outcome(self, task: Task, status: TaskStatus) -> None:
         """Record the outcome of a cron-fired task; ignore foreign tasks."""
@@ -49,21 +41,15 @@ class CronOutcomeReporter:
         except CronJobNotFoundError:
             logger.debug("cron outcome for a deleted job: job=%s task=%s", job_id, task.id)
             return
-        if status is TaskStatus.DONE and job.one_shot:
+        if job.one_shot and status in (TaskStatus.DONE, TaskStatus.FAILED):
             await self._store.delete_for_user(job.user_id, job.id)
             return
         await self._store.record_fire_result(
             job_id,
             status,
             error=_error_for(task, status),
-            retry_at=self._retry_at(job, status),
+            retry_at=None,
         )
-
-    def _retry_at(self, job: CronJob, status: TaskStatus) -> datetime | None:
-        if status is not TaskStatus.FAILED or job.retry_count >= self._retry_limit:
-            return None
-        backoff = self._backoff_base_seconds * 2**job.retry_count
-        return utc_now() + timedelta(seconds=backoff)
 
 
 def _error_for(task: Task, status: TaskStatus) -> str | None:

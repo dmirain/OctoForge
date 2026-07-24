@@ -1,8 +1,9 @@
 """TaskStore port and its in-memory implementation.
 
-A task row lives only while the task is in flight: terminal rows are deleted
-once the outcome is reported (a stopped task) or the result is delivered
-(done/failed), so `list_undelivered` normally returns crash leftovers only.
+Task rows are kept forever: a terminal task stays in the store and its
+`delivered_at` timestamp (set by `mark_delivered`) records that the result
+reached the user transport. `list_undelivered` therefore returns terminal
+tasks with `delivered_at IS NULL` — crash leftovers and fresh finals alike.
 """
 
 from typing import Protocol
@@ -39,20 +40,28 @@ class TaskStore(Protocol):
         """Mark the task as failed with an error."""
         ...
 
+    async def mark_cancelled(self, task: Task) -> None:
+        """Mark the task as cancelled; the row is kept, never delivered."""
+        ...
+
     async def delete(self, task_id: str) -> None:
         """Delete the task row or raise TaskNotFoundError."""
         ...
 
-    async def fail_orphaned(self, error: str) -> TaskList:
-        """Fail every PENDING/RUNNING task with `error`; return the affected tasks.
+    async def list_orphaned(self) -> TaskList:
+        """Return every PENDING/RUNNING task (read-only, no mutation).
 
-        Their in-memory executors (actor pump processes) died with the previous
-        service instance, so they can never finish on their own.
+        Their in-memory executors (actor pump processes) died with the
+        previous service instance, so they can never finish on their own.
         """
         ...
 
     async def list_undelivered(self) -> TaskList:
-        """Return finished (DONE/FAILED) tasks still having a row (crash leftovers)."""
+        """Return terminal (DONE/FAILED) tasks whose result was not delivered."""
+        ...
+
+    async def mark_delivered(self, task_id: str) -> None:
+        """Stamp the task's result as delivered to the user transport."""
         ...
 
 
@@ -84,19 +93,26 @@ class InMemoryTaskStore:
         task.error = error
         task.finished_at = utc_now()
 
+    async def mark_cancelled(self, task: Task) -> None:
+        task.status = TaskStatus.CANCELLED
+        task.finished_at = utc_now()
+
     async def delete(self, task_id: str) -> None:
         task = await self.get(task_id)
         del self._tasks[task.id]
 
-    async def fail_orphaned(self, error: str) -> TaskList:
+    async def list_orphaned(self) -> TaskList:
         active = (TaskStatus.PENDING, TaskStatus.RUNNING)
-        orphaned = [task for task in self._tasks.values() if task.status in active]
-        for task in orphaned:
-            task.status = TaskStatus.FAILED
-            task.error = error
-            task.finished_at = utc_now()
-        return orphaned
+        return [task for task in self._tasks.values() if task.status in active]
 
     async def list_undelivered(self) -> TaskList:
         finished = (TaskStatus.DONE, TaskStatus.FAILED)
-        return [task for task in self._tasks.values() if task.status in finished]
+        return [
+            task
+            for task in self._tasks.values()
+            if task.status in finished and task.delivered_at is None
+        ]
+
+    async def mark_delivered(self, task_id: str) -> None:
+        task = await self.get(task_id)
+        task.delivered_at = utc_now()
