@@ -13,7 +13,7 @@ Most agent frameworks bake tools and prompts straight into source code: every ne
 ## Why
 
 - 🧠 **The agent grows itself.** Knowledge, skills, HTTP tool descriptors, user datasets, and memories are just rows in SQLite (async SQLAlchemy), ranked by embedding similarity plus an optional cross-encoder rerank. The agent saves new instructions on its own — ship it once, let it accumulate capability over time.
-- 🔀 **Long jobs don't block the conversation.** Every dialog is an actor with its own foreground/background processes. Work can be pushed to the background with a notification on completion, an LLM router classifies each incoming message (inject into the running process / start a new one / cancel / promote to foreground), and a built-in cron scheduler wakes dialogs on a schedule — using the exact same task machinery.
+- 🔀 **Long jobs don't block the conversation.** Every dialog is an actor with its own foreground/background processes. Work can be pushed to the background with a notification on completion, an LLM router classifies each incoming message (inject into the running process / start a new one / cancel), and a built-in cron scheduler wakes dialogs on a schedule — using the exact same task machinery.
 - 🐙 **One core, many surfaces.** A web chat UI and a Telegram bot run on the same conversation engine. The core (`octoforge-core`) never imports FastAPI — it's a plain, typed Python library you can embed anywhere.
 
 ## How it works
@@ -158,7 +158,7 @@ async def main() -> None:
             events = runner.subscribe()  # subscribe BEFORE submit, or events get lost
             await runner.submit("Hi! What can you do?")
             while True:
-                event = await events.get()
+                event = (await events.get()).payload  # subscribe() yields ConversationEvent(dialog_id, seq, payload)
                 if isinstance(event, TextDelta):
                     print(event.text, end="", flush=True)
                 elif isinstance(event, Finished):
