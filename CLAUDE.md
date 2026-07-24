@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 OctoForge is a multi-user LLM agent: tools as executable Jinja templates, knowledge stored in the DB, background tasks with notifications. Two surfaces: a web chat UI and a Telegram bot.
 
-The living design doc is `docs/design.md` and code conventions are `AGENTS.md` — **both in Russian**. Read them before non-trivial work; this file is the English quick-start on top of them.
+The living design doc is `docs/design.md`; code conventions are `AGENTS.md`. Read them before non-trivial work; this file is a shorter quick-start covering similar ground.
+
+**Keep this file and `AGENTS.md` in sync.** They describe the same project from two angles. When one changes — conventions, structure, commands, language rules — check whether the other needs the same update in the same change. Don't let them drift apart.
 
 ## Commands
 
@@ -29,10 +31,10 @@ Config is `.env` (see `.env.example`); all vars are prefixed `OF_`.
 
 **Monorepo of two independent Python projects**, each with its own `pyproject.toml`, deps and tests:
 
-- `core/` — library `octoforge-core` (src-layout). Domain, ports, services, LLM clients. **Never imports fastapi**; sqlalchemy appears only in `db/` and the SQL stores (`instructions/store.py`, `datasets/store.py`, `memory/store.py`, `cron/store.py`).
+- `core/` — library `octoforge-core` (src-layout). Domain, ports, services, LLM clients. **Never imports fastapi**; sqlalchemy appears only in `db/` and the SQL stores (`instructions/store.py`, `datasets/store.py`, `memory/store.py`, `context/store.py`, `cron/store.py`).
 - `web/` — app `octoforge-web` (src-layout). Thin FastAPI adapter + Telegram adapter. Depends on `octoforge-core`.
 
-Clean-architecture dependency rule: dependencies point inward. External clients (LLM, HTTP, DB) reach services through `Protocol` ports; the whole object graph is assembled in one place — `web/src/octoforge_web/main.py:runtime()` (the composition root, shared by the HTTP app and the standalone Telegram surface).
+Clean-architecture dependency rule: dependencies point inward. External clients (LLM, HTTP, DB) reach services through `Protocol` ports. Reusable builder functions (`build_llm_client`, `build_tool_registry`, `build_conversation_manager`, etc.) live in `core/composition.py` — ports and configs only, no fastapi; `web/src/octoforge_web/main.py:runtime()` is just the default assembly on top of them (shared by the HTTP app and the standalone Telegram surface), and an alternative composition root can reuse the same builders without copying code.
 
 ### The process model (the core mental model)
 
@@ -56,14 +58,15 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 - `datasets/` — user data (`datasets` / `dataset_records`), JSON-schema validation, owner isolation at the SQL level; descriptors also feed `instruction_search`.
 - `memory/` — key/value memories, `user_id` NULL = global scope, LIKE search over "own + global".
 - `cron/` — `CronScheduler` asyncio loop with CAS lease (`lease_ttl`), coalescing missed fires; a fire calls `ConversationManager.wake` → a background process. See `docs/cron.md`.
+- `context/` — dialog narrative compaction: a rolling summary (`dialog_summaries` table, via `LlmContextCompactor`) plus a verbatim hot tail, triggered by char/token thresholds or reactively on `ContextOverflowError`. See `docs/context.md`.
 
 ### Embeddings / reranker (optional but needed for instructions & datasets)
 
-`EmbeddingClient` port has two backends chosen by `OF_EMBEDDING_BACKEND`: local sentence-transformers (`llm/local_embeddings.py`) or an OpenAI-compatible HTTP endpoint (`llm/embeddings.py`). Optional cross-encoder `RerankerClient` (`llm/reranker.py`). Without a working backend the app still starts (the registry sync is skipped), but instruction/dataset search & save are unavailable.
+`EmbeddingClient` port has two backends chosen by `OF_EMBEDDING_BACKEND`: local sentence-transformers (`llm/local_embeddings.py`) or an OpenAI-compatible HTTP endpoint (`llm/embeddings.py`). Optional `RerankerClient` also has two backends: a local cross-encoder (`llm/reranker.py`) or an HTTP one (`llm/http_reranker.py`, SiliconFlow-compatible, gated on `OF_RERANKER_API_KEY`). Without a working embedding backend the app still starts (the registry sync is skipped), but instruction/dataset search & save are unavailable.
 
 ### Telegram surface
 
-`web/src/octoforge_web/telegram/` — raw-httpx Bot API client (no aiogram), `TelegramPoller` (long-poll), `TelegramBridge` renders runner events into a throttled draft message. Channel `"telegram"`, `user_id = "tg:<id>"`, private chats only. Agent markdown answers are converted to Telegram HTML (`markdown.py`) with a plain-text fallback. Runs alongside web, or standalone (`python -m octoforge_web.telegram`) with no HTTP listener.
+`web/src/octoforge_web/telegram/` — raw-httpx Bot API client (no aiogram), `TelegramPoller` (long-poll), `TelegramBridge` renders runner events into a throttled draft message. Channel `"telegram"`, `user_id = "tg:<id>"`, private chats only. Agent markdown answers are converted to Telegram HTML (`markdown.py`) with a plain-text fallback; a final containing a table/checklist/`<details>`/math is upgraded in place to a Bot API 10.1 Rich Message (`telegram/rich.py`, toggle `OF_TELEGRAM_RICH_MESSAGES`, ≤ 32,768 chars, one message only — falls back to the HTML version on failure). Access is gated by an invite system (`telegram/invites/`, its own SQLite DB via `OF_TELEGRAM_DATABASE_URL`): admins (`OF_TELEGRAM_ADMIN_IDS`) always pass, everyone else needs `/start <code>` with a code that hasn't expired (`OF_TELEGRAM_INVITE_TTL_SECONDS`); the gate only activates once the admin list is non-empty. An `admin_manage` tool (list/generate/revoke/restore invites, cross-user instruction search/publish) is hidden from non-admins via the same `visible_to(context)` hook `ToolRegistry` uses elsewhere. Runs alongside web, or standalone (`python -m octoforge_web.telegram`) with no HTTP listener.
 
 ## Conventions worth flagging (full list in AGENTS.md)
 
@@ -71,6 +74,7 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 - **Full typing** (ruff `ANN` + mypy strict); bare `Any` in annotations is banned (ANN401). Data travels as domain objects/enums (`StrEnum`), not dicts — dicts only at the JSON boundary.
 - **Complexity limits** are enforced (`C901` ≤ 10, `PLR0915` ≤ 50 statements, `PLR0911` ≤ 6 returns): split functions, don't disable the rule.
 - **Tests ship with the change** (pytest + pytest-asyncio; mock LLM/HTTP).
-- **Language rule**: user-facing text and all docs (`docs/`, `AGENTS.md`) are **Russian**; commit messages, docstrings and code comments are **English**. Exception: `README.md` and anything it links to are **English**, written for a mass GitHub audience — it's the project's public storefront, not internal documentation.
+- **Language rule**: commit messages, docstrings and code comments are **English**. `README.md` (and anything it links to) and `AGENTS.md` are **English** too — the former is the project's public storefront, the latter is AI coding-agent guidance, conventionally written in English. Everything else — conversation, `docs/`, any other documentation — follows whatever language the user asks for; don't default to a fixed one.
+- **Communication style**: structure responses clearly and keep the level of detail medium — enough to be useful, not exhaustive — always in whatever language the user is using.
 - **Docs update with code**: any logic change is also written into `docs/design.md` in the same change.
 - **Git mutations only with explicit permission** — ask before every `commit`/`push`/etc.
