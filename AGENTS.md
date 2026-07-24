@@ -66,12 +66,17 @@ Mandatory across all project code:
 11. **DI (Dependency Injection)** — dependencies arrive from outside: via the constructor, parameters, or `Depends` at the web layer. Constructing dependencies inside a method is forbidden; the object graph is assembled in exactly one place (the composition root: `web/src/octoforge_web/main.py` and the `core/composition.py` builders).
 12. **Languages** — commit messages, docstrings, and code comments are English. `README.md` (and anything it links to) is English, aimed at a mass GitHub audience — it's the project's public storefront, not internal documentation. This file is English too, since AI coding-agent guidance conventionally lives in English. Everything else — conversation with the user, `docs/`, any other documentation — follows whatever language the user asks for; don't default to a fixed one.
 13. **Communication style** — structure your responses clearly and keep the level of detail medium: enough to be useful, not exhaustive. Always respond in whatever language the user is using in that conversation.
+14. **Migrations are append-only** — a `PreToolUse` hook (`.claude/settings.json`) blocks edits to any Alembic migration file already committed to git HEAD. Add a new migration file instead of editing an old one.
 
 ## Workflow rules
 
 - **Git commits only with the user's explicit permission.** Ask every time before `git commit` and any other git mutation (push, reset, rebase, etc.).
 - **Documentation updates ship with the code.** Every change to logic, and every new idea, is written into `docs/design.md` (and into this file too, whenever conventions, structure, or commands change) in the same change.
 - **`AGENTS.md` and `CLAUDE.md` stay in sync.** Whenever one gets a conventions/structure/commands/language update, apply the same update to the other before considering the change done.
+- **Plan before touching subtle areas.** Changes to `agent/router.py`, `agent/runner.py`, `cron/`, or `context/` (compaction) have non-obvious invariants (branch reconstruction, watermarks, the pull model) — use plan mode first. A one-file, obviously-scoped fix doesn't need it.
+- **Definition of done.** A change isn't done until `make check` passes — run it and show the output, don't just assert success.
+- **Get a second opinion before shipping.** For a non-trivial diff, run a review pass (e.g. `/code-review`) in a fresh context in addition to `make check` — a green test suite doesn't catch every logic gap.
+- **On compaction, keep the essentials.** When a long session gets compacted, always preserve the list of modified files, any `OF_*` env vars or migration ids touched, and the last `make check` result.
 
 ## Tooling
 

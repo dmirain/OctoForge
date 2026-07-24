@@ -78,3 +78,8 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 - **Communication style**: structure responses clearly and keep the level of detail medium — enough to be useful, not exhaustive — always in whatever language the user is using.
 - **Docs update with code**: any logic change is also written into `docs/design.md` in the same change.
 - **Git mutations only with explicit permission** — ask before every `commit`/`push`/etc.
+- **Migrations are append-only**: a `PreToolUse` hook (`.claude/settings.json`) blocks edits to any Alembic migration file already committed to git HEAD. Add a new migration file instead of editing an old one.
+- **Plan before touching subtle areas**: changes to `agent/router.py`, `agent/runner.py`, `cron/`, or `context/` (compaction) have non-obvious invariants (branch reconstruction, watermarks, the pull model) — use plan mode first. A one-file, obviously-scoped fix doesn't need it.
+- **Definition of done**: a change isn't done until `make check` passes — run it and show the output, don't just assert success.
+- **Get a second opinion before shipping**: for a non-trivial diff, run a review pass (e.g. `/code-review`) in a fresh context in addition to `make check` — a green test suite doesn't catch every logic gap.
+- **On compaction, keep the essentials**: when a long session gets compacted, always preserve the list of modified files, any `OF_*` env vars or migration ids touched, and the last `make check` result.

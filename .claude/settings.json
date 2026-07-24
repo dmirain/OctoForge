@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r \".tool_input.file_path // empty\" | { read -r f; case \"$f\" in *core/src/octoforge_core/db/migrations/versions/*.py) root=$(git rev-parse --show-toplevel 2>/dev/null); rel=\"core/src/octoforge_core/db/migrations/versions/${f##*core/src/octoforge_core/db/migrations/versions/}\"; if [ -n \"$root\" ] && git -C \"$root\" cat-file -e \"HEAD:$rel\" 2>/dev/null; then printf \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"This Alembic migration already exists in git HEAD (already merged/applied). Create a new migration file instead of editing this one.\\\"}}\"; fi ;; esac; }"
+          }
+        ]
+      }
+    ]
+  }
+}

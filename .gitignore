@@ -13,3 +13,4 @@ telegram.db
 backups/
 OctoForgeBotToken.txt
 logs/
+.claude/scheduled_tasks.lock
