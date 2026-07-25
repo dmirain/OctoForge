@@ -1,0 +1,32 @@
+services:
+  octoforge:
+    build:
+      context: .
+      args:
+        # CPU-only by default. For a CUDA build set e.g.
+        # TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 (and add GPU
+        # passthrough below via deploy.resources.reservations.devices, which
+        # needs the NVIDIA Container Toolkit on the host).
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Redirect SQLite files into the persisted volume regardless of what
+      # OF_DATABASE_URL / OF_TELEGRAM_DATABASE_URL are set to in .env.
+      OF_DATABASE_URL: sqlite+aiosqlite:///./data/octoforge.db
+      OF_TELEGRAM_DATABASE_URL: sqlite+aiosqlite:///./data/telegram.db
+    volumes:
+      - octoforge-data:/app/data
+      - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  octoforge-data:
+  hf-cache:
