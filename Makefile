@@ -27,12 +27,12 @@ upgrade:
 	$(BIN)/pip install --upgrade -e "web[dev]"
 
 lint:
-	$(BIN)/ruff check core/src core/tests web/src web/tests
-	$(BIN)/ruff format --check core/src core/tests web/src web/tests
+	$(BIN)/ruff check core/src core/tests web/src web/tests tools
+	$(BIN)/ruff format --check core/src core/tests web/src web/tests tools
 
 format:
-	$(BIN)/ruff check --fix core/src core/tests web/src web/tests
-	$(BIN)/ruff format core/src core/tests web/src web/tests
+	$(BIN)/ruff check --fix core/src core/tests web/src web/tests tools
+	$(BIN)/ruff format core/src core/tests web/src web/tests tools
 
 typecheck:
 	cd core && ../$(BIN)/mypy
