@@ -53,7 +53,7 @@ Telegram bot (optional): set `OF_TELEGRAM_BOT_TOKEN` in `.env` and it starts alo
 make run-telegram
 ```
 
-For production: run `uvicorn octoforge_web.main:app` without `--reload`, as a single process (SQLite has exactly one writer), and watch `/health` (liveness) and `/health/ready` (readiness — checks the database).
+For production, run it in containers — `docker compose up -d` starts Postgres plus the Telegram bot, and `docker compose --profile web up -d` adds the web surface on `:8000`. See [docs/deploy.md](docs/deploy.md) for the topology, the one-off SQLite→Postgres data migration (`tools/sqlite_to_postgres.py`) and day-2 operations. Running natively works too: `uvicorn octoforge_web.main:app` without `--reload`, and on SQLite as a single process (exactly one writer). Watch `/health` (liveness) and `/health/ready` (readiness — checks the database).
 
 ### Configuration
 

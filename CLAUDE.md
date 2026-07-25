@@ -41,6 +41,7 @@ Take these from here, don't guess:
 | Readiness (checks the DB) | `GET /health/ready` |
 | API docs | `GET /docs` (Swagger UI), schema at `/openapi.json` — FastAPI defaults, not overridden |
 | Telegram bot | no HTTP port — long-polling only (`make run-telegram`) |
+| Deployment | `docker compose up -d` = postgres + telegram; `--profile web` adds the HTTP surface. Topology, SQLite→Postgres migration and day-2 ops: `docs/deploy.md` |
 | Logs | stdout/stderr only (`logging.basicConfig`, no file handler) — redirect yourself if backgrounding, e.g. `make run > /tmp/octoforge.log 2>&1 &` |
 
 ## Architecture

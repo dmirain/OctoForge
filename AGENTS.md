@@ -63,6 +63,7 @@ Take these from here, don't guess:
 | Readiness (checks the DB) | `GET /health/ready` |
 | API docs | `GET /docs` (Swagger UI), schema at `/openapi.json` — FastAPI defaults, not overridden |
 | Telegram bot | no HTTP port — long-polling only (`make run-telegram`) |
+| Deployment | `docker compose up -d` = postgres + telegram (the web surface sits behind `--profile web`); one image, `OF_TELEGRAM_BOT_TOKEN` blanked on the web service so only one poller owns the bot. See `docs/deploy.md` |
 | Logs | stdout/stderr only (`logging.basicConfig`, no file handler) — redirect yourself if backgrounding, e.g. `make run > /tmp/octoforge.log 2>&1 &` |
 
 ## Code conventions

@@ -1,3 +1,22 @@
+# Default `docker compose up -d` runs the deployment as it exists today:
+# Postgres plus the Telegram bot, no HTTP listener. The web surface is behind a
+# profile — `docker compose --profile web up -d` adds it.
+x-app-build: &app-build
+  context: .
+  args:
+    # CPU-only by default. For a CUDA build set e.g.
+    # TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 (and add GPU
+    # passthrough via deploy.resources.reservations.devices, which needs the
+    # NVIDIA Container Toolkit on the host).
+    TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+
+# Reach Postgres over the compose network. These override whatever the URLs are
+# in .env, where a host-side SQLite path would silently create a throwaway file
+# inside the container.
+x-app-databases: &app-databases
+  OF_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_DB:-octoforge}
+  OF_TELEGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_TELEGRAM_DB:-octoforge_telegram}
+
 services:
   postgres:
     image: postgres:18-alpine
@@ -17,7 +36,7 @@ services:
       # so the volume goes one level up — this also keeps `pg_upgrade --link`
       # possible later. See docker-library/postgres#1259.
       - pg-data:/var/lib/postgresql
-      # runs once per volume: creates the invite and test databases
+      # runs once per volume: creates the invite, test and dev databases
       - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-octoforge} -d ${POSTGRES_DB:-octoforge}"]
@@ -27,30 +46,43 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  octoforge:
-    build:
-      context: .
-      args:
-        # CPU-only by default. For a CUDA build set e.g.
-        # TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 (and add GPU
-        # passthrough below via deploy.resources.reservations.devices, which
-        # needs the NVIDIA Container Toolkit on the host).
-        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+  telegram:
+    build: *app-build
+    image: octoforge:local
+    command: ["python", "-m", "octoforge_web.telegram"]
+    env_file:
+      - .env
+    environment: *app-databases
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # the host's model cache: without it the container re-downloads the
+      # 1.1 GB embedding model on first start
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    # No ports and no healthcheck on purpose: this surface only makes outbound
+    # connections (Bot API long poll, LLM, embeddings) and exposes no endpoint
+    # to probe. Liveness is left to `restart`.
+    restart: unless-stopped
+
+  web:
+    profiles: ["web"]
+    build: *app-build
+    image: octoforge:local
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      # Point the app at the postgres service on the compose network. This
-      # overrides whatever OF_DATABASE_URL sits in .env, where a host-side
-      # SQLite path would silently create a throwaway file inside the container.
-      OF_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_DB:-octoforge}
-      OF_TELEGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_TELEGRAM_DB:-octoforge_telegram}
+      <<: *app-databases
+      # the dedicated telegram service owns the bot: a second poller on the
+      # same token gets `Conflict: terminated by other getUpdates request`
+      OF_TELEGRAM_BOT_TOKEN: ""
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - hf-cache:/root/.cache/huggingface
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -60,4 +92,3 @@ services:
 
 volumes:
   pg-data:
-  hf-cache:

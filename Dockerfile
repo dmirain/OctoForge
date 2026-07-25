@@ -17,12 +17,8 @@ COPY web/ ./web/
 # and run the container with the NVIDIA Container Toolkit -- not needed for CPU).
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
-RUN pip install --no-cache-dir --extra-index-url ${TORCH_INDEX_URL} "./core[local-embeddings]" \
+RUN pip install --no-cache-dir --extra-index-url ${TORCH_INDEX_URL} "./core[local-embeddings,postgres]" \
     && pip install --no-cache-dir ./web
-
-RUN mkdir -p /app/data
-
-ENV OF_DATABASE_URL=sqlite+aiosqlite:///./data/octoforge.db
 
 EXPOSE 8000
 
