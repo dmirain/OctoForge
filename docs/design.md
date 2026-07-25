@@ -940,13 +940,33 @@ ORM-модели — в `octoforge_core/db/models.py`; доменные объе
   для due-выборки; пара (`claimed_by`, `claimed_at`) — аренда планировщика (lease TTL)
 
 Все `*_at` — timezone-aware UTC: `UTCDateTime` (`db/base.py`) принудительно выставляет UTC при
-чтении/записи (SQLite возвращает naive datetime). Схема ведётся Alembic-миграциями
+чтении/записи. Тип колонки при этом зависит от диалекта, контракт в Python — нет: на Postgres
+это нативный `timestamptz` (asyncpg отвергает aware-значение, привязанное к `timestamp without
+time zone`), на SQLite — naive-значение, нормализованное к UTC, и обратная простановка UTC при
+чтении. Ветку выбирает `load_dialect_impl`.
+
+Схема ведётся Alembic-миграциями
 (`db/migrations/`, baseline автогенерён из ORM-метаданных): на старте composition root
 вызывает `bootstrap_schema` — свежая или уже-управляемая БД мигрируется до head; БД, созданная
 до Alembic (таблицы есть, `alembic_version` нет), штампуется на baseline и догоняется до head
 (ALTER-миграции добавляют колонки условно — legacy-БД могла быть создана более новым
 `create_all`). `init_db` (`create_all`)
 остаётся для тестов и как fallback в composition root, если миграции не удалось применить.
+
+**Два диалекта.** Прод работает на Postgres (`postgresql+asyncpg://`, драйвер — extra
+`postgres` у `octoforge-core`), тесты и встраиваемый вариант — на SQLite. Историческую цепочку
+миграций вне SQLite проиграть нельзя: три ревизии объявляют булевы колонки с
+`server_default=sa.text('0')` (Postgres не принимает integer-дефолт для boolean), одна создаёт
+частичный индекс только с `sqlite_where`, ещё одна строит индексы сырым SQL. Миграции
+append-only (правки закоммиченных блокирует `PreToolUse`-хук), поэтому пустая не-SQLite база
+получает актуальную схему через `Base.metadata.create_all` и штампуется на head
+(`_create_and_stamp` в `db/engine.py`), а дальше идут обычные апгрейды — новые миграции обязаны
+быть диалект-нейтральными. Частичные unique-индексы (`uq_memories_global_key`,
+`uq_instructions_public_type_title`) объявляют предикат для обоих диалектов: без
+`postgresql_where` Postgres собрал бы **полный** unique-индекс, и одинаковый ключ памяти у двух
+пользователей стал бы конфликтом, а приватная инструкция перестала бы шэдоуить публичную.
+Диалект-чувствительные места покрыты `core/tests/test_postgres_stores.py` (гоняется по
+`OF_TEST_DATABASE_URL`, без него скипается).
 
 ## API (`octoforge_web/api/`)
 

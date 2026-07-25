@@ -22,7 +22,11 @@ class MemoryRow(Base):
             "uq_memories_global_key",
             "key",
             unique=True,
+            # every dialect that runs this schema needs the predicate: without
+            # it the index is a plain unique one over `key`, which would forbid
+            # two users from holding the same key
             sqlite_where=text("user_id IS NULL"),
+            postgresql_where=text("user_id IS NULL"),
         ),
     )
 

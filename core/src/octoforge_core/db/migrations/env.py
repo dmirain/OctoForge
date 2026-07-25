@@ -15,7 +15,10 @@ from sqlalchemy import engine_from_config, pool
 
 from octoforge_core.db.base import Base
 
-# Import every model module so all tables register on Base.metadata.
+# Import every model module so all tables register on Base.metadata. A module
+# missing here is invisible to autogenerate, which would then propose dropping
+# its table (`dialog_summaries` was missing until 2026-07-25).
+import octoforge_core.context.models  # noqa: E402,F401
 import octoforge_core.cron.models  # noqa: E402,F401
 import octoforge_core.datasets.models  # noqa: E402,F401
 import octoforge_core.db.models  # noqa: E402,F401

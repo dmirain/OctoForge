@@ -9,10 +9,11 @@ description = "OctoForge web wrapper (FastAPI)"
 license = { text = "BUSL-1.1" }
 requires-python = ">=3.11"
 dependencies = [
-    # web is the reference deployment; keep local embeddings/reranker working
-    # out of the box. Building against a leaner octoforge-core (OpenAI-compatible
-    # embeddings only, no torch) is exactly why core makes the extra optional.
-    "octoforge-core[local-embeddings]",
+    # web is the reference deployment: keep local embeddings/reranker and the
+    # Postgres driver working out of the box. Building against a leaner
+    # octoforge-core (OpenAI-compatible embeddings only, no torch; SQLite only)
+    # is exactly why core makes both extras optional.
+    "octoforge-core[local-embeddings,postgres]",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "pydantic-settings>=2",

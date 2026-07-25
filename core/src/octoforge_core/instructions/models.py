@@ -30,7 +30,11 @@ class InstructionRow(Base):
             "type",
             "title",
             unique=True,
+            # the predicate is required on every dialect: a plain unique index
+            # over (type, title) would stop a private copy from shadowing the
+            # public record
             sqlite_where=text("owner_id IS NULL"),
+            postgresql_where=text("owner_id IS NULL"),
         ),
     )
 

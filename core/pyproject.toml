@@ -25,6 +25,12 @@ dependencies = [
 local-embeddings = [
     "sentence-transformers>=3",
 ]
+# The async Postgres driver. Not a hard dependency: aiosqlite covers the
+# embedded case, and a library consumer that never points OF_DATABASE_URL at
+# postgresql+asyncpg:// has no reason to install it.
+postgres = [
+    "asyncpg>=0.30",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",

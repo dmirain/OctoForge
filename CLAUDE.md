@@ -86,7 +86,8 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 
 ## Conventions worth flagging (full list in AGENTS.md)
 
-- **UTC everywhere** — timezone-aware UTC only, obtained via `utc_now()` (`octoforge_core/time.py`); naive datetimes are forbidden (a SQLite `TypeDecorator` enforces it).
+- **UTC everywhere** — timezone-aware UTC only, obtained via `utc_now()` (`octoforge_core/time.py`); naive datetimes are forbidden (the `UTCDateTime` `TypeDecorator` enforces it — `timestamptz` on Postgres, normalized naive on SQLite).
+- **Two SQL dialects** — prod runs Postgres (`postgresql+asyncpg://`, the `postgres` extra on `octoforge-core`), tests and the embeddable setup run SQLite. Dialect-sensitive store behavior is covered by `core/tests/test_postgres_stores.py`, which skips unless `OF_TEST_DATABASE_URL` is set.
 - **Full typing** (ruff `ANN` + mypy strict); bare `Any` in annotations is banned (ANN401). Data travels as domain objects/enums (`StrEnum`), not dicts — dicts only at the JSON boundary.
 - **Complexity limits** are enforced (`C901` ≤ 10, `PLR0915` ≤ 50 statements, `PLR0911` ≤ 6 returns): split functions, don't disable the rule.
 - **Tests ship with the change** (pytest + pytest-asyncio; mock LLM/HTTP).
@@ -94,7 +95,7 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 - **Communication style**: structure responses clearly and keep the level of detail medium — enough to be useful, not exhaustive — always in whatever language the user is using.
 - **Docs update with code**: any logic change is also written into `docs/design.md` in the same change.
 - **Git mutations only with explicit permission** — ask before every `commit`/`push`/etc. Same for `gh`: check `gh auth status` before assuming it's unavailable (it may be authenticated with a repo-scoped fine-grained token) — use it for releases/issues/PRs/`gh repo edit`, but being authenticated isn't standing permission, ask before consequential actions.
-- **Migrations are append-only**: a `PreToolUse` hook (`.claude/settings.json`) blocks edits to any Alembic migration file already committed to git HEAD. Add a new migration file instead of editing an old one.
+- **Migrations are append-only**: a `PreToolUse` hook (`.claude/settings.json`) blocks edits to any Alembic migration file already committed to git HEAD. Add a new migration file instead of editing an old one. Write new ones dialect-neutrally (`sa.false()` not `sa.text('0')`; both `sqlite_where=` and `postgresql_where=` on partial indexes) — prod runs Postgres, tests run SQLite.
 - **Plan before touching subtle areas**: changes to `agent/router.py`, `agent/runner.py`, `cron/`, or `context/` (compaction) have non-obvious invariants (branch reconstruction, watermarks, the pull model) — use plan mode first. A one-file, obviously-scoped fix doesn't need it.
 - **Parallelize once the plan is set**: tests and the matching `docs/design.md` update don't have to wait for the implementation to land. Once a plan fixes the interfaces and behavior, write (or delegate to parallel subagents) the tests, the docs update, and the implementation at the same time instead of serializing them.
 - **Definition of done**: a change isn't done until `make check` passes — run it yourself and show the output, don't just assert success, and don't take a subagent's summary of its own work as confirmation — look at the actual diff or output.
