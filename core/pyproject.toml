@@ -14,10 +14,17 @@ dependencies = [
     "alembic>=1.13",
     "aiosqlite>=0.19",
     "croniter>=6,<7",
-    "sentence-transformers>=3",
 ]
 
 [project.optional-dependencies]
+# sentence-transformers pulls in torch (and, via its default PyPI wheel, a
+# pile of CUDA packages) -- only worth the download if you actually want the
+# local embeddings/reranker backends (OF_EMBEDDING_BACKEND=local). Without
+# this extra, octoforge-core still works fully with the OpenAI-compatible
+# embeddings/reranker HTTP backends.
+local-embeddings = [
+    "sentence-transformers>=3",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",

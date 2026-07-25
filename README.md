@@ -88,10 +88,16 @@ The built-in tool surface (`ToolRegistry`), wired up in the composition root:
 
 ## Using it as a library
 
-`octoforge-core` is a standalone package with no web dependencies (httpx, SQLAlchemy, Alembic, croniter, sentence-transformers; ships `py.typed`):
+`octoforge-core` is a standalone package with no web dependencies (httpx, SQLAlchemy, Alembic, croniter; ships `py.typed`):
 
 ```bash
 pip install -e core   # from the repo root; no FastAPI required
+```
+
+Local embeddings/reranking (`sentence-transformers`, which pulls in torch) are an optional extra, not a hard dependency — skip it if you're only using the OpenAI-compatible backends:
+
+```bash
+pip install -e "core[local-embeddings]"
 ```
 
 Pick your depth of embedding:

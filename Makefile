@@ -5,7 +5,7 @@ BIN := $(VENV)/bin
 
 install:
 	python3 -m venv $(VENV)
-	$(BIN)/pip install -e "core[dev]" -e "web[dev]"
+	$(BIN)/pip install -e "core[dev,local-embeddings]" -e "web[dev]"
 
 lint:
 	$(BIN)/ruff check core/src core/tests web/src web/tests

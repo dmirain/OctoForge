@@ -107,3 +107,13 @@ async def test_concurrent_first_calls_load_the_model_once(
     await asyncio.gather(*(embedder.embed((f"text {index}",)) for index in range(CONCURRENT_CALLS)))
 
     assert len(created) == EXPECTED_CALLS_ONE
+
+
+def test_missing_sentence_transformers_raises_a_clear_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the local-embeddings extra, construction fails fast with install guidance."""
+    monkeypatch.setattr(local_embeddings, "SentenceTransformer", None)
+
+    with pytest.raises(ImportError, match="local-embeddings"):
+        SentenceTransformerEmbedder(MODEL_NAME)

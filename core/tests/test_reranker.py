@@ -110,3 +110,13 @@ async def test_concurrent_first_calls_load_the_model_once(
     )
 
     assert len(created) == EXPECTED_LOADS_ONE
+
+
+def test_missing_sentence_transformers_raises_a_clear_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the local-embeddings extra, construction fails fast with install guidance."""
+    monkeypatch.setattr(reranker_module, "CrossEncoder", None)
+
+    with pytest.raises(ImportError, match="local-embeddings"):
+        CrossEncoderReranker(RerankerConfig(model=MODEL_NAME))
