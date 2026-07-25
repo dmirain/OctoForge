@@ -34,7 +34,7 @@ class SqlAlchemyDatasetStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def create(  # noqa: PLR0913 — flat row fields, mirroring InstructionStore.upsert
+    async def create(  # noqa: PLR0913, PLR0917 — flat row fields, mirroring InstructionStore.upsert
         self,
         owner_user_id: str,
         name: str,

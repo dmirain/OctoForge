@@ -131,7 +131,7 @@ class DatasetStore(Protocol):
     is scoped by `owner_user_id` (or by a descriptor id resolved under one).
     """
 
-    async def create(  # noqa: PLR0913 — flat row fields, mirroring the SQL rows
+    async def create(  # noqa: PLR0913, PLR0917 — flat row fields, mirroring the SQL rows
         self,
         owner_user_id: str,
         name: str,
@@ -204,7 +204,7 @@ class DatasetService(Protocol):
     The implementation is chosen in the composition root.
     """
 
-    async def create_dataset(  # noqa: PLR0913 — transport-shaped boundary signature
+    async def create_dataset(  # noqa: PLR0913, PLR0917 — transport-shaped boundary signature
         self,
         owner_user_id: str,
         name: str,
@@ -239,7 +239,7 @@ class DatasetService(Protocol):
         """
         ...
 
-    async def query_records(  # noqa: PLR0913 — transport-shaped boundary signature
+    async def query_records(  # noqa: PLR0913, PLR0917 — transport-shaped boundary signature
         self,
         owner_user_id: str,
         dataset_name: str,

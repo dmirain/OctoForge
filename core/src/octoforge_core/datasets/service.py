@@ -40,7 +40,7 @@ class LocalDatasetService:
         self._store = store
         self._embedder = embedder
 
-    async def create_dataset(  # noqa: PLR0913 — facade signature from the module boundary
+    async def create_dataset(  # noqa: PLR0913, PLR0917 — facade signature from the module boundary
         self,
         owner_user_id: str,
         name: str,
@@ -74,7 +74,7 @@ class LocalDatasetService:
             raise DatasetNotFoundError(dataset_name)
         return await self._store.add_record(dataset.id, owner_user_id, payload)
 
-    async def query_records(  # noqa: PLR0913 — facade signature from the module boundary
+    async def query_records(  # noqa: PLR0913, PLR0917 — facade signature from the module boundary
         self,
         owner_user_id: str,
         dataset_name: str,

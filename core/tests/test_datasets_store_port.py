@@ -61,7 +61,7 @@ class InMemoryDatasetStore:
         self.records: list[DatasetRecord] = []
         self.list_calls = 0
 
-    async def create(  # noqa: PLR0913 — mirrors the DatasetStore port signature
+    async def create(  # noqa: PLR0913, PLR0917 — mirrors the DatasetStore port signature
         self,
         owner_user_id: str,
         name: str,

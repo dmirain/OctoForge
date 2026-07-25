@@ -465,7 +465,7 @@ class FakeDatasetService:
         self.search_calls.append((owner_user_id, query, k))
         return self.hits
 
-    async def create_dataset(  # noqa: PLR0913 — protocol-shaped stub
+    async def create_dataset(  # noqa: PLR0913, PLR0917 — protocol-shaped stub
         self,
         owner_user_id: str,
         name: str,
@@ -487,7 +487,7 @@ class FakeDatasetService:
     ) -> DatasetRecord:
         raise NotImplementedError
 
-    async def query_records(  # noqa: PLR0913 — protocol-shaped stub
+    async def query_records(  # noqa: PLR0913, PLR0917 — protocol-shaped stub
         self,
         owner_user_id: str,
         dataset_name: str,
