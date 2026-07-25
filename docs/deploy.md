@@ -58,9 +58,11 @@ SQLite-файлы после переноса не удаляются — это
 
 ## Эксплуатация
 
-- **Бэкапы:** `docker compose exec -T postgres pg_dump -U octoforge octoforge | gzip > dump.sql.gz`
-  (плюс то же для `octoforge_telegram`). `pg_dump` консистентен на живой базе, в отличие от
-  копирования файлов.
+- **Бэкапы:** `tools/pg_backup.sh [каталог]` — дампит `octoforge` и `octoforge_telegram`
+  gzip'ом и оставляет последние `KEEP` файлов (по умолчанию 14). `pg_dump` консистентен на
+  живой базе, в отличие от копирования файлов. Для расписания — systemd-таймер, пример в
+  шапке скрипта (`systemctl --user enable --now`, плюс `loginctl enable-linger`, чтобы жил
+  после логаута).
 - **Логи:** `docker compose logs -f telegram`. Ротацию делает docker (`json-file` по умолчанию).
 - **Перезапуск после падения хоста:** `restart: unless-stopped` плюс включённый
   `docker.service` поднимают стек сами.
