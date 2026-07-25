@@ -563,3 +563,71 @@ async def test_store_reads_endpoint_records(
 
     stored = await service.get_by_name(TITLE_ALPHA, InstructionType.ENDPOINT, USER_ID)
     assert stored.type is InstructionType.ENDPOINT
+
+
+# --- memory records in the shared store --------------------------------------
+
+
+async def test_publish_refuses_memory_records(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A user's memory is never publishable, whoever asks."""
+    service = make_lenient_service(session_factory)
+    memory = await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)
+
+    with pytest.raises(InstructionNotFoundError):
+        await service.publish(memory.id)
+    stored = await service.get_by_name(TITLE_ALPHA, InstructionType.MEMORY, USER_ID)
+    assert stored.owner_id == USER_ID
+
+
+async def test_search_all_hides_memories_unless_asked_explicitly(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    """Admin cross-user search must not casually surface personal memories."""
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
+    register_vector(embedder, TITLE_BETA, CONTENT_B, V_RIGHT)
+    await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)
+    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B)
+    embedder.vectors[QUERY] = V_RIGHT
+
+    default = await service.search_all(QUERY, k=THREE_HITS)
+    explicit = await service.search_all(QUERY, k=THREE_HITS, kind=InstructionType.MEMORY)
+
+    assert [hit.instruction.title for hit in default] == [TITLE_BETA]
+    assert [hit.instruction.title for hit in explicit] == [TITLE_ALPHA]
+
+
+async def test_save_survives_an_embedding_failure(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    """The fact the user asked to remember must not vanish with the backend.
+
+    StubEmbedder raises KeyError for unregistered texts — the save degrades
+    to an empty embedding instead of failing, and the record stays findable
+    by name until the sweep re-embeds it.
+    """
+    saved = await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)
+
+    stored = await service.get_by_name(TITLE_ALPHA, InstructionType.MEMORY, USER_ID)
+    assert saved.id == stored.id
+    assert stored.content == CONTENT_A
+
+
+async def test_reembed_missing_finishes_deferred_embeddings(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    """The startup sweep turns embedding-less records back into search results."""
+    await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)  # embed fails
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)  # backend is back
+    embedder.vectors[QUERY] = V_RIGHT
+
+    swept = await service.reembed_missing()
+    hits = await service.search(USER_ID, QUERY, k=TWO_HITS, kind=InstructionType.MEMORY)
+
+    assert swept == 1
+    assert await service.reembed_missing() == 0  # idempotent: nothing left
+    assert [hit.instruction.title for hit in hits] == [TITLE_ALPHA]

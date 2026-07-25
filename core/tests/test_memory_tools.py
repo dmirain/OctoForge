@@ -1,18 +1,18 @@
-"""Tests for the memory runtime tools over the real SQL store."""
+"""Tests for the memory tools over the shared instruction store (type=memory)."""
 
 from collections.abc import AsyncIterator
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.memory.store import SqlAlchemyMemoryStore
-from octoforge_core.memory.tools import (
-    NO_HITS_MESSAGE,
-    MemoryDeleteTool,
-    MemorySearchTool,
-    MemoryStoreTool,
+from octoforge_core.instructions.api import (
+    InstructionDraft,
+    InstructionService,
+    InstructionType,
 )
+from octoforge_core.instructions.local import LocalInstructionService
+from octoforge_core.instructions.store import SqlAlchemyInstructionStore
+from octoforge_core.memory.tools import MemoryDeleteTool, MemoryStoreTool
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -20,41 +20,45 @@ MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 CTX_A = ToolContext(user_id="user-a", channel="web", dialog_id="dlg-a")
 CTX_A_OTHER_SURFACE = ToolContext(user_id="user-a", channel="telegram", dialog_id="dlg-a2")
 CTX_B = ToolContext(user_id="user-b", channel="web", dialog_id="dlg-b")
-DEFAULT_LIMIT = 2
-MAX_LIMIT = 4
-THREE_MEMORIES = 3
-SNIPPET_CHARS = 300
-LONG_CONTENT = "x" * 400
 CITY_KEY = "city"
 CITY_CONTENT = "lives in Berlin"
+SECOND_VERSION = 2
+TOP_K = 10
+
+
+class StubEmbedder:
+    """EmbeddingClient stub returning the same vector for every text."""
+
+    async def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        return tuple((1.0, 0.0) for _ in texts)
 
 
 @pytest.fixture
-async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+async def store() -> AsyncIterator[SqlAlchemyInstructionStore]:
     engine = create_engine(MEMORY_DATABASE_URL)
     await init_db(engine)
-    yield create_session_factory(engine)
+    yield SqlAlchemyInstructionStore(create_session_factory(engine))
     await engine.dispose()
 
 
 @pytest.fixture
-def store(session_factory: async_sessionmaker[AsyncSession]) -> SqlAlchemyMemoryStore:
-    return SqlAlchemyMemoryStore(session_factory)
+def service(store: SqlAlchemyInstructionStore) -> InstructionService:
+    return LocalInstructionService(store, StubEmbedder())
 
 
 @pytest.fixture
-def store_tool(store: SqlAlchemyMemoryStore) -> MemoryStoreTool:
-    return MemoryStoreTool(store=store)
+def store_tool(service: InstructionService) -> MemoryStoreTool:
+    return MemoryStoreTool(service=service)
 
 
 @pytest.fixture
-def search_tool(store: SqlAlchemyMemoryStore) -> MemorySearchTool:
-    return MemorySearchTool(store=store, default_limit=DEFAULT_LIMIT, max_limit=MAX_LIMIT)
+def delete_tool(service: InstructionService) -> MemoryDeleteTool:
+    return MemoryDeleteTool(service=service)
 
 
-@pytest.fixture
-def delete_tool(store: SqlAlchemyMemoryStore) -> MemoryDeleteTool:
-    return MemoryDeleteTool(store=store)
+async def find_memory_keys(service: InstructionService, user_id: str) -> list[str]:
+    hits = await service.search(user_id, "memories", TOP_K, InstructionType.MEMORY)
+    return [hit.instruction.title for hit in hits]
 
 
 # --- memory_store -----------------------------------------------------------
@@ -73,24 +77,62 @@ def test_tool_schemas_have_no_scope(
     assert "scope" not in delete_tool.spec.parameters_schema["properties"]
 
 
-async def test_store_reports_created_then_updated(store_tool: MemoryStoreTool) -> None:
-    created = await store_tool.execute(
+async def test_store_creates_a_private_memory_record(
+    service: InstructionService,
+    store_tool: MemoryStoreTool,
+) -> None:
+    output = await store_tool.execute(
         {"key": CITY_KEY, "content": CITY_CONTENT, "tags": ["profile"]}, CTX_A
     )
+
+    record = await service.get_by_name(CITY_KEY, InstructionType.MEMORY, CTX_A.user_id)
+    assert output == "memory stored (key=city, version=1)"
+    assert record.type is InstructionType.MEMORY
+    assert record.owner_id == CTX_A.user_id
+    assert record.content == CITY_CONTENT
+    assert record.tags == ("profile",)
+
+
+async def test_store_upserts_by_key(store_tool: MemoryStoreTool) -> None:
+    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
     updated = await store_tool.execute({"key": CITY_KEY, "content": "moved to Lisbon"}, CTX_A)
 
-    assert created == "memory stored (key=city, created=true)"
-    assert updated == "memory stored (key=city, created=false)"
+    assert updated == f"memory stored (key=city, version={SECOND_VERSION})"
+
+
+async def test_memories_come_back_through_instruction_search(
+    service: InstructionService,
+    store_tool: MemoryStoreTool,
+) -> None:
+    """The storage merge's point: one ranked search covers memories too."""
+    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
+
+    unfiltered = await service.search(CTX_A.user_id, "where does the user live", TOP_K)
+    memory_only = await service.search(
+        CTX_A.user_id, "where does the user live", TOP_K, InstructionType.MEMORY
+    )
+
+    assert CITY_KEY in [hit.instruction.title for hit in unfiltered]
+    assert [hit.instruction.title for hit in memory_only] == [CITY_KEY]
 
 
 async def test_store_writes_are_owner_scoped(
+    service: InstructionService,
     store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
 ) -> None:
     await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
 
-    assert CITY_CONTENT in await search_tool.execute({"query": "berlin"}, CTX_A)
-    assert await search_tool.execute({"query": "berlin"}, CTX_B) == NO_HITS_MESSAGE
+    assert CITY_KEY in await find_memory_keys(service, CTX_A.user_id)
+    assert CITY_KEY not in await find_memory_keys(service, CTX_B.user_id)
+
+
+async def test_memories_visible_across_user_surfaces(
+    service: InstructionService,
+    store_tool: MemoryStoreTool,
+) -> None:
+    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
+
+    assert CITY_KEY in await find_memory_keys(service, CTX_A_OTHER_SURFACE.user_id)
 
 
 async def test_store_rejects_invalid_arguments(store_tool: MemoryStoreTool) -> None:
@@ -110,146 +152,6 @@ async def test_store_rejects_invalid_arguments(store_tool: MemoryStoreTool) -> N
         )
 
 
-# --- memory_search ----------------------------------------------------------
-
-
-def test_search_tool_spec(search_tool: MemorySearchTool) -> None:
-    assert search_tool.spec.name == "memory_search"
-    # nothing is required: a query-less call is the catalog request
-    assert "required" not in search_tool.spec.parameters_schema
-
-
-async def test_search_formats_numbered_lines(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT, "tags": ["profile"]}, CTX_A)
-    await store_tool.execute({"key": "diet", "content": "vegetarian"}, CTX_A)
-
-    output = await search_tool.execute({"query": "e"}, CTX_A)
-
-    assert output == (
-        "1. [user] diet — vegetarian — tags: -\n2. [user] city — lives in Berlin — tags: profile"
-    )
-
-
-async def test_search_collapses_multiline_content(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    await store_tool.execute({"key": CITY_KEY, "content": "line one\nline two"}, CTX_A)
-
-    output = await search_tool.execute({"query": "line"}, CTX_A)
-
-    assert output == "1. [user] city — line one line two — tags: -"
-
-
-async def test_search_truncates_snippet(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    await store_tool.execute({"key": CITY_KEY, "content": LONG_CONTENT}, CTX_A)
-
-    output = await search_tool.execute({"query": "x"}, CTX_A)
-
-    assert output == f"1. [user] city — {'x' * SNIPPET_CHARS} — tags: -"
-
-
-async def test_search_no_hits(search_tool: MemorySearchTool) -> None:
-    assert await search_tool.execute({"query": "nothing"}, CTX_A) == NO_HITS_MESSAGE
-
-
-async def test_search_applies_default_limit(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    for index in range(THREE_MEMORIES):
-        await store_tool.execute({"key": f"key-{index}", "content": "common"}, CTX_A)
-
-    output = await search_tool.execute({"query": "common"}, CTX_A)
-
-    assert len(output.splitlines()) == DEFAULT_LIMIT
-
-
-async def test_search_explicit_limit_overrides_default(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    for index in range(THREE_MEMORIES):
-        await store_tool.execute({"key": f"key-{index}", "content": "common"}, CTX_A)
-
-    output = await search_tool.execute({"query": "common", "limit": THREE_MEMORIES}, CTX_A)
-
-    assert len(output.splitlines()) == THREE_MEMORIES
-
-
-async def test_search_without_a_query_lists_the_whole_memory(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    """The agent cannot guess a substring for a memory it has never seen."""
-    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
-    await store_tool.execute({"key": "diet", "content": "vegetarian"}, CTX_A)
-
-    catalog = await search_tool.execute({}, CTX_A)
-    blank = await search_tool.execute({"query": "   "}, CTX_A)
-
-    assert CITY_KEY in catalog
-    assert "diet" in catalog
-    assert blank == catalog
-
-
-async def test_search_catalog_stays_owner_scoped(
-    store: SqlAlchemyMemoryStore,
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    """A query-less listing must not become a hole in the owner isolation."""
-    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
-    await store.put(None, "shared", "everyone")  # legacy global entry, readable by all
-
-    catalog = await search_tool.execute({}, CTX_B)
-
-    assert CITY_KEY not in catalog
-    assert "shared" in catalog
-
-
-async def test_search_catalog_respects_the_default_limit(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    for index in range(THREE_MEMORIES):
-        await store_tool.execute({"key": f"key-{index}", "content": "body"}, CTX_A)
-
-    catalog = await search_tool.execute({}, CTX_A)
-
-    assert len(catalog.splitlines()) == DEFAULT_LIMIT
-
-
-async def test_search_rejects_invalid_arguments(search_tool: MemorySearchTool) -> None:
-    with pytest.raises(ToolArgumentsError):
-        await search_tool.execute({"query": 1}, CTX_A)
-    with pytest.raises(ToolArgumentsError):
-        await search_tool.execute({"query": "x", "limit": 0}, CTX_A)
-    with pytest.raises(ToolArgumentsError):
-        await search_tool.execute({"query": "x", "limit": MAX_LIMIT + 1}, CTX_A)
-    with pytest.raises(ToolArgumentsError):
-        await search_tool.execute({"query": "x", "limit": "2"}, CTX_A)
-    with pytest.raises(ToolArgumentsError):
-        await search_tool.execute({"query": "x", "limit": True}, CTX_A)
-
-
-async def test_search_visible_across_user_surfaces(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
-
-    output = await search_tool.execute({"query": "berlin"}, CTX_A_OTHER_SURFACE)
-
-    assert CITY_KEY in output
-
-
 # --- memory_delete ----------------------------------------------------------
 
 
@@ -259,8 +161,8 @@ def test_delete_tool_spec(delete_tool: MemoryDeleteTool) -> None:
 
 
 async def test_delete_removes_memory(
+    service: InstructionService,
     store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
     delete_tool: MemoryDeleteTool,
 ) -> None:
     await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
@@ -268,7 +170,7 @@ async def test_delete_removes_memory(
     output = await delete_tool.execute({"key": CITY_KEY}, CTX_A)
 
     assert output == "memory 'city' deleted"
-    assert await search_tool.execute({"query": "berlin"}, CTX_A) == NO_HITS_MESSAGE
+    assert CITY_KEY not in await find_memory_keys(service, CTX_A.user_id)
 
 
 async def test_delete_missing_reports_text(delete_tool: MemoryDeleteTool) -> None:
@@ -277,12 +179,21 @@ async def test_delete_missing_reports_text(delete_tool: MemoryDeleteTool) -> Non
     assert output == "memory 'missing' not found"
 
 
-async def test_delete_cannot_reach_global_memories(
-    store: SqlAlchemyMemoryStore,
+async def test_delete_cannot_reach_legacy_global_memories(
+    store: SqlAlchemyInstructionStore,
     delete_tool: MemoryDeleteTool,
 ) -> None:
-    """Legacy global entries stay readable but are out of the agent tool's reach."""
-    await store.put(None, "date_format", "ISO")
+    """Migrated global entries are public records, out of the agent tool's reach."""
+    await store.upsert(
+        InstructionDraft(
+            kind=InstructionType.MEMORY,
+            title="date_format",
+            content="ISO",
+            tags=(),
+            embedding=(1.0, 0.0),
+            owner_id=None,  # what the data migration produces for user_id NULL
+        )
+    )
 
     output = await delete_tool.execute({"key": "date_format"}, CTX_A)
 
@@ -290,8 +201,8 @@ async def test_delete_cannot_reach_global_memories(
 
 
 async def test_delete_respects_owner_isolation(
+    service: InstructionService,
     store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
     delete_tool: MemoryDeleteTool,
 ) -> None:
     await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
@@ -299,7 +210,7 @@ async def test_delete_respects_owner_isolation(
     output = await delete_tool.execute({"key": CITY_KEY}, CTX_B)
 
     assert output == "memory 'city' not found"
-    assert CITY_CONTENT in await search_tool.execute({"query": "berlin"}, CTX_A)
+    assert CITY_KEY in await find_memory_keys(service, CTX_A.user_id)
 
 
 async def test_delete_rejects_invalid_arguments(delete_tool: MemoryDeleteTool) -> None:

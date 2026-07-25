@@ -50,10 +50,12 @@ Scenario: durable user facts and preferences (name, city, diet, goals and the li
 1. Save facts with memory_store. Memory is private to this user; a fact useful to
    everyone is saved as a knowledge record via instruction_save instead (an admin
    publishes it later).
-2. Call memory_search before personal recommendations or when the answer may depend
-   on what the user told you earlier. With no query it lists the whole memory — use
-   that to see what is stored instead of guessing a substring or assuming nothing is
-   there; the list is short and the call is cheap.
+2. Memories come back through instruction_search, ranked together with skills and
+   knowledge. Before personal recommendations, or when the answer may depend on
+   what the user told you earlier, add a query about the user (e.g. 'user
+   preferences diet'); type=memory narrows the search to memories only. When the
+   user asks what you remember about them, search type=memory with broad queries
+   and present the hits honestly.
 3. Do not duplicate what lives in instructions (shared knowledge) or datasets
    (structured records). Memory is per-user and shared across the user's surfaces.
 Delete with memory_delete only on the user's explicit request."""

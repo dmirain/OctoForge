@@ -57,8 +57,6 @@ from octoforge_core.llm.errors import LLMError
 from octoforge_core.llm.http_reranker import HttpRerankerClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient
-from octoforge_core.memory.api import MemoryStore
-from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.external import ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchProvider
@@ -114,7 +112,6 @@ class Runtime:
     session_factory: async_sessionmaker[AsyncSession]
     task_store: TaskStore
     instructions: InstructionService
-    memory_store: MemoryStore
     admin_read_model: AdminReadModel
 
 
@@ -154,7 +151,6 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             # The app's own base URL is allowlisted so tool records can
             # target our loopback HTTP API (cron jobs) past the SSRF guard.
             guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
-            memory = SqlAlchemyMemoryStore(session_factory)
             summary_store = SqlAlchemySummaryStore(session_factory)
             registry = build_tool_registry(
                 outbound_http,
@@ -162,7 +158,6 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 stores=ToolStores(
                     tasks=task_store,
                     cron=cron_store,
-                    memory=memory,
                     archive=summary_store,
                     summaries=summary_store,
                 ),
@@ -256,7 +251,6 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     session_factory=session_factory,
                     task_store=task_store,
                     instructions=instructions,
-                    memory_store=memory,
                     admin_read_model=SqlAlchemyAdminStore(session_factory),
                 )
             finally:
@@ -296,7 +290,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.session_factory = rt.session_factory
             app.state.task_store = rt.task_store
             app.state.instructions = rt.instructions
-            app.state.memory_store = rt.memory_store
             app.state.admin_read_model = rt.admin_read_model
             yield
 
@@ -377,6 +370,11 @@ async def _sync_system_skills(instructions: InstructionService, settings: Settin
         return
     try:
         await sync_system_registry(instructions, CORE_SYSTEM_SKILLS + WEB_SYSTEM_SKILLS)
+        # finish deferred embeddings: records saved while the backend was down
+        # and rows produced by embedder-less data migrations
+        reembedded = await instructions.reembed_missing()
+        if reembedded:
+            logger.info("re-embedded %d record(s) stored without a vector", reembedded)
     except (LLMError, LLMResponseError, SQLAlchemyError):
         logger.warning(
             "System skill registry sync failed; starting without it",
@@ -430,8 +428,6 @@ def _tool_limits(settings: Settings) -> ToolLimits:
         instructions_top_k=settings.instructions_top_k,
         datasets_query_default_limit=settings.datasets_query_default_limit,
         datasets_query_max_limit=settings.datasets_query_max_limit,
-        memory_search_default_limit=settings.memory_search_default_limit,
-        memory_search_max_limit=settings.memory_search_max_limit,
         history_search_default_limit=settings.history_search_default_limit,
         history_search_max_limit=settings.history_search_max_limit,
     )

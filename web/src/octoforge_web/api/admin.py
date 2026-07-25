@@ -3,8 +3,9 @@
 Reads go through the core admin read model (`octoforge_core.admin`), which is
 the only cross-user view in the system. Writes deliberately reuse the same
 owner-scoped services the agent uses — `CronStore.set_enabled`,
-`TaskStore.delete`, `InstructionService.delete`/`publish`, `MemoryStore.delete` —
-so an operator action cannot bypass an invariant the agent respects.
+`TaskStore.delete`, `InstructionService.delete`/`publish` — so an operator
+action cannot bypass an invariant the agent respects. Memories live in the
+instruction store (type=memory) and are deleted through the same facade.
 """
 
 from collections.abc import Callable
@@ -28,9 +29,10 @@ from octoforge_core.instructions.api import (
     Instruction,
     InstructionNotFoundError,
     InstructionService,
+    InstructionType,
     SystemInstructionError,
 )
-from octoforge_core.memory.api import Memory, MemoryNotFoundError, MemoryStore
+from octoforge_core.memory.api import Memory
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task
 from octoforge_core.tasks.store import TaskStore
@@ -39,7 +41,6 @@ from octoforge_web.deps import (
     get_admin_read_model,
     get_cron_store,
     get_instruction_service,
-    get_memory_store,
     get_task_store,
     require_admin,
 )
@@ -50,7 +51,6 @@ ReadModelDep = Annotated[AdminReadModel, Depends(get_admin_read_model)]
 CronStoreDep = Annotated[CronStore, Depends(get_cron_store)]
 TaskStoreDep = Annotated[TaskStore, Depends(get_task_store)]
 InstructionsDep = Annotated[InstructionService, Depends(get_instruction_service)]
-MemoryStoreDep = Annotated[MemoryStore, Depends(get_memory_store)]
 LimitDep = Annotated[int | None, Query(ge=1)]
 OffsetDep = Annotated[int | None, Query(ge=0)]
 
@@ -232,13 +232,21 @@ async def memories(
 @router.delete("/memories/{key}")
 async def delete_memory(
     key: str,
-    store: MemoryStoreDep,
+    service: InstructionsDep,
     user_id: str | None = None,
 ) -> dict[str, str]:
-    """Delete a memory by key; `user_id` omitted means the global scope."""
+    """Delete a memory by key; `user_id` omitted targets a legacy global entry."""
     try:
-        await store.delete(user_id, key)
-    except MemoryNotFoundError as exc:
+        record = await service.get_by_name(key, InstructionType.MEMORY, user_id)
+        if user_id is not None and record.owner_id != user_id:
+            raise InstructionNotFoundError(key)
+        if record.owner_id is None:
+            # legacy global memory rows are public records: the owner-scoped
+            # delete cannot reach them, the registry-sync path can
+            await service.delete_system(key, InstructionType.MEMORY)
+        else:
+            await service.delete(record.owner_id, record.id)
+    except InstructionNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
     return DELETED_STATUS
 

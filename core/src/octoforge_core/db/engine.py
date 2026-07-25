@@ -19,8 +19,7 @@ import octoforge_core.context.models
 import octoforge_core.cron.models
 import octoforge_core.datasets.models
 import octoforge_core.db.models
-import octoforge_core.instructions.models
-import octoforge_core.memory.models  # noqa: F401
+import octoforge_core.instructions.models  # noqa: F401
 from octoforge_core.db.base import Base
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
@@ -73,8 +72,14 @@ def _bootstrap_sync(connection: Connection) -> None:
         _create_and_stamp(connection, config)
         return
     if tables and "alembic_version" not in tables:
-        # adopt a pre-Alembic database at baseline, then run later migrations
-        command.stamp(config, _BASELINE_REVISION)
+        # Adopt a pre-Alembic database. One created by an old octoforge (or an
+        # old create_all) still has the memories table: stamp it at baseline so
+        # the whole chain — including the memories→instructions data migration —
+        # replays over it. One created by today's create_all already matches
+        # head (create_all builds the current metadata, and memories is gone
+        # from it): stamp head, or the replay would touch dropped tables.
+        adopted = _BASELINE_REVISION if "memories" in tables else "head"
+        command.stamp(config, adopted)
     command.upgrade(config, "head")  # fresh, legacy, or already-managed database
 
 

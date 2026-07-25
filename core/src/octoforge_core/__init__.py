@@ -78,7 +78,7 @@ from octoforge_core.llm.errors import (
 from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.llm.usage import Completion, Usage
-from octoforge_core.memory.api import MemoryStore
+from octoforge_core.memory.api import Memory
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
@@ -130,7 +130,7 @@ __all__ = [
     "LLMResponseError",
     "LoopControl",
     "LoopEvent",
-    "MemoryStore",
+    "Memory",
     "MessageArchive",
     "MessageRepository",
     "MessageRole",

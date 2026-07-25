@@ -55,7 +55,6 @@ from octoforge_core.instructions.api import (
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
-from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
 from octoforge_core.tasks.store import InMemoryTaskStore
@@ -298,7 +297,6 @@ def build_third_party_root(
         stores=ToolStores(
             tasks=InMemoryTaskStore(),
             cron=SqlAlchemyCronStore(session_factory),
-            memory=SqlAlchemyMemoryStore(session_factory),
             archive=summary_store,
             summaries=summary_store,
         ),
@@ -319,8 +317,6 @@ def build_third_party_root(
             instructions_top_k=DEFAULT_K,
             datasets_query_default_limit=QUERY_LIMIT,
             datasets_query_max_limit=QUERY_LIMIT,
-            memory_search_default_limit=QUERY_LIMIT,
-            memory_search_max_limit=QUERY_LIMIT,
             history_search_default_limit=QUERY_LIMIT,
             history_search_max_limit=QUERY_LIMIT,
         ),

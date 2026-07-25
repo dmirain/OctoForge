@@ -10,7 +10,7 @@ implemented — this store ranks brute-force in the process.
 import uuid
 from typing import Any, cast
 
-from sqlalchemy import ColumnElement, delete, select, update
+from sqlalchemy import ColumnElement, delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -153,15 +153,44 @@ class SqlAlchemyInstructionStore:
             return result.rowcount > 0
 
     async def publish(self, instruction_id: str) -> Instruction | None:
-        """Make the record public (owner_id -> NULL); None when the id is unknown."""
+        """Make the record public (owner_id -> NULL); None when the id is unknown.
+
+        A memory-type record also answers None: memories are never published,
+        and the admin surface treats an unpublishable record as a missing one.
+        """
         async with self._session_factory() as session:
             row = await session.get(InstructionRow, instruction_id)
-            if row is None:
+            if row is None or row.type == InstructionType.MEMORY.value:
                 return None
             row.owner_id = None
             row.updated_at = utc_now()
             await session.commit()
             return _to_instruction(row)
+
+    async def list_missing_embeddings(self) -> list[Instruction]:
+        """Return records whose embedding is empty (failed or deferred embedding)."""
+        async with self._session_factory() as session:
+            statement = (
+                select(InstructionRow)
+                .where(func.json_array_length(InstructionRow.embedding) == 0)
+                .order_by(InstructionRow.created_at, InstructionRow.id)
+            )
+            rows = (await session.scalars(statement)).all()
+            return [_to_instruction(row) for row in rows]
+
+    async def set_embedding(self, instruction_id: str, embedding: tuple[float, ...]) -> bool:
+        """Store the embedding only; no version bump, no updated_at touch."""
+        async with self._session_factory() as session:
+            statement = (
+                update(InstructionRow)
+                .where(InstructionRow.id == instruction_id)
+                # re-embedding is maintenance, not an edit: the self-assignment
+                # suppresses the column's onupdate stamp
+                .values(embedding=list(embedding), updated_at=InstructionRow.updated_at)
+            )
+            result = cast(CursorResult[Any], await session.execute(statement))
+            await session.commit()
+            return result.rowcount > 0
 
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
         """Delete the public/system record (kind, title); registry sync only."""

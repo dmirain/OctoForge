@@ -25,7 +25,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import inspect, select, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from octoforge_core.cron.api import CronJob
@@ -38,8 +37,6 @@ from octoforge_core.db.repositories import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import InstructionDraft, InstructionType
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
-from octoforge_core.memory.models import MemoryRow
-from octoforge_core.memory.store import SqlAlchemyMemoryStore
 
 DATABASE_URL_ENV = "OF_TEST_DATABASE_URL"
 DATABASE_URL = os.environ.get(DATABASE_URL_ENV, "")
@@ -83,7 +80,6 @@ EXPECTED_TABLES = frozenset(
         "dialog_summaries",
         "dialogs",
         "instructions",
-        "memories",
         "messages",
         "tasks",
     }
@@ -151,6 +147,22 @@ def draft(owner_id: str | None, title: str = TITLE) -> InstructionDraft:
         content="do the thing",
         tags=("test",),
         embedding=EMBEDDING,
+        owner_id=owner_id,
+    )
+
+
+def memory_draft(
+    key: str,
+    content: str,
+    owner_id: str | None,
+    embedding: tuple[float, ...] = EMBEDDING,
+) -> InstructionDraft:
+    return InstructionDraft(
+        kind=InstructionType.MEMORY,
+        title=key,
+        content=content,
+        tags=(),
+        embedding=embedding,
         owner_id=owner_id,
     )
 
@@ -264,42 +276,31 @@ async def test_cron_claim_takes_over_a_stale_lease(
 async def test_two_users_may_share_a_memory_key(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The partial index must not degrade into a plain unique index over `key`."""
-    store = SqlAlchemyMemoryStore(session_factory)
+    """Memories live in instructions now: (type, title) may repeat across owners."""
+    store = SqlAlchemyInstructionStore(session_factory)
 
-    await store.put(USER_A, SHARED_KEY, "a note")
-    await store.put(USER_B, SHARED_KEY, "b note")
+    await store.upsert(memory_draft(SHARED_KEY, "a note", USER_A))
+    await store.upsert(memory_draft(SHARED_KEY, "b note", USER_B))
 
-    assert (await store.get(USER_A, SHARED_KEY)).content == "a note"
-    assert (await store.get(USER_B, SHARED_KEY)).content == "b note"
+    a_row = await store.get_by_title(SHARED_KEY, InstructionType.MEMORY, owner_id=USER_A)
+    b_row = await store.get_by_title(SHARED_KEY, InstructionType.MEMORY, owner_id=USER_B)
+    assert a_row is not None and a_row.content == "a note"
+    assert b_row is not None and b_row.content == "b note"
 
 
-async def test_global_memory_key_is_unique(
+async def test_missing_embeddings_roundtrip(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Two global rows with one key must collide on the partial unique index."""
-    store = SqlAlchemyMemoryStore(session_factory)
-    await store.put(None, SHARED_KEY, GLOBAL_CONTENT)
+    """json_array_length must find empty-embedding rows on Postgres too."""
+    store = SqlAlchemyInstructionStore(session_factory)
+    saved = await store.upsert(memory_draft(SHARED_KEY, GLOBAL_CONTENT, USER_A, embedding=()))
 
-    async with session_factory() as session:
-        # inserted directly: put() would find the existing row and update it
-        session.add(
-            MemoryRow(id="forced", user_id=None, key=SHARED_KEY, content="duplicate", tags=[])
-        )
-        with pytest.raises(IntegrityError):
-            await session.commit()
+    pending = await store.list_missing_embeddings()
+    stored = await store.set_embedding(saved.id, (1.0, 0.0))
 
-
-async def test_memory_search_is_case_insensitive(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """`ilike` keeps SQLite's case-insensitive behavior; plain LIKE would not."""
-    store = SqlAlchemyMemoryStore(session_factory)
-    await store.put(USER_A, "breakfast", "Porridge with BERRIES")
-
-    found = await store.search(USER_A, "berries", SEARCH_LIMIT)
-
-    assert [memory.key for memory in found] == ["breakfast"]
+    assert [record.id for record in pending] == [saved.id]
+    assert stored is True
+    assert await store.list_missing_embeddings() == []
 
 
 async def test_private_instruction_shadows_the_public_one(

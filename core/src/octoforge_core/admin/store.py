@@ -30,7 +30,6 @@ from octoforge_core.db.models import DialogRow, MessageRow, TaskRow
 from octoforge_core.instructions.api import Instruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.memory.api import Memory
-from octoforge_core.memory.models import MemoryRow
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 
 
@@ -49,13 +48,25 @@ class SqlAlchemyAdminStore:
                     ("messages", MessageRow),
                     ("tasks", TaskRow),
                     ("cron_jobs", CronJobRow),
-                    ("instructions", InstructionRow),
                     ("datasets", DatasetRow),
                     ("dataset_records", DatasetRecordRow),
-                    ("memories", MemoryRow),
                     ("dialog_summaries", SummaryRow),
                 )
             }
+            # memories share the instructions table (type=memory): the two
+            # console tabs split one table by type
+            counts["instructions"] = await _count(
+                session,
+                select(func.count())
+                .select_from(InstructionRow)
+                .where(InstructionRow.type != InstructionType.MEMORY.value),
+            )
+            counts["memories"] = await _count(
+                session,
+                select(func.count())
+                .select_from(InstructionRow)
+                .where(InstructionRow.type == InstructionType.MEMORY.value),
+            )
         return Totals(**counts)
 
     async def list_dialogs(self, limit: int, offset: int) -> Page[DialogOverview]:
@@ -163,7 +174,10 @@ class SqlAlchemyAdminStore:
         offset: int,
         query: str | None = None,
     ) -> Page[Instruction]:
-        filters = [] if not query else [InstructionRow.title.ilike(f"%{query}%")]
+        # the memories tab owns type=memory rows; this tab lists the rest
+        filters = [InstructionRow.type != InstructionType.MEMORY.value]
+        if query:
+            filters.append(InstructionRow.title.ilike(f"%{query}%"))
         statement = (
             select(InstructionRow)
             .where(*filters)
@@ -217,13 +231,15 @@ class SqlAlchemyAdminStore:
         )
 
     async def list_memories(self, limit: int, offset: int) -> Page[Memory]:
+        memory_only = InstructionRow.type == InstructionType.MEMORY.value
         statement = (
-            select(MemoryRow)
-            .order_by(MemoryRow.updated_at.desc(), MemoryRow.key)
+            select(InstructionRow)
+            .where(memory_only)
+            .order_by(InstructionRow.updated_at.desc(), InstructionRow.title)
             .limit(limit)
             .offset(offset)
         )
-        counter = select(func.count()).select_from(MemoryRow)
+        counter = select(func.count()).select_from(InstructionRow).where(memory_only)
         rows, total = await self._page(statement, counter)
         return Page(
             items=tuple(_to_memory(row) for row in rows), total=total, limit=limit, offset=offset
@@ -355,11 +371,12 @@ def _to_record(row: DatasetRecordRow) -> DatasetRecord:
     )
 
 
-def _to_memory(row: MemoryRow) -> Memory:
+def _to_memory(row: InstructionRow) -> Memory:
+    """Map a memory-type instruction row to the console's memory shape."""
     return Memory(
         id=row.id,
-        user_id=row.user_id,
-        key=row.key,
+        user_id=row.owner_id,
+        key=row.title,
         content=row.content,
         tags=tuple(row.tags),
         created_at=row.created_at,

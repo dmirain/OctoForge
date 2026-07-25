@@ -42,8 +42,7 @@ from octoforge_core.llm.embeddings import EmbeddingClient
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
-from octoforge_core.memory.api import MemoryStore
-from octoforge_core.memory.tools import MemoryDeleteTool, MemorySearchTool, MemoryStoreTool
+from octoforge_core.memory.tools import MemoryDeleteTool, MemoryStoreTool
 from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import ExternalCallTool, HttpRequestTool
@@ -62,8 +61,6 @@ class ToolLimits:
     instructions_top_k: int
     datasets_query_default_limit: int
     datasets_query_max_limit: int
-    memory_search_default_limit: int
-    memory_search_max_limit: int
     history_search_default_limit: int
     history_search_max_limit: int
 
@@ -74,7 +71,6 @@ class ToolStores:
 
     tasks: TaskStore
     cron: CronStore
-    memory: MemoryStore
     archive: MessageArchive
     summaries: SummaryStore
 
@@ -165,7 +161,7 @@ def build_tool_registry(
         registry.register(WebSearchTool(provider=services.search_provider))
     _register_instruction_tools(registry, services, limits)
     _register_dataset_tools(registry, services.datasets, limits)
-    _register_memory_tools(registry, stores.memory, limits)
+    _register_memory_tools(registry, services.instructions)
     _register_history_tool(registry, stores.archive, stores.summaries, limits)
     return registry
 
@@ -303,19 +299,15 @@ def _register_dataset_tools(
 
 def _register_memory_tools(
     registry: ToolRegistry,
-    store: MemoryStore,
-    limits: ToolLimits,
+    instructions: InstructionService,
 ) -> None:
-    """Register the memory tools over the shared memory store."""
-    registry.register(MemoryStoreTool(store=store))
-    registry.register(
-        MemorySearchTool(
-            store=store,
-            default_limit=limits.memory_search_default_limit,
-            max_limit=limits.memory_search_max_limit,
-        )
-    )
-    registry.register(MemoryDeleteTool(store=store))
+    """Register the memory write tools over the shared instruction store.
+
+    Reading memories is instruction_search's job (memories are ranked with
+    everything else), so no memory_search tool is registered.
+    """
+    registry.register(MemoryStoreTool(service=instructions))
+    registry.register(MemoryDeleteTool(service=instructions))
 
 
 def _register_history_tool(

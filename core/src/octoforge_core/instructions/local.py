@@ -70,8 +70,16 @@ class LocalInstructionService:
         k: int,
         kind: InstructionType | None = None,
     ) -> list[SearchHit]:
-        """Rank the whole table with no visibility filter (admin surface)."""
-        return await self._search(None, query, k, kind)
+        """Rank the whole table with no visibility filter (admin surface).
+
+        Memory records only surface when `kind` names them explicitly: a
+        cross-user search must not leak personal memories into an admin's
+        general instruction lookup.
+        """
+        hits = await self._search(None, query, k, kind)
+        if kind is None:
+            hits = [hit for hit in hits if hit.instruction.type is not InstructionType.MEMORY]
+        return hits
 
     async def _search(
         self,
@@ -121,7 +129,7 @@ class LocalInstructionService:
             title=title,
             content=content,
             tags=tags,
-            embedding=await self._embed(title, content),
+            embedding=await self._embed_lenient(title, content),
             system=False,
             owner_id=user_id,
         )
@@ -197,9 +205,45 @@ class LocalInstructionService:
         if not await self._store.delete_by_title(name, kind):
             raise InstructionNotFoundError(name)
 
+    async def reembed_missing(self) -> int:
+        """Embed and store vectors for records saved without one; return the count.
+
+        Batch-embeds everything in one call; individual `set_embedding` misses
+        (a record deleted mid-sweep) are simply skipped.
+        """
+        pending = await self._store.list_missing_embeddings()
+        if not pending:
+            return 0
+        embeddings = await self._embedder.embed(
+            tuple(_embedded_text(record.title, record.content) for record in pending)
+        )
+        stored = 0
+        for record, embedding in zip(pending, embeddings, strict=True):
+            if await self._store.set_embedding(record.id, embedding):
+                stored += 1
+        return stored
+
     async def _embed(self, title: str, content: str) -> tuple[float, ...]:
         (embedding,) = await self._embedder.embed((_embedded_text(title, content),))
         return embedding
+
+    async def _embed_lenient(self, title: str, content: str) -> tuple[float, ...]:
+        """Embed for an agent-facing save; a backend failure defers, not loses.
+
+        The fact the user just asked to remember must not vanish because the
+        embedding backend is down: the record is stored with an empty vector
+        (found by exact title until then) and the startup `reembed_missing`
+        sweep finishes the job.
+        """
+        try:
+            return await self._embed(title, content)
+        except Exception:
+            logger.warning(
+                "embedding failed, saving %r without a vector (reembed sweep will fix it)",
+                title,
+                exc_info=True,
+            )
+            return ()
 
     async def _ensure_not_system(self, kind: InstructionType, title: str) -> None:
         existing = await self._store.get_by_title(title, kind)

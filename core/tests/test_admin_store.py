@@ -19,7 +19,6 @@ from octoforge_core.db.repositories import DialogRepository, MessageRepository, 
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import InstructionDraft, InstructionType
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
-from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -84,6 +83,18 @@ def task(dialog_id: str, user_id: str, status: TaskStatus, kind: TaskKind = Task
     )
 
 
+def memory_draft(key: str, owner_id: str | None) -> InstructionDraft:
+    """A memory record as memory_store (or the data migration) produces it."""
+    return InstructionDraft(
+        kind=InstructionType.MEMORY,
+        title=key,
+        content=f"note about {key}",
+        tags=(),
+        embedding=EMBEDDING,
+        owner_id=owner_id,
+    )
+
+
 def test_clamp_page_defaults_and_caps() -> None:
     assert clamp_page(None, None) == (DEFAULT_LIMIT, 0)
     assert clamp_page(OVERSIZED_LIMIT, None) == (MAX_PAGE_SIZE, 0)
@@ -101,7 +112,7 @@ async def test_totals_counts_every_entity(
     )
     await SqlAlchemyTaskStore(session_factory).add(task(dialog.id, USER_A, TaskStatus.DONE))
     await SqlAlchemyCronStore(session_factory).create(cron_job("j1", USER_A, NOW))
-    await SqlAlchemyMemoryStore(session_factory).put(USER_A, "diet", "no sugar")
+    await SqlAlchemyInstructionStore(session_factory).upsert(memory_draft("diet", USER_A))
 
     totals = await store.totals()
 
@@ -228,18 +239,45 @@ async def test_datasets_and_their_records(
     assert {record.payload["dish"] for record in records.items} == {"soup", "salad"}
 
 
-async def test_memories_include_the_global_scope(
+async def test_memories_include_the_legacy_global_scope(
     session_factory: async_sessionmaker[AsyncSession],
     store: SqlAlchemyAdminStore,
 ) -> None:
-    memories = SqlAlchemyMemoryStore(session_factory)
-    await memories.put(USER_A, "diet", "no sugar")
-    await memories.put(None, "timezone", "Europe/Moscow")
+    instructions = SqlAlchemyInstructionStore(session_factory)
+    await instructions.upsert(memory_draft("diet", USER_A))
+    await instructions.upsert(memory_draft("timezone", None))
 
     page = await store.list_memories(DEFAULT_LIMIT, 0)
 
     assert page.total == TWO_ITEMS
+    assert {item.key for item in page.items} == {"diet", "timezone"}
     assert None in {item.user_id for item in page.items}
+
+
+async def test_memories_and_instructions_tabs_split_one_table(
+    session_factory: async_sessionmaker[AsyncSession],
+    store: SqlAlchemyAdminStore,
+) -> None:
+    """Memory rows must not leak into the instructions tab, nor vice versa."""
+    instructions = SqlAlchemyInstructionStore(session_factory)
+    await instructions.upsert(memory_draft("diet", USER_A))
+    await instructions.upsert(
+        InstructionDraft(
+            kind=InstructionType.KNOWLEDGE,
+            title="fact",
+            content="shared",
+            tags=(),
+            embedding=EMBEDDING,
+        )
+    )
+
+    listed = await store.list_instructions(DEFAULT_LIMIT, 0)
+    memories = await store.list_memories(DEFAULT_LIMIT, 0)
+    totals = await store.totals()
+
+    assert [item.title for item in listed.items] == ["fact"]
+    assert [item.key for item in memories.items] == ["diet"]
+    assert (totals.instructions, totals.memories) == (1, 1)
 
 
 async def test_summaries_are_listed_across_dialogs(

@@ -8,7 +8,6 @@ from octoforge_core import ConversationManager
 from octoforge_core.admin.api import AdminReadModel
 from octoforge_core.cron.api import CronStore
 from octoforge_core.instructions.api import InstructionService
-from octoforge_core.memory.api import MemoryStore
 from octoforge_core.tasks.store import TaskStore
 
 from octoforge_web.auth import check_basic_auth
@@ -40,11 +39,6 @@ def get_task_store(request: Request) -> TaskStore:
 def get_instruction_service(request: Request) -> InstructionService:
     """Return the instruction service built at application startup."""
     return cast(InstructionService, request.app.state.instructions)
-
-
-def get_memory_store(request: Request) -> MemoryStore:
-    """Return the memory store built at application startup."""
-    return cast(MemoryStore, request.app.state.memory_store)
 
 
 def get_admin_read_model(request: Request) -> AdminReadModel:

@@ -12,8 +12,7 @@ import octoforge_core.context.models
 import octoforge_core.cron.models
 import octoforge_core.datasets.models
 import octoforge_core.db.models
-import octoforge_core.instructions.models
-import octoforge_core.memory.models  # noqa: F401
+import octoforge_core.instructions.models  # noqa: F401
 from octoforge_core.db.base import Base
 from octoforge_core.db.engine import (
     _BASELINE_REVISION,
@@ -32,7 +31,6 @@ EXPECTED_TABLES = frozenset(
         "instructions",
         "datasets",
         "dataset_records",
-        "memories",
         "dialog_summaries",
     }
 )
@@ -182,8 +180,9 @@ async def test_bootstrap_adds_task_link_and_delivery_columns(tmp_path: Path) -> 
     assert "delivered_at" in task_columns
 
 
-def _downgrade_one_step(connection: Connection) -> None:
-    command.downgrade(_alembic_config(connection), "-1")
+def _downgrade_below_task_link(connection: Connection) -> None:
+    # explicit target: "-1" would undo whatever the newest migration is
+    command.downgrade(_alembic_config(connection), "e5f8a2c1d394")
 
 
 def _upgrade_to_head(connection: Connection) -> None:
@@ -195,7 +194,7 @@ async def test_task_link_and_delivery_migration_downgrades(tmp_path: Path) -> No
     try:
         await bootstrap_schema(engine)
         async with engine.begin() as connection:
-            await connection.run_sync(_downgrade_one_step)
+            await connection.run_sync(_downgrade_below_task_link)
         async with engine.connect() as connection:
             message_columns = await connection.run_sync(_table_columns, "messages")
             message_indexes = await connection.run_sync(_index_names, "messages")
@@ -213,3 +212,47 @@ async def test_task_link_and_delivery_migration_downgrades(tmp_path: Path) -> No
         assert "delivered_at" in task_columns
     finally:
         await engine.dispose()
+
+
+def _insert_legacy_memories(connection: Connection) -> None:
+    """Rows as the pre-merge memories table held them (baseline schema)."""
+    connection.execute(
+        text(
+            "INSERT INTO memories (id, user_id, key, content, tags, created_at, updated_at) "
+            "VALUES "
+            "('mem-1', 'user-a', 'city', 'Berlin', '[\"geo\"]',"
+            " '2026-01-01 00:00:00', '2026-01-02 00:00:00'),"
+            "('mem-2', NULL, 'shared', 'a global note', '[]',"
+            " '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+        )
+    )
+
+
+def _memory_instruction_rows(connection: Connection) -> list[tuple[str, str, str, str]]:
+    rows = connection.execute(
+        text(
+            "SELECT id, title, COALESCE(owner_id, ''), embedding FROM instructions "
+            "WHERE type = 'memory' ORDER BY id"
+        )
+    ).all()
+    return [(str(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows]
+
+
+async def test_memories_migrate_into_instructions(tmp_path: Path) -> None:
+    """The data migration keeps every memory: owned rows stay owned, global go public."""
+    engine = create_engine(_database_url(tmp_path))
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(_legacy_baseline_schema)
+            await connection.run_sync(_insert_legacy_memories)
+        await bootstrap_schema(engine)  # upgrades through f2a6c8d1e935
+        async with engine.connect() as connection:
+            rows = await connection.run_sync(_memory_instruction_rows)
+            tables = await connection.run_sync(_table_names)
+    finally:
+        await engine.dispose()
+    assert rows == [
+        ("mem-1", "city", "user-a", "[]"),  # empty embedding: the startup sweep fills it
+        ("mem-2", "shared", "", "[]"),
+    ]
+    assert "memories" not in tables

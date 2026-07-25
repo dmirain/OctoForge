@@ -25,11 +25,18 @@ from typing import Protocol, runtime_checkable
 
 
 class InstructionType(StrEnum):
-    """Kind of an instruction record."""
+    """Kind of an instruction record.
+
+    MEMORY is the per-user slice of the same store: a memory is structurally a
+    private knowledge record (title = the memory key), so it shares the table,
+    the embeddings and the search machinery instead of maintaining a parallel
+    LIKE-searched store. Memory records are always owned and never published.
+    """
 
     KNOWLEDGE = "knowledge"
     SKILL = "skill"
     ENDPOINT = "endpoint"
+    MEMORY = "memory"
 
 
 class InstructionNotFoundError(Exception):
@@ -169,7 +176,29 @@ class InstructionStore(Protocol):
         ...
 
     async def publish(self, instruction_id: str) -> Instruction | None:
-        """Make the record public (owner_id -> NULL); None when the id is unknown."""
+        """Make the record public (owner_id -> NULL); None when the id is unknown.
+
+        Memory-type records also answer None: a user's memory is never
+        publishable, and to the admin surface an unpublishable record looks
+        the same as a missing one.
+        """
+        ...
+
+    async def list_missing_embeddings(self) -> list[Instruction]:
+        """Return records stored with an empty embedding (deferred embedding).
+
+        Two sources produce them: a save whose embedding call failed (the
+        fact is kept rather than lost) and data migrations, which run without
+        an embedder. The startup sweep re-embeds them.
+        """
+        ...
+
+    async def set_embedding(self, instruction_id: str, embedding: tuple[float, ...]) -> bool:
+        """Store the embedding without touching content, version or timestamps.
+
+        Returns False when the id is unknown (the record was deleted between
+        the listing and the sweep).
+        """
         ...
 
 
@@ -230,7 +259,9 @@ class InstructionService(Protocol):
         """Search the whole table with no visibility filter (admin surface).
 
         Not for agent-facing tools: the admin console uses it to discover
-        private records by their ids before publishing them.
+        private records by their ids before publishing them. Memory records
+        are excluded unless `kind` names them explicitly — a cross-user
+        search must not surface personal memories casually.
         """
         ...
 
@@ -280,7 +311,8 @@ class InstructionService(Protocol):
     async def publish(self, instruction_id: str) -> Instruction:
         """Make the record public (owner -> None); admin surface, not an agent tool.
 
-        Raises `InstructionNotFoundError` when the id is unknown.
+        Raises `InstructionNotFoundError` when the id is unknown — or when it
+        names a memory record: a user's memory is never publishable.
         """
         ...
 
@@ -309,5 +341,15 @@ class InstructionService(Protocol):
         """Delete a record regardless of the system flag (registry sync only).
 
         Raises `InstructionNotFoundError` when nothing matches.
+        """
+        ...
+
+    async def reembed_missing(self) -> int:
+        """Embed and store vectors for records saved without one; return the count.
+
+        Called from the composition root at startup: it finishes what a
+        failed embedding backend or an embedder-less data migration left
+        behind. A record that fails again simply stays in the queue for the
+        next sweep.
         """
         ...

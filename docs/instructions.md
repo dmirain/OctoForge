@@ -33,7 +33,10 @@
 3. **Эндпоинт (endpoint)** — запись внешнего HTTP API: метод, url-шаблон, схема
    параметров, тип авторизации. Исполняется тулом `external_call`.
 4. **Знание (knowledge)** — факт, актуальный для всех пользователей («API X требует
-   заголовок Y»). Не память: память — отдельный модуль `memory/`.
+   заголовок Y»).
+5. **Память (memory)** — приватный факт одного пользователя. С 2026-07 хранится в том
+   же сторе (`type=memory`, title = ключ) и ищется тем же `instruction_search`;
+   пишется интентными тулами `memory_store`/`memory_delete`, никогда не публикуется.
 
 Маппинг со старой терминологией: «скил» (код, `Tool`/`ToolSpec`) → **тул**;
 «инструкция типа tool» → **эндпоинт**; «инструкция типа skill» → **скил**;
@@ -78,7 +81,7 @@
 - `task_create/list/delete` → `tasks/` (фоновые задачи и крон-задачи — один тул:
   со `schedule` `task_create` создаёт крон-задачу через `create_job` из `cron/`)
 - `cron_pause/resume` → `cron/`
-- `memory_store/search/delete` → `memory/`
+- `memory_store/delete` → `memory/` (хранение — стор инструкций, `type=memory`)
 - `data_put/query/forget` → `datasets/`
 - `history_search` → `context/`
 - `web_search` → `search/`
@@ -119,8 +122,10 @@ Composition root собирает реестр из доменных модул�
   поверх чужой публичной записи создаёт личную копию (для владельца она затеняет
   публичную в `get_by_name`).
 - **Видимость в поиске.** `instruction_search` ранжирует только публичные записи и
-  свои; фильтр `type` (knowledge/skill/endpoint) сужает выдачу до ранжирования.
-  Дескрипторы датасетов добавляются блоком, как раньше.
+  свои; фильтр `type` (knowledge/skill/endpoint/memory) сужает выдачу до ранжирования.
+  Дескрипторы датасетов добавляются блоком, как раньше. Админский `search_all` не
+  выдаёт память без явного `kind=MEMORY` — кросс-пользовательский поиск не должен
+  походя показывать личные записи.
 - **Удаление — по id и только свои.** `instruction_delete(id)` удаляет запись
   владельца; чужая или публичная выглядит как несуществующая. id берётся из выдачи
   `instruction_search` (строка `id:` у каждого хита).
@@ -183,10 +188,12 @@ Scenario: durable user facts and preferences (name, city, diet, goals and the li
 1. Save facts with memory_store. Memory is private to this user; a fact useful to
    everyone is saved as a knowledge record via instruction_save instead (an admin
    publishes it later).
-2. Call memory_search before personal recommendations or when the answer may depend
-   on what the user told you earlier. With no query it lists the whole memory — use
-   that to see what is stored instead of guessing a substring or assuming nothing is
-   there; the list is short and the call is cheap.
+2. Memories come back through instruction_search, ranked together with skills and
+   knowledge. Before personal recommendations, or when the answer may depend on
+   what the user told you earlier, add a query about the user (e.g. 'user
+   preferences diet'); type=memory narrows the search to memories only. When the
+   user asks what you remember about them, search type=memory with broad queries
+   and present the hits honestly.
 3. Do not duplicate what lives in instructions (shared knowledge) or datasets
    (structured records). Memory is per-user and shared across the user's surfaces.
 Delete with memory_delete only on the user's explicit request.
@@ -257,8 +264,9 @@ Scenario: find and author skill scenarios.
 Системный промпт держит только мета-правила, но извлечение знаний в них — не
 рекомендация, а первый шаг (правила 1–3, раздел «Системный промпт» в
 [design.md](design.md)): на любой запрос сложнее
-small talk сначала `instruction_search` (+ `memory_search`, когда ответ зависит от
-пользователя), найденная запись обязательна к исполнению, перебор запрещён. Причина
+small talk сначала `instruction_search` (один поиск, память включена; второй запрос
+«про пользователя», когда ответ зависит от него), найденная запись обязательна к
+исполнению, перебор запрещён. Причина
 формулировок — замеренное поведение: с прежним текстом модель на половине запросов
 шла делать задачу сразу (`data_put` без поиска сценария), а после неудачного
 `external_call` начинала пробовать `web_search` варианты до упора в лимит итераций.

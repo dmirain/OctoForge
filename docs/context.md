@@ -195,8 +195,8 @@ instructions/datasets/memory/cron):
 Саммари уже в промпте; для глубокого поиска — базовый скил `history_search`:
 
 - `history_search(query, topic?, date_from?, date_to?, limit?)` — LIKE-подстрока
-  по `messages.content` внутри текущего диалога (та же механика, что у
-  `memory_search`; изоляция — только свой dialog_id из `ToolContext`);
+  по `messages.content` внутри текущего диалога (изоляция — только свой
+  dialog_id из `ToolContext`);
   опциональный фильтр темы: совпадение по тегам `dialog_summaries` → выдача
   ограничена их seq-диапазонами. Даты — ISO date/datetime (naive читается как
   UTC; верхняя граница date-only покрывает день целиком, а datetime-граница —

@@ -46,7 +46,6 @@ from octoforge_core.instructions.api import (
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
-from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
 from octoforge_core.tasks.store import InMemoryTaskStore
@@ -86,7 +85,6 @@ ALL_BASIC_TOOLS = {
     "data_query",
     "data_forget",
     "memory_store",
-    "memory_search",
     "memory_delete",
     "history_search",
 }
@@ -177,10 +175,21 @@ class InMemoryInstructionStore:
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
         return self.records.pop((kind.value, title, None), None) is not None
 
+    async def list_missing_embeddings(self) -> list[Instruction]:
+        return [record for record in self.records.values() if not self.embeddings.get(record.id)]
+
+    async def set_embedding(self, instruction_id: str, embedding: tuple[float, ...]) -> bool:
+        if all(record.id != instruction_id for record in self.records.values()):
+            return False
+        self.embeddings[instruction_id] = embedding
+        return True
+
     async def publish(self, instruction_id: str) -> Instruction | None:
         for key, record in list(self.records.items()):
             if record.id != instruction_id:
                 continue
+            if record.type is InstructionType.MEMORY:
+                return None
             del self.records[key]
             published = Instruction(
                 id=record.id,
@@ -256,8 +265,6 @@ def default_limits() -> ToolLimits:
         instructions_top_k=5,
         datasets_query_default_limit=50,
         datasets_query_max_limit=200,
-        memory_search_default_limit=10,
-        memory_search_max_limit=50,
         history_search_default_limit=20,
         history_search_max_limit=100,
     )
@@ -281,7 +288,6 @@ def build_registry(
         stores=ToolStores(
             tasks=InMemoryTaskStore(),
             cron=SqlAlchemyCronStore(session_factory),
-            memory=SqlAlchemyMemoryStore(session_factory),
             archive=summary_store,
             summaries=summary_store,
         ),

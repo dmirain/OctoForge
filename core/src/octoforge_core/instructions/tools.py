@@ -14,11 +14,12 @@ from octoforge_core.tools.errors import ToolArgumentsError
 
 SEARCH_NAME = "instruction_search"
 SEARCH_DESCRIPTION = (
-    "Search the instructions store and the user's datasets for relevant records: "
-    "knowledge (facts worth sharing with everyone), skill scenarios (how-to guides "
-    "for non-obvious multi-step tasks), endpoint descriptions (API call contracts "
-    "executed by external_call) and dataset descriptors. "
-    "Pass 'type' to search one instruction kind only. "
+    "Search everything you know: knowledge (shared facts), skill scenarios (how-to "
+    "guides for non-obvious multi-step tasks), endpoint descriptions (API call "
+    "contracts executed by external_call), this user's private memories and their "
+    "dataset descriptors — one ranked search over all of it. "
+    "Pass 'type' to search one record kind only (e.g. type=memory for the user's "
+    "memories alone). "
     "Returns the top-k records with id, type, title, tags and full content: "
     "instructions first, dataset descriptors after them. "
     "This is the FIRST tool to call for any request that is not small talk, before "
@@ -62,15 +63,18 @@ SAVE_DESCRIPTION = (
     "(e.g. to get the weather, call the weather endpoint via external_call), "
     "endpoint — an API request contract executed by external_call (like an MCP tool). "
     "The record belongs to you: only you can see and delete it. "
-    "Existing (type, title) records of yours are replaced with a bumped version."
+    "Existing (type, title) records of yours are replaced with a bumped version. "
+    "Personal facts about the user are not instructions: save them with memory_store."
 )
 SAVED_TEMPLATE = "instruction saved: [{kind}] {title} (version {version})"
+# memory records are written through memory_store, never through this tool
+SAVABLE_KINDS = tuple(kind for kind in InstructionType if kind is not InstructionType.MEMORY)
 SAVE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "type": {
             "type": "string",
-            "enum": [kind.value for kind in InstructionType],
+            "enum": [kind.value for kind in SAVABLE_KINDS],
             "description": "Instruction kind",
         },
         "title": {"type": "string", "description": "Unique (per type) instruction title"},
@@ -171,6 +175,8 @@ class InstructionSaveTool:
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, upsert the caller's record and confirm the version."""
         kind = _parse_kind(arguments.get("type"))
+        if kind is InstructionType.MEMORY:
+            raise ToolArgumentsError("personal memories are saved with memory_store, not here")
         title = arguments.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ToolArgumentsError("title must be a non-empty string")

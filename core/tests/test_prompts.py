@@ -41,8 +41,10 @@ def test_system_prompt_puts_retrieval_before_action() -> None:
     what it finds, and forbid trial-and-error — the three rules that pull it
     towards the store instead of improvisation.
     """
-    assert "FIRST step is to search" in DEFAULT_SYSTEM_PROMPT
-    assert "memory_search" in DEFAULT_SYSTEM_PROMPT
+    assert "FIRST step is instruction_search" in DEFAULT_SYSTEM_PROMPT
+    # memories merged into the one search: the prompt must sell it as covering them
+    assert "memories" in DEFAULT_SYSTEM_PROMPT
+    assert "memory_search" not in DEFAULT_SYSTEM_PROMPT
     assert "binding" in DEFAULT_SYSTEM_PROMPT
     assert "trial and error" in DEFAULT_SYSTEM_PROMPT
     # searching must read as cheap, or the model keeps optimizing it away
