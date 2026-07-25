@@ -79,9 +79,10 @@ The built-in tool surface (`ToolRegistry`), wired up in the composition root:
 |---|---|
 | `http_request` | Arbitrary outbound HTTP call |
 | `external_call` | Calls a saved, DB-backed endpoint descriptor, behind an SSRF guard |
-| `instruction_search` / `instruction_save` | Finds and saves knowledge, skills, and endpoint descriptors by embedding similarity |
+| `recall` / `instruction_save` | One ranked search over skills, knowledge, memories and dataset descriptors; saves new records |
+| `endpoint_get` / `external_call` | Resolves a named endpoint's contract, then executes it (SSRF-guarded) |
 | `data_put` / `data_query` / `data_forget` | User datasets, validated against a JSON schema |
-| `memory_store` / `memory_search` / `memory_delete` | Key/value memory, per-user or global |
+| `memory_store` / `memory_delete` | Per-user memory, stored and searched with everything else |
 | `task_create` / `task_list` / `task_delete` | Background work — the same surface also creates cron jobs (just pass a `schedule`) |
 | `cron_pause` / `cron_resume` | Control a scheduled job |
 | `web_search` | Web search via serper.dev (requires `OF_SERPER_TOKEN`) |

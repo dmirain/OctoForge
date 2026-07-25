@@ -50,7 +50,7 @@ Scenario: durable user facts and preferences (name, city, diet, goals and the li
 1. Save facts with memory_store. Memory is private to this user; a fact useful to
    everyone is saved as a knowledge record via instruction_save instead (an admin
    publishes it later).
-2. Memories come back through instruction_search, ranked together with skills and
+2. Memories come back through recall, ranked together with skills and
    knowledge. Before personal recommendations, or when the answer may depend on
    what the user told you earlier, add a query about the user (e.g. 'user
    preferences diet'); type=memory narrows the search to memories only. When the
@@ -62,7 +62,7 @@ Delete with memory_delete only on the user's explicit request."""
 
 USER_DATASETS_CONTENT = """\
 Scenario: remember and track structured data for the user (food, weight, habits...).
-1. Find the dataset via instruction_search; if none fits, create it implicitly with
+1. Find the dataset via recall; if none fits, create it implicitly with
    data_put by declaring a JSON schema for the record.
 2. Write records with data_put; read and build reports with data_query (equality
    filters, date ranges, limit).
@@ -83,9 +83,17 @@ links. If the results are thin or contradictory, say so instead of guessing."""
 
 EXTERNAL_HTTP_CONTENT = """\
 Scenario: call an external API.
-1. Prefer a discovered endpoint: call external_call with the endpoint name and its
-   declared params instead of hand-crafting requests.
-2. Use http_request only for one-off calls not covered by any endpoint.
+1. Skills name the endpoints they use. Before the FIRST call of an endpoint in this
+   process, resolve its contract with endpoint_get(name) — it returns the method,
+   URL template and declared params; the contract stays in your context for repeat
+   calls. Several endpoints resolve in one turn (parallel endpoint_get calls).
+2. Execute with external_call(name, params), passing exactly the declared params.
+   Never call blindly: guessed params fail, and the error will just hand you the
+   contract you should have fetched first.
+3. No skill names an endpoint? Check whether the integration exists at all:
+   recall(type=endpoint, query='...'). Found and used successfully — save a skill
+   naming it (instruction_save), so the next run skips discovery.
+4. Use http_request only for one-off calls not covered by any endpoint.
 Outbound calls pass a security guard: public hosts only, no redirects. If a call is
 refused, report the refusal honestly instead of retrying variations."""
 
@@ -103,7 +111,7 @@ guessing."""
 
 SKILL_AUTHORING_CONTENT = """\
 Scenario: find and author skill scenarios.
-1. For every intent in the user's message call instruction_search with a single
+1. For every intent in the user's message call recall with a single
    free-text query: phrase it as the normalized intent (remind, schedule,
    report, track, lookup, save, call-api) plus the entity type (reminder,
    recurring-report, user-data, weather, history, web-fact), e.g.

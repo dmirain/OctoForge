@@ -100,11 +100,11 @@ async def test_store_upserts_by_key(store_tool: MemoryStoreTool) -> None:
     assert updated == f"memory stored (key=city, version={SECOND_VERSION})"
 
 
-async def test_memories_come_back_through_instruction_search(
+async def test_memories_come_back_through_recall(
     service: InstructionService,
     store_tool: MemoryStoreTool,
 ) -> None:
-    """The storage merge's point: one ranked search covers memories too."""
+    """The storage merge's point: one ranked search (recall) covers memories too."""
     await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
 
     unfiltered = await service.search(CTX_A.user_id, "where does the user live", TOP_K)

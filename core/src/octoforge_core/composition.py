@@ -45,7 +45,7 @@ from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.memory.tools import MemoryDeleteTool, MemoryStoreTool
 from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
-from octoforge_core.net.tools import ExternalCallTool, HttpRequestTool
+from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool, HttpRequestTool
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.tools import WebSearchTool
@@ -277,6 +277,7 @@ def _register_instruction_tools(
     )
     registry.register(InstructionSaveTool(service=services.instructions))
     registry.register(InstructionDeleteTool(service=services.instructions))
+    registry.register(EndpointGetTool(service=services.instructions))
     registry.register(ExternalCallTool(executor=services.executor))
 
 

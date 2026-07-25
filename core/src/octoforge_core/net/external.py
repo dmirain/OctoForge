@@ -78,7 +78,15 @@ class ExternalCallExecutor:
             name, InstructionType.ENDPOINT, user_id=user_id
         )
         spec = parse_tool_spec(instruction.content)
-        validated = _validate_params(spec, params)
+        try:
+            validated = _validate_params(spec, params)
+        except ExternalCallError as exc:
+            # a blind call (endpoint_get skipped): return the declared contract
+            # with the error so the model self-corrects in one step instead of
+            # retrying guessed parameter variations
+            raise ExternalCallError(
+                f"{exc}; the endpoint declares this contract: {instruction.content}"
+            ) from exc
         url = _render_url(spec, validated)
         await self._guard.check(url)
         headers = self._auth_headers_for(url, user_id)

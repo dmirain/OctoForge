@@ -61,8 +61,15 @@ class LocalInstructionService:
         k: int,
         kind: InstructionType | None = None,
     ) -> list[SearchHit]:
-        """Rank the records visible to `user_id`; `kind` filters before ranking."""
-        return await self._search(user_id, query, k, kind)
+        """Rank the records visible to `user_id`; `kind` filters before ranking.
+
+        Endpoint records are excluded unless `kind` names them explicitly:
+        skills reference endpoints by name and `endpoint_get` resolves the
+        contract at call time (late binding), so mixing thousands of endpoint
+        records into every planning search would only drown the skills and
+        knowledge the agent is actually orienting by.
+        """
+        return await self._search(user_id, query, k, kind, exclude=(InstructionType.ENDPOINT,))
 
     async def search_all(
         self,
@@ -76,10 +83,7 @@ class LocalInstructionService:
         cross-user search must not leak personal memories into an admin's
         general instruction lookup.
         """
-        hits = await self._search(None, query, k, kind)
-        if kind is None:
-            hits = [hit for hit in hits if hit.instruction.type is not InstructionType.MEMORY]
-        return hits
+        return await self._search(None, query, k, kind, exclude=(InstructionType.MEMORY,))
 
     async def _search(
         self,
@@ -87,25 +91,42 @@ class LocalInstructionService:
         query: str,
         k: int,
         kind: InstructionType | None,
+        exclude: tuple[InstructionType, ...] = (),
     ) -> list[SearchHit]:
         """Embed the query, rank the candidates by cosine and bump usage of the hits.
 
         Candidates come from the store: vector-capable stores run the search
         on their side, the rest hand over the visible rows for brute-force
         cosine. With a reranker configured, the cosine stage returns a
-        shortlist of `rerank_candidates` which the cross-encoder re-scores
-        down to top-k.
+        shortlist of `rerank_candidates` which the cross-encoder re-scores.
+        A mixed (kind-less) search additionally caps every type's share of
+        the top-k, so one dominant record type cannot push the others out —
+        the shortlist is oversampled to have something to backfill with.
+        `exclude` only applies to kind-less searches: an explicit kind wins.
         """
         if not query.strip() or k <= 0:
             return []
+        mixed = kind is None
+        # a mixed search oversamples the cosine stage so the type caps have a
+        # tail to backfill from; with a reranker the shortlist stays at
+        # rerank_candidates — the cross-encoder's input size is its cost knob
+        fetch = self._shortlist_size(k)
+        if mixed and self._reranker is None:
+            fetch = max(fetch, k * 3)
         (query_embedding,) = await self._embedder.embed((query,))
-        candidates = await self._candidates(query_embedding, k, user_id)
+        candidates = await self._candidates(query_embedding, fetch, user_id)
         if kind is not None:
             candidates = [
                 candidate for candidate in candidates if candidate.instruction.type is kind
             ]
-        shortlist = rank(candidates, query, query_embedding, self._shortlist_size(k))
-        hits = await self._apply_reranker(query, shortlist, k)
+        else:
+            candidates = [
+                candidate for candidate in candidates if candidate.instruction.type not in exclude
+            ]
+        shortlist = rank(candidates, query, query_embedding, fetch)
+        hits = await self._apply_reranker(query, shortlist, len(shortlist) if mixed else k)
+        if mixed:
+            hits = _cap_types(hits, k)
         await self._store.bump_usage(tuple(hit.instruction.id for hit in hits))
         return hits
 
@@ -256,14 +277,12 @@ class LocalInstructionService:
     async def _candidates(
         self,
         query_embedding: tuple[float, ...],
-        k: int,
+        fetch: int,
         user_id: str | None,
     ) -> list[EmbeddedInstruction]:
         """Fetch the ranking input: vector search on the store side when supported."""
         if isinstance(self._store, InstructionVectorSearch):
-            return await self._store.search_by_vector(
-                query_embedding, self._shortlist_size(k), user_id
-            )
+            return await self._store.search_by_vector(query_embedding, fetch, user_id)
         return await self._store.list_with_embeddings(user_id)
 
     async def _apply_reranker(
@@ -286,6 +305,33 @@ class LocalInstructionService:
             logger.warning("reranker failed, falling back to the cosine shortlist", exc_info=True)
             return shortlist[:k]
         return rerank(shortlist, scores, k, query)
+
+
+def _cap_types(hits: list[SearchHit], k: int) -> list[SearchHit]:
+    """Trim a mixed ranking to k hits with no type crowding the others out.
+
+    Too many records of one kind confuse the model more than they help
+    (agreed 2026-07-25): the first pass keeps every type's share at
+    ceil(k/2) so other types backfill from the oversampled tail; the second
+    pass relaxes the cap when there is nothing else to show — a cap must
+    diversify, never starve the result.
+    """
+    cap = max(1, -(-k // 2))  # ceil(k/2) without importing math
+    taken: list[SearchHit] = []
+    skipped: list[SearchHit] = []
+    per_type: dict[InstructionType, int] = {}
+    for hit in hits:
+        if len(taken) == k:
+            return taken
+        kind = hit.instruction.type
+        if per_type.get(kind, 0) == cap:
+            skipped.append(hit)
+            continue
+        per_type[kind] = per_type.get(kind, 0) + 1
+        taken.append(hit)
+    filled = taken + skipped[: k - len(taken)]
+    filled.sort(key=lambda hit: (-hit.score, hit.instruction.title))
+    return filled
 
 
 def _embedded_text(title: str, content: str) -> str:

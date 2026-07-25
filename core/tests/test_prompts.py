@@ -41,7 +41,7 @@ def test_system_prompt_puts_retrieval_before_action() -> None:
     what it finds, and forbid trial-and-error — the three rules that pull it
     towards the store instead of improvisation.
     """
-    assert "FIRST step is instruction_search" in DEFAULT_SYSTEM_PROMPT
+    assert "FIRST step is recall" in DEFAULT_SYSTEM_PROMPT
     # memories merged into the one search: the prompt must sell it as covering them
     assert "memories" in DEFAULT_SYSTEM_PROMPT
     assert "memory_search" not in DEFAULT_SYSTEM_PROMPT
@@ -56,7 +56,7 @@ def test_system_prompt_puts_retrieval_before_action() -> None:
 
 
 def test_system_prompt_holds_meta_rules_only() -> None:
-    assert "instruction_search" in DEFAULT_SYSTEM_PROMPT
+    assert "recall" in DEFAULT_SYSTEM_PROMPT
     assert "instruction_save" in DEFAULT_SYSTEM_PROMPT
     assert "System service notes" in DEFAULT_SYSTEM_PROMPT
     assert "finished background task" not in DEFAULT_SYSTEM_PROMPT

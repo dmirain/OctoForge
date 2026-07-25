@@ -4,7 +4,7 @@ Memory is the per-user slice of the instruction store (`InstructionType.MEMORY`)
 a memory is structurally a private knowledge record whose title is the memory
 key. The tools here are intent-shaped wrappers — "remember this about the user"
 is a different intent than "save shared knowledge", so the tool names survive
-the storage merge. Reading goes through the shared search (`instruction_search`),
+the storage merge. Reading goes through the shared search (`recall`),
 which ranks memories with the same embeddings machinery as everything else;
 a dedicated memory_search tool no longer exists.
 """
@@ -27,7 +27,7 @@ STORE_DESCRIPTION = (
     "existing key is replaced). The memory belongs to this user and follows them "
     "across every surface; it is never shared with other users. Facts useful to "
     "everyone are saved as knowledge records via instruction_save instead. "
-    "Stored memories come back through instruction_search."
+    "Stored memories come back through recall."
 )
 STORED_TEMPLATE = "memory stored (key={key}, version={version})"
 STORE_SCHEMA: dict[str, Any] = {

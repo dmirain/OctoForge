@@ -208,7 +208,7 @@ class RootLLM:
     complete() serves the router (always inject); stream() drives the dialog:
     the first call waits on a gate (so the second user message meets an active
     process and exercises the router), then asks for web_search, then for
-    instruction_search, then finishes with the final reply.
+    recall, then finishes with the final reply.
     """
 
     def __init__(self) -> None:
@@ -247,9 +247,7 @@ class RootLLM:
             await self.first_stream_gate.wait()
             yield StreamFinished(message=_tool_call("call-search", "web_search", SEARCH_QUERY))
         elif call_number == SECOND_CALL:
-            yield StreamFinished(
-                message=_tool_call("call-instructions", "instruction_search", SAVED_TITLE)
-            )
+            yield StreamFinished(message=_tool_call("call-instructions", "recall", SAVED_TITLE))
         else:
             yield LlmTextDelta(text=FINAL_REPLY)
             yield StreamFinished(

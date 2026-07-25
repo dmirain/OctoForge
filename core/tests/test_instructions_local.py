@@ -631,3 +631,45 @@ async def test_reembed_missing_finishes_deferred_embeddings(
     assert swept == 1
     assert await service.reembed_missing() == 0  # idempotent: nothing left
     assert [hit.instruction.title for hit in hits] == [TITLE_ALPHA]
+
+
+# --- endpoint late binding and type caps -------------------------------------
+
+
+async def test_search_hides_endpoints_unless_asked_explicitly(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    """Skills name endpoints; planning searches must not drown in their records."""
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
+    register_vector(embedder, TITLE_BETA, CONTENT_B, V_RIGHT)
+    await service.save(USER_ID, InstructionType.ENDPOINT, TITLE_ALPHA, CONTENT_A)
+    await service.save(USER_ID, InstructionType.SKILL, TITLE_BETA, CONTENT_B)
+    embedder.vectors[QUERY] = V_RIGHT
+
+    default = await service.search(USER_ID, QUERY, k=THREE_HITS)
+    explicit = await service.search(USER_ID, QUERY, k=THREE_HITS, kind=InstructionType.ENDPOINT)
+
+    assert [hit.instruction.title for hit in default] == [TITLE_BETA]
+    assert [hit.instruction.title for hit in explicit] == [TITLE_ALPHA]
+
+
+async def test_mixed_search_caps_each_types_share(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    """One dominant record type must not push the others out of the top-k."""
+    for index in range(4):
+        title = f"skill {index}"
+        register_vector(embedder, title, CONTENT_A, V_RIGHT)
+        await service.save(USER_ID, InstructionType.SKILL, title, CONTENT_A)
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_DIAGONAL)  # ranks below the skills
+    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    embedder.vectors[QUERY] = V_RIGHT
+
+    hits = await service.search(USER_ID, QUERY, k=THREE_HITS)
+
+    types = [hit.instruction.type for hit in hits]
+    # cap = ceil(3/2) = 2 skills; the knowledge record backfills the last slot
+    assert types.count(InstructionType.SKILL) == TWO_HITS
+    assert InstructionType.KNOWLEDGE in types

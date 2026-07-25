@@ -47,7 +47,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "last resort.\n"
     "Rules:\n"
     "1. Orient before acting. On every request beyond small talk or a question you "
-    "can answer from this conversation alone, your FIRST step is instruction_search: "
+    "can answer from this conversation alone, your FIRST step is recall: "
     "one search covers how-to scenarios, shared knowledge, dataset descriptors AND "
     "your private memories about this user. Query with the intent plus the entity "
     "it concerns ('remind reminder', 'report user-data', 'call-api weather'); issue "

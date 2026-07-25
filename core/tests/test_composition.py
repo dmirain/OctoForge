@@ -77,7 +77,8 @@ ALL_BASIC_TOOLS = {
     "cron_pause",
     "cron_resume",
     "web_search",
-    "instruction_search",
+    "recall",
+    "endpoint_get",
     "instruction_save",
     "instruction_delete",
     "external_call",
@@ -340,7 +341,7 @@ async def test_skills_run_over_substituted_ports(
 
     search_output = await registry.get("web_search").execute({"query": SEARCH_QUERY}, CONTEXT)
     assert FAKE_ANSWER in search_output
-    search_hits = await registry.get("instruction_search").execute({"query": SAVED_TITLE}, CONTEXT)
+    search_hits = await registry.get("recall").execute({"query": SAVED_TITLE}, CONTEXT)
     assert SAVED_TITLE in search_hits
 
 

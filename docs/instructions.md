@@ -2,8 +2,8 @@
 
 > Целевая модель v3 (согласована 2026-07-21). **Статус: реализовано** (включая
 > rename Skill→Tool в коде; каноническая форма запроса intent/entity отложена; поиск —
-> свободный текст `instruction_search(query, k?, type?)`). Пре-поиск роутера **отменён
-> решением от 2026-07-21** — признан избыточным усложнением, достаточно `instruction_search`
+> свободный текст `recall(query, k?, type?)`). Пре-поиск роутера **отменён
+> решением от 2026-07-21** — признан избыточным усложнением, достаточно `recall`
 > + правила промпта; код удалён (см. раздел «Пре-поиск скилов до прогона»).
 > Отменяет прежнюю модель «knowledge/skill/tool в едином хранилище» и промежуточную v2
 > «в схеме один instruction_search, тулы активируются поиском».
@@ -13,8 +13,8 @@
 > пользователь из сессии, `ToolContext.user_id`, не из аргументов тула); видимость =
 > публичные + свои. Публикация — только админская поверхность: `publish(id)` в core и
 > actions `search_instructions`/`publish_instruction` админ-тула Telegram (UI — позднее).
-> Триада тулов унифицирована по имени: `instruction_search` переименован в
-> **`instruction_search`** (+ опциональный фильтр `type`), добавлен **`instruction_delete`**
+> Триада тулов унифицирована по имени: `recall` переименован в
+> **`recall`** (+ опциональный фильтр `type`), добавлен **`instruction_delete`**
 > (только по id, только свои записи; id виден в выдаче поиска). Подробности — раздел
 > «Владельцы и видимость (v4)».
 
@@ -35,7 +35,7 @@
 4. **Знание (knowledge)** — факт, актуальный для всех пользователей («API X требует
    заголовок Y»).
 5. **Память (memory)** — приватный факт одного пользователя. С 2026-07 хранится в том
-   же сторе (`type=memory`, title = ключ) и ищется тем же `instruction_search`;
+   же сторе (`type=memory`, title = ключ) и ищется тем же `recall`;
    пишется интентными тулами `memory_store`/`memory_delete`, никогда не публикуется.
 
 Маппинг со старой терминологией: «скил» (код, `Tool`/`ToolSpec`) → **тул**;
@@ -49,21 +49,40 @@
   состав статичен и не меняется в рантайме. Описания — ёмкие (1–2 предложения +
   JSON-схема аргументов).
 - **Скилов в контексте изначально нет.** Агент не должен импровизировать применение
-  тулов: сначала `instruction_search`, найденный скил попадает в контекст (как результат
+  тулов: сначала `recall`, найденный скил попадает в контекст (как результат
   вызова) и остаётся до конца процесса — он и говорит, как правильно использовать тулы.
 - **Поиск — на каждый интент сообщения пользователя.** Составная просьба («напомни
   вечером про продукты и скажи, что там с погодой») — это два интента: два поиска или
   один поиск с двумя формулировками. Повторный поиск по тому же интенту внутри процесса
   не нужен — скил уже в контексте.
 - Запрос формируется **канонически**, а не сырым текстом пользователя:
-  `instruction_search(intent, entity, text?)` — нормализованное действие (remind / schedule /
+  `recall(intent, entity, text?)` — нормализованное действие (remind / schedule /
   report / track / lookup / save / call-api…) + тип сущности (reminder,
   recurring-report, user-data, weather, history, web-fact…). Пример: «напиши мне
   вечером, что надо купить продукты» → `intent=remind, entity=reminder`
   («напомни про событие»). Сервис собирает эмбеддинг-запрос из канонических полей.
 
+- **Endpoint'ы — позднее связывание (решение 2026-07-25).** В дефолтной выдаче
+  `recall` endpoint-записей **нет**: при целевом масштабе (~2000 ручек против ~100
+  скилов) они бы доминировали в любой «действенной» выдаче. Двухфазная схема:
+  *планирование* — `recall` находит скил, скил называет ручки по именам;
+  *связывание* — `endpoint_get(name)` перед первым вызовом отдаёт контракт (метод,
+  URL-шаблон, объявленные параметры; несколько ручек — параллельными вызовами в
+  одном ходу), затем `external_call(name, params)` исполняет. Явный
+  `recall(type=endpoint, ...)` остаётся как discovery-ветка «скила нет — существует
+  ли интеграция вообще»; успешную импровизацию агент сохраняет скилом, замыкая цикл.
+  Бэкстоп слепого вызова: ошибка валидации параметров в `external_call` несёт в
+  тексте объявленный контракт записи — самокоррекция за одну итерацию вместо
+  перебора вариантов.
+- **Капы по типам (решение 2026-07-25).** Смешанная (без `type`) выдача `recall` не
+  отдаёт одному типу больше `ceil(k/2)` мест: слишком много записей одного рода
+  путают модель сильнее, чем помогают. Косинусная стадия оверсэмплится (k×3 без
+  реранкера; с реранкером ширина остаётся `rerank_candidates` — это его ручка
+  стоимости), кап только диверсифицирует и никогда не голодит выдачу: если других
+  типов нет, лимит снимается добором.
+
 Итого типичный ход: сообщение → роутер (только маршрутизация) → агент вызывает
-`instruction_search` на каждый интент → сценарий в контексте → исполнение тулами по
+`recall` на каждый интент → сценарий в контексте → исполнение тулами по
 сценариям.
 
 ## Запись скила
@@ -86,7 +105,7 @@
 - `history_search` → `context/`
 - `web_search` → `search/`
 - `http_request`, `external_call` → `net/`
-- `instruction_search`, `instruction_save`, `instruction_delete` → `instructions/`
+- `recall`, `instruction_save`, `instruction_delete` → `instructions/`
 
 Пакет `tools/` остаётся фреймворком: протокол тула, контекст вызова, реестр.
 Composition root собирает реестр из доменных модулей.
@@ -121,14 +140,14 @@ Composition root собирает реестр из доменных модул�
   `ToolContext.user_id` — модель user_id не передаёт и подменить не может. Сохранение
   поверх чужой публичной записи создаёт личную копию (для владельца она затеняет
   публичную в `get_by_name`).
-- **Видимость в поиске.** `instruction_search` ранжирует только публичные записи и
+- **Видимость в поиске.** `recall` ранжирует только публичные записи и
   свои; фильтр `type` (knowledge/skill/endpoint/memory) сужает выдачу до ранжирования.
   Дескрипторы датасетов добавляются блоком, как раньше. Админский `search_all` не
   выдаёт память без явного `kind=MEMORY` — кросс-пользовательский поиск не должен
   походя показывать личные записи.
 - **Удаление — по id и только свои.** `instruction_delete(id)` удаляет запись
   владельца; чужая или публичная выглядит как несуществующая. id берётся из выдачи
-  `instruction_search` (строка `id:` у каждого хита).
+  `recall` (строка `id:` у каждого хита).
 - **Публикация — админская.** Core: `InstructionService.publish(id)` (owner → NULL,
   односторонне) и `search_all(query, k)` (поиск без фильтра видимости). Telegram:
   actions `search_instructions` (находит id чужой приватной записи) и
@@ -188,7 +207,7 @@ Scenario: durable user facts and preferences (name, city, diet, goals and the li
 1. Save facts with memory_store. Memory is private to this user; a fact useful to
    everyone is saved as a knowledge record via instruction_save instead (an admin
    publishes it later).
-2. Memories come back through instruction_search, ranked together with skills and
+2. Memories come back through recall, ranked together with skills and
    knowledge. Before personal recommendations, or when the answer may depend on
    what the user told you earlier, add a query about the user (e.g. 'user
    preferences diet'); type=memory narrows the search to memories only. When the
@@ -203,7 +222,7 @@ Delete with memory_delete only on the user's explicit request.
 
 ```
 Scenario: remember and track structured data for the user (food, weight, habits...).
-1. Find the dataset via instruction_search; if none fits, create it implicitly with
+1. Find the dataset via recall; if none fits, create it implicitly with
    data_put by declaring a JSON schema for the record.
 2. Write records with data_put; read and build reports with data_query (equality
    filters, date ranges, limit).
@@ -244,7 +263,7 @@ refused, report the refusal honestly instead of retrying variations.
 
 ```
 Scenario: find and author skill scenarios.
-1. For every intent in the user's message call instruction_search with a single
+1. For every intent in the user's message call recall with a single
    free-text query: phrase it as the normalized intent (remind, schedule,
    report, track, lookup, save, call-api) plus the entity type (reminder,
    recurring-report, user-data, weather, history, web-fact), e.g.
@@ -264,7 +283,7 @@ Scenario: find and author skill scenarios.
 Системный промпт держит только мета-правила, но извлечение знаний в них — не
 рекомендация, а первый шаг (правила 1–3, раздел «Системный промпт» в
 [design.md](design.md)): на любой запрос сложнее
-small talk сначала `instruction_search` (один поиск, память включена; второй запрос
+small talk сначала `recall` (один поиск, память включена; второй запрос
 «про пользователя», когда ответ зависит от него), найденная запись обязательна к
 исполнению, перебор запрещён. Причина
 формулировок — замеренное поведение: с прежним текстом модель на половине запросов
@@ -277,7 +296,7 @@ small talk сначала `instruction_search` (один поиск, памят�
 (крон vs немедленный фон — один тул `task_create`, работа с памятью, датасеты,
 `web_search`, `history_search`)
 живут в системных сценариях (раздел выше), не в промпте. Нормализация интентов — на
-модели при вызове `instruction_search` (форма описана в системном скиле
+модели при вызове `recall` (форма описана в системном скиле
 `skill_authoring`); роутер нормализацией не занимается.
 
 ## Оптимизация итераций
@@ -299,12 +318,12 @@ small talk сначала `instruction_search` (один поиск, памят�
 Пре-поиск признан избыточным усложнением:
 
 - дублирование: одни и те же сценарии приходят и заметкой пре-поиска, и tool-результатом
-  `instruction_search`, а потом ещё и остаются в горячем хвосте;
+  `recall`, а потом ещё и остаются в горячем хвосте;
 - переменная заметка на второй позиции ветки ломает стабильный префикс
   («промпт + темы») для prefix-cache;
 - цена удаления умеренная: одна лишняя итерация петли на непокрытый интент — дешёвая
   при prefix-кэшировании;
-- вместо механической страховки — правило промпта «на каждый интент — `instruction_search`»
+- вместо механической страховки — правило промпта «на каждый интент — `recall`»
   и системный скил `skill_authoring`. Осознанный риск: слабая модель может начать
   импровизировать тулами, не поискав сценарий; при подтверждении риска — дешёвый
   запасной выход (микрокаталог заголовков, см. «Где осознанно расходимся»), а не
@@ -391,7 +410,7 @@ Discovery скилов — **поиском, а не всегда-видимым
 - Реранк — опциональный второй этап: сбой реранкера не ломает поиск — warning в лог
   и деградация до cosine-шортлиста; хит с точным совпадением title удерживается
   первым и после реранка (cross-encoder может занизить ему балл).
-- Выдача `instruction_search` — двумя блоками без общей сортировки: сначала инструкции
+- Выдача `recall` — двумя блоками без общей сортировки: сначала инструкции
   (в порядке своего ранжирования), затем дескрипторы датасетов (в своём) — шкалы
   score несравнимы (после реранка у инструкций — логиты cross-encoder'а, у
   датасетов — cosine), score в текстовую выдачу не выводится. Итог ограничен
@@ -441,7 +460,7 @@ Discovery скилов — **поиском, а не всегда-видимым
    кодовые «skills» → «tools» на уровне имён и документации; `SkillOrigin` удалён.
 2. Переезд тулов из `skills/basic/` по доменным модулям (маппинг выше).
 3. Запись скила += флаг `system`; защита системных записей в `instruction_save`/`delete`.
-4. `instructions_search` → `instruction_search(intent, entity, text?)`: канонические поля
+4. `instructions_search` → `recall(intent, entity, text?)`: канонические поля
    запроса, ответ с полными сценариями.
 5. `seed.py` → декларативный системный реестр (дефолт core + прикладные пакеты web)
    с синком при старте; реестр core = 7 системных скилов из раздела выше.

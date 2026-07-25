@@ -23,8 +23,9 @@ from octoforge_core.net.external import (
 )
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tool_spec import parse_tool_spec
-from octoforge_core.net.tools import ExternalCallTool
+from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool
 from octoforge_core.tools.base import ToolContext
+from octoforge_core.tools.errors import ToolArgumentsError
 
 PUBLIC_IP = "93.184.216.34"
 PRIVATE_IP = "10.0.0.1"
@@ -246,6 +247,19 @@ async def test_execute_rejects_missing_required_param() -> None:
 
     with pytest.raises(ExternalCallError, match="missing"):
         await executor.execute(TOOL_NAME, {})
+
+
+async def test_param_errors_carry_the_declared_contract() -> None:
+    """A blind call must self-correct in one step, not retry guessed variants."""
+    executor = make_executor(ok_handler())
+
+    with pytest.raises(ExternalCallError, match="declares this contract") as missing:
+        await executor.execute(TOOL_NAME, {})
+    with pytest.raises(ExternalCallError, match="declares this contract") as unknown:
+        await executor.execute(TOOL_NAME, {"city": "London", "extra": "x"})
+
+    assert "url_template" in str(missing.value)
+    assert "url_template" in str(unknown.value)
 
 
 async def test_execute_rejects_unknown_param() -> None:
@@ -488,3 +502,47 @@ async def test_auth_header_is_not_sent_to_a_userinfo_spoofed_origin() -> None:
     assert result.status == HTTPStatus.OK  # a public host, so the request went out
     assert captured[0].url.host == SPOOFED_HOST
     assert captured[0].headers.get(USER_ID_HEADER) is None
+
+
+# --- endpoint_get -----------------------------------------------------------
+
+ENDPOINT_GET_CONTEXT = ToolContext(user_id="user-test", channel="web", dialog_id="dlg")
+
+
+def test_endpoint_get_spec() -> None:
+    tool = EndpointGetTool(service=FakeInstructionService({}))
+
+    assert tool.spec.name == "endpoint_get"
+    assert tool.spec.parameters_schema["required"] == ["name"]
+
+
+async def test_endpoint_get_returns_the_contract() -> None:
+    """The late-binding step: a skill names the endpoint, this resolves its contract."""
+    service = FakeInstructionService({TOOL_NAME: WEATHER_TOOL_CONTENT})
+    tool = EndpointGetTool(service=service)
+
+    output = await tool.execute({"name": TOOL_NAME}, ENDPOINT_GET_CONTEXT)
+
+    assert output.startswith(f"[endpoint] {TOOL_NAME}")
+    assert "url_template" in output
+    # the lookup is visibility-scoped: the caller's own endpoints resolve too
+    assert service.get_by_name_calls == [(TOOL_NAME, InstructionType.ENDPOINT, "user-test")]
+
+
+async def test_endpoint_get_not_found_points_to_discovery() -> None:
+    tool = EndpointGetTool(service=FakeInstructionService({}))
+
+    output = await tool.execute({"name": "nope"}, ENDPOINT_GET_CONTEXT)
+
+    assert output == (
+        "endpoint 'nope' not found; discover endpoints with recall(type=endpoint, query=...)"
+    )
+
+
+async def test_endpoint_get_rejects_invalid_arguments() -> None:
+    tool = EndpointGetTool(service=FakeInstructionService({}))
+
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute({}, ENDPOINT_GET_CONTEXT)
+    with pytest.raises(ToolArgumentsError):
+        await tool.execute({"name": "  "}, ENDPOINT_GET_CONTEXT)

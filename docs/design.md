@@ -60,7 +60,7 @@ core/                          # библиотека octoforge-core — дом�
                                #   ProcessInfo/ProcessPlace, LLMRouter (one-shot tool call, таймаут, фолбэк)
       prompts.py               # порты промптов: PromptProvider (Protocol) + StaticPromptProvider
                                #   поверх вшитых DEFAULT_SYSTEM_PROMPT (мета-правила: answer-first,
-                               #   instruction_search на непокрытый интент, сохранение по
+                               #   recall на непокрытый интент, сохранение по
                                #   аудитории (сценарий/память/knowledge), формат markdown)
                                #   и ROUTER_SYSTEM_PROMPT (роутинг процессов);
                                #   имена SYSTEM/ROUTER_PROMPT_NAME
@@ -109,7 +109,7 @@ core/                          # библиотека octoforge-core — дом�
                                #   (store инъектируется; vector-capable store → search_by_vector)
       registry.py              # SystemSkill + CORE_SYSTEM_SKILLS (8 системных сценариев)
                                #   + sync_system_registry (синк системной части стора при старте)
-      tools.py                 # instruction_search (полные сценарии + id в выдаче, фильтр type),
+      tools.py                 # recall (полные сценарии + id в выдаче, фильтр type),
                                #   instruction_save (приватные записи), instruction_delete (по id)
     datasets/                  # обособленный модуль датасетов (per-user трекеры, этап C)
       api.py                   # граница модуля: DatasetService (Protocol), Dataset, DatasetRecord,
@@ -413,7 +413,7 @@ target вообще не читает), поэтому модель, запол�
 задают **приоритет извлечения над импровизацией**:
 
 1. **Сначала поиск.** На любой запрос сложнее small talk (или вопроса, на который
-   отвечает сам диалог) первый шаг — `instruction_search`: один поиск покрывает
+   отвечает сам диалог) первый шаг — `recall`: один поиск покрывает
    сценарии, знания, дескрипторы датасетов И память о пользователе. Запрос — «интент +
    сущность» (`remind reminder`, `report user-data`, `call-api weather`); второй запрос
    «про пользователя» в том же ходу, когда ответ может зависеть от него лично. Поиск
@@ -443,17 +443,17 @@ target вообще не читает), поэтому модель, запол�
 клиент рендерит её нативно (Telegram — rich-апгрейдом финала, см. выше). Пер-туловая
 методика (крон, фон, память, датасеты, история, веб, внешние вызовы) живёт в системных
 сценариях реестра (`instructions/registry.py`, см. [instructions.md](instructions.md))
-и попадает в контекст поиском (`instruction_search` на каждый непокрытый интент).
+и попадает в контекст поиском (`recall` на каждый непокрытый интент).
 
 Почему так, а не «мягкой» формулировкой прежней версии: замер на живой модели
 (8 типовых запросов, стаб-тулы с боевыми описаниями, считается первый ход) дал
 4/8 против 10/10 после правки. Прежний текст ронял именно то, на что жаловались:
 `data_put` без поиска сценария, `task_create` без поиска, а на «погоду» —
-`instruction_search` → `external_call` → `web_search` → `web_search` до упора в
+`recall` → `external_call` → `web_search` → `web_search` до упора в
 лимит итераций, то есть перебор вместо честного отчёта. Правило «поиск бесплатен»
 формулируется в промпте явно, иначе модель оптимизирует поиск как «лишний вызов».
 Ту же политику несут **описания тулов** (они попадают в контекст всегда, в отличие
-от сценариев): у `instruction_search` — «первый тул на любой непустяковый запрос,
+от сценариев): у `recall` — «первый тул на любой непустяковый запрос,
 ищет всё, включая память», у `http_request` — «путь отступления, не по умолчанию:
 сначала поищи endpoint, не исследуй API перебором», у `web_search` — «только
 публичные факты; своё — в инструкциях и памяти».
@@ -486,7 +486,7 @@ provider_internal, transport; остальные фатальны. Однора�
 (эмбеддинги, реранкер) ретраят транзиентные классы через хелпер `retry_transient` —
 одна дополнительная попытка с минимальной фиксированной задержкой
 (`SHORT_RETRY_MAX_RETRIES`/`SHORT_RETRY_DELAY_SECONDS`): транзиентный 429 эндпоинта
-эмбеддингов не должен валить `instruction_search`, но и сталлить поиск нельзя.
+эмбеддингов не должен валить `recall`, но и сталлить поиск нельзя.
 Ленивая загрузка локальных моделей (bi-encoder, cross-encoder) — под
 `threading.Lock`: конкурентные первые вызовы из worker-потоков не грузят модель дважды.
 
@@ -598,8 +598,11 @@ DTO `Usage` (prompt/completion/cached токены) приезжает в `Strea
 v3 — тул; переименование кода отложено). Реализации живут в доменных модулях
 (`cron/tools.py`, `memory/tools.py`, `datasets/tools.py`, `context/tools.py`,
 `tasks/tools.py`, `search/tools.py`, `net/tools.py`, `instructions/tools.py`):
-`http_request`, `task_create`, `task_list`, `task_delete`, `instruction_search`,
-`instruction_save`, `instruction_delete`, `external_call`, `data_put`, `data_query`,
+`http_request`, `task_create`, `task_list`, `task_delete`, `recall` (бывший
+`instruction_search`: имя тула — интерфейс для LLM, «recall» одинаково покрывает
+и «как сделать отчёт», и «кто мой автор», и «что юзер говорил раньше»),
+`instruction_save`, `instruction_delete`, `endpoint_get` (позднее связывание ручек,
+см. [instructions.md](instructions.md)), `external_call`, `data_put`, `data_query`,
 `data_forget`, `memory_store`, `memory_delete`, `cron_pause`,
 `cron_resume`, `web_search`, `history_search`.
 Подключаются в composition root. Имена тулов — с подчёркиваниями, не с точками:
@@ -701,7 +704,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `ExternalCallExecutor` и в туле `http_request` (там тоже `follow_redirects=False` —
   поведение не изменилось, httpx и раньше не следовал редиректам по умолчанию). Известное
   ограничение TOCTOU/DNS-rebinding задокументировано в docstring гварда.
-- **Рантайм-тулы** — тонкие адаптеры (`instructions/tools.py`): `instruction_search(query, k?, type?)`
+- **Рантайм-тулы** — тонкие адаптеры (`instructions/tools.py`): `recall(query, k?, type?)`
   (k по умолчанию — `OF_INSTRUCTIONS_TOP_K`; ответ — полные сценарии + id записей,
   без сниппетов; `type` сужает поиск до одного вида),
   `instruction_save(type, title, content, tags?)` (приватная запись владельца из сессии;
@@ -737,7 +740,7 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `data_query(dataset, equals?, date_from?, date_to?, limit?)` (date-only = весь день
   UTC; лимиты `OF_DATASETS_QUERY_DEFAULT_LIMIT`/`OF_DATASETS_QUERY_MAX_LIMIT`),
   `data_forget(dataset)` (явный каскад DELETE записей, ответ — счётчик).
-- **Дескрипторы в `instruction_search`**: тулу передан `DatasetService` (опциональный
+- **Дескрипторы в `recall`**: тулу передан `DatasetService` (опциональный
   параметр конструктора), хиты обоих фасадов сливаются по убыванию score; датасеты
   форматируются как `[dataset] <name>` со сниппетом description + списком полей.
 
@@ -753,7 +756,7 @@ knowledge-запись: `InstructionType.MEMORY`, `title` = ключ памят�
 - **Что это дало.** Один поисковый механизм (эмбеддинги + буст точного заголовка +
   опциональный реранкер) вместо параллельного LIKE-поиска: агент больше не должен
   угадывать подстроку — семантика находит «день рождения» по «birthday». Один вызов
-  (`instruction_search`) вместо двух в первом ходу. Минус один тул из всегда-в-контексте
+  (`recall`) вместо двух в первом ходу. Минус один тул из всегда-в-контексте
   (`memory_search` удалён). Прежний «каталог по пустому query» удалён вместе с ним —
   это был костыль под слабость LIKE; на вопрос «что ты обо мне помнишь?» скил
   `user_memory` предписывает поиск `type=memory` широкими запросами.
@@ -784,7 +787,7 @@ knowledge-запись: `InstructionType.MEMORY`, `title` = ключ памят�
   pre-Alembic базы различает возраст по наличию этой таблицы — есть `memories` →
   stamp baseline и полный прогон цепочки (включая перенос), нет → stamp head.
 - **Промпт**: методика — в системном скиле `user_memory`; в системном промпте память
-  входит в правило 1 (один `instruction_search` покрывает и её; второй запрос «про
+  входит в правило 1 (один `recall` покрывает и её; второй запрос «про
   пользователя» в том же ходу, когда ответ может зависеть от него лично). Автоинъекция
   памяти в контекст по-прежнему сознательно не делается — поиск по требованию дешевле
   по токенам и не ломает prefix-cache системного сообщения.
@@ -1169,7 +1172,7 @@ per-router зависимость: он должен покрывать и то,
   задача — тихо, обрезка ошибки до 500
 - `core/tests/test_cron_tools.py` — тулы `cron_pause`/`cron_resume` (owner-изоляция,
   resume пересчитывает `next_fire_at` от now)
-- `core/tests/test_instruction_tools.py` — адаптеры `instruction_search`/`instruction_save`/
+- `core/tests/test_instruction_tools.py` — адаптеры `recall`/`instruction_save`/
   `instruction_delete`/`external_call` (валидация аргументов + happy path на фейках)
 - `core/tests/test_datasets.py` — контрактный набор фасада DatasetService на `:memory:`
   (create/get, дубликат имени, одно имя у разных owner'ов, изоляция, query: equals с
@@ -1180,9 +1183,9 @@ per-router зависимость: он должен покрывать и то,
 - `core/tests/test_data_tools.py` — `data_put` (создание со schema+description, отказ без
   них, запись в существующий, нарушения схемы текстом), `data_query` (JSON-строки, фильтры,
   лимиты, date-only границы, not-found текстом), `data_forget` (счётчик, not-found),
-  `instruction_search` с datasets (merged-выдача с `[dataset]`)
+  `recall` с datasets (merged-выдача с `[dataset]`)
 - `core/tests/test_memory_tools.py` — `memory_store`/`memory_delete` поверх стора
-  инструкций (upsert по ключу, видимость через instruction_search и фильтр type=memory,
+  инструкций (upsert по ключу, видимость через recall и фильтр type=memory,
   изоляция владельцев, недосягаемость легаси-глобальных записей, ошибки аргументов)
 - `core/tests/test_instructions_store_port.py`, `core/tests/test_datasets_store_port.py` —
   подмена store-портов (P1 модульности): in-memory `InstructionStore`/`DatasetStore`

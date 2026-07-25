@@ -222,7 +222,9 @@ async def test_vector_capable_store_receives_the_search() -> None:
 
     hits = await service.search(USER_ID, QUERY, k=TWO_HITS)
 
-    assert store.vector_calls == [(V_QUERY, TWO_HITS, USER_ID)]
+    # a kind-less search oversamples to k*3: the type caps need a tail to
+    # backfill from (see LocalInstructionService._search)
+    assert store.vector_calls == [(V_QUERY, TWO_HITS * 3, USER_ID)]
     assert store.list_calls == 0  # the brute-force path was not used
     assert len(hits) == TWO_HITS
 
