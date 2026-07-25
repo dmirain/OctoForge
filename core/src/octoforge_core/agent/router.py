@@ -1,6 +1,7 @@
 """Message router: maps an incoming user message to process operations."""
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -9,6 +10,8 @@ from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, PromptProvider
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.ports import LLMClient
 from octoforge_core.tools.base import ToolSpec
+
+logger = logging.getLogger(__name__)
 
 
 class RouteAction(StrEnum):
@@ -87,7 +90,10 @@ ROUTE_TOOL_SPEC = ToolSpec(
                         },
                         "target_id": {
                             "type": ["string", "null"],
-                            "description": "Target process id for cancel; null otherwise.",
+                            "description": (
+                                "Process id to cancel; ignored for inject and start_new "
+                                "(pass null there)."
+                            ),
                         },
                     },
                     "required": ["action", "target_id"],
@@ -132,10 +138,12 @@ class LLMRouter:
                 timeout=self._timeout_seconds,
             )
         except Exception:  # router failures must not break the dialog
+            logger.warning("router LLM call failed; falling back", exc_info=True)
             return _fallback(processes)
         reply = completion.message
         call = next((c for c in reply.tool_calls if c.name == ROUTE_TOOL_NAME), None)
         if call is None:
+            logger.warning("router answer carried no %s call; falling back", ROUTE_TOOL_NAME)
             return _fallback(processes)
         known_ids = {process.id for process in processes}
         raw_ops = call.arguments.get("ops")
@@ -193,16 +201,29 @@ def _dedupe_singletons(ops: tuple[RouteOp, ...]) -> tuple[RouteOp, ...]:
 
 
 def _parse_op(raw: object, known_ids: set[str]) -> RouteOp | None:
-    """Validate one raw op; invalid ops are dropped, not reported."""
+    """Validate one raw op; an unusable op is dropped (and logged, never silent).
+
+    `target_id` is only meaningful for cancel, which needs a known process to
+    stop. For inject and start_new the field is ignored whatever it holds:
+    injection is the pull model (the message already lives in the narrative and
+    every running process re-syncs it — `ConversationRunner._apply_inject` never
+    looks at a target), so a model that helpfully fills in the id of the process
+    it means still expresses a valid decision. Dropping the whole op over that
+    field turned a correct inject into an empty package, i.e. START_NEW — the
+    opposite routing.
+    """
     if not isinstance(raw, dict):
+        logger.warning("router op dropped, not an object: %r", raw)
         return None
     try:
         action = RouteAction(str(raw.get("action")))
     except ValueError:
+        logger.warning("router op dropped, unknown action: %r", raw)
         return None
     target = raw.get("target_id")
     if action in (RouteAction.INJECT, RouteAction.START_NEW):
-        return RouteOp(action=action) if target is None else None
+        return RouteOp(action=action)
     if not isinstance(target, str) or target not in known_ids:
+        logger.warning("router op dropped, %s needs a known target: %r", action.value, raw)
         return None
     return RouteOp(action=action, target_id=target)

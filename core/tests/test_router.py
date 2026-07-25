@@ -1,7 +1,10 @@
 """Tests for the LLMRouter message router."""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
+
+import pytest
 
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import (
@@ -25,6 +28,7 @@ MAX_PROCESSES = 5
 TIMEOUT_SECONDS = 0.05
 SLOW_LLM_DELAY_SECONDS = 60.0
 CUSTOM_ROUTER_PROMPT = "CUSTOM ROUTER: limit {limit}; processes:\n{processes}"
+ROUTER_LOGGER = "octoforge_core.agent.router"
 
 
 def foreground() -> ProcessInfo:
@@ -258,8 +262,6 @@ async def test_invalid_ops_are_dropped() -> None:
         reply=route_reply(
             [
                 {"action": "explode", "target_id": None},
-                {"action": "inject", "target_id": FG_ID},
-                {"action": "start_new", "target_id": BG_ID},
                 {"action": "cancel", "target_id": None},
                 # a stale "promote" op (removed route) is dropped like any unknown action
                 {"action": "promote", "target_id": BG_ID},
@@ -273,6 +275,98 @@ async def test_invalid_ops_are_dropped() -> None:
     decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
 
     assert decision.ops == (RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),)
+
+
+async def test_inject_keeps_its_op_when_the_model_fills_target_id() -> None:
+    """A superfluous target_id must not turn an inject into an empty package.
+
+    Measured against deepseek-v4-pro: on a clarification aimed at a running
+    foreground it answers `inject(target_id=<that process>)` in most runs.
+    Dropping the op left ops=(), which the runner maps to START_NEW — the
+    clarification span a new process instead of reaching the running one.
+    `_apply_inject` never reads a target (the pull model), so the field is
+    simply ignored.
+    """
+    llm = ScriptedLLM(reply=route_reply([{"action": "inject", "target_id": FG_ID}]))
+    router = make_router(llm)
+
+    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
+
+
+async def test_inject_keeps_its_op_when_target_id_is_unknown() -> None:
+    """An id nobody knows is still just a superfluous field on an inject."""
+    llm = ScriptedLLM(reply=route_reply([{"action": "inject", "target_id": UNKNOWN_ID}]))
+    router = make_router(llm)
+
+    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
+
+
+async def test_start_new_keeps_its_op_when_the_model_fills_target_id() -> None:
+    llm = ScriptedLLM(reply=route_reply([{"action": "start_new", "target_id": BG_ID}]))
+    router = make_router(llm)
+
+    decision = await router.route((background(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
+
+
+async def test_inject_with_a_target_still_wins_over_start_new() -> None:
+    """The inject-drops-start_new guardrail holds once the target is ignored."""
+    llm = ScriptedLLM(
+        reply=route_reply(
+            [
+                {"action": "inject", "target_id": FG_ID},
+                {"action": "start_new", "target_id": BG_ID},
+                {"action": "cancel", "target_id": BG_ID},
+            ]
+        )
+    )
+    router = make_router(llm)
+
+    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == (
+        RouteOp(action=RouteAction.INJECT),
+        RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),
+    )
+
+
+async def test_dropped_ops_are_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """A dropped op must leave a trace: silent drops hid a routing bug for weeks."""
+    llm = ScriptedLLM(reply=route_reply([{"action": "cancel", "target_id": UNKNOWN_ID}]))
+    router = make_router(llm)
+
+    with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
+        decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert decision.ops == ()
+    assert "cancel needs a known target" in caplog.text
+
+
+async def test_missing_tool_call_logs_the_fallback(caplog: pytest.LogCaptureFixture) -> None:
+    llm = ScriptedLLM(reply=plain_reply())
+    router = make_router(llm)
+
+    with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
+        await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert ROUTE_TOOL_NAME in caplog.text
+    assert "falling back" in caplog.text
+
+
+async def test_llm_failure_logs_the_fallback(caplog: pytest.LogCaptureFixture) -> None:
+    llm = ScriptedLLM(error=RuntimeError("provider down"))
+    router = make_router(llm)
+
+    with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
+        await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+
+    assert "router LLM call failed" in caplog.text
+    assert "provider down" in caplog.text
 
 
 async def test_all_invalid_ops_yield_an_empty_decision() -> None:
