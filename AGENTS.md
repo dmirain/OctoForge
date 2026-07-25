@@ -39,6 +39,8 @@ OctoForge is a multi-user LLM agent: Python, FastAPI, SQLAlchemy (async, SQLite)
 - `web/` — the `octoforge-web` application (src-layout): the FastAPI wrapper, `api/` (dialog/cron/sse/schemas), `prompts.py` (`FilePromptProvider`), `telegram/` (the Telegram surface adapter: models/client/bridge/poller, `admin.py` — the admin tool, `invites/` — invites on a separate database, `__main__` — standalone startup with no HTTP API), static assets, the composition root in `main.py` (a shared `runtime()` for both web and standalone). Depends on `octoforge-core`.
 - Root: `Makefile`, `README.md`, `LICENSE`, `CONTRIBUTING.md`, `.env.example`, `docs/`, `.github/`.
 
+- the operator console (stage H): a cross-user read model in core (`admin/api.py` — `AdminReadModel` Protocol, `Page[T]`, `DialogOverview`, `MessageRecord`, `Totals`; `admin/store.py` — SELECT+count only, row→DTO mappings mirroring each module's private converters) plus `web/api/admin.py` (paginated listings for dialogs/messages/tasks/cron/instructions/datasets/records/memories/summaries and actions that reuse `CronStore.set_enabled`/`delete_for_user`, `TaskStore.delete`, `MemoryStore.delete`, `InstructionService.publish`/`delete`) and a single static page `static/admin.html`; authentication is HTTP Basic for the whole surface except the health probes (`web/auth.py`, middleware in `create_app`; PBKDF2 hash written `pbkdf2_sha256:iterations:salt:digest` — `:` because docker compose interpolates `$` in `.env`; an empty hash means 503, never open; `logging.getLogger("httpx")` is pinned to WARNING because the Bot API URL carries the token and this process runs the bot);
+
 ## Build and test commands
 
 - `make install` — create `.venv` and install both projects editable with dev dependencies
@@ -63,7 +65,8 @@ Take these from here, don't guess:
 | Readiness (checks the DB) | `GET /health/ready` |
 | API docs | `GET /docs` (Swagger UI), schema at `/openapi.json` — FastAPI defaults, not overridden |
 | Telegram bot | no HTTP port — long-polling only (`make run-telegram`) |
-| Deployment | `docker compose up -d` = postgres + telegram (the web surface sits behind `--profile web`); one image, `OF_TELEGRAM_BOT_TOKEN` blanked on the web service so only one poller owns the bot. See `docs/deploy.md` |
+| Deployment | `docker compose up -d` = postgres + app + caddy. The app is one process serving the HTTP API, the operator console and the Telegram bot — split across containers and two cron schedulers/recovery sweeps would race on one database with no channel filter. `--profile standalone` keeps the bot-only service. See `docs/deploy.md` |
+| Operator console | `/admin.html` behind HTTP Basic; cross-user reads via `octoforge_core.admin`, mutations via the owner-scoped services |
 | Logs | stdout/stderr only (`logging.basicConfig`, no file handler) — redirect yourself if backgrounding, e.g. `make run > /tmp/octoforge.log 2>&1 &` |
 
 ## Code conventions

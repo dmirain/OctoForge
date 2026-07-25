@@ -1,0 +1,34 @@
+# TLS terminator in front of the app. Caddy obtains and renews the Let's
+# Encrypt certificate itself (HTTP-01 on :80, then serves :443), so there is no
+# certbot, no cron job and no renewal hook to forget. Certificates and the ACME
+# account live in the caddy-data volume — keep it, or every rebuild starts a new
+# issuance and burns rate limit.
+#
+# ACME_CA lets a deployment point at the staging endpoint while verifying that
+# port 80 is reachable from the internet; unset it for the real certificate.
+{
+	email {$ACME_EMAIL}
+	acme_ca {$ACME_CA:https://acme-v02.api.letsencrypt.org/directory}
+}
+
+{$SITE_DOMAIN} {
+	encode zstd gzip
+
+	# The app authenticates every request itself (HTTP Basic, health probes
+	# aside), so the proxy stays a plain terminator and forwards credentials
+	# untouched.
+	reverse_proxy app:8000
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		output stderr
+		format console
+	}
+}

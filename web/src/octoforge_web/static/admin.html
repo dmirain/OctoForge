@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OctoForge — консоль</title>
+<style>
+  :root {
+    --bg: #12141a; --panel: #1a1d26; --line: #2b3040; --text: #e6e8ef;
+    --muted: #8c93a8; --accent: #7aa2f7; --danger: #f7768e; --ok: #9ece6a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7fb; --panel: #fff; --line: #dfe3ee; --text: #1a1d26;
+      --muted: #666e85; --accent: #3055b3; --danger: #c03a52; --ok: #3f7d20;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  header .totals { color: var(--muted); font-size: 12px; }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; padding: 10px 18px;
+    border-bottom: 1px solid var(--line); }
+  nav button { background: transparent; color: var(--muted); border: 1px solid transparent;
+    border-radius: 7px; padding: 6px 11px; cursor: pointer; font: inherit; }
+  nav button:hover { color: var(--text); border-color: var(--line); }
+  nav button[aria-current="true"] { color: var(--text); border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  main { padding: 16px 18px 40px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .toolbar input, .toolbar select { background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; font: inherit; }
+  .toolbar .spacer { flex: 1; }
+  .count { color: var(--muted); font-size: 12px; }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
+    vertical-align: top; }
+  th { position: sticky; top: 0; background: var(--panel); font-weight: 600;
+    color: var(--muted); white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  td.mono, th.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  td .clip { display: block; max-width: 52ch; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  td.wrap .clip { white-space: pre-wrap; max-width: 70ch; overflow: visible; }
+  button.link { background: none; border: none; color: var(--accent); cursor: pointer;
+    padding: 0; font: inherit; }
+  button.act { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 8px; cursor: pointer; font-size: 12px; }
+  button.act.danger { color: var(--danger); }
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  .tag { display: inline-block; border: 1px solid var(--line); border-radius: 5px;
+    padding: 0 5px; margin-right: 3px; font-size: 11px; color: var(--muted); }
+  .yes { color: var(--ok); } .no { color: var(--muted); }
+  .err { color: var(--danger); margin-bottom: 10px; }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 12px; max-width: min(900px, 92vw); width: 100%; }
+  dialog pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 12px; }
+  dialog .close { float: right; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OctoForge · консоль</h1>
+  <span class="totals" id="totals">…</span>
+</header>
+<nav id="nav"></nav>
+<main>
+  <div class="err" id="error" hidden></div>
+  <div class="toolbar" id="toolbar"></div>
+  <div class="scroll"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
+  <div class="pager">
+    <button class="act" id="prev">← назад</button>
+    <button class="act" id="next">вперёд →</button>
+    <span class="count" id="range"></span>
+  </div>
+</main>
+<dialog id="viewer"><button class="act close" id="viewer-close">закрыть</button><pre id="viewer-body"></pre></dialog>
+
+<script>
+"use strict";
+
+const state = { view: "dialogs", offset: 0, limit: 50, query: "", status: "", dialogId: null, datasetId: null };
+
+const short = (value) => (value === null || value === undefined ? "—" : String(value));
+const time = (value) => (value ? String(value).replace("T", " ").slice(0, 19) : "—");
+const flag = (value) => `<span class="${value ? "yes" : "no"}">${value ? "да" : "нет"}</span>`;
+const tags = (list) => (list && list.length ? list.map((t) => `<span class="tag">${esc(t)}</span>`).join("") : "—");
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+function clip(value, cls) {
+  return `<td class="${cls || ""}"><span class="clip" title="${esc(value)}">${esc(short(value))}</span></td>`;
+}
+
+function open(text) {
+  document.getElementById("viewer-body").textContent = text;
+  document.getElementById("viewer").showModal();
+}
+
+const VIEWS = {
+  dialogs: {
+    title: "Диалоги", path: () => "/api/admin/dialogs",
+    columns: ["user_id", "канал", "сообщений", "задач", "последнее", "создан", ""],
+    row: (d) => `${clip(d.user_id, "mono")}<td>${esc(d.channel)}</td><td>${d.message_count}</td>` +
+      `<td>${d.task_count}</td><td class="mono">${time(d.last_message_at)}</td>` +
+      `<td class="mono">${time(d.created_at)}</td>` +
+      `<td><button class="act" data-open-dialog="${esc(d.id)}">сообщения</button></td>`,
+  },
+  messages: {
+    title: "Сообщения диалога", path: () => `/api/admin/dialogs/${state.dialogId}/messages`,
+    columns: ["seq", "роль", "текст", "задача", "токены", "время"],
+    row: (m) => `<td>${m.seq}</td><td>${esc(m.role)}</td>` +
+      `<td class="wrap"><span class="clip">${esc(m.content)}</span></td>` +
+      `${clip(m.task_id, "mono")}<td class="mono">${short(m.prompt_tokens)}/${short(m.completion_tokens)}</td>` +
+      `<td class="mono">${time(m.created_at)}</td>`,
+  },
+  tasks: {
+    title: "Задачи", path: () => "/api/admin/tasks",
+    filters: ["status"],
+    columns: ["title", "вид", "статус", "user_id", "доставлено", "результат", "создана", ""],
+    row: (t) => `${clip(t.title)}<td>${esc(t.kind)}</td><td>${esc(t.status)}</td>` +
+      `${clip(t.user_id, "mono")}<td>${flag(t.delivered_at)}</td>` +
+      `<td><button class="link" data-view="${esc(t.result || t.error || "")}">открыть</button></td>` +
+      `<td class="mono">${time(t.created_at)}</td>` +
+      `<td><button class="act danger" data-delete="/api/admin/tasks/${esc(t.id)}">удалить</button></td>`,
+  },
+  cron: {
+    title: "Cron", path: () => "/api/admin/cron",
+    columns: ["title", "расписание", "tz", "вкл", "следующий", "последний", "итог", "user_id", ""],
+    row: (c) => `${clip(c.title)}<td class="mono">${esc(c.schedule)}</td><td>${esc(c.timezone)}</td>` +
+      `<td>${flag(c.enabled)}</td><td class="mono">${time(c.next_fire_at)}</td>` +
+      `<td class="mono">${time(c.last_fire_at)}</td><td>${esc(short(c.last_status))}</td>` +
+      `${clip(c.user_id, "mono")}` +
+      `<td><button class="act" data-post="/api/admin/cron/${esc(c.id)}/enabled?enabled=${!c.enabled}">` +
+      `${c.enabled ? "пауза" : "включить"}</button> ` +
+      `<button class="act danger" data-delete="/api/admin/cron/${esc(c.id)}">удалить</button></td>`,
+  },
+  instructions: {
+    title: "Инструкции", path: () => "/api/admin/instructions",
+    filters: ["query"],
+    columns: ["тип", "title", "владелец", "system", "версия", "теги", "текст", ""],
+    row: (i) => `<td>${esc(i.type)}</td>${clip(i.title)}${clip(i.owner_id || "public", "mono")}` +
+      `<td>${flag(i.system)}</td><td>${i.version}</td><td>${tags(i.tags)}</td>` +
+      `<td><button class="link" data-view="${esc(i.content)}">открыть</button></td>` +
+      `<td>${i.owner_id ? `<button class="act" data-post="/api/admin/instructions/${esc(i.id)}/publish">опубликовать</button>` : ""}</td>`,
+  },
+  datasets: {
+    title: "Датасеты", path: () => "/api/admin/datasets",
+    columns: ["name", "владелец", "описание", "поля", "версия", ""],
+    row: (d) => `${clip(d.name)}${clip(d.owner_user_id, "mono")}${clip(d.description)}` +
+      `<td>${tags(d.fields)}</td><td>${d.version}</td>` +
+      `<td><button class="act" data-open-dataset="${esc(d.id)}">записи</button></td>`,
+  },
+  records: {
+    title: "Записи датасета", path: () => `/api/admin/datasets/${state.datasetId}/records`,
+    columns: ["id", "владелец", "payload", "создана"],
+    row: (r) => `${clip(r.id, "mono")}${clip(r.owner_user_id, "mono")}` +
+      `<td><button class="link" data-view="${esc(JSON.stringify(r.payload, null, 2))}">открыть</button></td>` +
+      `<td class="mono">${time(r.created_at)}</td>`,
+  },
+  memories: {
+    title: "Память", path: () => "/api/admin/memories",
+    columns: ["key", "владелец", "содержимое", "теги", "обновлена", ""],
+    row: (m) => `${clip(m.key)}${clip(m.user_id || "global", "mono")}${clip(m.content)}` +
+      `<td>${tags(m.tags)}</td><td class="mono">${time(m.updated_at)}</td>` +
+      `<td><button class="act danger" data-delete="/api/admin/memories/${encodeURIComponent(m.key)}` +
+      `${m.user_id ? `?user_id=${encodeURIComponent(m.user_id)}` : ""}">удалить</button></td>`,
+  },
+  summaries: {
+    title: "Сводки", path: () => "/api/admin/summaries",
+    columns: ["dialog_id", "seq", "темы", "текст", "создана"],
+    row: (s) => `${clip(s.dialog_id, "mono")}<td class="mono">${s.seq_from}–${s.seq_to}</td>` +
+      `<td>${tags(s.topics)}</td>` +
+      `<td><button class="link" data-view="${esc(s.content)}">открыть</button></td>` +
+      `<td class="mono">${time(s.created_at)}</td>`,
+  },
+};
+
+const NAV = [
+  ["dialogs", "Диалоги"], ["tasks", "Задачи"], ["cron", "Cron"], ["instructions", "Инструкции"],
+  ["datasets", "Датасеты"], ["memories", "Память"], ["summaries", "Сводки"],
+];
+
+function renderNav() {
+  document.getElementById("nav").innerHTML = NAV
+    .map(([key, label]) => `<button data-nav="${key}" aria-current="${key === state.view}">${label}</button>`)
+    .join("");
+}
+
+function renderToolbar(view) {
+  const parts = [];
+  if (state.view === "messages") parts.push(`<button class="act" data-nav="dialogs">← к диалогам</button>`);
+  if (state.view === "records") parts.push(`<button class="act" data-nav="datasets">← к датасетам</button>`);
+  if (view.filters?.includes("query")) {
+    parts.push(`<input id="f-query" placeholder="поиск по title" value="${esc(state.query)}">`);
+  }
+  if (view.filters?.includes("status")) {
+    const options = ["", "pending", "running", "done", "failed", "cancelled"]
+      .map((s) => `<option value="${s}" ${s === state.status ? "selected" : ""}>${s || "любой статус"}</option>`);
+    parts.push(`<select id="f-status">${options.join("")}</select>`);
+  }
+  parts.push(`<span class="spacer"></span><span class="count" id="title">${esc(view.title)}</span>`);
+  document.getElementById("toolbar").innerHTML = parts.join(" ");
+  document.getElementById("f-query")?.addEventListener("change", (e) => {
+    state.query = e.target.value; state.offset = 0; load();
+  });
+  document.getElementById("f-status")?.addEventListener("change", (e) => {
+    state.status = e.target.value; state.offset = 0; load();
+  });
+}
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+  return response.status === 204 ? null : response.json();
+}
+
+function fail(message) {
+  const box = document.getElementById("error");
+  box.hidden = false;
+  box.textContent = message;
+}
+
+async function loadTotals() {
+  const totals = await api("/api/admin/totals");
+  document.getElementById("totals").textContent = Object.entries(totals)
+    .map(([key, value]) => `${key}: ${value}`).join(" · ");
+}
+
+async function load() {
+  const view = VIEWS[state.view];
+  document.getElementById("error").hidden = true;
+  renderNav();
+  renderToolbar(view);
+  const params = new URLSearchParams({ limit: state.limit, offset: state.offset });
+  if (view.filters?.includes("query") && state.query) params.set("query", state.query);
+  if (view.filters?.includes("status") && state.status) params.set("status", state.status);
+  try {
+    const page = await api(`${view.path()}?${params}`);
+    document.getElementById("head").innerHTML =
+      `<tr>${view.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>`;
+    document.getElementById("body").innerHTML = page.items.length
+      ? page.items.map((item) => `<tr>${view.row(item)}</tr>`).join("")
+      : `<tr><td colspan="${view.columns.length}" class="count">пусто</td></tr>`;
+    const to = Math.min(page.offset + page.limit, page.total);
+    document.getElementById("range").textContent = `${page.total ? page.offset + 1 : 0}–${to} из ${page.total}`;
+    document.getElementById("prev").disabled = page.offset === 0;
+    document.getElementById("next").disabled = to >= page.total;
+  } catch (error) {
+    fail(`не удалось загрузить: ${error.message}`);
+  }
+}
+
+document.addEventListener("click", async (event) => {
+  const target = event.target.closest("[data-nav],[data-open-dialog],[data-open-dataset],[data-view],[data-delete],[data-post]");
+  if (!target) return;
+  const data = target.dataset;
+  if (data.nav) { state.view = data.nav; state.offset = 0; state.query = ""; state.status = ""; return load(); }
+  if (data.openDialog) { state.dialogId = data.openDialog; state.view = "messages"; state.offset = 0; return load(); }
+  if (data.openDataset) { state.datasetId = data.openDataset; state.view = "records"; state.offset = 0; return load(); }
+  if (data.view !== undefined) return open(data.view || "(пусто)");
+  if (data.delete && confirm("Удалить безвозвратно?")) {
+    try { await api(data.delete, { method: "DELETE" }); await Promise.all([load(), loadTotals()]); }
+    catch (error) { fail(`удаление не удалось: ${error.message}`); }
+    return;
+  }
+  if (data.post) {
+    try { await api(data.post, { method: "POST" }); await load(); }
+    catch (error) { fail(`действие не удалось: ${error.message}`); }
+  }
+});
+
+document.getElementById("prev").addEventListener("click", () => {
+  state.offset = Math.max(0, state.offset - state.limit); load();
+});
+document.getElementById("next").addEventListener("click", () => {
+  state.offset += state.limit; load();
+});
+document.getElementById("viewer-close").addEventListener("click", () => {
+  document.getElementById("viewer").close();
+});
+
+loadTotals().catch((error) => fail(`не удалось получить сводку: ${error.message}`));
+load();
+</script>
+</body>
+</html>

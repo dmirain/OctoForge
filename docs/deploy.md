@@ -1,27 +1,65 @@
-# Деплой: Postgres и бот в контейнерах
+# Деплой: Postgres, приложение и TLS в контейнерах
 
-Целевая топология — `docker compose`: сервис `postgres` держит состояние, сервис `telegram`
-крутит бота (только исходящие соединения, порт не слушается). Web-поверхность лежит за
-профилем и по умолчанию не поднимается:
+Целевая топология — `docker compose`:
 
 ```bash
-docker compose up -d              # postgres + telegram
-docker compose --profile web up -d  # плюс web на :8000
+docker compose up -d   # postgres + app + caddy
 ```
 
-Образ один на оба сервиса (`octoforge:local`), различаются только `command` и порты. У
-web-сервиса `OF_TELEGRAM_BOT_TOKEN` принудительно пуст: два поллера на одном токене получают от
-Bot API `Conflict: terminated by other getUpdates request`, поэтому бота владеет ровно один
-сервис.
+- **postgres** — состояние;
+- **app** — один процесс: HTTP API, консоль оператора и Telegram-бот (бот поднимается в том же
+  процессе, потому что `OF_TELEGRAM_BOT_TOKEN` задан). Порт наружу не публикуется, только
+  `expose: 8000` во внутреннюю сеть;
+- **caddy** — терминирует TLS на 80/443, сам получает и продлевает сертификат Let's Encrypt.
+
+Почему обе поверхности в одном процессе: разнеси их по контейнерам — получишь два
+cron-планировщика и два recovery-sweep'а на одной базе, а ни один из них не фильтрует по
+`channel`. Тогда срабатывание крона телеграм-пользователя может выполнить web-процесс, у чьего
+раннера нет бриджа для доставки. Для деплоя вообще без HTTP остался профиль:
+`docker compose --profile standalone up -d telegram`.
+
+## TLS и сертификат
+
+Всё делает Caddy (`docker/Caddyfile`): HTTP-01 на :80, редирект 80→443, продление без certbot,
+без cron-задач и без хуков. Сертификаты и ACME-аккаунт лежат в томе `caddy-data` — потеряешь
+том, и выдача начнётся заново (у Let's Encrypt есть лимиты). Перед первым боевым запуском
+имеет смысл проверить доступность порта на staging-эндпоинте:
+
+```bash
+ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory docker compose up -d caddy
+docker compose logs caddy | grep "certificate obtained"
+docker compose up -d --force-recreate caddy   # снова боевой CA
+```
+
+## Консоль оператора и аутентификация
+
+`https://<SITE_DOMAIN>/admin.html` — таблицы по всем сущностям (диалоги и их сообщения, задачи,
+cron, инструкции, датасеты и записи, память, сводки) плюс действия: пауза/возобновление и
+удаление cron-задач, удаление задач и памяти, публикация инструкции.
+
+Аутентификация — HTTP Basic поверх TLS, одна операторская пара логин/пароль
+(`OF_ADMIN_USERNAME`, `OF_ADMIN_PASSWORD_HASH`). Гейт стоит middleware'ом на **всём**, кроме
+`/health` и `/health/ready`: чат-UI, `/api/dialog/*`, `/docs`, статика. Это не система
+пользователей — `X-User-Id` по-прежнему выбирает диалог; но на публично доступном хосте без
+пароля любой мог бы подставить чужой id и читать чужие диалоги.
+
+Сменить пароль:
+
+```bash
+python tools/hash_password.py            # печатает пароль и строку для .env
+# заменить OF_ADMIN_PASSWORD_HASH в .env
+docker compose up -d --build app         # именно --build: хэш читается кодом из образа
+```
 
 ## Что где лежит
 
 | | |
 |---|---|
 | Базы | `octoforge` (приложение), `octoforge_telegram` (инвайты), `octoforge_dev` (локальный запуск), `octoforge_test` (тесты) |
+| Сертификаты | том `caddy-data` (плюс `caddy-config`) |
 | Том с кластером | `pg-data` → `/var/lib/postgresql` (у образа 18+ данные в подкаталоге мажора) |
 | Кэш моделей | bind-mount `~/.cache/huggingface` — иначе контейнер заново тянет 1.1 GB эмбеддера |
-| Секреты | `.env` (LLM-ключ, токен бота, serper); держи `chmod 600` |
+| Секреты | `.env` (LLM-ключ, токен бота, serper, хэш пароля консоли); держи `chmod 600`. Значения не должны содержать `$` — compose его интерполирует |
 | Порт Postgres | `127.0.0.1:5432` — только loopback, для `psql`/`pg_dump` с хоста |
 
 ## Переезд с SQLite (одноразовый)
@@ -48,8 +86,8 @@ Bot API `Conflict: terminated by other getUpdates request`, поэтому бо�
      --invite-target postgresql+asyncpg://octoforge:octoforge@127.0.0.1:5432/octoforge_telegram
    ```
    Скрипт сверяет счётчики по каждой таблице и возвращает ненулевой код при расхождении.
-5. **Поднять бота:** `docker compose up -d telegram`, затем `docker compose logs -f telegram` —
-   ждём `Telegram surface is up without the HTTP API`.
+5. **Поднять стек:** `docker compose up -d`, затем `docker compose logs -f app` — ждём
+   `Application startup complete`.
 6. **Проверить живьём:** написать боту сообщение и дождаться ближайшего срабатывания крона
    (`docker compose exec postgres psql -U octoforge -d octoforge -c 'SELECT title, next_fire_at, last_status FROM cron_jobs ORDER BY next_fire_at'`).
 
@@ -82,7 +120,9 @@ SQLite-файлы после переноса не удаляются — это
   gunzip -c ~/octoforge-backups/octoforge-ГГГГММДД-ЧЧММСС.sql.gz \
     | docker compose exec -T postgres psql -q -U octoforge -d restore_check
   ```
-- **Логи:** `docker compose logs -f telegram`. Ротацию делает docker (`json-file` по умолчанию).
+- **Логи:** `docker compose logs -f app`. Ротацию делает docker (`json-file` по умолчанию).
+  Логгер `httpx` принудительно на WARNING: на INFO он печатает полный URL запроса, а у Bot API
+  в URL лежит токен.
 - **Перезапуск после падения хоста:** `restart: unless-stopped` плюс включённый
   `docker.service` поднимают стек сами.
 - **Обновление кода:** `docker compose build && docker compose up -d`. Схема доводится на

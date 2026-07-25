@@ -1,5 +1,6 @@
 """Tests for the cron job API."""
 
+import base64
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -9,10 +10,14 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from octoforge_web.auth import hash_password
 from octoforge_web.config import Settings
 from octoforge_web.main import create_app
 
 TEST_BASE_URL = "http://test-llm/v1"
+ADMIN_USER = "operator"
+ADMIN_PASSWORD = "console-secret"
+ADMIN_ITERATIONS = 1_000
 USER_A = "alice"
 USER_B = "bob"
 USER_ID_HEADER = "X-User-Id"
@@ -23,11 +28,25 @@ MISSING_JOB_ID = "no-such-job"
 EXPECTED_TWO_JOBS = 2
 
 
+def basic_auth_header(username: str, password: str) -> dict[str, str]:
+    """Basic credentials as a header: this TestClient takes no `auth=` argument."""
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[TestClient]:
     database_url = f"sqlite+aiosqlite:///{tmp_path}/octoforge-test.db"
-    settings = Settings(llm_base_url=TEST_BASE_URL, database_url=database_url)
-    with TestClient(create_app(settings)) as test_client:
+    settings = Settings(
+        llm_base_url=TEST_BASE_URL,
+        database_url=database_url,
+        admin_username=ADMIN_USER,
+        admin_password_hash=hash_password(ADMIN_PASSWORD, iterations=ADMIN_ITERATIONS),
+    )
+    # every endpoint but the health probes sits behind the operator credential
+    with TestClient(
+        create_app(settings), headers=basic_auth_header(ADMIN_USER, ADMIN_PASSWORD)
+    ) as test_client:
         yield test_client
 
 

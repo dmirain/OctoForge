@@ -1,6 +1,12 @@
-# Default `docker compose up -d` runs the deployment as it exists today:
-# Postgres plus the Telegram bot, no HTTP listener. The web surface is behind a
-# profile — `docker compose --profile web up -d` adds it.
+# Default `docker compose up -d`: Postgres, the app (HTTP API + operator console
+# + the Telegram bot in one process) and Caddy terminating TLS for SITE_DOMAIN.
+#
+# One process serves both surfaces on purpose. Splitting web and telegram across
+# two containers would put two cron schedulers and two recovery sweeps on one
+# database, and neither filters by channel — a Telegram user's firing could be
+# executed by the web process, whose runner has no bridge to deliver it. The
+# telegram-only service stays available under the `standalone` profile for a
+# deployment that runs no HTTP surface at all.
 x-app-build: &app-build
   context: .
   args:
@@ -46,10 +52,9 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  telegram:
+  app:
     build: *app-build
     image: octoforge:local
-    command: ["python", "-m", "octoforge_web.telegram"]
     env_file:
       - .env
     environment: *app-databases
@@ -60,35 +65,58 @@ services:
       # the host's model cache: without it the container re-downloads the
       # 1.1 GB embedding model on first start
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
-    # No ports and no healthcheck on purpose: this surface only makes outbound
-    # connections (Bot API long poll, LLM, embeddings) and exposes no endpoint
-    # to probe. Liveness is left to `restart`.
-    restart: unless-stopped
-
-  web:
-    profiles: ["web"]
-    build: *app-build
-    image: octoforge:local
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      <<: *app-databases
-      # the dedicated telegram service owns the bot: a second poller on the
-      # same token gets `Conflict: terminated by other getUpdates request`
-      OF_TELEGRAM_BOT_TOKEN: ""
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    # No published port: Caddy reaches it over the compose network, so the app
+    # never answers without TLS.
+    expose:
+      - "8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      app:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      # point ACME_CA at https://acme-staging-v02.api.letsencrypt.org/directory
+      # while checking that inbound :80 works — staging has loose rate limits
+      ACME_CA: ${ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      # certificates and the ACME account: losing this volume means re-issuing
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+  telegram:
+    profiles: ["standalone"]
+    build: *app-build
+    image: octoforge:local
+    command: ["python", "-m", "octoforge_web.telegram"]
+    env_file:
+      - .env
+    environment: *app-databases
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    # No ports and no healthcheck on purpose: this surface only makes outbound
+    # connections (Bot API long poll, LLM, embeddings) and exposes no endpoint
+    # to probe. Liveness is left to `restart`.
     restart: unless-stopped
 
 volumes:
   pg-data:
+  caddy-data:
+  caddy-config:

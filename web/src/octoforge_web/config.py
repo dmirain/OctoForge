@@ -49,6 +49,7 @@ DEFAULT_TELEGRAM_RICH_MESSAGES = True
 DEFAULT_TELEGRAM_DATABASE_URL = "sqlite+aiosqlite:///./telegram.db"
 DEFAULT_TELEGRAM_INVITE_TTL_SECONDS = 259200.0  # 3 days
 FILE_SCHEME_PREFIX = "file:"
+DEFAULT_ADMIN_USERNAME = "admin"
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -111,6 +112,12 @@ class Settings(BaseSettings):
     serper_token: str = ""
     system_prompt_source: str = ""
     router_prompt_source: str = ""
+    # Operator credential for the console and the HTTP API. The hash format is
+    # `pbkdf2_sha256:iterations:salt:digest`; generate one with
+    # `tools/hash_password.py`. Empty means the HTTP surface answers 503 rather
+    # than serving an unauthenticated console (fail closed).
+    admin_username: str = DEFAULT_ADMIN_USERNAME
+    admin_password_hash: str = ""
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

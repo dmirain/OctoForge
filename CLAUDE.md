@@ -41,7 +41,8 @@ Take these from here, don't guess:
 | Readiness (checks the DB) | `GET /health/ready` |
 | API docs | `GET /docs` (Swagger UI), schema at `/openapi.json` — FastAPI defaults, not overridden |
 | Telegram bot | no HTTP port — long-polling only (`make run-telegram`) |
-| Deployment | `docker compose up -d` = postgres + telegram; `--profile web` adds the HTTP surface. Topology, SQLite→Postgres migration and day-2 ops: `docs/deploy.md` |
+| Deployment | `docker compose up -d` = postgres + app (HTTP + console + bot in one process) + caddy (TLS for `SITE_DOMAIN`); `--profile standalone` runs the bot alone. See `docs/deploy.md` |
+| Operator console | `https://<SITE_DOMAIN>/admin.html`, HTTP Basic (`OF_ADMIN_USERNAME` / `OF_ADMIN_PASSWORD_HASH`, generate with `tools/hash_password.py`) |
 | Logs | stdout/stderr only (`logging.basicConfig`, no file handler) — redirect yourself if backgrounding, e.g. `make run > /tmp/octoforge.log 2>&1 &` |
 
 ## Architecture
@@ -75,6 +76,7 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 - `datasets/` — user data (`datasets` / `dataset_records`), JSON-schema validation, owner isolation at the SQL level; descriptors also feed `instruction_search`.
 - `memory/` — key/value memories, `user_id` NULL = global scope, LIKE search over "own + global".
 - `cron/` — `CronScheduler` asyncio loop with CAS lease (`lease_ttl`), coalescing missed fires; a fire calls `ConversationManager.wake` → a background process. See `docs/cron.md`.
+- `admin/` — the cross-user read model behind the operator console: `AdminReadModel` Protocol plus paginated `Page[T]` listings for every entity, read-only (mutations go through the owner-scoped services). Everywhere else queries are owner-scoped; this module is the one deliberate exception, and it lives in core so the web adapter never needs SQLAlchemy.
 - `context/` — dialog narrative compaction: a rolling summary (`dialog_summaries` table, via `LlmContextCompactor`) plus a verbatim hot tail, triggered by char/token thresholds or reactively on `ContextOverflowError`. See `docs/context.md`.
 
 ### Embeddings / reranker (optional but needed for instructions & datasets)
@@ -86,6 +88,14 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 ### Telegram surface
 
 `web/src/octoforge_web/telegram/` — raw-httpx Bot API client (no aiogram), `TelegramPoller` (long-poll), `TelegramBridge` renders runner events into a throttled draft message. Channel `"telegram"`, `user_id = "tg:<id>"`, private chats only. Agent markdown answers are converted to Telegram HTML (`markdown.py`) with a plain-text fallback; a final containing a table/checklist/`<details>`/math is upgraded in place to a Bot API 10.1 Rich Message (`telegram/rich.py`, toggle `OF_TELEGRAM_RICH_MESSAGES`, ≤ 32,768 chars, one message only — falls back to the HTML version on failure). Access is gated by an invite system (`telegram/invites/`, its own SQLite DB via `OF_TELEGRAM_DATABASE_URL`): admins (`OF_TELEGRAM_ADMIN_IDS`) always pass, everyone else needs `/start <code>` with a code that hasn't expired (`OF_TELEGRAM_INVITE_TTL_SECONDS`); the gate only activates once the admin list is non-empty. An `admin_manage` tool (list/generate/revoke/restore invites, cross-user instruction search/publish) is hidden from non-admins via the same `visible_to(context)` hook `ToolRegistry` uses elsewhere. Runs alongside web, or standalone (`python -m octoforge_web.telegram`) with no HTTP listener.
+
+### Authentication
+
+Every HTTP endpoint except `/health` and `/health/ready` sits behind one operator credential
+(HTTP Basic, middleware in `create_app`; `web/auth.py` hashes with stdlib PBKDF2 in the
+`pbkdf2_sha256:iterations:salt:digest` format — `:` because docker compose interpolates `$` in
+`.env`). An empty hash fails closed with 503. This authenticates the *operator*, not the agent's
+users: `X-User-Id` still selects the dialog and is still a trusted string.
 
 ## Conventions worth flagging (full list in AGENTS.md)
 

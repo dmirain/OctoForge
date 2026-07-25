@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from octoforge_core import (
     ConversationManager,
@@ -35,6 +36,8 @@ from octoforge_core import (
     create_session_factory,
     init_db,
 )
+from octoforge_core.admin.api import AdminReadModel
+from octoforge_core.admin.store import SqlAlchemyAdminStore
 from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
 from octoforge_core.composition import RunnerOptions, ToolLimits, ToolServices, ToolStores
 from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
@@ -54,17 +57,21 @@ from octoforge_core.llm.errors import LLMError
 from octoforge_core.llm.http_reranker import HttpRerankerClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient
+from octoforge_core.memory.api import MemoryStore
 from octoforge_core.memory.store import SqlAlchemyMemoryStore
 from octoforge_core.net.external import ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.serper import SerperSearchProvider
+from octoforge_core.tasks.store import TaskStore
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from octoforge_web.api.admin import router as admin_router
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
+from octoforge_web.auth import check_basic_auth, is_open_path
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
 from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
@@ -86,10 +93,14 @@ HEALTH_STATUS = "ok"
 READY_STATUS = "ready"
 NOT_READY_STATUS = "not-ready"
 WEB_CHANNEL = "web"
+HTTPX_LOGGER = "httpx"
 USER_ID_HEADER = "X-User-Id"
 USER_ID_HEADER_VALUE_TEMPLATE = "{user_id}"
 
 logger = logging.getLogger(__name__)
+
+# Signature of the next handler in Starlette's middleware chain.
+NextCall = Callable[[Request], Awaitable[Response]]
 
 
 @dataclass(slots=True)
@@ -101,6 +112,10 @@ class Runtime:
     channel: str
     cron_store: CronStore
     session_factory: async_sessionmaker[AsyncSession]
+    task_store: TaskStore
+    instructions: InstructionService
+    memory_store: MemoryStore
+    admin_read_model: AdminReadModel
 
 
 @asynccontextmanager
@@ -239,6 +254,10 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     channel=WEB_CHANNEL,
                     cron_store=cron_store,
                     session_factory=session_factory,
+                    task_store=task_store,
+                    instructions=instructions,
+                    memory_store=memory,
+                    admin_read_model=SqlAlchemyAdminStore(session_factory),
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, telegram)
@@ -250,9 +269,16 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
 
 
 def _configure_logging() -> None:
-    """Ensure application and core logs reach a handler (idempotent)."""
+    """Ensure application and core logs reach a handler (idempotent).
+
+    httpx is pinned to WARNING for the same reason the standalone Telegram entry
+    point does it: it logs full request URLs at INFO, and a Bot API URL carries
+    the bot token — which would then sit in the container logs of a process that
+    also runs the bot.
+    """
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    logging.getLogger(HTTPX_LOGGER).setLevel(logging.WARNING)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -268,9 +294,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.channel = rt.channel
             app.state.cron_store = rt.cron_store
             app.state.session_factory = rt.session_factory
+            app.state.task_store = rt.task_store
+            app.state.instructions = rt.instructions
+            app.state.memory_store = rt.memory_store
+            app.state.admin_read_model = rt.admin_read_model
             yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)
+
+    @app.middleware("http")
+    async def authenticate(request: Request, call_next: NextCall) -> Response:
+        """Require the operator credential for everything but the health probes.
+
+        A middleware rather than per-router dependencies because it has to cover
+        what routers do not: the static console, `/docs` and `/openapi.json`.
+        Exceptions raised here bypass the app's handlers, so the 401 is built by
+        hand.
+        """
+        if not is_open_path(request.url.path):
+            try:
+                check_basic_auth(
+                    request,
+                    resolved_settings.admin_username,
+                    resolved_settings.admin_password_hash,
+                )
+            except HTTPException as denied:
+                return JSONResponse(
+                    status_code=denied.status_code,
+                    content={"detail": denied.detail},
+                    headers=denied.headers,
+                )
+        return await call_next(request)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -291,6 +345,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(dialog_router)
     app.include_router(cron_router)
+    app.include_router(admin_router)
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
 
