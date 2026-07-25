@@ -83,7 +83,7 @@ Mandatory across all project code:
 
 ## Workflow rules
 
-- **Git commits only with the user's explicit permission.** Ask every time before `git commit` and any other git mutation (push, reset, rebase, etc.).
+- **Git commits only with the user's explicit permission.** Ask every time before `git commit` and any other git mutation (push, reset, rebase, etc.). The same holds for `gh` when authenticated: creating a release, editing repo settings, and touching issues/PRs are equally consequential — being authenticated is not standing permission, ask first.
 - **Documentation updates ship with the code.** Every change to logic, and every new idea, is written into `docs/design.md` (and into this file too, whenever conventions, structure, or commands change) in the same change.
 - **`AGENTS.md` and `CLAUDE.md` stay in sync.** Whenever one gets a conventions/structure/commands/language update, apply the same update to the other before considering the change done.
 - **Plan before touching subtle areas.** Changes to `agent/router.py`, `agent/runner.py`, `cron/`, or `context/` (compaction) have non-obvious invariants (branch reconstruction, watermarks, the pull model) — use plan mode first. A one-file, obviously-scoped fix doesn't need it.
@@ -100,6 +100,7 @@ Mandatory across all project code:
 - mypy — type checking (`strict = true`)
 - pytest + pytest-asyncio — tests
 - Makefile — the single entry point for checks and running the app
+- `gh` CLI — check `gh auth status` before assuming it's unavailable; it may be installed and authenticated (a fine-grained token scoped to this repo). When it is, use it for GitHub-specific work: releases, issues, PRs, `gh repo edit` for repo settings.
 
 ## Documentation
 
