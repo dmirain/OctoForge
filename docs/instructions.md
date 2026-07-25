@@ -147,6 +147,11 @@ Composition root собирает реестр из доменных модул�
 методику из системного промпта в искомые сценарии: «когда применять / шаги /
 осторожности». Тексты сценариев — на английском (они идут в LLM). Деструктивные
 операции всегда с правилом «покажи и подтверди у пользователя перед удалением».
+Помимо скилов реестр поставляет одну knowledge-запись — `about_octoforge`
+(идентичность системы: что такое OctoForge, модель способностей «всё — данные»,
+поверхности, изоляция пользователей, и указание искать инсталляционные факты в
+knowledge-записях админов, а на пустую выдачу отвечать «не знаю»). Она гарантирует,
+что вопросам «кто ты / кто твой автор» есть что находить на любой инсталляции.
 
 ### `deferred_work` — отложенная работа: фоновые задачи и крон (tasks/ + cron/)
 
@@ -175,10 +180,13 @@ process limit, tell the user instead of retrying in a loop.
 
 ```
 Scenario: durable user facts and preferences (name, city, diet, goals and the like).
-1. Save facts with memory_store, scope user. Use scope global only for facts shared
-   by everyone, and with care.
+1. Save facts with memory_store. Memory is private to this user; a fact useful to
+   everyone is saved as a knowledge record via instruction_save instead (an admin
+   publishes it later).
 2. Call memory_search before personal recommendations or when the answer may depend
-   on what the user told you earlier.
+   on what the user told you earlier. With no query it lists the whole memory — use
+   that to see what is stored instead of guessing a substring or assuming nothing is
+   there; the list is short and the call is cheap.
 3. Do not duplicate what lives in instructions (shared knowledge) or datasets
    (structured records). Memory is per-user and shared across the user's surfaces.
 Delete with memory_delete only on the user's explicit request.
@@ -235,7 +243,9 @@ Scenario: find and author skill scenarios.
    recurring-report, user-data, weather, history, web-fact), e.g.
    'remind reminder'; add free text only when it narrows the search. Do not
    improvise tool usage before searching — the scenario says how to use the
-   tools correctly.
+   tools correctly. A found scenario is binding: follow its steps as written
+   rather than solving the task your own way, and improvise only after a search
+   returned nothing usable.
 2. After completing a novel multi-step task, save the working scenario with
    instruction_save (type skill): clear steps, naming every tool the scenario uses.
    Save durable facts as type knowledge.
@@ -244,9 +254,15 @@ Scenario: find and author skill scenarios.
 
 ## Промпт
 
-Системный промпт держит только мета-правила: формат ответов; «не импровизируй
-применение тулов — следуй сценариям из контекста, а для любого непокрытого интента
-сначала вызови `instruction_search`»; рекомендация формулировать запрос как
+Системный промпт держит только мета-правила, но извлечение знаний в них — не
+рекомендация, а первый шаг (правила 1–3, раздел «Системный промпт» в
+[design.md](design.md)): на любой запрос сложнее
+small talk сначала `instruction_search` (+ `memory_search`, когда ответ зависит от
+пользователя), найденная запись обязательна к исполнению, перебор запрещён. Причина
+формулировок — замеренное поведение: с прежним текстом модель на половине запросов
+шла делать задачу сразу (`data_put` без поиска сценария), а после неудачного
+`external_call` начинала пробовать `web_search` варианты до упора в лимит итераций.
+Остальное — формат ответов; рекомендация формулировать запрос как
 «нормализованный интент + тип сущности» (инструмент принимает один аргумент —
 свободный текст `query`, канонические поля intent/entity отложены); «после новой
 многошаговой задачи сохрани сценарий через `instruction_save`». Пер-туловые правила

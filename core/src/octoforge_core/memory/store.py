@@ -82,21 +82,22 @@ class SqlAlchemyMemoryStore(MemoryStore):
             return _to_memory(row)
 
     async def search(self, user_id: str, query: str, limit: int) -> list[Memory]:
-        """Return visible memories matching the substring, newest first."""
+        """Return visible memories, newest first; a blank query lists the catalog."""
         needle = query.strip()
-        if not needle:
-            return []
-        pattern = f"%{_escape_like(needle)}%"
+        visible = or_(MemoryRow.user_id == user_id, MemoryRow.user_id.is_(None))
+        conditions = [visible]
+        if needle:
+            pattern = f"%{_escape_like(needle)}%"
+            conditions.append(
+                or_(
+                    MemoryRow.key.ilike(pattern, escape=LIKE_ESCAPE),
+                    MemoryRow.content.ilike(pattern, escape=LIKE_ESCAPE),
+                )
+            )
         async with self._session_factory() as session:
             statement = (
                 select(MemoryRow)
-                .where(
-                    or_(MemoryRow.user_id == user_id, MemoryRow.user_id.is_(None)),
-                    or_(
-                        MemoryRow.key.ilike(pattern, escape=LIKE_ESCAPE),
-                        MemoryRow.content.ilike(pattern, escape=LIKE_ESCAPE),
-                    ),
-                )
+                .where(*conditions)
                 .order_by(MemoryRow.updated_at.desc(), MemoryRow.key)
                 .limit(limit)
             )

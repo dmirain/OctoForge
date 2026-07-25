@@ -21,7 +21,13 @@ SEARCH_DESCRIPTION = (
     "Pass 'type' to search one instruction kind only. "
     "Returns the top-k records with id, type, title, tags and full content: "
     "instructions first, dataset descriptors after them. "
-    "Call it for any user intent not covered by the scenarios already in your context."
+    "This is the FIRST tool to call for any request that is not small talk, before "
+    "you plan an approach or touch any other tool: the store usually already holds "
+    "the scenario, the endpoint contract or the facts, and following a stored record "
+    "beats designing your own way. It is a cheap local lookup — the cost of a "
+    "redundant search is far below the cost of improvising past an existing one. "
+    "Query with the intent plus the entity it concerns ('remind reminder', "
+    "'report user-data', 'call-api weather')."
 )
 MAX_K = 20
 DATASET_SNIPPET_CHARS = 300

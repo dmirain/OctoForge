@@ -65,17 +65,25 @@ def test_store_tool_spec(store_tool: MemoryStoreTool) -> None:
     assert store_tool.spec.parameters_schema["required"] == ["key", "content"]
 
 
+def test_tool_schemas_have_no_scope(
+    store_tool: MemoryStoreTool, delete_tool: MemoryDeleteTool
+) -> None:
+    """The global write scope was removed: shared facts go through knowledge+publish."""
+    assert "scope" not in store_tool.spec.parameters_schema["properties"]
+    assert "scope" not in delete_tool.spec.parameters_schema["properties"]
+
+
 async def test_store_reports_created_then_updated(store_tool: MemoryStoreTool) -> None:
     created = await store_tool.execute(
         {"key": CITY_KEY, "content": CITY_CONTENT, "tags": ["profile"]}, CTX_A
     )
     updated = await store_tool.execute({"key": CITY_KEY, "content": "moved to Lisbon"}, CTX_A)
 
-    assert created == "memory stored (scope=user, key=city, created=true)"
-    assert updated == "memory stored (scope=user, key=city, created=false)"
+    assert created == "memory stored (key=city, created=true)"
+    assert updated == "memory stored (key=city, created=false)"
 
 
-async def test_store_default_scope_is_user(
+async def test_store_writes_are_owner_scoped(
     store_tool: MemoryStoreTool,
     search_tool: MemorySearchTool,
 ) -> None:
@@ -83,18 +91,6 @@ async def test_store_default_scope_is_user(
 
     assert CITY_CONTENT in await search_tool.execute({"query": "berlin"}, CTX_A)
     assert await search_tool.execute({"query": "berlin"}, CTX_B) == NO_HITS_MESSAGE
-
-
-async def test_store_global_scope_visible_to_everyone(
-    store_tool: MemoryStoreTool,
-    search_tool: MemorySearchTool,
-) -> None:
-    output = await store_tool.execute(
-        {"key": "date_format", "content": "render dates as ISO 8601", "scope": "global"}, CTX_A
-    )
-
-    assert output == "memory stored (scope=global, key=date_format, created=true)"
-    assert "[global] date_format" in await search_tool.execute({"query": "ISO"}, CTX_B)
 
 
 async def test_store_rejects_invalid_arguments(store_tool: MemoryStoreTool) -> None:
@@ -112,12 +108,6 @@ async def test_store_rejects_invalid_arguments(store_tool: MemoryStoreTool) -> N
         await store_tool.execute(
             {"key": CITY_KEY, "content": CITY_CONTENT, "tags": ["geo", 1]}, CTX_A
         )
-    with pytest.raises(ToolArgumentsError):
-        await store_tool.execute(
-            {"key": CITY_KEY, "content": CITY_CONTENT, "scope": "everyone"}, CTX_A
-        )
-    with pytest.raises(ToolArgumentsError):
-        await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT, "scope": 1}, CTX_A)
 
 
 # --- memory_search ----------------------------------------------------------
@@ -125,7 +115,8 @@ async def test_store_rejects_invalid_arguments(store_tool: MemoryStoreTool) -> N
 
 def test_search_tool_spec(search_tool: MemorySearchTool) -> None:
     assert search_tool.spec.name == "memory_search"
-    assert search_tool.spec.parameters_schema["required"] == ["query"]
+    # nothing is required: a query-less call is the catalog request
+    assert "required" not in search_tool.spec.parameters_schema
 
 
 async def test_search_formats_numbered_lines(
@@ -192,11 +183,52 @@ async def test_search_explicit_limit_overrides_default(
     assert len(output.splitlines()) == THREE_MEMORIES
 
 
+async def test_search_without_a_query_lists_the_whole_memory(
+    store_tool: MemoryStoreTool,
+    search_tool: MemorySearchTool,
+) -> None:
+    """The agent cannot guess a substring for a memory it has never seen."""
+    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
+    await store_tool.execute({"key": "diet", "content": "vegetarian"}, CTX_A)
+
+    catalog = await search_tool.execute({}, CTX_A)
+    blank = await search_tool.execute({"query": "   "}, CTX_A)
+
+    assert CITY_KEY in catalog
+    assert "diet" in catalog
+    assert blank == catalog
+
+
+async def test_search_catalog_stays_owner_scoped(
+    store: SqlAlchemyMemoryStore,
+    store_tool: MemoryStoreTool,
+    search_tool: MemorySearchTool,
+) -> None:
+    """A query-less listing must not become a hole in the owner isolation."""
+    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
+    await store.put(None, "shared", "everyone")  # legacy global entry, readable by all
+
+    catalog = await search_tool.execute({}, CTX_B)
+
+    assert CITY_KEY not in catalog
+    assert "shared" in catalog
+
+
+async def test_search_catalog_respects_the_default_limit(
+    store_tool: MemoryStoreTool,
+    search_tool: MemorySearchTool,
+) -> None:
+    for index in range(THREE_MEMORIES):
+        await store_tool.execute({"key": f"key-{index}", "content": "body"}, CTX_A)
+
+    catalog = await search_tool.execute({}, CTX_A)
+
+    assert len(catalog.splitlines()) == DEFAULT_LIMIT
+
+
 async def test_search_rejects_invalid_arguments(search_tool: MemorySearchTool) -> None:
     with pytest.raises(ToolArgumentsError):
-        await search_tool.execute({}, CTX_A)
-    with pytest.raises(ToolArgumentsError):
-        await search_tool.execute({"query": "  "}, CTX_A)
+        await search_tool.execute({"query": 1}, CTX_A)
     with pytest.raises(ToolArgumentsError):
         await search_tool.execute({"query": "x", "limit": 0}, CTX_A)
     with pytest.raises(ToolArgumentsError):
@@ -235,27 +267,26 @@ async def test_delete_removes_memory(
 
     output = await delete_tool.execute({"key": CITY_KEY}, CTX_A)
 
-    assert output == "memory 'city' deleted (scope=user)"
+    assert output == "memory 'city' deleted"
     assert await search_tool.execute({"query": "berlin"}, CTX_A) == NO_HITS_MESSAGE
 
 
 async def test_delete_missing_reports_text(delete_tool: MemoryDeleteTool) -> None:
     output = await delete_tool.execute({"key": "missing"}, CTX_A)
 
-    assert output == "memory 'missing' not found (scope=user)"
+    assert output == "memory 'missing' not found"
 
 
-async def test_delete_global_requires_global_scope(
-    store_tool: MemoryStoreTool,
+async def test_delete_cannot_reach_global_memories(
+    store: SqlAlchemyMemoryStore,
     delete_tool: MemoryDeleteTool,
 ) -> None:
-    await store_tool.execute({"key": "date_format", "content": "ISO", "scope": "global"}, CTX_A)
+    """Legacy global entries stay readable but are out of the agent tool's reach."""
+    await store.put(None, "date_format", "ISO")
 
-    user_scoped = await delete_tool.execute({"key": "date_format"}, CTX_A)
-    global_scoped = await delete_tool.execute({"key": "date_format", "scope": "global"}, CTX_A)
+    output = await delete_tool.execute({"key": "date_format"}, CTX_A)
 
-    assert user_scoped == "memory 'date_format' not found (scope=user)"
-    assert global_scoped == "memory 'date_format' deleted (scope=global)"
+    assert output == "memory 'date_format' not found"
 
 
 async def test_delete_respects_owner_isolation(
@@ -267,7 +298,7 @@ async def test_delete_respects_owner_isolation(
 
     output = await delete_tool.execute({"key": CITY_KEY}, CTX_B)
 
-    assert output == "memory 'city' not found (scope=user)"
+    assert output == "memory 'city' not found"
     assert CITY_CONTENT in await search_tool.execute({"query": "berlin"}, CTX_A)
 
 
@@ -276,5 +307,3 @@ async def test_delete_rejects_invalid_arguments(delete_tool: MemoryDeleteTool) -
         await delete_tool.execute({}, CTX_A)
     with pytest.raises(ToolArgumentsError):
         await delete_tool.execute({"key": "  "}, CTX_A)
-    with pytest.raises(ToolArgumentsError):
-        await delete_tool.execute({"key": CITY_KEY, "scope": "everyone"}, CTX_A)

@@ -10,11 +10,11 @@ STORE_NAME = "memory_store"
 STORE_DESCRIPTION = (
     "Store a personal note or a durable fact about the user (birthdays, relatives, "
     'preferences — e.g. "my wife\'s birthday is March 5") under a key (upsert: an '
-    "existing key of the same scope is replaced). Scope 'user' (default) is visible "
-    "to this user on every surface; scope 'global' is visible to all users — use it "
-    "sparingly, for facts shared by everyone."
+    "existing key is replaced). The memory belongs to this user and follows them "
+    "across every surface; it is never shared with other users. Facts useful to "
+    "everyone are saved as knowledge records via instruction_save instead."
 )
-STORED_TEMPLATE = "memory stored (scope={scope}, key={key}, created={created})"
+STORED_TEMPLATE = "memory stored (key={key}, created={created})"
 STORE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -25,20 +25,19 @@ STORE_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "description": "Optional tags",
         },
-        "scope": {
-            "type": "string",
-            "enum": [scope.value for scope in MemoryScope],
-            "description": "Who sees the memory: this user (default) or everyone",
-        },
     },
     "required": ["key", "content"],
 }
 
 SEARCH_NAME = "memory_search"
 SEARCH_DESCRIPTION = (
-    "Search memories visible to this user (own entries plus global ones) by a "
-    "case-insensitive substring over key and content; newest first. Use it before "
-    "personal recommendations and whenever the user's durable facts may matter."
+    "Read what you remember about this user (own entries plus global ones), newest "
+    "first. Call it with NO query to list the whole memory — it is short, and this is "
+    "how you learn what is stored before you answer from assumptions; pass a query "
+    "only to filter by a case-insensitive substring over key and content. Cheap and "
+    "local: call it whenever the answer may depend on the user personally (personal "
+    "recommendations, their setup, past decisions), not only when you already know a "
+    "matching memory exists."
 )
 SNIPPET_CHARS = 300
 NO_HITS_MESSAGE = "no memories found"
@@ -46,28 +45,24 @@ ENTRY_TEMPLATE = "[{scope}] {key} — {snippet} — tags: {tags}"
 SEARCH_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "query": {"type": "string", "description": "Substring to look for in key/content"},
+        "query": {
+            "type": "string",
+            "description": (
+                "Optional substring to look for in key/content; omit it to list every memory"
+            ),
+        },
         "limit": {"type": "integer", "description": "How many memories to return"},
     },
-    "required": ["query"],
 }
 
 DELETE_NAME = "memory_delete"
-DELETE_DESCRIPTION = (
-    "Delete one memory by key. Scope 'user' (default) targets this user's memory; "
-    "scope 'global' targets a memory shared by all users."
-)
-DELETED_TEMPLATE = "memory '{key}' deleted (scope={scope})"
-NOT_FOUND_TEMPLATE = "memory '{key}' not found (scope={scope})"
+DELETE_DESCRIPTION = "Delete one of this user's memories by key."
+DELETED_TEMPLATE = "memory '{key}' deleted"
+NOT_FOUND_TEMPLATE = "memory '{key}' not found"
 DELETE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "key": {"type": "string", "description": "Memory key"},
-        "scope": {
-            "type": "string",
-            "enum": [scope.value for scope in MemoryScope],
-            "description": "Which memory to delete: this user's (default) or a global one",
-        },
     },
     "required": ["key"],
 }
@@ -88,15 +83,18 @@ class MemoryStoreTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        """Validate arguments, upsert the memory and report created/updated."""
+        """Validate arguments, upsert the caller's memory and report created/updated.
+
+        Writes are always user-scoped: the global scope was removed from the
+        agent-facing tool — the sanctioned path to shared facts is a knowledge
+        record plus the admin's publish, not an instantly-global write that any
+        user could use to color every other user's answers.
+        """
         key = _non_empty_string(arguments.get("key"), "key")
         content = _non_empty_string(arguments.get("content"), "content")
         tags = _tags(arguments.get("tags"))
-        scope = _scope(arguments.get("scope"))
-        owner = None if scope is MemoryScope.GLOBAL else context.user_id
-        memory, created = await self._store.put(owner, key, content, tags)
+        memory, created = await self._store.put(context.user_id, key, content, tags)
         return STORED_TEMPLATE.format(
-            scope=scope.value,
             key=memory.key,
             created="true" if created else "false",
         )
@@ -119,10 +117,15 @@ class MemorySearchTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        """Validate arguments, search and format the hits as numbered lines."""
-        query = arguments.get("query")
-        if not isinstance(query, str) or not query.strip():
-            raise ToolArgumentsError("query must be a non-empty string")
+        """Validate arguments, search and format the hits as numbered lines.
+
+        An omitted (or blank) query is the catalog request: the store then
+        returns the newest visible memories unfiltered.
+        """
+        raw_query = arguments.get("query")
+        if raw_query is not None and not isinstance(raw_query, str):
+            raise ToolArgumentsError("query must be a string")
+        query = raw_query or ""
         limit = self._limit(arguments.get("limit"))
         memories = await self._store.search(context.user_id, query, limit)
         if not memories:
@@ -156,17 +159,15 @@ class MemoryDeleteTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        """Validate arguments, delete the memory and report the outcome as text."""
+        """Validate arguments, delete the caller's memory and report the outcome as text."""
         key = arguments.get("key")
         if not isinstance(key, str) or not key.strip():
             raise ToolArgumentsError("key must be a non-empty string")
-        scope = _scope(arguments.get("scope"))
-        owner = None if scope is MemoryScope.GLOBAL else context.user_id
         try:
-            await self._store.delete(owner, key)
+            await self._store.delete(context.user_id, key)
         except MemoryNotFoundError:
-            return NOT_FOUND_TEMPLATE.format(key=key, scope=scope.value)
-        return DELETED_TEMPLATE.format(key=key, scope=scope.value)
+            return NOT_FOUND_TEMPLATE.format(key=key)
+        return DELETED_TEMPLATE.format(key=key)
 
 
 def _non_empty_string(raw: object, argument: str) -> str:
@@ -181,17 +182,6 @@ def _tags(raw: object) -> tuple[str, ...]:
     if not isinstance(raw, list) or not all(isinstance(tag, str) for tag in raw):
         raise ToolArgumentsError("tags must be an array of strings")
     return tuple(raw)
-
-
-def _scope(raw: object) -> MemoryScope:
-    if raw is None:
-        return MemoryScope.USER
-    if not isinstance(raw, str):
-        raise ToolArgumentsError("scope must be 'user' or 'global'")
-    try:
-        return MemoryScope(raw)
-    except ValueError as exc:
-        raise ToolArgumentsError("scope must be 'user' or 'global'") from exc
 
 
 def _format_entry(memory: Memory) -> str:

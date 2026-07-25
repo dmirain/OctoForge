@@ -77,8 +77,10 @@ class MemoryStore(Protocol):
         Visibility: the user's own entries plus the global ones
         (user_id IS NULL). Matching: case-insensitive substring over key OR
         content (SQL LIKE). Order: updated_at DESC, then key for determinism.
-        A blank query short-circuits to an empty list without a database
-        round-trip.
+        A blank query is the catalog request: the newest `limit` visible
+        memories with no filter at all. The agent cannot guess a substring for
+        something it has never seen, so listing the whole (small) memory is the
+        cheapest way for it to learn what it remembers about the user.
         """
         ...
 

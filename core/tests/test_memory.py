@@ -206,11 +206,17 @@ async def test_search_respects_limit(store: MemoryStore) -> None:
     assert len(hits) == TWO_HITS
 
 
-async def test_search_blank_query_short_circuits(store: MemoryStore) -> None:
+async def test_search_blank_query_lists_visible_memories(store: MemoryStore) -> None:
+    """A blank query is the catalog request, not a no-op: see docs/design.md."""
     await store.put(OWNER_A, CITY_KEY, CITY_CONTENT)
+    await store.put(None, "shared", "global fact")
+    await store.put(OWNER_B, "other", "not visible")
 
-    assert await store.search(OWNER_A, "   ", limit=10) == []
-    assert await store.search(OWNER_A, "", limit=10) == []
+    blank = await store.search(OWNER_A, "", limit=10)
+    whitespace = await store.search(OWNER_A, "   ", limit=10)
+
+    assert {memory.key for memory in blank} == {CITY_KEY, "shared"}
+    assert {memory.key for memory in whitespace} == {CITY_KEY, "shared"}
 
 
 async def test_put_recovers_from_a_find_then_insert_race(

@@ -34,6 +34,25 @@ def test_static_provider_raises_for_an_unknown_name() -> None:
         provider.get(UNKNOWN_NAME)
 
 
+def test_system_prompt_puts_retrieval_before_action() -> None:
+    """The observed failure mode is answering from the model's own head.
+
+    The prompt must therefore make retrieval the first step, bind the agent to
+    what it finds, and forbid trial-and-error — the three rules that pull it
+    towards the store instead of improvisation.
+    """
+    assert "FIRST step is to search" in DEFAULT_SYSTEM_PROMPT
+    assert "memory_search" in DEFAULT_SYSTEM_PROMPT
+    assert "binding" in DEFAULT_SYSTEM_PROMPT
+    assert "trial and error" in DEFAULT_SYSTEM_PROMPT
+    # searching must read as cheap, or the model keeps optimizing it away
+    assert "cheap" in DEFAULT_SYSTEM_PROMPT
+    # assertion-shaped trigger: identity/installation questions look like small
+    # talk, so without this clause the model answers them from its own head
+    assert "search before asserting" in DEFAULT_SYSTEM_PROMPT
+    assert "say you do not know" in DEFAULT_SYSTEM_PROMPT
+
+
 def test_system_prompt_holds_meta_rules_only() -> None:
     assert "instruction_search" in DEFAULT_SYSTEM_PROMPT
     assert "instruction_save" in DEFAULT_SYSTEM_PROMPT

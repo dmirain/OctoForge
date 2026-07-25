@@ -47,10 +47,13 @@ process limit, tell the user instead of retrying in a loop."""
 
 USER_MEMORY_CONTENT = """\
 Scenario: durable user facts and preferences (name, city, diet, goals and the like).
-1. Save facts with memory_store, scope user. Use scope global only for facts shared
-   by everyone, and with care.
+1. Save facts with memory_store. Memory is private to this user; a fact useful to
+   everyone is saved as a knowledge record via instruction_save instead (an admin
+   publishes it later).
 2. Call memory_search before personal recommendations or when the answer may depend
-   on what the user told you earlier.
+   on what the user told you earlier. With no query it lists the whole memory — use
+   that to see what is stored instead of guessing a substring or assuming nothing is
+   there; the list is short and the call is cheap.
 3. Do not duplicate what lives in instructions (shared knowledge) or datasets
    (structured records). Memory is per-user and shared across the user's surfaces.
 Delete with memory_delete only on the user's explicit request."""
@@ -84,6 +87,18 @@ Scenario: call an external API.
 Outbound calls pass a security guard: public hosts only, no redirects. If a call is
 refused, report the refusal honestly instead of retrying variations."""
 
+ABOUT_OCTOFORGE_CONTENT = """\
+About this system: you are OctoForge, a multi-user LLM agent. Your capabilities are
+data, not code: skill scenarios say how tasks are done here, knowledge records hold
+shared facts, endpoint records describe external APIs you can call, and each user has
+a private memory and private datasets. All of it lives in a searchable store that
+admins extend without redeploying you. You serve several surfaces (web chat, Telegram);
+each user's dialogs, memory and datasets are isolated from other users.
+Installation-specific facts — who operates this deployment, who its author is, what
+community it serves — are separate knowledge records maintained by the admins: search
+for them, and when no record answers the question, say you do not know rather than
+guessing."""
+
 SKILL_AUTHORING_CONTENT = """\
 Scenario: find and author skill scenarios.
 1. For every intent in the user's message call instruction_search with a single
@@ -92,7 +107,9 @@ Scenario: find and author skill scenarios.
    recurring-report, user-data, weather, history, web-fact), e.g.
    'remind reminder'; add free text only when it narrows the search. Do not
    improvise tool usage before searching — the scenario says how to use the
-   tools correctly.
+   tools correctly. A found scenario is binding: follow its steps as written
+   rather than solving the task your own way, and improvise only after a search
+   returned nothing usable.
 2. After completing a novel multi-step task, save the working scenario with
    instruction_save (type skill): clear steps, naming every tool the scenario uses.
    Save durable facts useful to everyone as type knowledge.
@@ -140,6 +157,12 @@ CORE_SYSTEM_SKILLS: tuple[SystemSkill, ...] = (
         title="skill_authoring",
         content=SKILL_AUTHORING_CONTENT,
         tags=("skills", "authoring", "scenario"),
+    ),
+    SystemSkill(
+        kind=InstructionType.KNOWLEDGE,
+        title="about_octoforge",
+        content=ABOUT_OCTOFORGE_CONTENT,
+        tags=("identity", "system", "author", "capabilities"),
     ),
 )
 

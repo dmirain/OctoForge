@@ -21,7 +21,7 @@ from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 FIRST_VERSION = 1
 SECOND_VERSION = 2
-CORE_SKILLS_COUNT = 7
+CORE_SKILLS_COUNT = 8
 TWO_ENTRIES = 2
 USER_ID = "user-test"
 
@@ -69,7 +69,10 @@ async def service() -> AsyncIterator[InstructionService]:
 
 async def test_core_registry_covers_the_module_scenarios() -> None:
     assert len(CORE_SYSTEM_SKILLS) == CORE_SKILLS_COUNT
-    assert {entry.kind for entry in CORE_SYSTEM_SKILLS} == {InstructionType.SKILL}
+    assert {entry.kind for entry in CORE_SYSTEM_SKILLS} == {
+        InstructionType.SKILL,
+        InstructionType.KNOWLEDGE,
+    }
     titles = {entry.title for entry in CORE_SYSTEM_SKILLS}
     assert titles == {
         "deferred_work",
@@ -79,7 +82,22 @@ async def test_core_registry_covers_the_module_scenarios() -> None:
         "web_lookup",
         "external_http",
         "skill_authoring",
+        "about_octoforge",
     }
+
+
+async def test_registry_ships_the_identity_knowledge() -> None:
+    """Identity questions must resolve from the store, not from the model's head.
+
+    The registry therefore guarantees a knowledge record about the system
+    itself exists on every installation, and that record tells the agent to
+    admit ignorance on installation facts no record answers.
+    """
+    entry = next(e for e in CORE_SYSTEM_SKILLS if e.title == "about_octoforge")
+
+    assert entry.kind is InstructionType.KNOWLEDGE
+    assert "say you do not know" in entry.content
+    assert "author" in entry.tags
 
 
 async def test_sync_creates_system_records(service: InstructionService) -> None:

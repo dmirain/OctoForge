@@ -12,7 +12,12 @@ TRUNCATED_SUFFIX = "\n...[truncated]"
 NO_RESULTS_MESSAGE = "no results"
 
 TOOL_NAME = "web_search"
-TOOL_DESCRIPTION = "Search the web; returns titles, links and snippets."
+TOOL_DESCRIPTION = (
+    "Search the public web; returns titles, links and snippets. For public facts and "
+    "current events only. Anything specific to this user or this installation — how a "
+    "task is done here, an API contract, the user's own data or past decisions — is "
+    "not on the web: look it up with instruction_search and memory_search instead."
+)
 PARAMETERS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {

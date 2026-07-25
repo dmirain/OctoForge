@@ -14,7 +14,11 @@ from octoforge_core.tools.errors import ToolArgumentsError
 REQUEST_NAME = "http_request"
 REQUEST_DESCRIPTION = (
     "Perform an HTTP request and return the response status and body. "
-    "Use it to call external APIs and fetch web pages."
+    "The fallback path, not the default one: a stored endpoint record executed by "
+    "external_call carries the checked URL, params and auth, so run instruction_search "
+    "first and use this tool only when no endpoint covers the call. Never explore an "
+    "API with it — do not guess URLs or parameters, and do not repeat a failed request "
+    "with variations; report the failure instead."
 )
 MAX_RESPONSE_CHARS = 4000
 TRUNCATED_SUFFIX = "\n...[truncated]"
