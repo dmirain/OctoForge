@@ -25,7 +25,9 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
+from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -36,7 +38,12 @@ from octoforge_web.telegram.bridge import (
     TelegramBridge,
     TelegramBridgeOptions,
 )
-from octoforge_web.telegram.client import MAX_MESSAGE_LENGTH, USER_ID_PREFIX, TelegramApiError
+from octoforge_web.telegram.client import (
+    MAX_MESSAGE_LENGTH,
+    TELEGRAM_CHANNEL,
+    USER_ID_PREFIX,
+    TelegramApiError,
+)
 
 CHAT_ID = 12345
 TELEGRAM_USER_ID = f"{USER_ID_PREFIX}{CHAT_ID}"
@@ -53,6 +60,8 @@ ECHO_TOOL = "echo_tool"
 ECHO_OUTPUT = "echo output"
 CALL_ID = "call-1"
 LONG_REPLY_TAIL = "x" * 100
+CRON_TITLE = "morning report"
+CRON_RESULT = "the report is ready"
 EXPECTED_MESSAGE_COUNT = 2
 
 
@@ -231,6 +240,7 @@ async def make_manager(
     llm_client: LLMClient,
     session_factory: async_sessionmaker[AsyncSession],
     registry: ToolRegistry | None = None,
+    tasks: InMemoryTaskStore | None = None,
 ) -> ConversationManager:
     loop = AgentLoop(
         llm_client=llm_client,
@@ -247,7 +257,7 @@ async def make_manager(
         ),
         dialogs=DialogRepository(session_factory),
         messages=MessageRepository(session_factory),
-        tasks=InMemoryTaskStore(),
+        tasks=tasks if tasks is not None else InMemoryTaskStore(),
     )
 
 
@@ -274,6 +284,50 @@ async def wait_until(predicate: Callable[[], bool]) -> None:
             await asyncio.sleep(POLL_SECONDS)
 
     await asyncio.wait_for(poll(), WAIT_TIMEOUT_SECONDS)
+
+
+async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A result redelivered before the bridge subscribes must still reach the chat.
+
+    `runtime()` sweeps undelivered results before the surfaces start, so the
+    redelivery finds no subscriber; the outbox has to hold it until the bridge
+    is warmed, otherwise a cron answer that landed while the bot was down is
+    silently stamped delivered and never shown.
+    """
+    client = FakeTelegramClient()
+    tasks = InMemoryTaskStore()
+    manager = await make_manager(ScriptedLLM([]), session_factory, tasks=tasks)
+    dialog = await DialogRepository(session_factory).get_or_create(
+        TELEGRAM_USER_ID, TELEGRAM_CHANNEL
+    )
+    task = Task(
+        dialog_id=dialog.id,
+        user_id=dialog.user_id,
+        channel=dialog.channel,
+        title=CRON_TITLE,
+        kind=TaskKind.RUN,
+        input={"prompt": CRON_TITLE},
+        status=TaskStatus.DONE,
+        result=CRON_RESULT,
+        started_at=utc_now(),
+    )
+    await tasks.add(task)
+
+    await manager.recover_interrupted()  # no bridge is attached yet
+    await asyncio.sleep(POLL_SECONDS * 5)
+
+    assert client.sent == []
+    assert task.delivered_at is None
+
+    bridge = make_bridge(client, manager)
+    await bridge.start()  # what TelegramBridgeRegistry.warm() does at startup
+
+    await wait_until(lambda: client.sent != [])
+    assert client.sent == [(CHAT_ID, CRON_RESULT, PARSE_MODE_HTML)]
+    await wait_until(lambda: task.delivered_at is not None)
+    await bridge.aclose()
 
 
 async def test_single_delta_sends_one_message(

@@ -2036,6 +2036,69 @@ async def test_recover_interrupted_skips_already_delivered_results(
     assert runner.history() == []
 
 
+async def test_redelivery_without_a_subscriber_waits_instead_of_being_stamped(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The startup sweep runs before the surfaces attach (see `main.runtime`).
+
+    Broadcasting into zero subscriber queues reaches nobody, so stamping the
+    task delivered there would drop the result for good: the next sweep skips
+    a stamped row, and a push surface (Telegram) shows nothing.
+    """
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([])
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
+    await store.add(task)
+
+    await manager.recover_interrupted()
+    await asyncio.sleep(POLL_SECONDS * 5)  # give the actor a chance to misbehave
+
+    assert task.delivered_at is None
+    assert await store.list_undelivered() == [task]
+
+    # the transport attaches (an SSE client connects, a Telegram bridge warms)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
+
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert finished[0].message == ChatMessage(
+        role=MessageRole.ASSISTANT, content=TASK_RESULT, task_id=task.id
+    )
+    await wait_for_condition(lambda: task.delivered_at is not None)
+    assert llm.requests == []  # redelivery needs no LLM run
+
+
+async def test_cron_result_of_an_unwatched_dialog_waits_for_a_subscriber(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A firing whose dialog has no transport attached keeps its result queued."""
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        BranchLLM(main=[], background=[reply(TASK_RESULT)]),
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(store=store),
+    )
+
+    assert await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID) is True
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    task = await single_task(store, runner.dialog_id)
+    await wait_for_condition(lambda: task.status is TaskStatus.DONE)
+    await asyncio.sleep(POLL_SECONDS * 5)
+
+    assert task.delivered_at is None
+    assert runner._pending_deliveries != []  # the outbox holds it
+
+    queue = runner.subscribe()
+    await collect_until(queue, is_delivered(TASK_RESULT))
+
+    await wait_for_condition(lambda: task.delivered_at is not None)
+    assert runner._pending_deliveries == []
+
+
 async def test_recover_interrupted_noop_without_candidates(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

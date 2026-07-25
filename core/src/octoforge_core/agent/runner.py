@@ -8,8 +8,10 @@ narrative at every iteration boundary (the pull model), so a message lands
 in the narrative exactly once and every running process sees it. Finished
 tasks are delivered through the outbox (`_pending_deliveries`): foreground
 (streamed) tasks are only stamped delivered, background ones are broadcast
-as a whole (TextDelta + Finished / Failed) once the foreground is free.
-There is no report run — delivery never involves an LLM call.
+as a whole (TextDelta + Finished / Failed) once the foreground is free and
+a transport is attached (with no subscriber the outbox waits — see
+`_flush_deliveries`). There is no report run — delivery never involves an
+LLM call.
 """
 
 import asyncio
@@ -135,6 +137,11 @@ class _Cancel:
 
 
 @dataclass(frozen=True, slots=True)
+class _Flush:
+    """A fresh subscriber asking the actor to drain the delivery outbox."""
+
+
+@dataclass(frozen=True, slots=True)
 class _ProcessTerminated:
     """A process (or a recovery sweep) asking the actor to deliver a task outcome.
 
@@ -157,7 +164,7 @@ class _Delivery:
     task_id: str | None
 
 
-_Command = _Submit | _Cancel | _ProcessTerminated
+_Command = _Submit | _Cancel | _ProcessTerminated | _Flush
 
 
 @dataclass(slots=True)
@@ -452,9 +459,17 @@ class ConversationRunner:
         )
 
     def subscribe(self) -> asyncio.Queue[ConversationEvent]:
-        """Attach a subscriber queue receiving broadcast events."""
+        """Attach a subscriber queue receiving broadcast events.
+
+        Attaching also asks the actor to drain the outbox: results that
+        terminated while no transport was attached wait there (a cron firing
+        into a dialog nobody watches, the startup redelivery sweep, which runs
+        before the surfaces come up). Live stream events are never replayed —
+        only the outbox is.
+        """
         queue: asyncio.Queue[ConversationEvent] = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_SIZE)
         self._subscribers.add(queue)
+        self._inbox.put_nowait(_Flush())
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue[ConversationEvent]) -> None:
@@ -499,6 +514,8 @@ class ConversationRunner:
             self._handle_cancel()
         elif isinstance(command, _ProcessTerminated):
             await self._handle_terminated(command)
+        elif isinstance(command, _Flush):
+            await self._flush_if_free()
 
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
@@ -609,13 +626,20 @@ class ConversationRunner:
     async def _flush_deliveries(self) -> None:
         """Broadcast queued deliveries, stamping each task delivered only after sending.
 
+        With no subscriber attached the outbox is left alone: a broadcast into
+        zero queues reaches nobody, and stamping it delivered would lose the
+        result for good (`delivered_at` also stops the startup redelivery
+        sweep). It drains on the next `subscribe()` instead — that is how a
+        push surface such as Telegram still gets a result that finished while
+        its bridge was down.
+
         A store failure mid-flush keeps the remaining deliveries queued (the
         already-broadcast one included): the next flush re-sends it — a
         duplicate in the transport is the accepted price of never losing a
         result.
         """
         async with self._flush_lock:
-            while self._pending_deliveries:
+            while self._pending_deliveries and self._subscribers:
                 delivery = self._pending_deliveries[0]
                 for event in delivery.events:
                     self._broadcast(event)
