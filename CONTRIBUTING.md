@@ -13,6 +13,7 @@ Open an issue. For bugs, include what you expected, what actually happened, and 
   ```bash
   make check   # ruff check → ruff format --check → mypy --strict → pytest
   ```
+  If it fails on code CI is happy with, your `.venv` is probably behind — CI resolves dependencies fresh on every run, while `make install` keeps whatever already satisfies the constraints. `make upgrade` refreshes it.
 - Tests ship with the change. A bug fix without a regression test, or a feature without coverage, will come back with a request to add one.
 
 ## Code conventions

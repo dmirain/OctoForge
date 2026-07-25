@@ -13,6 +13,7 @@ The living design doc is `docs/design.md`; code conventions are `AGENTS.md`. Rea
 All checks and runs go through the `Makefile`:
 
 - `make install` — create `.venv` and install both projects editable with dev deps
+- `make upgrade` — refresh an existing `.venv` to what CI installs; run it when `make check` disagrees with CI on unchanged code (`install` leaves already-satisfied deps alone, so the linter silently drifts). both checkers are capped in the dev extras (`ruff>=0.16,<0.17`, `mypy>=2.3,<3`) precisely because their releases change verdicts on unchanged code
 - `make check` — full gate: `ruff check` → `ruff format --check` → `mypy strict` → `pytest`, for both projects
 - `make lint` / `make format` / `make typecheck` / `make test` — individual steps
 - `make run` — uvicorn with autoreload (needs `.env` with `OF_LLM_API_KEY`); serves chat UI at http://127.0.0.1:8000

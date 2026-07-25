@@ -42,12 +42,13 @@ OctoForge is a multi-user LLM agent: Python, FastAPI, SQLAlchemy (async, SQLite)
 ## Build and test commands
 
 - `make install` — create `.venv` and install both projects editable with dev dependencies
+- `make upgrade` — refresh an existing `.venv` to what CI installs (CI resolves everything fresh every run, `install` keeps already-satisfied deps); reach for it when `make check` fails locally on code CI accepts
 - `make check` — ruff (lint + format check) → mypy strict → pytest, for both projects
 - `make lint` / `make typecheck` / `make test` / `make format` — the individual steps
 - `make run` — uvicorn with autoreload (needs `.env` with `OF_LLM_API_KEY`)
 - `make run-telegram` — Telegram bot only, no HTTP API (long polling, no port opened; needs `OF_TELEGRAM_BOT_TOKEN`)
 
-ruff/mypy/pytest configs live in `core/pyproject.toml` and `web/pyproject.toml` respectively.
+ruff/mypy/pytest configs live in `core/pyproject.toml` and `web/pyproject.toml` respectively. Both checkers are capped there (`ruff>=0.16,<0.17`, `mypy>=2.3,<3`): a ruff minor bump stabilizes preview rules (PLR0917 in 0.16) and flips both lint errors and `noqa` usefulness, a mypy major changes inference — so an unbounded range lets CI and a local `.venv` disagree on unchanged code. Bump a cap deliberately, with the fallout in the same change.
 
 ### Runtime reference (for agents/scripts)
 

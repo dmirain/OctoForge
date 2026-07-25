@@ -28,8 +28,13 @@ local-embeddings = [
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
-    "ruff>=0.6",
-    "mypy>=1.11",
+    # Both checkers are capped: their releases change verdicts on unchanged
+    # code (a ruff minor stabilizes preview rules — PLR0917 in 0.16 — and
+    # flips both lint errors and `noqa` usefulness; a mypy major changes
+    # inference), so an unbounded range makes CI and a local .venv disagree.
+    # Bump deliberately, with the fallout in the same change.
+    "ruff>=0.16,<0.17",
+    "mypy>=2.3,<3",
 ]
 
 [tool.setuptools.packages.find]

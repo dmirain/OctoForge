@@ -23,8 +23,9 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "httpx>=0.27",
-    "ruff>=0.6",
-    "mypy>=1.11",
+    # keep in sync with core's dev extra (see the note there)
+    "ruff>=0.16,<0.17",
+    "mypy>=2.3,<3",
 ]
 
 [tool.setuptools.packages.find]
