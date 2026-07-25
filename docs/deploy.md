@@ -60,9 +60,28 @@ SQLite-файлы после переноса не удаляются — это
 
 - **Бэкапы:** `tools/pg_backup.sh [каталог]` — дампит `octoforge` и `octoforge_telegram`
   gzip'ом и оставляет последние `KEEP` файлов (по умолчанию 14). `pg_dump` консистентен на
-  живой базе, в отличие от копирования файлов. Для расписания — systemd-таймер, пример в
-  шапке скрипта (`systemctl --user enable --now`, плюс `loginctl enable-linger`, чтобы жил
-  после логаута).
+  живой базе, в отличие от копирования файлов. По расписанию это делает systemd-таймер
+  пользователя (`~/.config/systemd/user/octoforge-backup.{service,timer}`, ежедневно,
+  `Persistent=true` догоняет пропущенный запуск, дампы в `~/octoforge-backups`):
+
+  ```bash
+  systemctl --user list-timers octoforge-backup.timer
+  systemctl --user start octoforge-backup.service   # разовый прогон
+  journalctl --user -u octoforge-backup.service -n 20
+  ```
+
+  Два подвоха. Первый: `ExecStart` идёт через `sg docker -c`, потому что user-менеджер
+  systemd стартовал до того, как аккаунт попал в группу `docker`, и юниты наследуют старый
+  набор групп — без `sg` служба не достаёт `/var/run/docker.sock`. Второй: нужен
+  `sudo loginctl enable-linger $USER`, иначе user-менеджер (а с ним таймер) не работает без
+  активной сессии и не поднимается после ребута.
+
+- **Проверка бэкапа:** восстановление в отдельную базу, а не «файл есть, значит порядок»:
+  ```bash
+  docker compose exec -T postgres psql -U octoforge -d postgres -c 'CREATE DATABASE restore_check OWNER octoforge'
+  gunzip -c ~/octoforge-backups/octoforge-ГГГГММДД-ЧЧММСС.sql.gz \
+    | docker compose exec -T postgres psql -q -U octoforge -d restore_check
+  ```
 - **Логи:** `docker compose logs -f telegram`. Ротацию делает docker (`json-file` по умолчанию).
 - **Перезапуск после падения хоста:** `restart: unless-stopped` плюс включённый
   `docker.service` поднимают стек сами.
