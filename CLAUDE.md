@@ -16,6 +16,8 @@ All checks and runs go through the `Makefile`:
 - `make upgrade` — refresh an existing `.venv` to what CI installs; run it when `make check` disagrees with CI on unchanged code (`install` leaves already-satisfied deps alone, so the linter silently drifts). both checkers are capped in the dev extras (`ruff>=0.16,<0.17`, `mypy>=2.3,<3`) precisely because their releases change verdicts on unchanged code
 - `make check` — full gate: `ruff check` → `ruff format --check` → `mypy strict` → `pytest`, for both projects
 - `make lint` / `make format` / `make typecheck` / `make test` — individual steps
+- `make db-up` / `make db-down` / `make db-psql` — the compose Postgres service (`postgres:18-alpine`, published on `127.0.0.1:5432`; the init script creates `octoforge_telegram`, `octoforge_test` and `octoforge_dev` next to `octoforge`)
+- `make test-pg` — the Postgres store tests against that service (`make check` skips them); run it after touching `db/`, any `*_store.py` or a migration
 - `make run` — uvicorn with autoreload (needs `.env` with `OF_LLM_API_KEY`); serves chat UI at http://127.0.0.1:8000
 - `make run-telegram` — Telegram bot only, no HTTP listener (needs `OF_TELEGRAM_BOT_TOKEN`)
 

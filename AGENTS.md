@@ -45,6 +45,8 @@ OctoForge is a multi-user LLM agent: Python, FastAPI, SQLAlchemy (async, SQLite)
 - `make upgrade` — refresh an existing `.venv` to what CI installs (CI resolves everything fresh every run, `install` keeps already-satisfied deps); reach for it when `make check` fails locally on code CI accepts
 - `make check` — ruff (lint + format check) → mypy strict → pytest, for both projects
 - `make lint` / `make typecheck` / `make test` / `make format` — the individual steps
+- `make db-up` / `make db-down` / `make db-psql` — the compose Postgres service (`postgres:18-alpine` on `127.0.0.1:5432`; its init script creates `octoforge_telegram`, `octoforge_test`, `octoforge_dev` alongside `octoforge`). Point a local run at `octoforge_dev`, never at the deployment database
+- `make test-pg` — `core/tests/test_postgres_stores.py` against that service; `make check` skips it for lack of `OF_TEST_DATABASE_URL`. The fixture drops the `public` schema, so the URL must name a database containing "test" (guarded)
 - `make run` — uvicorn with autoreload (needs `.env` with `OF_LLM_API_KEY`)
 - `make run-telegram` — Telegram bot only, no HTTP API (long polling, no port opened; needs `OF_TELEGRAM_BOT_TOKEN`)
 

@@ -968,6 +968,14 @@ append-only (правки закоммиченных блокирует `PreTool
 Диалект-чувствительные места покрыты `core/tests/test_postgres_stores.py` (гоняется по
 `OF_TEST_DATABASE_URL`, без него скипается).
 
+Сервер живёт в compose (`postgres:18-alpine`, порт публикуется только на `127.0.0.1`), базы
+разведены: `octoforge` — приложение, `octoforge_telegram` — инвайты (свой `Base`, без Alembic),
+`octoforge_test` — тесты (фикстура дропает схему), `octoforge_dev` — локальный запуск. Три
+последние создаёт init-скрипт `docker/postgres-init/`, потому что энтрипоинт образа создаёт
+только `POSTGRES_DB`. Том монтируется на `/var/lib/postgresql`, а не на `.../data`: с 18-й
+версии образ хранит кластер в подкаталоге с номером мажора и со старым монтированием не
+стартует (docker-library/postgres#1259).
+
 ## API (`octoforge_web/api/`)
 
 Реализовано (диалог — get-or-create по (user_id, channel); канал `"web"` объявлен в composition root):

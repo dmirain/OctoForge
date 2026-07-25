@@ -1,4 +1,32 @@
 services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-octoforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-octoforge}
+      POSTGRES_DB: ${POSTGRES_DB:-octoforge}
+      POSTGRES_TELEGRAM_DB: ${POSTGRES_TELEGRAM_DB:-octoforge_telegram}
+      POSTGRES_TEST_DB: ${POSTGRES_TEST_DB:-octoforge_test}
+      POSTGRES_DEV_DB: ${POSTGRES_DEV_DB:-octoforge_dev}
+    ports:
+      # loopback only: psql/pg_dump from the host without exposing the server
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # 18+ stores the cluster in a major-version subdirectory (/var/lib/postgresql/18/docker)
+      # and refuses to start with a mount on the old /var/lib/postgresql/data path,
+      # so the volume goes one level up — this also keeps `pg_upgrade --link`
+      # possible later. See docker-library/postgres#1259.
+      - pg-data:/var/lib/postgresql
+      # runs once per volume: creates the invite and test databases
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-octoforge} -d ${POSTGRES_DB:-octoforge}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
   octoforge:
     build:
       context: .
@@ -13,12 +41,15 @@ services:
     env_file:
       - .env
     environment:
-      # Redirect SQLite files into the persisted volume regardless of what
-      # OF_DATABASE_URL / OF_TELEGRAM_DATABASE_URL are set to in .env.
-      OF_DATABASE_URL: sqlite+aiosqlite:///./data/octoforge.db
-      OF_TELEGRAM_DATABASE_URL: sqlite+aiosqlite:///./data/telegram.db
+      # Point the app at the postgres service on the compose network. This
+      # overrides whatever OF_DATABASE_URL sits in .env, where a host-side
+      # SQLite path would silently create a throwaway file inside the container.
+      OF_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_DB:-octoforge}
+      OF_TELEGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_TELEGRAM_DB:-octoforge_telegram}
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
-      - octoforge-data:/app/data
       - hf-cache:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -28,5 +59,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  octoforge-data:
+  pg-data:
   hf-cache:

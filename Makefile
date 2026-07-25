@@ -1,7 +1,11 @@
 VENV := .venv
 BIN := $(VENV)/bin
 
-.PHONY: install upgrade lint format typecheck test check run run-telegram
+.PHONY: install upgrade lint format typecheck test check test-pg db-up db-down db-psql run run-telegram
+
+# Test database of the compose postgres service. Separate from the app database
+# on purpose: the Postgres store tests drop and recreate the public schema.
+PG_TEST_URL ?= postgresql+asyncpg://octoforge:octoforge@127.0.0.1:5432/octoforge_test
 
 install:
 	python3 -m venv $(VENV)
@@ -39,6 +43,21 @@ test:
 	cd web && ../$(BIN)/pytest
 
 check: lint typecheck test
+
+db-up:
+	docker compose up -d --wait postgres
+
+db-down:
+	docker compose stop postgres
+
+db-psql:
+	docker compose exec postgres psql -U octoforge -d octoforge
+
+# The dialect-sensitive store tests against a real server; `make check` skips
+# them (no OF_TEST_DATABASE_URL), so run this after touching db/, any *_store.py
+# or a migration.
+test-pg: db-up
+	cd core && OF_TEST_DATABASE_URL="$(PG_TEST_URL)" ../$(BIN)/pytest tests/test_postgres_stores.py
 
 run:
 	$(BIN)/uvicorn octoforge_web.main:app --reload --reload-dir web/src

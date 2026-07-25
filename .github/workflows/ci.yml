@@ -8,6 +8,25 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    services:
+      # The Postgres store tests (core/tests/test_postgres_stores.py) need a
+      # real server; without OF_TEST_DATABASE_URL they skip, which would hide
+      # every dialect regression they exist to catch.
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: octoforge
+          POSTGRES_PASSWORD: octoforge
+          POSTGRES_DB: octoforge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U octoforge -d octoforge_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,3 +40,8 @@ jobs:
 
       - name: Check (ruff + mypy + pytest, both projects)
         run: make check
+
+      - name: Postgres store tests
+        env:
+          OF_TEST_DATABASE_URL: postgresql+asyncpg://octoforge:octoforge@127.0.0.1:5432/octoforge_test
+        run: cd core && ../.venv/bin/pytest tests/test_postgres_stores.py

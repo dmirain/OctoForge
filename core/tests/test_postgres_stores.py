@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import inspect, select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -42,10 +43,26 @@ from octoforge_core.memory.store import SqlAlchemyMemoryStore
 
 DATABASE_URL_ENV = "OF_TEST_DATABASE_URL"
 DATABASE_URL = os.environ.get(DATABASE_URL_ENV, "")
+TEST_DATABASE_MARKER = "test"
 
 pytestmark = pytest.mark.skipif(
     not DATABASE_URL, reason=f"{DATABASE_URL_ENV} is not set (Postgres store tests)"
 )
+
+
+def _guard_database_name(url: str) -> None:
+    """Refuse to run against a database whose name does not say "test".
+
+    The fixture below drops the whole `public` schema, so a URL pointing at the
+    application database would wipe it. `make test-pg` targets `octoforge_test`.
+    """
+    name = make_url(url).database or ""
+    if TEST_DATABASE_MARKER not in name:
+        raise pytest.UsageError(
+            f"{DATABASE_URL_ENV} points at database {name!r}, which does not look like a test "
+            f"database (name must contain {TEST_DATABASE_MARKER!r}); these tests drop its schema"
+        )
+
 
 USER_A = "user-a"
 USER_B = "user-b"
@@ -84,6 +101,7 @@ async def pristine_engine() -> AsyncIterator[AsyncEngine]:
     `Base.metadata.drop_all` would leave `alembic_version` behind, and the
     bootstrap test needs a truly empty database, so the schema is recreated.
     """
+    _guard_database_name(DATABASE_URL)
     engine = create_engine(DATABASE_URL)
     async with engine.begin() as connection:
         await connection.execute(text("DROP SCHEMA public CASCADE"))
