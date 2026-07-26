@@ -20,7 +20,9 @@ from dataclasses import dataclass
 
 from octoforge_core.context.api import (
     INTERRUPTED_NOTE,
+    NO_COMPACTED_SEQ,
     ArchivedMessage,
+    AssembledContext,
     ContextCompactor,
     DialogueSummary,
     MessageArchive,
@@ -67,9 +69,13 @@ class CompactorConfig:
 class NoopContextCompactor(ContextCompactor):
     """ContextCompactor passthrough: the full narrative, never any compaction."""
 
-    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
-        """Return the history unchanged."""
-        return list(history)
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
+        """Return the history unchanged (everything is the hot tail)."""
+        return AssembledContext(messages=list(history), tail_count=len(history))
+
+    async def compacted_boundary(self, dialog_id: str) -> int:
+        """Nothing is ever compacted: the narrative starts at the beginning."""
+        return NO_COMPACTED_SEQ
 
     async def compact_now(self, dialog: Dialog) -> bool:
         """Never compacts: there is nothing to rebuild against."""
@@ -95,7 +101,7 @@ class LlmContextCompactor(ContextCompactor):
         self._config = config
         self._running: dict[str, asyncio.Task[None]] = {}
 
-    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
         """Return `[topics block?] + hot tail`; trigger compaction on overflow."""
         max_seq_to = await self._store.max_seq_to(dialog.id)
         tail_count = await self._archive.count_after(dialog.id, max_seq_to)
@@ -106,8 +112,12 @@ class LlmContextCompactor(ContextCompactor):
             self._trigger_compact(dialog)
         summaries = await self._store.list_for_dialog(dialog.id)
         if not summaries:
-            return tail
-        return [_topics_block(summaries), *tail]
+            return AssembledContext(messages=tail, tail_count=len(tail))
+        return AssembledContext(messages=[_topics_block(summaries), *tail], tail_count=len(tail))
+
+    async def compacted_boundary(self, dialog_id: str) -> int:
+        """The narrative's hot slice starts right after the last compacted seq."""
+        return await self._store.max_seq_to(dialog_id)
 
     async def _token_overflow(self, dialog: Dialog, after_seq: int) -> bool:
         """Whether the last run's prompt approached the model's context window.

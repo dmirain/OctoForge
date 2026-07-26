@@ -212,6 +212,23 @@ class MessageRepository:
             )
             return value is not None
 
+    async def list_after(self, dialog_id: str, after_seq: int) -> list[ChatMessage]:
+        """Return the messages with seq strictly above `after_seq`, ordered by seq.
+
+        The actor's initial narrative load: only the hot slice past the
+        compaction boundary lives in memory — older history is reachable
+        through summaries and history_search. (Defined above `list`: that
+        method shadows the builtin in the class scope, breaking annotations
+        below it.)
+        """
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(MessageRow)
+                .where(MessageRow.dialog_id == dialog_id, MessageRow.seq > after_seq)
+                .order_by(MessageRow.seq)
+            )
+            return [_to_chat_message(row) for row in result.all()]
+
     async def list(self, dialog_id: str) -> list[ChatMessage]:
         """Return the dialog messages ordered by seq."""
         async with self._session_factory() as session:

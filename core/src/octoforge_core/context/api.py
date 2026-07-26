@@ -46,6 +46,20 @@ class DialogueSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class AssembledContext:
+    """Result of assembling a branch: the messages plus the hot-tail size.
+
+    `tail_count` is how many trailing narrative messages went in verbatim —
+    the actor uses it to trim its in-memory narrative down to the hot tail
+    once compaction has advanced (everything older is reachable through
+    summaries and history_search only).
+    """
+
+    messages: list[ChatMessage]
+    tail_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class ArchivedMessage:
     """One message of the archive with its seq (unlike ChatMessage)."""
 
@@ -63,13 +77,24 @@ class ContextCompactor(Protocol):
     default for tests). The implementation is chosen in the composition root.
     """
 
-    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
         """Return the narrative part of a process branch: topics block + hot tail.
 
-        `history` is the actor's in-memory narrative, a mirror of the archive
-        (the actor persists a message before appending it). Triggering
-        background compaction on overflow is the implementation's business;
-        assemble itself never blocks on it.
+        `history` is the actor's in-memory narrative, a mirror of the hot
+        slice of the archive (the actor persists a message before appending
+        it). Triggering background compaction on overflow is the
+        implementation's business; assemble itself never blocks on it.
+        The reported `tail_count` lets the actor drop compacted messages
+        from memory.
+        """
+        ...
+
+    async def compacted_boundary(self, dialog_id: str) -> int:
+        """Return the highest archive seq covered by compaction (0 when none).
+
+        The actor's initial narrative load starts right after this boundary:
+        older messages live as summaries and through history_search, not in
+        memory.
         """
         ...
 

@@ -132,7 +132,6 @@ class _Submit:
     message: ChatMessage
     recorded: bool = False
     client_message_id: str | None = None
-    narrative_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,9 +233,11 @@ class ConversationRunner:
         self._processes: dict[str, _Process] = {}
         self._foreground_id: str | None = None
         self._pending_deliveries: list[_Delivery] = []
-        # narrative indices of user messages that need no (further) answer:
-        # an answer task was created from them, or they were pure commands
-        self._covered_indices: set[int] = set()
+        # row ids of user messages that need no (further) answer: an answer
+        # task was created from them, or they were pure commands. Ids, not
+        # narrative indices — the narrative is trimmed to the hot tail as
+        # compaction advances, and indices would shift under a queued command
+        self._covered_ids: set[str] = set()
         # serializes the limit-check → process-create sequence between the
         # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
         # which run in pump/scheduler tasks outside the actor's inbox
@@ -483,7 +484,11 @@ class ConversationRunner:
         self._subscribers.discard(queue)
 
     def history(self) -> list[ChatMessage]:
-        """Return a copy of the dialog narrative."""
+        """Return a copy of the in-memory narrative (the hot tail only).
+
+        Compacted history is not held in memory: it lives in the archive,
+        reachable through summaries and history_search.
+        """
         return list(self._narrative)
 
     @property
@@ -523,7 +528,6 @@ class ConversationRunner:
 
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
-        index = command.narrative_index
         if not command.recorded:
             if await self._is_duplicate(command.client_message_id):
                 logger.info(
@@ -534,12 +538,12 @@ class ConversationRunner:
                 return
             message_id = await self._persist(message, client_message_id=command.client_message_id)
             # the routed/narrative copy carries its row id: an answer task
-            # created from this message links back via source_message_id
+            # created from this message links back via source_message_id, and
+            # coverage tracking keys on it
             message = replace(message, id=message_id)
             self._narrative.append(message)
-            index = len(self._narrative) - 1
         decision = await self._router.route(self._snapshot(), message.content, self._max_processes)
-        await self._apply_decision(message, decision, index)
+        await self._apply_decision(message, decision)
 
     async def _is_duplicate(self, client_message_id: str | None) -> bool:
         """Whether a submit with this idempotency key was already recorded."""
@@ -673,9 +677,7 @@ class ConversationRunner:
             for process in self._processes.values()
         )
 
-    async def _apply_decision(
-        self, message: ChatMessage, decision: RouteDecision, index: int | None
-    ) -> None:
+    async def _apply_decision(self, message: ChatMessage, decision: RouteDecision) -> None:
         ops = decision.ops or (RouteOp(action=RouteAction.START_NEW),)
         cancelled: set[str] = set()
         inject = False
@@ -685,20 +687,15 @@ class ConversationRunner:
                     cancelled.add(op.target_id)
             elif op.action is RouteAction.INJECT:
                 inject = True
-                await self._apply_inject(message, cancelled, index)
+                await self._apply_inject(message, cancelled)
             elif op.action is RouteAction.START_NEW:
-                await self._apply_start_new(message, cancelled, index)
-        if not inject and index is not None:
+                await self._apply_start_new(message, cancelled)
+        if not inject and message.id is not None:
             # a package without inject is fully handled here: start_new covers
             # the message itself, bare cancel packages are pure commands
-            self._covered_indices.add(index)
+            self._covered_ids.add(message.id)
 
-    async def _apply_inject(
-        self,
-        message: ChatMessage,
-        cancelled: set[str],
-        index: int | None,
-    ) -> None:
+    async def _apply_inject(self, message: ChatMessage, cancelled: set[str]) -> None:
         """No-op for process control: the message already lives in the narrative.
 
         A running process picks it up at its next iteration sync; without a
@@ -706,17 +703,12 @@ class ConversationRunner:
         """
         if self._foreground() is not None:
             return
-        await self._apply_start_new(message, cancelled, index)
+        await self._apply_start_new(message, cancelled)
 
-    async def _apply_start_new(
-        self,
-        message: ChatMessage,
-        cancelled: set[str],
-        index: int | None,
-    ) -> None:
+    async def _apply_start_new(self, message: ChatMessage, cancelled: set[str]) -> None:
         async with self._spawn_lock:
             if not self._exceeds_limit(cancelled):
-                await self._start_new(message, index)
+                await self._start_new(message)
                 return
         await self._reject_for_limit(message)
 
@@ -733,7 +725,7 @@ class ConversationRunner:
         )
         await self._deliver_notice(notice)
 
-    async def _start_new(self, message: ChatMessage, index: int | None) -> None:
+    async def _start_new(self, message: ChatMessage) -> None:
         """Start the foreground answer process of a narrative user message."""
         self._suspend_foreground()
         task = await self._prepare_process_task(
@@ -752,18 +744,42 @@ class ConversationRunner:
         process.synced_len = len(process.branch)
         process.watermark = len(self._narrative)
         self._foreground_id = process.id
-        if index is not None:
-            self._covered_indices.add(index)
+        if message.id is not None:
+            self._covered_ids.add(message.id)
 
     def _system_message(self) -> ChatMessage:
         return ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME))
 
     async def _assemble_narrative(self) -> list[ChatMessage]:
-        """Assemble the narrative part of a branch, date-enveloping its tail copy."""
-        narrative = await self._compactor.assemble(self._dialog, self._narrative)
+        """Assemble the narrative part of a branch, date-enveloping its tail copy.
+
+        The assembled tail size also drives the memory diet: once compaction
+        has advanced, everything before the hot tail is dropped from the
+        in-memory narrative (S3, 2026-07-26 audit) — it stays reachable
+        through the topics block and history_search, exactly like the prompt.
+        """
+        assembled = await self._compactor.assemble(self._dialog, self._narrative)
+        self._trim_narrative(assembled.tail_count)
+        narrative = assembled.messages
         if narrative:
             narrative[-1] = _with_date_envelope(narrative[-1])
         return narrative
+
+    def _trim_narrative(self, tail_count: int) -> None:
+        """Drop compacted messages from memory, keeping bookkeeping consistent.
+
+        Watermarks are positions in the narrative list, so they shift by the
+        dropped count; coverage tracking keys on message ids and only needs
+        the dropped ids pruned.
+        """
+        drop = len(self._narrative) - tail_count
+        if drop <= 0:
+            return
+        dropped_ids = {message.id for message in self._narrative[:drop] if message.id is not None}
+        del self._narrative[:drop]
+        self._covered_ids -= dropped_ids
+        for process in self._processes.values():
+            process.watermark = max(0, process.watermark - drop)
 
     def _suspend_foreground(self) -> None:
         foreground = self._foreground()
@@ -935,10 +951,10 @@ class ConversationRunner:
         """
         if not process.narrative_built:
             return
-        for index in range(process.watermark, len(self._narrative)):
-            message = self._narrative[index]
-            if message.role is MessageRole.USER and index not in self._covered_indices:
-                self._inbox.put_nowait(_Submit(message, recorded=True, narrative_index=index))
+        for message in self._narrative[process.watermark :]:
+            covered = message.id is not None and message.id in self._covered_ids
+            if message.role is MessageRole.USER and not covered:
+                self._inbox.put_nowait(_Submit(message, recorded=True))
 
     async def _finalize(self, process: _Process, terminal: LoopEvent) -> TaskStatus:
         """Fold the run outcome into the narrative and the task store."""
@@ -1139,7 +1155,10 @@ class ConversationManager:
 
     async def _build_runner(self, user_id: str, channel: str) -> ConversationRunner:
         dialog = await self._dialogs.get_or_create(user_id, channel)
-        history = await self._messages.list(dialog.id)
+        # only the hot slice lives in memory: everything up to the compaction
+        # boundary is reachable through summaries and history_search
+        boundary = await self._config.compactor.compacted_boundary(dialog.id)
+        history = await self._messages.list_after(dialog.id, boundary)
         # no awaits past this point: the runner is registered in the same
         # event-loop step it starts in, so a cancelled build cannot leak a
         # started actor

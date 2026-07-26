@@ -37,7 +37,7 @@ from octoforge_core.agent.runner import (
     RunnerConfig,
     TaskOutcomeListener,
 )
-from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
+from octoforge_core.context.api import INTERRUPTED_NOTE, AssembledContext, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
@@ -175,8 +175,11 @@ class FakeCompactor:
         self.compact_calls = 0
         self.closed: list[str] = []
 
-    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
-        return list(history)
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
+        return AssembledContext(messages=list(history), tail_count=len(history))
+
+    async def compacted_boundary(self, dialog_id: str) -> int:
+        return 0
 
     async def compact_now(self, dialog: Dialog) -> bool:
         self.compact_calls += 1
@@ -1760,10 +1763,13 @@ class GatedCompactor:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> list[ChatMessage]:
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
         self.entered.set()
         await self.release.wait()
-        return list(history)
+        return AssembledContext(messages=list(history), tail_count=len(history))
+
+    async def compacted_boundary(self, dialog_id: str) -> int:
+        return 0
 
     async def compact_now(self, dialog: Dialog) -> bool:
         return True
@@ -2300,11 +2306,11 @@ class SlowHistoryRepository(MessageRepository):
         self.release = asyncio.Event()
         self.loads = 0
 
-    async def list(self, dialog_id: str) -> list[ChatMessage]:
+    async def list_after(self, dialog_id: str, after_seq: int) -> list[ChatMessage]:
         self.loads += 1
         if self.loads == 1:  # only the FIRST contact is slow
             await self.release.wait()
-        return await super().list(dialog_id)
+        return await super().list_after(dialog_id, after_seq)
 
 
 async def test_one_dialogs_slow_init_does_not_block_another(
@@ -2349,4 +2355,104 @@ async def test_concurrent_first_contacts_share_one_build(
 
     assert len({id(runner) for runner in runners}) == 1
     assert slow.loads == 1  # one build, not five (the first load runs unreleased)
+    await manager.stop_all()
+
+
+# --- hot-tail narrative (S3) --------------------------------------------------
+
+
+class TailCompactor:
+    """ContextCompactor stub keeping only the last `tail` narrative messages."""
+
+    def __init__(self, tail: int, boundary: int = 0) -> None:
+        self.tail = tail
+        self.boundary = boundary
+
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
+        kept = list(history[-self.tail :]) if self.tail else []
+        return AssembledContext(messages=kept, tail_count=len(kept))
+
+    async def compacted_boundary(self, dialog_id: str) -> int:
+        return self.boundary
+
+    async def compact_now(self, dialog: Dialog) -> bool:
+        return False
+
+    async def aclose(self, dialog_id: str) -> None:
+        pass
+
+
+async def test_narrative_trims_to_the_hot_tail(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Compacted messages leave memory: the narrative mirrors the hot tail only (S3)."""
+    llm = ScriptedLLM([reply(), reply(SECOND_REPLY)])
+    manager = make_manager(
+        llm,
+        quick_registry(),
+        session_factory,
+        ManagerOptions(compactor=TailCompactor(tail=1)),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await collect_completions(queue, 1)
+    await runner.submit("second")
+    await collect_completions(queue, 1)
+
+    # at the second start the assembled tail was just ["second"]: everything
+    # older was dropped from memory; the new final still appends normally
+    contents = [message.content for message in runner.history()]
+    assert contents == ["second", SECOND_REPLY]
+    await manager.stop_all()
+
+
+async def test_initial_narrative_load_starts_after_the_compaction_boundary(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A runner never loads compacted history into memory (S3)."""
+    dialogs = DialogRepository(session_factory)
+    messages = MessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+    for content in ("old-1", "old-2", "hot-3"):
+        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content=content))
+    manager = make_manager(
+        ScriptedLLM([]),
+        quick_registry(),
+        session_factory,
+        ManagerOptions(compactor=TailCompactor(tail=10, boundary=2)),
+    )
+
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    assert [message.content for message in runner.history()] == ["hot-3"]
+    await manager.stop_all()
+
+
+async def test_trim_narrative_remaps_watermarks_and_prunes_coverage(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """White-box: trimming shifts process watermarks and drops stale covered ids."""
+    tool = BlockingTool()
+    llm = ScriptedLLM([blocking_call()])
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    runner.subscribe()
+    await runner.submit("first")
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    process = next(iter(runner._processes.values()))
+    watermark_before = process.watermark
+    (first_message,) = runner.history()
+    assert first_message.id is not None
+    assert first_message.id in runner._covered_ids
+
+    runner._trim_narrative(0)  # everything compacted away
+
+    assert runner.history() == []
+    assert process.watermark == 0 and watermark_before > 0
+    assert first_message.id not in runner._covered_ids
+
+    tool.release.set()
     await manager.stop_all()

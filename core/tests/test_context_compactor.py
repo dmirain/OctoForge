@@ -330,7 +330,10 @@ async def test_noop_compactor_returns_the_history_unchanged(
     history = [ChatMessage(role=MessageRole.USER, content="hi")]
     compactor = NoopContextCompactor()
 
-    assert await compactor.assemble(dialog, history) == history
+    assembled = await compactor.assemble(dialog, history)
+    assert assembled.messages == history
+    assert assembled.tail_count == len(history)
+    assert await compactor.compacted_boundary(dialog.id) == 0
     await compactor.aclose(dialog.id)
 
 
@@ -343,7 +346,9 @@ async def test_assemble_without_summaries_returns_the_full_tail(
     compactor = make_compactor(store, llm)
     history = await append_history(session_factory, dialog.id, ["one", "two"])
 
-    assert await compactor.assemble(dialog, history) == history
+    assembled = await compactor.assemble(dialog, history)
+    assert assembled.messages == history
+    assert assembled.tail_count == len(history)
     assert llm.requests == []  # below the limit: no compaction triggered
 
 
@@ -356,8 +361,12 @@ async def test_assemble_prepends_the_topics_block_and_drops_compacted_messages(
     history = await append_history(session_factory, dialog.id, ["old one", "old two", "new"])
     await store.create(make_summary(dialog.id, 1, 2))
 
-    branch = await compactor.assemble(dialog, history)
+    assembled = await compactor.assemble(dialog, history)
+    branch = assembled.messages
 
+    assert assembled.tail_count == 1  # the actor may trim its narrative to this
+    compacted_up_to_second = 2
+    assert await compactor.compacted_boundary(dialog.id) == compacted_up_to_second
     assert len(branch) == BLOCK_AND_TAIL  # topics block + the one tail message
     block = branch[0]
     assert block.role is MessageRole.SYSTEM
@@ -393,7 +402,7 @@ async def test_overflow_compacts_the_oldest_messages_in_background(
     assert summary.topics == ("alpha", "beta")
     assert summary.content == "compressed facts"
 
-    branch = await compactor.assemble(dialog, history)
+    branch = (await compactor.assemble(dialog, history)).messages
     assert branch[0].role is MessageRole.SYSTEM
     assert "compressed facts" in branch[0].content
     assert [m.content for m in branch[1:]] == [TEN_CHARS, TEN_CHARS]
@@ -463,7 +472,7 @@ async def test_failed_compaction_logs_a_warning_and_the_dialog_lives(
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
 
     with caplog.at_level(logging.WARNING, logger="octoforge_core.context.compactor"):
-        branch = await compactor.assemble(dialog, history)
+        branch = (await compactor.assemble(dialog, history)).messages
         await wait_for_condition(
             lambda: any("context compaction failed" in r.message for r in caplog.records)
         )
