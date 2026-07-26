@@ -154,11 +154,20 @@ def test_settings_resolve_the_source(tmp_path: Path) -> None:
 
 
 def test_shipped_russian_overlay_matches_the_registry() -> None:
-    """The deployment's overlay must not silently patch a renamed scenario."""
+    """The deployment's overlay must not silently patch a renamed scenario.
+
+    Only `append`-only patches need a known target: an entry carrying
+    `content` legitimately declares a record of its own (that is how this
+    installation ships scenarios without code).
+    """
     overlay = Path(__file__).resolve().parents[2] / "docker" / "system_skills.ru.json"
     patches = load_overlay(overlay)
     known = {(entry.kind, entry.title) for entry in CORE_SYSTEM_SKILLS + WEB_SYSTEM_SKILLS}
 
     assert patches  # the file parses and carries entries
-    unknown = [patch.title for patch in patches if (patch.kind, patch.title) not in known]
-    assert unknown == []
+    orphans = [
+        patch.title
+        for patch in patches
+        if patch.content is None and (patch.kind, patch.title) not in known
+    ]
+    assert orphans == []
