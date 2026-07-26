@@ -50,7 +50,11 @@ from octoforge_core.cron.waker import ManagerCronWaker
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
-from octoforge_core.instructions.registry import CORE_SYSTEM_SKILLS, sync_system_registry
+from octoforge_core.instructions.registry import (
+    CORE_SYSTEM_SKILLS,
+    SystemSkill,
+    sync_system_registry,
+)
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from octoforge_core.llm.errors import LLMError
@@ -72,6 +76,7 @@ from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.auth import check_basic_auth, is_open_path
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
+from octoforge_web.skill_overlay import apply_overlay, load_overlay
 from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
 from octoforge_web.telegram.admin import AdminAccess, AdminManageTool, AdminStores
 from octoforge_web.telegram.bridge import RunnerProvider
@@ -369,7 +374,7 @@ async def _sync_system_skills(instructions: InstructionService, settings: Settin
     if not settings.embeddings_configured():
         return
     try:
-        await sync_system_registry(instructions, CORE_SYSTEM_SKILLS + WEB_SYSTEM_SKILLS)
+        await sync_system_registry(instructions, _system_registry(settings))
         # finish deferred embeddings: records saved while the backend was down
         # and rows produced by embedder-less data migrations
         reembedded = await instructions.reembed_missing()
@@ -380,6 +385,25 @@ async def _sync_system_skills(instructions: InstructionService, settings: Settin
             "System skill registry sync failed; starting without it",
             exc_info=True,
         )
+
+
+def _system_registry(settings: Settings) -> tuple[SystemSkill, ...]:
+    """Built-in registry with the installation's file overlay applied.
+
+    The overlay (`OF_SYSTEM_SKILLS_SOURCE`) is how a deployment tunes
+    scenarios — localized trigger phrases, house rules, extra records —
+    without a rebuild and without editing core. No source configured: the
+    built-in registry as is.
+    """
+    registry = CORE_SYSTEM_SKILLS + WEB_SYSTEM_SKILLS
+    path = settings.to_skills_overlay_path()
+    if path is None:
+        return registry
+    patches = load_overlay(path)
+    if not patches:
+        return registry
+    logger.info("system skills overlay applied: %d patch(es) from %s", len(patches), path)
+    return apply_overlay(registry, patches)
 
 
 def _build_embedder(settings: Settings, http_client: httpx.AsyncClient) -> EmbeddingClient:

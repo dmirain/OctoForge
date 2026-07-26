@@ -11,6 +11,8 @@ from octoforge_core.net.external import ExternalCallAuth
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from octoforge_web.skill_overlay import parse_overlay_source
+
 ENV_PREFIX = "OF_"
 ENV_FILE = ".env"
 DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
@@ -108,6 +110,10 @@ class Settings(BaseSettings):
     serper_token: str = ""
     system_prompt_source: str = ""
     router_prompt_source: str = ""
+    # Installer's lever on the system-skill registry: a `file:` JSON overlay
+    # applied before the startup sync (replace/extend/add records without a
+    # rebuild). See `skill_overlay.py`.
+    system_skills_source: str = ""
     # Operator credential for the console and the HTTP API. The hash format is
     # `pbkdf2_sha256:iterations:salt:digest`; generate one with
     # `tools/hash_password.py`. Empty means the HTTP surface answers 503 rather
@@ -160,6 +166,16 @@ class Settings(BaseSettings):
             )
             for entry in self.external_call_auth_whitelist
         )
+
+    def to_skills_overlay_path(self) -> Path | None:
+        """Resolve `OF_SYSTEM_SKILLS_SOURCE` into a path; None when unset.
+
+        Raises ValueError on an unsupported scheme: a mistyped source must
+        fail at startup rather than silently serve the built-in registry.
+        """
+        if not self.system_skills_source:
+            return None
+        return parse_overlay_source(self.system_skills_source)
 
     def to_prompt_files(self) -> dict[str, Path]:
         """Map prompt names to their override files (`file:` scheme, empty = default).

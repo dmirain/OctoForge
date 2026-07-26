@@ -65,6 +65,9 @@ services:
       # the host's model cache: without it the container re-downloads the
       # 1.1 GB embedding model on first start
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      # system-skill overlay (OF_SYSTEM_SKILLS_SOURCE): scenario tuning for this
+      # installation — edit the file and restart, no rebuild
+      - ./docker/system_skills.ru.json:/etc/octoforge/system_skills.json:ro
     # No published port: Caddy reaches it over the compose network, so the app
     # never answers without TLS.
     expose:

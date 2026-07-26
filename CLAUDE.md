@@ -74,6 +74,7 @@ Tool descriptions carry policy, not just mechanics: they are the only guidance a
 
 Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQL-backed implementation:
 
+- **system-skill overlay**: the registry in code is the default; `OF_SYSTEM_SKILLS_SOURCE=file:...` (JSON, `web/skill_overlay.py`) appends to / replaces / adds records before the startup sync — that is how this deployment adds Russian trigger phrases (`docker/system_skills.ru.json`) without rebuilding or editing core.
 - `instructions/` — knowledge/skill/endpoint records in the `instructions` table; cosine ranking + exact-title boost + optional cross-encoder rerank of the shortlist. The system-owned slice (`system` flag) is a declarative registry (`CORE_SYSTEM_SKILLS` in core, `WEB_SYSTEM_SKILLS` in web) synced at startup; agent-facing save/delete refuse system records.
 - `datasets/` — user data (`datasets` / `dataset_records`), JSON-schema validation, owner isolation at the SQL level; descriptors also feed `recall`.
 - `memory/` — thin module: memories are `InstructionType.MEMORY` records in the instruction store (title = key, owner = user; never publishable, hidden from admin `search_all` unless asked explicitly). Tools `memory_store`/`memory_delete` only; reading goes through `recall` (embeddings, `type=memory` filter). Saves embed leniently (backend down → empty vector, startup `reembed_missing()` sweep finishes); migration `f2a6c8d1e935` folded the old `memories` table in.
