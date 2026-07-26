@@ -91,6 +91,7 @@ from octoforge_web.telegram.poller import (
     TelegramBridgeRegistry,
     TelegramMembership,
     TelegramPoller,
+    TelegramPollerOptions,
 )
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -256,7 +257,14 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 manager.get_or_create_runner,
                 dialogs,
                 outbound_http,
-                invites,
+                _TelegramExtras(
+                    invites=invites,
+                    secrets_link=(
+                        _secrets_link_builder(settings, secret_links)
+                        if secret_store is not None
+                        else None
+                    ),
+                ),
             )
             try:
                 yield Runtime(
@@ -535,12 +543,32 @@ async def _build_invite_store(
     return store, engine
 
 
+@dataclass(frozen=True, slots=True)
+class _TelegramExtras:
+    """Optional collaborators of the Telegram surface."""
+
+    invites: tuple[SqlAlchemyInviteStore, AsyncEngine] | None = None
+    secrets_link: Callable[[str], str] | None = None
+
+
+def _secrets_link_builder(
+    settings: Settings, secret_links: SecretLinkService
+) -> Callable[[str], str]:
+    """Build the /secrets URL factory: a fresh one-time token per request."""
+
+    def build(user_id: str) -> str:
+        token = secret_links.issue(user_id)
+        return f"{settings.resolved_public_base_url()}/secrets.html?token={token}"
+
+    return build
+
+
 def _start_telegram(
     settings: Settings,
     runner_provider: RunnerProvider,
     dialogs: DialogRepository,
     http_client: httpx.AsyncClient,
-    invites: tuple[SqlAlchemyInviteStore, AsyncEngine] | None = None,
+    extras: _TelegramExtras | None = None,
 ) -> tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None:
     """Start the Telegram long-poll adapter when a bot token is configured.
 
@@ -550,6 +578,7 @@ def _start_telegram(
     """
     if not settings.telegram_bot_token:
         return None
+    resolved = extras if extras is not None else _TelegramExtras()
     client = TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token)
     registry = TelegramBridgeRegistry(
         runner_provider=runner_provider,
@@ -558,13 +587,16 @@ def _start_telegram(
         rich_messages_enabled=settings.telegram_rich_messages,
     )
     membership = None
-    if invites is not None and settings.telegram_admin_ids:
-        membership = TelegramMembership(invites[0], settings.telegram_admin_ids)
+    if resolved.invites is not None and settings.telegram_admin_ids:
+        membership = TelegramMembership(resolved.invites[0], settings.telegram_admin_ids)
     poller = TelegramPoller(
         client=client,
         registry=registry,
-        poll_timeout_seconds=settings.telegram_poll_timeout_seconds,
-        membership=membership,
+        options=TelegramPollerOptions(
+            poll_timeout_seconds=settings.telegram_poll_timeout_seconds,
+            membership=membership,
+            secrets_link=resolved.secrets_link,
+        ),
     )
     return registry, asyncio.create_task(_run_telegram(poller, registry, dialogs))
 

@@ -44,11 +44,13 @@ from octoforge_web.telegram.poller import (
     GREETING_TEXT,
     GROUP_NOTICE,
     INVITE_INVALID_TEXT,
+    SECRETS_DISABLED_TEXT,
     TEXT_ONLY_NOTICE,
     WELCOME_TEXT,
     TelegramBridgeRegistry,
     TelegramMembership,
     TelegramPoller,
+    TelegramPollerOptions,
     chat_id_from_user_id,
 )
 
@@ -199,6 +201,7 @@ def make_poller(
     client: FakeTelegramClient,
     provider: RunnerProvider = forbidden_provider,
     membership: TelegramMembership | None = None,
+    secrets_link: Callable[[str], str] | None = None,
 ) -> TelegramPoller:
     registry = TelegramBridgeRegistry(
         runner_provider=provider,
@@ -208,9 +211,12 @@ def make_poller(
     return TelegramPoller(
         client=client,
         registry=registry,
-        poll_timeout_seconds=POLL_TIMEOUT,
-        error_backoff_seconds=NO_BACKOFF,
-        membership=membership,
+        options=TelegramPollerOptions(
+            poll_timeout_seconds=POLL_TIMEOUT,
+            error_backoff_seconds=NO_BACKOFF,
+            membership=membership,
+            secrets_link=secrets_link,
+        ),
     )
 
 
@@ -501,3 +507,33 @@ async def test_start_with_expired_code_is_denied() -> None:
 
     assert client.sent == [(TELEGRAM_USER_ID, INVITE_INVALID_TEXT, None)]
     await engine.dispose()
+
+
+async def test_secrets_command_replies_with_a_link_and_never_reaches_the_dialog() -> None:
+    """The T2 ingestion entry: /secrets is intercepted before the pipeline."""
+    client = FakeTelegramClient()
+    issued: list[str] = []
+
+    def link(user_id: str) -> str:
+        issued.append(user_id)
+        return f"https://example.com/secrets.html?token=tok-{user_id}"
+
+    # forbidden_provider raises if the message ever reaches the dialog pipeline
+    poller = make_poller(client, secrets_link=link)
+
+    await poller.dispatch(make_update(1, "/secrets"))
+
+    assert issued == [USER_ID]
+    ((_, text, _),) = client.sent
+    assert "secrets.html?token=tok-" in text
+    assert "Никогда не присылайте секреты" in text
+
+
+async def test_secrets_command_without_the_feature_reports_it() -> None:
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+
+    await poller.dispatch(make_update(1, "/secrets"))
+
+    ((_, text, _),) = client.sent
+    assert text == SECRETS_DISABLED_TEXT

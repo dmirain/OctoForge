@@ -2,7 +2,8 @@
 
 import asyncio
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from enum import StrEnum
 
 import httpx
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 COMMAND_START = "/start"
 COMMAND_CANCEL = "/cancel"
+COMMAND_SECRETS = "/secrets"
 GREETING_TEXT = (
     "Привет! Я OctoForge — напиши вопрос, и я постараюсь помочь. "
     "Команда /cancel прерывает текущий ответ."
@@ -41,6 +43,12 @@ INVITE_INVALID_TEXT = (
     "Этот код недействителен или уже использован. Обратитесь к администратору за новым кодом."
 )
 TEXT_ONLY_NOTICE = "Пока понимаю только текстовые сообщения."
+SECRETS_LINK_TEXT = (
+    "Ссылка на форму секретов (действует 10 минут):\n{url}\n\n"
+    "Значения шифруются, ассистент видит только коды секретов. "
+    "Никогда не присылайте секреты сообщением в чат."
+)
+SECRETS_DISABLED_TEXT = "Хранилище секретов не настроено на этой инсталляции."
 GROUP_NOTICE = "Пока работаю только в личных чатах."
 DEFAULT_ERROR_BACKOFF_SECONDS = 5.0
 DRAIN_TIMEOUT_SECONDS = 0.0
@@ -142,6 +150,20 @@ class TelegramBridgeRegistry:
             await bridge.aclose()
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramPollerOptions:
+    """Behavior knobs of the poller beyond its two collaborators.
+
+    `secrets_link` builds the one-time secrets-form URL for a user id
+    (None: the /secrets command reports the feature as not configured).
+    """
+
+    poll_timeout_seconds: float
+    error_backoff_seconds: float = DEFAULT_ERROR_BACKOFF_SECONDS
+    membership: TelegramMembership | None = None
+    secrets_link: Callable[[str], str] | None = None
+
+
 class TelegramPoller:
     """Long-poll loop: fetch updates, advance the offset, dispatch to bridges."""
 
@@ -149,15 +171,14 @@ class TelegramPoller:
         self,
         client: TelegramClient,
         registry: TelegramBridgeRegistry,
-        poll_timeout_seconds: float,
-        error_backoff_seconds: float = DEFAULT_ERROR_BACKOFF_SECONDS,
-        membership: TelegramMembership | None = None,
+        options: TelegramPollerOptions,
     ) -> None:
         self._client = client
         self._registry = registry
-        self._poll_timeout_seconds = poll_timeout_seconds
-        self._error_backoff_seconds = error_backoff_seconds
-        self._membership = membership
+        self._poll_timeout_seconds = options.poll_timeout_seconds
+        self._error_backoff_seconds = options.error_backoff_seconds
+        self._membership = options.membership
+        self._secrets_link = options.secrets_link
         self._offset: int | None = None
 
     async def run_forever(self) -> None:
@@ -189,15 +210,35 @@ class TelegramPoller:
         user_id = f"{USER_ID_PREFIX}{message.from_user.id}"
         if not await self._check_membership(user_id, chat_id, message.text):
             return
-        if message.text == COMMAND_START or _start_code(message.text) is not None:
-            if message.text == COMMAND_START:
+        await self._dispatch_text(update, user_id, chat_id, message.text)
+
+    async def _dispatch_text(
+        self, update: TelegramUpdate, user_id: str, chat_id: int, text: str
+    ) -> None:
+        """Route an allowed text: surface commands first, then the dialog bridge."""
+        if text == COMMAND_START or _start_code(text) is not None:
+            if text == COMMAND_START:
                 await self._client.send_message(chat_id, GREETING_TEXT)
             return  # a successful claim was already welcomed by the gate
+        if text.strip() == COMMAND_SECRETS:
+            # intercepted BEFORE the dialog pipeline: the command (and the
+            # secrets themselves, entered on the linked form) never reach the
+            # narrative, the archive or the LLM
+            await self._send_secrets_link(user_id, chat_id)
+            return
         bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
-        if message.text == COMMAND_CANCEL:
+        if text == COMMAND_CANCEL:
             await bridge.cancel()
             return
-        await bridge.handle_text(message.text, client_message_id=str(update.update_id))
+        await bridge.handle_text(text, client_message_id=str(update.update_id))
+
+    async def _send_secrets_link(self, user_id: str, chat_id: int) -> None:
+        if self._secrets_link is None:
+            await self._client.send_message(chat_id, SECRETS_DISABLED_TEXT)
+            return
+        await self._client.send_message(
+            chat_id, SECRETS_LINK_TEXT.format(url=self._secrets_link(user_id))
+        )
 
     async def _check_membership(self, user_id: str, chat_id: int, text: str) -> bool:
         """Apply the invite gate (no gate configured = everyone passes)."""
