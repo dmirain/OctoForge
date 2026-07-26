@@ -37,6 +37,7 @@ from octoforge_core.agent.runner import (
     ConversationManager,
     RunnerConfig,
     TaskOutcomeListener,
+    _Submit,
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, AssembledContext, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
@@ -2492,4 +2493,34 @@ async def test_failed_submit_persist_reports_to_the_transport(
     failed = next(e.payload for e in events if isinstance(e.payload, Failed))
     assert failed.error == SUBMIT_FAILED_ERROR
     assert runner.history() == []  # nothing was recorded, nothing routed
+    await manager.stop_all()
+
+
+async def test_covered_requeue_is_not_routed_twice(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A requeue racing the original routing must not produce a second answer.
+
+    _requeue_unanswered runs in a terminating pump while the actor may still
+    be inside the router call for the same message (coverage is marked only
+    after routing), so the message can reach the inbox twice — the covered
+    duplicate is dropped instead of routed.
+    """
+    router = FakeRouter()
+    llm = ScriptedLLM([reply()])
+    manager = make_manager(llm, quick_registry(), session_factory, ManagerOptions(router=router))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("question")
+    await collect_completions(queue, 1)
+    routed_before = len(router.calls)
+    (recorded,) = [m for m in runner.history() if m.role is MessageRole.USER]
+    assert recorded.id is not None and recorded.id in runner._covered_ids
+
+    runner._inbox.put_nowait(_Submit(recorded, recorded=True))
+    await asyncio.sleep(POLL_SECONDS * 5)  # let the actor drain the inbox
+
+    assert len(router.calls) == routed_before  # the duplicate was dropped, not routed
+    assert [m.content for m in runner.history() if m.role is MessageRole.USER] == ["question"]
     await manager.stop_all()

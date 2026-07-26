@@ -530,6 +530,13 @@ class ConversationRunner:
 
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
+        if command.recorded and message.id is not None and message.id in self._covered_ids:
+            # a requeue raced the original routing: _requeue_unanswered runs in
+            # a terminating pump while the actor may still be inside the router
+            # call for this very message (coverage is only marked after it), so
+            # the message can arrive here twice — routing the duplicate could
+            # start a SECOND answer process for one user message
+            return
         if not command.recorded:
             try:
                 if await self._is_duplicate(command.client_message_id):
