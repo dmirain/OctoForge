@@ -22,3 +22,12 @@ class LoopControl:
     @property
     def is_cancelled(self) -> bool:
         return self._cancelled.is_set()
+
+    async def wait_cancelled(self) -> None:
+        """Block until cancellation is requested.
+
+        The loop races this against the next stream event, so a cancel
+        interrupts a silent LLM stream immediately instead of waiting for
+        the next token (or the idle timeout) to notice the flag.
+        """
+        await self._cancelled.wait()

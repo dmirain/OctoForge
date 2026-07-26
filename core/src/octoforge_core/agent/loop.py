@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass, field
 
 from octoforge_core.agent.control import LoopControl
@@ -37,6 +38,10 @@ EMPTY_STREAM_MESSAGE = "LLM stream ended without a final message"
 STREAM_IDLE_TIMEOUT_MESSAGE = "LLM stream idle timeout"
 ERROR_OUTPUT_PREFIX = "error: "
 CANCELLED_OUTPUT = "cancelled"
+
+
+class _RunCancelled(Exception):
+    """Internal signal: the cancel flag interrupted the wait for a stream event."""
 
 
 @dataclass(slots=True)
@@ -268,26 +273,39 @@ class AgentLoop:
         tracker: _ToolRunTracker,
         state: _AssistantStreamState,
     ) -> AsyncIterator[LoopEvent]:
-        """Consume stream events until the end, cancellation, or idle timeout."""
-        while True:
-            try:
-                event = await self._next_event(stream)
-            except TimeoutError:
-                state.timed_out = True
-                return
-            if event is None:
-                return
-            if control.is_cancelled:
-                state.interrupted = True
-                return
-            loop_events, finished, usage = self._handle_stream_event(
-                event, state.content_parts, tracker
-            )
-            if finished is not None:
-                state.final_message = finished
-                state.usage = usage
-            for loop_event in loop_events:
-                yield loop_event
+        """Consume stream events until the end, cancellation, or idle timeout.
+
+        Cancellation is raced against the next stream event: checking the
+        flag only between events meant a user's stop waited for the provider
+        to produce another token — up to the idle timeout on a stalled
+        stream (measured as a 120 s worst case in the 2026-07-26 audit).
+        """
+        cancel_watch = asyncio.create_task(control.wait_cancelled())
+        try:
+            while True:
+                try:
+                    event = await self._next_event(stream, cancel_watch)
+                except TimeoutError:
+                    state.timed_out = True
+                    return
+                except _RunCancelled:
+                    state.interrupted = True
+                    return
+                if event is None:
+                    return
+                if control.is_cancelled:
+                    state.interrupted = True
+                    return
+                loop_events, finished, usage = self._handle_stream_event(
+                    event, state.content_parts, tracker
+                )
+                if finished is not None:
+                    state.final_message = finished
+                    state.usage = usage
+                for loop_event in loop_events:
+                    yield loop_event
+        finally:
+            cancel_watch.cancel()
 
     async def _finalize_assistant(
         self,
@@ -359,14 +377,39 @@ class AgentLoop:
         history.extend(tracker.tool_messages(message.tool_calls))
         yield AssistantMessage(message=message, interrupted=True)
 
-    async def _next_event(self, stream: AsyncIterator[StreamEvent]) -> StreamEvent | None:
-        """Await the next stream event under the idle timeout; None = stream ended."""
+    async def _next_event(
+        self,
+        stream: AsyncIterator[StreamEvent],
+        cancel_watch: asyncio.Task[None],
+    ) -> StreamEvent | None:
+        """Await the next stream event under the idle timeout; None = stream ended.
+
+        Races the stream against the run's cancellation: raises _RunCancelled
+        when the cancel lands first, TimeoutError when neither arrives within
+        the idle timeout. An event that completed together with the cancel is
+        still delivered — the caller re-checks the flag right after.
+        """
+        stream_task: asyncio.Task[StreamEvent] = asyncio.ensure_future(anext(stream))
         try:
-            if self._stream_idle_timeout is None:
-                return await anext(stream)
-            return await asyncio.wait_for(anext(stream), timeout=self._stream_idle_timeout)
-        except StopAsyncIteration:
-            return None
+            done, _ = await asyncio.wait(
+                {stream_task, cancel_watch},
+                timeout=self._stream_idle_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except BaseException:
+            stream_task.cancel()
+            raise
+        if stream_task in done:
+            try:
+                return stream_task.result()
+            except StopAsyncIteration:
+                return None
+        stream_task.cancel()
+        with suppress(asyncio.CancelledError, StopAsyncIteration):
+            await stream_task
+        if cancel_watch in done:
+            raise _RunCancelled
+        raise TimeoutError
 
     async def _stream_tool_calls(
         self,

@@ -583,3 +583,36 @@ async def test_disabled_idle_timeout_keeps_waiting() -> None:
 
     assert isinstance(events[-1], Finished)
     assert events[-1].message == final_reply()
+
+
+async def test_cancel_interrupts_a_stalled_stream_immediately() -> None:
+    """A user's stop must not wait for the next token or the idle timeout (C1).
+
+    The stream stalls silently (no idle timeout configured — the worst case);
+    the cancel is raced against the stream wait, so the run ends promptly and
+    the partial content streamed so far is preserved.
+    """
+    partial = "stalled-part"
+    llm = StallingLLM([LlmTextDelta(text=partial)])
+    control = LoopControl()
+    loop = AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=3)
+    history = [user_message()]
+    events: list[LoopEvent] = []
+
+    started = asyncio.get_running_loop().time()
+
+    async def cancel_soon() -> None:
+        await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
+        control.cancel()
+
+    canceller = asyncio.create_task(cancel_soon())
+    async for event in loop.stream(history, control, CTX):
+        events.append(event)
+    await canceller
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < STALL_SECONDS / 2  # ended on the cancel, not the stall
+    assistant = next(e for e in events if isinstance(e, AssistantMessage))
+    assert assistant.interrupted is True
+    assert assistant.message.content == partial
+    assert isinstance(events[-1], Cancelled)
