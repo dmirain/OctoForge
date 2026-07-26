@@ -162,19 +162,27 @@ class LlmContextCompactor(ContextCompactor):
                 await running
             if await self._store.max_seq_to(dialog.id) > before:
                 return True  # the awaited run already advanced the range
+        # _start_compact re-checks the guard: an assemble may have triggered a
+        # fresh run during the awaits above, and starting our own would race
+        # it — two concurrent summarize+replace runs for one dialog
         task = self._start_compact(dialog)
         await task
         return await self._store.max_seq_to(dialog.id) > before
 
     def _trigger_compact(self, dialog: Dialog) -> None:
         """Start a background compaction unless one is already running (guard)."""
-        running = self._running.get(dialog.id)
-        if running is not None and not running.done():
-            return  # one compaction per dialog at a time; the next assemble re-triggers
         self._start_compact(dialog)
 
     def _start_compact(self, dialog: Dialog) -> asyncio.Task[None]:
-        """Register a compaction task as the dialog's running one and return it."""
+        """Return the dialog's running compaction, starting one when none is live.
+
+        The single place enforcing one-compaction-per-dialog: every path
+        (background trigger, reactive compact_now) goes through it, so two
+        callers can never register two concurrent runs for one dialog.
+        """
+        running = self._running.get(dialog.id)
+        if running is not None and not running.done():
+            return running
         task = asyncio.create_task(self._compact(dialog))
         self._running[dialog.id] = task
         task.add_done_callback(lambda done: self._on_compact_done(dialog.id, done))

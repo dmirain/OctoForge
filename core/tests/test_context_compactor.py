@@ -762,3 +762,27 @@ async def test_aclose_leaves_other_dialogs_compactions_running(
     await _wait_for_summaries(store, dialog.id, count=1)
 
     assert await store.list_for_dialog(other.id) == []  # the cancelled run wrote nothing
+
+
+async def test_start_compact_is_the_single_concurrency_guard(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every path (trigger, compact_now) shares one guard: no dialog runs twice.
+
+    The old guard lived only in the background trigger; compact_now could
+    register a second concurrent run when an assemble triggered during its
+    awaits — two summarize+replace runs racing for one dialog.
+    """
+    dialog = await make_dialog(session_factory)
+    llm = GatedSummarizingLLM([SUMMARY_REPLY])
+    compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
+    await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
+
+    first = compactor._start_compact(dialog)
+    second = compactor._start_compact(dialog)
+    llm.release.set()
+    await first
+
+    assert second is first  # the second caller joined the running compaction
+    assert llm.calls == 1
