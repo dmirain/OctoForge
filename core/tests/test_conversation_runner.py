@@ -30,6 +30,7 @@ from octoforge_core.agent.router import (
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
     RESTART_LIMIT_ERROR,
+    SUBSCRIBER_QUEUE_SIZE,
     ConversationEvent,
     ConversationManager,
     RunnerConfig,
@@ -2189,3 +2190,49 @@ async def test_request_result_delivery_is_idempotent(
     assert queue.empty()
     delivered = [e.payload for e in events if isinstance(e.payload, Finished)]
     assert len(delivered) == 1
+
+
+# --- slow-subscriber broadcast policy (C3) ----------------------------------
+
+
+async def test_full_subscriber_queue_never_drops_terminal_events(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A laggy transport loses stream chatter, never a result.
+
+    Terminal events gate `delivered_at`: dropping one would mean the store
+    says delivered while no transport ever saw the result. The oldest queued
+    event is evicted instead.
+    """
+    manager = make_manager(ScriptedLLM([]), quick_registry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    for _ in range(SUBSCRIBER_QUEUE_SIZE + 5):  # flood the queue past its capacity
+        runner._broadcast(TextDelta(text="x"))
+
+    final = Finished(message=ChatMessage(role=MessageRole.ASSISTANT, content=REPLY))
+    accepted = runner._broadcast(final)
+
+    assert accepted == 1
+    payloads = []
+    while not queue.empty():
+        payloads.append(queue.get_nowait().payload)
+    finals = [p for p in payloads if isinstance(p, Finished)]
+    assert len(finals) == 1 and finals[0].message.content == REPLY
+    await manager.stop_all()
+
+
+async def test_full_subscriber_queue_drops_stream_chatter(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = make_manager(ScriptedLLM([]), quick_registry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    for _ in range(SUBSCRIBER_QUEUE_SIZE):
+        runner._broadcast(TextDelta(text="x"))
+
+    accepted = runner._broadcast(TextDelta(text="overflow"))
+
+    assert accepted == 0
+    assert queue.qsize() == SUBSCRIBER_QUEUE_SIZE  # nothing evicted for a delta
+    await manager.stop_all()

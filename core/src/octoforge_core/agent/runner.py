@@ -56,6 +56,10 @@ from octoforge_core.tools.base import ToolContext
 logger = logging.getLogger(__name__)
 
 SUBSCRIBER_QUEUE_SIZE = 100
+# events a transport must never miss: terminals close a streamed message and
+# gate `delivered_at`, process markers drive the surface's UI state. Stream
+# chatter (TextDelta, tool events) may drop on a lagging subscriber instead.
+_CRITICAL_EVENTS = (Finished, Failed, Cancelled, ProcessSuspended, ProcessCompleted)
 TITLE_MAX_LENGTH = 60
 SPAWN_REFUSAL_TEMPLATE = (
     "cannot spawn: process limit ({limit}) reached; active: {titles} — ask the user what to cancel"
@@ -641,8 +645,14 @@ class ConversationRunner:
         async with self._flush_lock:
             while self._pending_deliveries and self._subscribers:
                 delivery = self._pending_deliveries[0]
+                accepted = 0
                 for event in delivery.events:
-                    self._broadcast(event)
+                    accepted = self._broadcast(event)
+                if accepted == 0:
+                    # the terminal (last) event reached no queue: do not stamp
+                    # it delivered — the delivery stays queued for a flush with
+                    # a live subscriber (mirrors the no-subscriber wait above)
+                    break
                 if delivery.task_id is not None:
                     # a racing task_delete must not wedge the outbox behind it
                     with suppress(TaskNotFoundError):
@@ -1011,17 +1021,31 @@ class ConversationRunner:
             self._dialog.id, message, usage=usage, client_message_id=client_message_id
         )
 
-    def _broadcast(self, event: LoopEvent) -> None:
+    def _broadcast(self, event: LoopEvent) -> int:
+        """Fan the event out; return how many subscriber queues accepted it.
+
+        A slow subscriber's full queue drops stream chatter (deltas, tool
+        events) but never a critical event: terminals and process markers are
+        exactly what the outbox stamps `delivered_at` on — dropping one would
+        lose a result for good while the store says it was delivered. For a
+        critical event the oldest queued event is evicted instead, so it
+        always lands.
+        """
         self._seq += 1
         envelope = ConversationEvent(
             dialog_id=self._dialog.id,
             seq=self._seq,
             payload=event,
         )
+        critical = isinstance(event, _CRITICAL_EVENTS)
+        accepted = 0
         for queue in self._subscribers:
             try:
                 queue.put_nowait(envelope)
-            except asyncio.QueueFull:  # slow subscribers drop events; keep it countable
+                accepted += 1
+            except asyncio.QueueFull:
+                if critical and self._evict_and_put(queue, envelope):
+                    accepted += 1
                 self._dropped_events += 1
                 logger.debug(
                     "dropped SSE event: dialog=%s seq=%s dropped_total=%s",
@@ -1029,6 +1053,20 @@ class ConversationRunner:
                     self._seq,
                     self._dropped_events,
                 )
+        return accepted
+
+    @staticmethod
+    def _evict_and_put(
+        queue: asyncio.Queue[ConversationEvent], envelope: ConversationEvent
+    ) -> bool:
+        """Make room for a critical event by evicting the oldest queued one."""
+        with suppress(asyncio.QueueEmpty):
+            queue.get_nowait()
+        try:
+            queue.put_nowait(envelope)
+        except asyncio.QueueFull:  # only full again if maxsize is 0
+            return False
+        return True
 
 
 class _DialogTaskSpawner:
