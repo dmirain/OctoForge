@@ -16,6 +16,7 @@ LLM call.
 
 import asyncio
 import logging
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
@@ -233,7 +234,7 @@ class ConversationRunner:
         self._narrative = history
         self._processes: dict[str, _Process] = {}
         self._foreground_id: str | None = None
-        self._pending_deliveries: list[_Delivery] = []
+        self._pending_deliveries: deque[_Delivery] = deque()
         # row ids of user messages that need no (further) answer: an answer
         # task was created from them, or they were pure commands. Ids, not
         # narrative indices — the narrative is trimmed to the hot tail as
@@ -672,7 +673,7 @@ class ConversationRunner:
                     # a racing task_delete must not wedge the outbox behind it
                     with suppress(TaskNotFoundError):
                         await self._tasks.mark_delivered(delivery.task_id)
-                self._pending_deliveries.pop(0)
+                self._pending_deliveries.popleft()
 
     def _snapshot(self) -> tuple[ProcessInfo, ...]:
         return tuple(

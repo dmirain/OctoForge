@@ -566,7 +566,7 @@ async def test_submit_streams_events_and_updates_narrative(
     assert task.status is TaskStatus.DONE
     # the foreground stream was the delivery: the actor stamps it asynchronously
     await wait_for_condition(lambda: task.delivered_at is not None)
-    assert runner._pending_deliveries == []  # nothing left in the outbox
+    assert not runner._pending_deliveries  # nothing left in the outbox
     assert runner.history() == [
         ChatMessage(role=MessageRole.USER, content="hi"),
         replace(reply(), task_id=task.id),
@@ -780,7 +780,7 @@ async def test_suspended_process_final_is_delivered_whole_after_the_foreground(
     assert {task.title for task in tasks} == {"first", "second"}
     assert all(task.status is TaskStatus.DONE for task in tasks)
     assert all(task.delivered_at is not None for task in tasks)
-    assert runner._pending_deliveries == []
+    assert not runner._pending_deliveries
     history = runner.history()
     assert [m.content for m in history] == ["first", "second", "second final", "first final"]
     task_ids = {task.id for task in tasks}
@@ -1057,7 +1057,7 @@ async def test_process_limit_notice_flushes_immediately_when_foreground_is_free(
     task = await single_task(store, runner.dialog_id)
     assert task.status is TaskStatus.DONE
     assert task.delivered_at is not None
-    assert runner._pending_deliveries == []
+    assert not runner._pending_deliveries
 
 
 async def test_spawn_task_refuses_over_the_process_limit(
@@ -1138,7 +1138,7 @@ async def test_delete_task_stops_a_live_background_process(
     # the stopped task's row is kept as CANCELLED and nothing is delivered
     row = await single_task(store, runner.dialog_id)
     assert row.status is TaskStatus.CANCELLED
-    assert runner._pending_deliveries == []
+    assert not runner._pending_deliveries
 
     # the actor survived the cancelled task's termination notice
     await runner.submit("ping")
@@ -1252,7 +1252,7 @@ async def test_background_delivery_waits_for_a_busy_foreground(
     deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
     assert deltas == ["after", TASK_RESULT]
     assert task.delivered_at is not None
-    assert runner._pending_deliveries == []
+    assert not runner._pending_deliveries
     # the foreground pulled the background final into its next iteration
     second_request = llm.main_requests[1]
     assert any(TASK_RESULT in m.content for m in second_request)
@@ -1296,7 +1296,7 @@ async def test_delivery_is_retried_when_marking_delivered_fails(
     )
 
     assert task.delivered_at is not None
-    assert runner._pending_deliveries == []
+    assert not runner._pending_deliveries
     # the retry re-sends the events: the transport may see a duplicate
     result_deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)].count(
         TASK_RESULT
@@ -1417,7 +1417,7 @@ async def test_wake_runs_cron_tagged_background_process(
     assert task.input["cron_job_id"] == CRON_JOB_ID
     assert isinstance(task.input["fired_at"], str)  # the parent linkage timestamp
     assert runner.history() == [finished[0].message]
-    assert runner._pending_deliveries == []
+    assert not runner._pending_deliveries
     assert llm.main_requests == []  # no report run
     background_request = llm.background_requests[0]
     assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
@@ -2105,7 +2105,7 @@ async def test_cron_result_of_an_unwatched_dialog_waits_for_a_subscriber(
     await collect_until(queue, is_delivered(TASK_RESULT))
 
     await wait_for_condition(lambda: task.delivered_at is not None)
-    assert runner._pending_deliveries == []
+    assert not runner._pending_deliveries
 
 
 async def test_recover_interrupted_noop_without_candidates(
@@ -2483,7 +2483,7 @@ async def test_failed_submit_persist_reports_to_the_transport(
     """
     manager = make_manager(ScriptedLLM([reply()]), quick_registry(), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    runner._messages = FailingAppendRepository(session_factory)  # noqa: SLF001
+    runner._messages = FailingAppendRepository(session_factory)
     queue = runner.subscribe()
 
     await runner.submit("hello?")
