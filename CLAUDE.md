@@ -72,6 +72,8 @@ Tool descriptions carry policy, not just mechanics: they are the only guidance a
 
 ### Self-contained domain modules
 
+- `secrets/` — per-user secrets: Fernet-encrypted, host-bound, resolved only inside `external_call` (endpoint records declare `auth: {secret: code}`); ingestion via `/secrets` in Telegram → one-time link → `/secrets.html` (token-authenticated, outside the Basic gate). The LLM only ever sees secret codes; responses are scrubbed of value echoes.
+
 Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQL-backed implementation:
 
 - **system-skill overlay**: the registry in code is the default; `OF_SYSTEM_SKILLS_SOURCE=file:...` (JSON, `web/skill_overlay.py`) appends to / replaces / adds records before the startup sync — that is how this deployment adds Russian trigger phrases (`docker/system_skills.ru.json`) without rebuilding or editing core.
