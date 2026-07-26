@@ -136,11 +136,6 @@ class _Submit:
 
 
 @dataclass(frozen=True, slots=True)
-class _Cancel:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
 class _Flush:
     """A fresh subscriber asking the actor to drain the delivery outbox."""
 
@@ -168,7 +163,7 @@ class _Delivery:
     task_id: str | None
 
 
-_Command = _Submit | _Cancel | _ProcessTerminated | _Flush
+_Command = _Submit | _ProcessTerminated | _Flush
 
 
 @dataclass(slots=True)
@@ -307,8 +302,15 @@ class ConversationRunner:
         )
 
     async def cancel(self) -> None:
-        """Cancel the foreground process, if any (explicit user request)."""
-        await self._inbox.put(_Cancel())
+        """Cancel the foreground process, if any (explicit user request).
+
+        Applied directly, not through the inbox: the actor may be busy inside
+        a routing LLM call (up to OF_ROUTER_TIMEOUT_SECONDS), and a queued
+        cancel would wait behind it — a stop must act now. Only the running
+        LoopControl and the foreground pointer are touched, both owned by
+        this event loop, so bypassing the inbox is race-free.
+        """
+        self._handle_cancel()
 
     async def spawn_task(self, title: str, prompt: str) -> str:
         """Create a RUN task with its background process; refuse when the limit is hit."""
@@ -514,8 +516,6 @@ class ConversationRunner:
     async def _dispatch(self, command: _Command) -> None:
         if isinstance(command, _Submit):
             await self._handle_submit(command)
-        elif isinstance(command, _Cancel):
-            self._handle_cancel()
         elif isinstance(command, _ProcessTerminated):
             await self._handle_terminated(command)
         elif isinstance(command, _Flush):

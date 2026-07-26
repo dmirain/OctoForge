@@ -22,6 +22,7 @@ from octoforge_core.agent.events import (
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import (
+    MessageRouter,
     ProcessInfo,
     RouteAction,
     RouteDecision,
@@ -414,7 +415,7 @@ def reply(content: str = REPLY) -> ChatMessage:
 class ManagerOptions:
     """Optional knobs for building a test ConversationManager."""
 
-    router: FakeRouter | None = None
+    router: MessageRouter | None = None
     store: TaskStore | None = None
     max_processes: int = MAX_PROCESSES
     listener: TaskOutcomeListener | None = None
@@ -2235,4 +2236,54 @@ async def test_full_subscriber_queue_drops_stream_chatter(
 
     assert accepted == 0
     assert queue.qsize() == SUBSCRIBER_QUEUE_SIZE  # nothing evicted for a delta
+    await manager.stop_all()
+
+
+class StuckRouter:
+    """MessageRouter stub hanging until released (a slow routing LLM call)."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def route(
+        self,
+        processes: tuple[ProcessInfo, ...],
+        message: str,
+        max_processes: int,
+    ) -> RouteDecision:
+        if processes:  # first message routes instantly (empty snapshot skips the LLM anyway)
+            self.entered.set()
+            await self.release.wait()
+        return RouteDecision()
+
+
+async def test_cancel_bypasses_an_actor_stuck_in_routing(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A stop must act now, not queue behind a routing LLM call (C2).
+
+    The actor is busy routing the second message (a call that may take up to
+    the router timeout); the user's cancel still stops the foreground
+    immediately because it never goes through the inbox.
+    """
+    tool = BlockingTool()
+    router = StuckRouter()
+    llm = ScriptedLLM([blocking_call()])
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit("second")  # the actor enters the stuck router call
+    await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
+
+    await runner.cancel()
+    events = await collect_until(queue, lambda e: isinstance(e.payload, Cancelled))
+
+    assert any(isinstance(e.payload, Cancelled) for e in events)
+    router.release.set()
     await manager.stop_all()

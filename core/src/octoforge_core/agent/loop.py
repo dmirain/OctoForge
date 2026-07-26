@@ -132,11 +132,24 @@ class _ToolRunTracker:
             else:
                 events.append(ToolCallCompleted(call=result.call, output=result.content))
 
-    async def wait(self) -> AsyncIterator[LoopEvent]:
-        """Yield completion events as the remaining runs finish."""
+    async def wait(
+        self, cancel_watch: asyncio.Task[None] | None = None
+    ) -> AsyncIterator[LoopEvent]:
+        """Yield completion events as the remaining runs finish.
+
+        With a `cancel_watch` the wait is interruptible: the run's cancel
+        returns immediately (results that already landed stay drained), so a
+        user's stop is not held hostage by a long tool call.
+        """
         pending = {task for task in self._tasks.values() if not task.done()}
         while pending:
-            _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            wait_set: set[asyncio.Task[None]] = set(pending)
+            if cancel_watch is not None:
+                wait_set.add(cancel_watch)
+            done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+            if cancel_watch is not None and cancel_watch in done:
+                return
+            pending -= done
             for event in self.drain():
                 yield event
         for event in self.drain():
@@ -239,7 +252,7 @@ class AgentLoop:
             if not outcome.message.tool_calls:
                 yield Finished(message=outcome.message, usage=outcome.usage)
                 return
-            async for event in self._stream_tool_calls(outcome.message, tracker, history):
+            async for event in self._stream_tool_calls(outcome.message, tracker, history, control):
                 yield event
         yield Failed(error=MAX_ITERATIONS_MESSAGE)
 
@@ -416,18 +429,28 @@ class AgentLoop:
         message: ChatMessage,
         tracker: _ToolRunTracker,
         history: list[ChatMessage],
+        control: LoopControl,
     ) -> AsyncIterator[LoopEvent]:
         """Finish the iteration's tool runs; history follows the call order.
 
         Streams without incremental tool-call events (mocks, batch providers)
-        fall back to spawning every call of the final message here.
+        fall back to spawning every call of the final message here. The wait
+        races the run's cancellation: a stop during a long tool call aborts
+        the remaining runs now (their replies read "cancelled"), and the next
+        iteration boundary turns the flag into the Cancelled terminal.
         """
         if not tracker.seen:
             for call in message.tool_calls:
                 tracker.spawn(call)
                 yield ToolCallRequested(call=call)
-        async for event in tracker.wait():
-            yield event
+        cancel_watch = asyncio.create_task(control.wait_cancelled())
+        try:
+            async for event in tracker.wait(cancel_watch):
+                yield event
+        finally:
+            cancel_watch.cancel()
+        if control.is_cancelled:
+            await tracker.abort()
         history.extend(tracker.tool_messages(message.tool_calls))
 
 
