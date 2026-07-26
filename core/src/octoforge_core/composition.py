@@ -43,7 +43,7 @@ from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.memory.tools import MemoryDeleteTool, MemoryStoreTool
-from octoforge_core.net.external import ExternalCallAuth, ExternalCallExecutor
+from octoforge_core.net.external import CallCredentials, ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool, HttpRequestTool
 from octoforge_core.ports import LLMClient
@@ -132,14 +132,14 @@ def build_external_executor(
     service: InstructionService,
     http_client: httpx.AsyncClient,
     guard: SsrfGuard,
-    auth_whitelist: tuple[ExternalCallAuth, ...] = (),
+    credentials: CallCredentials | None = None,
 ) -> ExternalCallExecutor:
     """Build the executor of external calls described by tool records."""
     return ExternalCallExecutor(
         service=service,
         http_client=http_client,
         guard=guard,
-        auth_whitelist=auth_whitelist,
+        credentials=credentials,
     )
 
 

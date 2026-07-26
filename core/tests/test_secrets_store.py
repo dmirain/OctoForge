@@ -131,6 +131,10 @@ async def test_validation(store: SqlAlchemySecretStore) -> None:
         await store.put(USER_A, CODE, "", HOST)
     with pytest.raises(InvalidSecretError):
         await store.put(USER_A, CODE, VALUE, "https://host/with/path")
+    with pytest.raises(InvalidSecretError):  # header injection guard
+        await store.put(USER_A, CODE, "tok\r\nX-Evil: 1", HOST)
+    with pytest.raises(InvalidSecretError):  # non-ASCII cannot travel in a header
+        await store.put(USER_A, CODE, "секрет", HOST)
     # normalization: case and trailing dot fold away
     await store.put(USER_A, "  GMAIL_TOKEN ".strip().lower(), VALUE, "Gmail.googleapis.com.")
     assert (await store.list(USER_A))[0].allowed_host == HOST

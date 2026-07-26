@@ -48,6 +48,12 @@ class SqlAlchemySecretStore:
         host = normalize_host(allowed_host)
         if not value or len(value) > MAX_VALUE_CHARS:
             raise InvalidSecretError(f"secret value must be 1..{MAX_VALUE_CHARS} characters")
+        if not _is_header_safe(value):
+            # the value travels as an HTTP header: control characters would be
+            # a header-injection vector, non-ASCII is unencodable there anyway
+            raise InvalidSecretError(
+                "secret value must be printable ASCII (it is sent as an HTTP header)"
+            )
         ciphertext = self._fernet.encrypt(value.encode()).decode()
         async with self._session_factory() as session:
             row = await _find_row(session, user_id, code)
@@ -116,6 +122,10 @@ class SqlAlchemySecretStore:
             row.last_used_at = utc_now()
             await session.commit()
             return value
+
+
+def _is_header_safe(value: str) -> bool:
+    return all(" " <= char <= "~" for char in value)
 
 
 async def _find_row(session: AsyncSession, user_id: str, code: str) -> SecretRow | None:

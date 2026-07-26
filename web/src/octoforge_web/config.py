@@ -120,6 +120,18 @@ class Settings(BaseSettings):
     # than serving an unauthenticated console (fail closed).
     admin_username: str = DEFAULT_ADMIN_USERNAME
     admin_password_hash: str = ""
+    # Master key of the per-user secret store (Fernet, urlsafe base64; generate
+    # with `python -c "from cryptography.fernet import Fernet;
+    # print(Fernet.generate_key().decode())"`). Empty disables the feature:
+    # endpoints declaring auth.secret then answer with a clear error.
+    secrets_key: str = ""
+    # Public base URL of this installation (the /secrets one-time links are
+    # built against it); defaults to the loopback self_base_url for dev.
+    public_base_url: str = ""
+
+    def resolved_public_base_url(self) -> str:
+        """Base URL for user-facing links: configured public one or self."""
+        return (self.public_base_url or self.self_base_url).rstrip("/")
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

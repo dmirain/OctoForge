@@ -61,10 +61,12 @@ from octoforge_core.llm.errors import LLMError
 from octoforge_core.llm.http_reranker import HttpRerankerClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient
-from octoforge_core.net.external import ExternalCallAuth
+from octoforge_core.net.external import CallCredentials, ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.serper import SerperSearchProvider
+from octoforge_core.secrets.api import SecretStore
+from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.tasks.store import TaskStore
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -118,6 +120,7 @@ class Runtime:
     task_store: TaskStore
     instructions: InstructionService
     admin_read_model: AdminReadModel
+    secret_store: SecretStore | None
 
 
 @asynccontextmanager
@@ -136,6 +139,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     messages = MessageRepository(session_factory)
     task_store = SqlAlchemyTaskStore(session_factory)
     cron_store = SqlAlchemyCronStore(session_factory)
+    secret_store = _build_secret_store(settings, session_factory)
     invites = await _build_invite_store(settings)
     try:
         async with (
@@ -173,7 +177,10 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         service=instructions,
                         http_client=outbound_http,
                         guard=guard,
-                        auth_whitelist=_external_call_whitelist(settings),
+                        credentials=CallCredentials(
+                            auth_whitelist=_external_call_whitelist(settings),
+                            secrets=secret_store,
+                        ),
                     ),
                     search_provider=_build_search_provider(settings, outbound_http),
                 ),
@@ -257,6 +264,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     task_store=task_store,
                     instructions=instructions,
                     admin_read_model=SqlAlchemyAdminStore(session_factory),
+                    secret_store=secret_store,
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, telegram)
@@ -296,6 +304,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.task_store = rt.task_store
             app.state.instructions = rt.instructions
             app.state.admin_read_model = rt.admin_read_model
+            app.state.secret_store = rt.secret_store
             yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)
@@ -404,6 +413,20 @@ def _system_registry(settings: Settings) -> tuple[SystemSkill, ...]:
         return registry
     logger.info("system skills overlay applied: %d patch(es) from %s", len(patches), path)
     return apply_overlay(registry, patches)
+
+
+def _build_secret_store(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> SecretStore | None:
+    """Build the encrypted secret store when OF_SECRETS_KEY is configured.
+
+    A malformed key raises at startup: silently starting without secrets
+    would surface much later as a confusing per-call failure.
+    """
+    if not settings.secrets_key:
+        return None
+    return SqlAlchemySecretStore(session_factory, settings.secrets_key)
 
 
 def _build_embedder(settings: Settings, http_client: httpx.AsyncClient) -> EmbeddingClient:

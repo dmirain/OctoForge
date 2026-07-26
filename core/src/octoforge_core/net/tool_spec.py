@@ -7,6 +7,20 @@ An endpoint record's `content` is a JSON document, e.g.:
      "params_schema": {"city": {"type": "string", "required": true}},
      "auth": "none"}
 
+`auth` may also be an object declaring a per-user secret the executor must
+inject as a header at request time:
+
+    "auth": {"secret": "gmail_token",
+             "header": "Authorization",
+             "format": "Bearer {value}"}
+
+The LLM only ever sees this declaration (the secret *code*); the value is
+resolved by the executor from the secret store and never enters any prompt.
+The substitution deliberately exists ONLY here, in the admin-authored record
+template — never in agent-supplied parameter values, which would hand a
+prompt-injected agent an exfiltration channel. Headers only: a query-string
+secret would leak into URLs, proxies and logs.
+
 Parsing lives on the execution side (core), not in the instructions module:
 the module only stores the document.
 """
@@ -21,6 +35,9 @@ from octoforge_core.net.errors import ToolSpecError
 ALLOWED_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 SUPPORTED_PARAM_TYPE = "string"
 DEFAULT_AUTH = "none"
+DEFAULT_SECRET_HEADER = "Authorization"
+DEFAULT_SECRET_FORMAT = "Bearer {value}"
+SECRET_VALUE_FIELD = "{value}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,17 +48,33 @@ class ToolParamSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class SecretAuth:
+    """Declaration of the per-user secret a call must carry.
+
+    Resolved by the executor at request time; the record (and therefore the
+    LLM) knows the code, never the value.
+    """
+
+    code: str
+    header: str = DEFAULT_SECRET_HEADER
+    format: str = DEFAULT_SECRET_FORMAT
+
+
+@dataclass(frozen=True, slots=True)
 class ToolSpec:
     """Executable view of an endpoint instruction record.
 
-    `auth` is informational only: internal authorization is injected by the
-    executor from the composition-root whitelist, never from the record.
+    A string `auth` is informational only (legacy records); `secret_auth`
+    is the executable declaration parsed from an object-valued `auth`.
+    Installation-level authorization still comes from the composition-root
+    whitelist, never from the record.
     """
 
     method: str
     url_template: str
     params: dict[str, ToolParamSpec] = field(default_factory=dict)
     auth: str = DEFAULT_AUTH
+    secret_auth: SecretAuth | None = None
 
 
 def parse_tool_spec(content: str) -> ToolSpec:
@@ -51,10 +84,31 @@ def parse_tool_spec(content: str) -> ToolSpec:
     url_template = _parse_url_template(data.get("url_template"))
     params = _parse_params_schema(data.get("params_schema"))
     _validate_template_fields(url_template, params)
-    auth = data.get("auth", DEFAULT_AUTH)
-    if not isinstance(auth, str):
-        raise ToolSpecError("auth must be a string")
-    return ToolSpec(method=method, url_template=url_template, params=params, auth=auth)
+    raw_auth = data.get("auth", DEFAULT_AUTH)
+    if isinstance(raw_auth, str):
+        return ToolSpec(method=method, url_template=url_template, params=params, auth=raw_auth)
+    if isinstance(raw_auth, dict):
+        return ToolSpec(
+            method=method,
+            url_template=url_template,
+            params=params,
+            auth="secret",
+            secret_auth=_parse_secret_auth(raw_auth),
+        )
+    raise ToolSpecError("auth must be a string or a secret declaration object")
+
+
+def _parse_secret_auth(raw: dict[str, object]) -> SecretAuth:
+    code = raw.get("secret")
+    if not isinstance(code, str) or not code.strip():
+        raise ToolSpecError("auth.secret must be a non-empty secret code")
+    header = raw.get("header", DEFAULT_SECRET_HEADER)
+    if not isinstance(header, str) or not header.strip():
+        raise ToolSpecError("auth.header must be a non-empty header name")
+    value_format = raw.get("format", DEFAULT_SECRET_FORMAT)
+    if not isinstance(value_format, str) or SECRET_VALUE_FIELD not in value_format:
+        raise ToolSpecError(f"auth.format must contain the {SECRET_VALUE_FIELD} placeholder")
+    return SecretAuth(code=code.strip(), header=header.strip(), format=value_format)
 
 
 def _load_json(content: str) -> dict[str, Any]:

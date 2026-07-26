@@ -7,7 +7,7 @@ composition-root auth whitelist, and performs the HTTP request.
 """
 
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -15,11 +15,25 @@ from octoforge_core.config import DEFAULT_TIMEOUT_SECONDS
 from octoforge_core.instructions.api import InstructionService, InstructionType
 from octoforge_core.net.errors import ExternalCallError
 from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
-from octoforge_core.net.tool_spec import ToolSpec, parse_tool_spec
+from octoforge_core.net.tool_spec import SecretAuth, ToolSpec, parse_tool_spec
+from octoforge_core.secrets.api import (
+    SecretHostMismatchError,
+    SecretNotFoundError,
+    SecretStore,
+)
 
 MAX_BODY_CHARS = 8000
 TRUNCATED_SUFFIX = "\n...[truncated]"
 USER_ID_PLACEHOLDER = "{user_id}"
+SECRET_SCRUBBED = "[secret]"
+SECRETS_DISABLED_MESSAGE = (
+    "this endpoint requires a per-user secret, but secrets are not configured "
+    "on this installation (OF_SECRETS_KEY is not set)"
+)
+SECRET_MISSING_TEMPLATE = (
+    "secret '{code}' is not set for this user: ask them to run /secrets in "
+    "Telegram (it opens a secure form) and add the secret, then retry"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +53,19 @@ class ExternalCallAuth:
 
 
 @dataclass(frozen=True, slots=True)
+class CallCredentials:
+    """Credential sources of the executor.
+
+    `auth_whitelist` — installation-level headers for allowlisted origins
+    (from the composition root's env). `secrets` — the per-user secret store
+    for endpoints declaring `auth.secret`; None disables the feature.
+    """
+
+    auth_whitelist: tuple[ExternalCallAuth, ...] = ()
+    secrets: SecretStore | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ExternalCallResult:
     """Outcome of an external call; error statuses are data, not exceptions."""
 
@@ -54,14 +81,16 @@ class ExternalCallExecutor:
         service: InstructionService,
         http_client: httpx.AsyncClient,
         guard: SsrfGuard,
-        auth_whitelist: tuple[ExternalCallAuth, ...] = (),
+        credentials: CallCredentials | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        resolved = credentials if credentials is not None else CallCredentials()
         self._service = service
         self._http = http_client
         self._guard = guard
-        self._auth_whitelist = auth_whitelist
+        self._auth_whitelist = resolved.auth_whitelist
         self._timeout = timeout_seconds
+        self._secrets = resolved.secrets
 
     async def execute(
         self,
@@ -90,6 +119,9 @@ class ExternalCallExecutor:
         url = _render_url(spec, validated)
         await self._guard.check(url)
         headers = self._auth_headers_for(url, user_id)
+        secret_value = await self._resolve_secret(spec.secret_auth, url, user_id)
+        if secret_value is not None and spec.secret_auth is not None:
+            headers[spec.secret_auth.header] = spec.secret_auth.format.format(value=secret_value)
         try:
             response = await self._http.request(
                 spec.method,
@@ -100,7 +132,35 @@ class ExternalCallExecutor:
             )
         except httpx.HTTPError as exc:
             raise ExternalCallError(f"external call failed: {exc}") from exc
-        return ExternalCallResult(status=response.status_code, body=_truncate(response.text))
+        body = _scrub(response.text, secret_value)
+        return ExternalCallResult(status=response.status_code, body=_truncate(body))
+
+    async def _resolve_secret(
+        self,
+        auth: SecretAuth | None,
+        url: str,
+        user_id: str | None,
+    ) -> str | None:
+        """Resolve the endpoint's declared secret for the target host.
+
+        The single moment a secret value exists outside the store: it goes
+        into one request header and is never logged, never returned to the
+        caller and scrubbed from the response body. Failures translate into
+        agent-readable guidance (the code, never the value).
+        """
+        if auth is None:
+            return None
+        if self._secrets is None:
+            raise ExternalCallError(SECRETS_DISABLED_MESSAGE)
+        if user_id is None:
+            raise ExternalCallError("this endpoint requires a per-user secret: no user in context")
+        host = (urlsplit(url).hostname or "").lower()
+        try:
+            return await self._secrets.resolve(user_id, auth.code, host)
+        except SecretNotFoundError:
+            raise ExternalCallError(SECRET_MISSING_TEMPLATE.format(code=auth.code)) from None
+        except SecretHostMismatchError as exc:
+            raise ExternalCallError(str(exc)) from None
 
     def _auth_headers_for(self, url: str, user_id: str | None) -> dict[str, str]:
         for entry in self._auth_whitelist:
@@ -132,6 +192,18 @@ def _validate_params(spec: ToolSpec, params: dict[str, str]) -> dict[str, str]:
 def _render_url(spec: ToolSpec, params: dict[str, str]) -> str:
     quoted = {name: quote(value, safe="") for name, value in params.items()}
     return spec.url_template.format(**quoted)
+
+
+def _scrub(body: str, secret_value: str | None) -> str:
+    """Remove echoes of the injected secret from the response body.
+
+    Some APIs reflect request headers (echo endpoints, error pages); the body
+    goes to the LLM and the archive, so any literal occurrence of the value
+    is replaced before anyone else sees it.
+    """
+    if not secret_value:
+        return body
+    return body.replace(secret_value, SECRET_SCRUBBED)
 
 
 def _truncate(body: str) -> str:

@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 
@@ -18,12 +19,18 @@ from octoforge_core.net.errors import ExternalCallError, SsrfBlockedError, ToolS
 from octoforge_core.net.external import (
     MAX_BODY_CHARS,
     TRUNCATED_SUFFIX,
+    CallCredentials,
     ExternalCallAuth,
     ExternalCallExecutor,
 )
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tool_spec import parse_tool_spec
 from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool
+from octoforge_core.secrets.api import (
+    SecretHostMismatchError,
+    SecretNotFoundError,
+    SecretStore,
+)
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -117,19 +124,33 @@ class FakeInstructionService:
         raise NotImplementedError
 
 
+@dataclass(frozen=True)
+class ExecutorOptions:
+    """Optional knobs of make_executor bundled to appease the arg-count limit."""
+
+    records: dict[str, str] | None = None
+    ips: tuple[str, ...] = (PUBLIC_IP,)
+    whitelist: tuple[ExternalCallAuth, ...] = ()
+    allowed_prefixes: tuple[str, ...] = ()
+    secrets: SecretStore | None = None
+
+
 def make_executor(
     handler: Callable[[httpx.Request], httpx.Response],
     records: dict[str, str] | None = None,
-    ips: tuple[str, ...] = (PUBLIC_IP,),
-    whitelist: tuple[ExternalCallAuth, ...] = (),
-    allowed_prefixes: tuple[str, ...] = (),
+    options: ExecutorOptions | None = None,
 ) -> ExternalCallExecutor:
+    resolved = options if options is not None else ExecutorOptions()
+    if records is not None:
+        resolved = replace(resolved, records=records)
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return ExternalCallExecutor(
-        service=FakeInstructionService(records or {TOOL_NAME: WEATHER_TOOL_CONTENT}),
+        service=FakeInstructionService(resolved.records or {TOOL_NAME: WEATHER_TOOL_CONTENT}),
         http_client=http_client,
-        guard=SsrfGuard(resolver=StubResolver(ips), allowed_prefixes=allowed_prefixes),
-        auth_whitelist=whitelist,
+        guard=SsrfGuard(
+            resolver=StubResolver(resolved.ips), allowed_prefixes=resolved.allowed_prefixes
+        ),
+        credentials=CallCredentials(auth_whitelist=resolved.whitelist, secrets=resolved.secrets),
     )
 
 
@@ -325,7 +346,7 @@ async def test_auth_header_added_only_for_whitelisted_prefix() -> None:
         ),
     )
     records = {TOOL_NAME: WEATHER_TOOL_CONTENT, INTERNAL_TOOL_NAME: INTERNAL_TOOL_CONTENT}
-    executor = make_executor(handler, records=records, whitelist=whitelist)
+    executor = make_executor(handler, records=records, options=ExecutorOptions(whitelist=whitelist))
 
     await executor.execute(INTERNAL_TOOL_NAME, {"service": "billing"})
     await executor.execute(TOOL_NAME, {"city": "London"})
@@ -342,7 +363,7 @@ async def test_ssrf_block_prevents_the_request() -> None:
         calls.append(request)
         return httpx.Response(HTTPStatus.OK)
 
-    executor = make_executor(handler, ips=(PRIVATE_IP,))
+    executor = make_executor(handler, options=ExecutorOptions(ips=(PRIVATE_IP,)))
 
     with pytest.raises(SsrfBlockedError):
         await executor.execute(TOOL_NAME, {"city": "London"})
@@ -411,15 +432,17 @@ def make_self_executor(
     return make_executor(
         handler,
         records={SELF_TOOL_NAME: SELF_TOOL_CONTENT},
-        ips=(LOOPBACK_IP,),  # would be blocked without the allowlisted prefix
-        whitelist=(
-            ExternalCallAuth(
-                base_url_prefix=SELF_BASE_URL,
-                header_name=USER_ID_HEADER,
-                header_value=header_value,
+        options=ExecutorOptions(
+            ips=(LOOPBACK_IP,),  # would be blocked without the allowlisted prefix
+            whitelist=(
+                ExternalCallAuth(
+                    base_url_prefix=SELF_BASE_URL,
+                    header_name=USER_ID_HEADER,
+                    header_value=header_value,
+                ),
             ),
+            allowed_prefixes=(SELF_BASE_URL,),
         ),
-        allowed_prefixes=(SELF_BASE_URL,),
     )
 
 
@@ -486,15 +509,17 @@ async def test_auth_header_is_not_sent_to_a_userinfo_spoofed_origin() -> None:
     executor = make_executor(
         handler,
         records={SPOOF_TOOL_NAME: SPOOF_TOOL_CONTENT},
-        ips=(PUBLIC_IP,),
-        whitelist=(
-            ExternalCallAuth(
-                base_url_prefix=SELF_BASE_URL,
-                header_name=USER_ID_HEADER,
-                header_value=USER_ID_TEMPLATE,
+        options=ExecutorOptions(
+            ips=(PUBLIC_IP,),
+            whitelist=(
+                ExternalCallAuth(
+                    base_url_prefix=SELF_BASE_URL,
+                    header_name=USER_ID_HEADER,
+                    header_value=USER_ID_TEMPLATE,
+                ),
             ),
+            allowed_prefixes=(SELF_BASE_URL,),
         ),
-        allowed_prefixes=(SELF_BASE_URL,),
     )
 
     result = await executor.execute(SPOOF_TOOL_NAME, {}, user_id=USER_A)
@@ -546,3 +571,156 @@ async def test_endpoint_get_rejects_invalid_arguments() -> None:
         await tool.execute({}, ENDPOINT_GET_CONTEXT)
     with pytest.raises(ToolArgumentsError):
         await tool.execute({"name": "  "}, ENDPOINT_GET_CONTEXT)
+
+
+# --- per-user secret injection ----------------------------------------------
+
+SECRET_TOOL_NAME = "mail_api"
+SECRET_CODE = "mail_token"
+SECRET_VALUE = "tok-very-secret-12345"
+SECRET_HOST = "api.mail.example.com"
+SECRET_TOOL_CONTENT = json.dumps(
+    {
+        "method": "GET",
+        "url_template": f"https://{SECRET_HOST}/v1/inbox",
+        "params_schema": {},
+        "auth": {"secret": SECRET_CODE, "header": "X-Api-Key", "format": "Key {value}"},
+    }
+)
+
+
+class FakeSecretStore:
+    """SecretStore stub with one scripted secret and recorded resolutions."""
+
+    def __init__(self, code: str = SECRET_CODE, host: str = SECRET_HOST) -> None:
+        self._code = code
+        self._host = host
+        self.resolutions: list[tuple[str, str, str]] = []
+
+    async def put(self, user_id: str, code: str, value: str, allowed_host: str) -> object:
+        raise NotImplementedError
+
+    async def list(self, user_id: str) -> list[object]:
+        raise NotImplementedError
+
+    async def delete(self, user_id: str, code: str) -> None:
+        raise NotImplementedError
+
+    async def resolve(self, user_id: str, code: str, host: str) -> str:
+        self.resolutions.append((user_id, code, host))
+        if code != self._code:
+            raise SecretNotFoundError(code)
+        if host != self._host:
+            raise SecretHostMismatchError(f"secret '{code}' is bound to '{self._host}'")
+        return SECRET_VALUE
+
+
+async def test_secret_is_injected_as_the_declared_header() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="{}")
+
+    store = FakeSecretStore()
+    executor = make_executor(
+        handler,
+        records={SECRET_TOOL_NAME: SECRET_TOOL_CONTENT},
+        options=ExecutorOptions(secrets=store),
+    )
+
+    await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+
+    assert captured[0].headers["X-Api-Key"] == f"Key {SECRET_VALUE}"
+    assert store.resolutions == [("user-test", SECRET_CODE, SECRET_HOST)]
+
+
+async def test_secret_echo_is_scrubbed_from_the_response() -> None:
+    """Echo endpoints reflect request headers; the LLM must never see the value."""
+    executor = make_executor(
+        lambda request: httpx.Response(
+            HTTPStatus.OK, text=f'{{"headers": {{"X-Api-Key": "Key {SECRET_VALUE}"}}}}'
+        ),
+        records={SECRET_TOOL_NAME: SECRET_TOOL_CONTENT},
+        options=ExecutorOptions(secrets=FakeSecretStore()),
+    )
+
+    result = await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+
+    assert SECRET_VALUE not in result.body
+    assert "[secret]" in result.body
+
+
+async def test_missing_secret_guides_the_agent() -> None:
+    executor = make_executor(
+        ok_handler(),
+        records={SECRET_TOOL_NAME: SECRET_TOOL_CONTENT},
+        options=ExecutorOptions(secrets=FakeSecretStore(code="other_code")),
+    )
+
+    with pytest.raises(ExternalCallError, match="/secrets"):
+        await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+
+
+async def test_secrets_disabled_is_a_clear_error() -> None:
+    executor = make_executor(ok_handler(), records={SECRET_TOOL_NAME: SECRET_TOOL_CONTENT})
+
+    with pytest.raises(ExternalCallError, match="not configured"):
+        await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+
+
+async def test_host_mismatch_error_reaches_the_agent_without_the_value() -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://another.example.com/v1",
+            "params_schema": {},
+            "auth": {"secret": SECRET_CODE},
+        }
+    )
+    executor = make_executor(
+        ok_handler(),
+        records={"other_api": content},
+        options=ExecutorOptions(secrets=FakeSecretStore()),
+    )
+
+    with pytest.raises(ExternalCallError, match="bound to") as denied:
+        await executor.execute("other_api", {}, user_id="user-test")
+
+    assert SECRET_VALUE not in str(denied.value)
+
+
+def test_tool_spec_parses_secret_auth_with_defaults() -> None:
+    spec = parse_tool_spec(
+        json.dumps(
+            {
+                "method": "GET",
+                "url_template": "https://api.example.com/x",
+                "auth": {"secret": "mail_token"},
+            }
+        )
+    )
+
+    assert spec.secret_auth is not None
+    assert spec.secret_auth.code == "mail_token"
+    assert spec.secret_auth.header == "Authorization"
+    assert spec.secret_auth.format == "Bearer {value}"
+    assert spec.auth == "secret"
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {"secret": ""},
+        {"secret": "x", "header": ""},
+        {"secret": "x", "format": "no placeholder"},
+        42,
+    ],
+)
+def test_tool_spec_rejects_malformed_secret_auth(auth: object) -> None:
+    content = json.dumps(
+        {"method": "GET", "url_template": "https://api.example.com/x", "auth": auth}
+    )
+
+    with pytest.raises(ToolSpecError):
+        parse_tool_spec(content)
