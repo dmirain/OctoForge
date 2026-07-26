@@ -13,6 +13,7 @@ private ones; new records are always private to their author, and only the
 admin-facing `publish` makes a record public.
 """
 
+import asyncio
 import logging
 
 from octoforge_core.instructions.api import (
@@ -123,7 +124,9 @@ class LocalInstructionService:
             candidates = [
                 candidate for candidate in candidates if candidate.instruction.type not in exclude
             ]
-        shortlist = rank(candidates, query, query_embedding, fetch)
+        # off the event loop: brute-force scoring is CPU work that grows with
+        # the table and must not stall every other dialog in the process
+        shortlist = await asyncio.to_thread(rank, candidates, query, query_embedding, fetch)
         hits = await self._apply_reranker(query, shortlist, len(shortlist) if mixed else k)
         if mixed:
             hits = _cap_types(hits, k)

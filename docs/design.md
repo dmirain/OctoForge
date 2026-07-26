@@ -677,7 +677,15 @@ DTO `SearchResponse`/`SearchResult`, ошибка `SearchError`), а не от �
   `title + "\n" + content` через порт `EmbeddingClient` (два бэкенда: OpenAI-совместимый
   `llm/embeddings.py` и локальный sentence-transformers `llm/local_embeddings.py`; выбор —
   `OF_EMBEDDING_BACKEND`), ранжирование — brute-force cosine + буст точного `title`
-  (`ranking.py`, чистые функции; полная формула 70/30 + MMR — позже подменой модуля) +
+  (`ranking.py`, чистые функции; полная формула 70/30 + MMR — позже подменой модуля).
+  Скоринг векторизован numpy и вынесен с event loop (аудит 2026-07-26): чистопитоновский
+  косинус замораживал весь процесс на ~850 мс при 10k записей на каждый `recall`;
+  теперь — матричное произведение в `asyncio.to_thread`, причём конвертация
+  кортежи→массив чанкована (один сплошной `np.asarray` держит GIL и столл возвращался
+  даже из потока) — замер после: максимальный разрыв event loop 19 мс при 10k. Записи с
+  пустым/чужим по размерности вектором получают score 0, а не ошибку (отложенные
+  эмбеддинги, смена модели). Маппинг строк стора в DTO тоже уведён в `to_thread`.
+  Дальше по масштабу — pgvector (порт `InstructionVectorSearch` готов). Плюс
   опциональный реранк шортлиста кросс-энкодером (`OF_RERANKER_MODEL`; двухстадийная схема
   как в b2e: cosine-шортлист `rerank_candidates` → cross-encoder → top-k). Бэкенд реранка
   выбирается в composition root: с `OF_RERANKER_API_KEY` — HTTP-клиент

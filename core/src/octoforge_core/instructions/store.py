@@ -7,6 +7,7 @@ vector-search capability (`InstructionVectorSearch`) is deliberately not
 implemented — this store ranks brute-force in the process.
 """
 
+import asyncio
 import uuid
 from typing import Any, cast
 
@@ -109,13 +110,17 @@ class SqlAlchemyInstructionStore:
                     InstructionRow.owner_id.is_(None) | (InstructionRow.owner_id == user_id)
                 )
             rows = (await session.scalars(statement)).all()
-            return [
+        # off the event loop: mapping N rows of 1024-float embeddings into DTOs
+        # is pure-Python CPU work that grows with the table
+        return await asyncio.to_thread(
+            lambda: [
                 EmbeddedInstruction(
                     instruction=_to_instruction(row),
                     embedding=tuple(row.embedding),
                 )
                 for row in rows
             ]
+        )
 
     async def list_system(self) -> list[Instruction]:
         """Return every system (registry-owned) record, oldest first."""
