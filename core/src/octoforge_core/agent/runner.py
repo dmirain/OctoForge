@@ -73,6 +73,7 @@ CRON_LIMIT_NOTICE_TEMPLATE = (
     "Active processes: {titles}."
 )
 SPAWNED_TEMPLATE = "task {task_id} spawned"
+SUBMIT_FAILED_ERROR = "your message could not be saved — please send it again"
 RESTART_LIMIT_ERROR = "could not resume after the service restart: process limit reached"
 DEFAULT_TASK_ERROR = "unknown error"
 BACKGROUND_TASK_PROMPT = (
@@ -529,14 +530,24 @@ class ConversationRunner:
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
         if not command.recorded:
-            if await self._is_duplicate(command.client_message_id):
-                logger.info(
-                    "duplicate submit skipped: dialog=%s key=%s",
-                    self._dialog.id,
-                    command.client_message_id,
+            try:
+                if await self._is_duplicate(command.client_message_id):
+                    logger.info(
+                        "duplicate submit skipped: dialog=%s key=%s",
+                        self._dialog.id,
+                        command.client_message_id,
+                    )
+                    return
+                message_id = await self._persist(
+                    message, client_message_id=command.client_message_id
                 )
+            except Exception:
+                # a store failure here silently swallowed the user's message
+                # (the actor's catch only logged it): tell the transport, so
+                # the user knows to resend instead of waiting for an answer
+                logger.exception("submit persist failed: dialog=%s", self._dialog.id)
+                self._broadcast(Failed(error=SUBMIT_FAILED_ERROR))
                 return
-            message_id = await self._persist(message, client_message_id=command.client_message_id)
             # the routed/narrative copy carries its row id: an answer task
             # created from this message links back via source_message_id, and
             # coverage tracking keys on it

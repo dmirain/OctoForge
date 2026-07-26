@@ -31,6 +31,7 @@ from octoforge_core.agent.router import (
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
     RESTART_LIMIT_ERROR,
+    SUBMIT_FAILED_ERROR,
     SUBSCRIBER_QUEUE_SIZE,
     ConversationEvent,
     ConversationManager,
@@ -2455,4 +2456,40 @@ async def test_trim_narrative_remaps_watermarks_and_prunes_coverage(
     assert first_message.id not in runner._covered_ids
 
     tool.release.set()
+    await manager.stop_all()
+
+
+class FailingAppendRepository(MessageRepository):
+    """MessageRepository whose append always fails (a broken store)."""
+
+    async def append(
+        self,
+        dialog_id: str,
+        message: ChatMessage,
+        usage: Usage | None = None,
+        client_message_id: str | None = None,
+    ) -> str:
+        raise RuntimeError("store down")
+
+
+async def test_failed_submit_persist_reports_to_the_transport(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A store failure must not swallow the user's message silently.
+
+    Previously the actor's catch only logged it: the user watched an answer
+    that would never come. Now the transport receives a Failed event telling
+    them to resend.
+    """
+    manager = make_manager(ScriptedLLM([reply()]), quick_registry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    runner._messages = FailingAppendRepository(session_factory)  # noqa: SLF001
+    queue = runner.subscribe()
+
+    await runner.submit("hello?")
+    events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
+
+    failed = next(e.payload for e in events if isinstance(e.payload, Failed))
+    assert failed.error == SUBMIT_FAILED_ERROR
+    assert runner.history() == []  # nothing was recorded, nothing routed
     await manager.stop_all()
