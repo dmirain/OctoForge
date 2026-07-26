@@ -1104,29 +1104,55 @@ class ConversationManager:
         self._messages = messages
         self._tasks = tasks
         self._runners: dict[str, ConversationRunner] = {}
+        # (user_id, channel) -> the build task, memoized: concurrent callers
+        # await one build, later callers get the finished runner from it
+        self._builds: dict[tuple[str, str], asyncio.Task[ConversationRunner]] = {}
         self._lock = asyncio.Lock()
 
     async def get_or_create_runner(self, user_id: str, channel: str) -> ConversationRunner:
         """Return the live runner for (user_id, channel); the dialog is created on first contact.
 
         The runner narrative is rebuilt from the persisted messages, so a dialog
-        survives process restarts (in-flight processes do not).
+        survives process restarts (in-flight processes do not). The lock only
+        guards the build map: initialization does DB work (the dialog row, the
+        history load), and holding one global lock across it serialized every
+        dialog in the process behind the slowest first contact (2026-07-26
+        audit) — now only callers of the *same* dialog share a build.
         """
+        key = (user_id, channel)
         async with self._lock:
-            dialog = await self._dialogs.get_or_create(user_id, channel)
-            runner = self._runners.get(dialog.id)
-            if runner is None:
-                history = await self._messages.list(dialog.id)
-                runner = ConversationRunner(
-                    dialog=dialog,
-                    config=self._config,
-                    messages=self._messages,
-                    tasks=self._tasks,
-                    history=history,
-                )
-                runner.start()
-                self._runners[dialog.id] = runner
-            return runner
+            build = self._builds.get(key)
+            if build is None:
+                build = asyncio.create_task(self._build_runner(user_id, channel))
+                self._builds[key] = build
+        try:
+            return await asyncio.shield(build)
+        except BaseException:
+            # drop the memo only when the BUILD itself died — a caller
+            # cancelled mid-await (shield keeps the build running) must not
+            # evict a build that other callers are about to share
+            if build.done() and (build.cancelled() or build.exception() is not None):
+                async with self._lock:
+                    if self._builds.get(key) is build:
+                        del self._builds[key]
+            raise
+
+    async def _build_runner(self, user_id: str, channel: str) -> ConversationRunner:
+        dialog = await self._dialogs.get_or_create(user_id, channel)
+        history = await self._messages.list(dialog.id)
+        # no awaits past this point: the runner is registered in the same
+        # event-loop step it starts in, so a cancelled build cannot leak a
+        # started actor
+        runner = ConversationRunner(
+            dialog=dialog,
+            config=self._config,
+            messages=self._messages,
+            tasks=self._tasks,
+            history=history,
+        )
+        runner.start()
+        self._runners[dialog.id] = runner
+        return runner
 
     async def wake(
         self,
@@ -1195,8 +1221,15 @@ class ConversationManager:
     async def stop_all(self) -> None:
         """Stop and deregister every live runner (the app is shutting down)."""
         async with self._lock:
+            builds = tuple(self._builds.values())
+            self._builds.clear()
             runners = tuple(self._runners.values())
             self._runners.clear()
+        for build in builds:
+            if not build.done():
+                build.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await build
         for runner in runners:
             try:
                 await runner.stop()

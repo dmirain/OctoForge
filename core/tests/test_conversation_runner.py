@@ -2287,3 +2287,66 @@ async def test_cancel_bypasses_an_actor_stuck_in_routing(
     assert any(isinstance(e.payload, Cancelled) for e in events)
     router.release.set()
     await manager.stop_all()
+
+
+# --- per-dialog runner initialization (S2) -----------------------------------
+
+
+class SlowHistoryRepository(MessageRepository):
+    """MessageRepository whose history load blocks until released."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        super().__init__(session_factory)
+        self.release = asyncio.Event()
+        self.loads = 0
+
+    async def list(self, dialog_id: str) -> list[ChatMessage]:
+        self.loads += 1
+        if self.loads == 1:  # only the FIRST contact is slow
+            await self.release.wait()
+        return await super().list(dialog_id)
+
+
+async def test_one_dialogs_slow_init_does_not_block_another(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The manager lock guards the build map only, not the DB work (S2).
+
+    Previously one global lock was held across the dialog row and the full
+    history load: the slowest first contact serialized every dialog in the
+    process.
+    """
+    slow = SlowHistoryRepository(session_factory)
+    manager = make_manager(ScriptedLLM([reply()]), quick_registry(), session_factory)
+    manager._messages = slow
+
+    first = asyncio.create_task(manager.get_or_create_runner(USER_ID, CHANNEL))
+    await wait_for_condition(lambda: slow.loads == 1)  # first build is stuck loading
+
+    # a different dialog must come up while the first is still loading
+    other = await asyncio.wait_for(
+        manager.get_or_create_runner("user-2", CHANNEL), timeout=TIMEOUT_SECONDS
+    )
+    assert other.dialog_id != ""
+
+    slow.release.set()
+    runner = await asyncio.wait_for(first, timeout=TIMEOUT_SECONDS)
+    assert runner is not other
+    await manager.stop_all()
+
+
+async def test_concurrent_first_contacts_share_one_build(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    slow = SlowHistoryRepository(session_factory)
+    slow.release.set()
+    manager = make_manager(ScriptedLLM([reply()]), quick_registry(), session_factory)
+    manager._messages = slow
+
+    runners = await asyncio.gather(
+        *(manager.get_or_create_runner(USER_ID, CHANNEL) for _ in range(5))
+    )
+
+    assert len({id(runner) for runner in runners}) == 1
+    assert slow.loads == 1  # one build, not five (the first load runs unreleased)
+    await manager.stop_all()
