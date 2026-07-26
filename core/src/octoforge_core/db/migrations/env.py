@@ -23,6 +23,7 @@ import octoforge_core.cron.models  # noqa: E402,F401
 import octoforge_core.datasets.models  # noqa: E402,F401
 import octoforge_core.db.models  # noqa: E402,F401
 import octoforge_core.instructions.models  # noqa: E402,F401
+import octoforge_core.secrets.models  # noqa: E402,F401
 
 config = context.config
 if config.config_file_name is not None:

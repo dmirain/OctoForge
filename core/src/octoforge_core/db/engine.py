@@ -19,7 +19,8 @@ import octoforge_core.context.models
 import octoforge_core.cron.models
 import octoforge_core.datasets.models
 import octoforge_core.db.models
-import octoforge_core.instructions.models  # noqa: F401
+import octoforge_core.instructions.models
+import octoforge_core.secrets.models  # noqa: F401
 from octoforge_core.db.base import Base
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
