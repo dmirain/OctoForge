@@ -40,7 +40,11 @@ WWW_AUTHENTICATE = {"WWW-Authenticate": 'Basic realm="OctoForge"'}
 BASIC_PREFIX = "basic "
 UNAUTHORIZED_MESSAGE = "authentication required"
 MISCONFIGURED_MESSAGE = "admin credentials are not configured"
-OPEN_PATHS = frozenset({"/health", "/health/ready"})
+OPEN_PATHS = frozenset({"/health", "/health/ready", "/secrets.html"})
+# The self-service secrets surface authenticates with its own one-time token
+# (see api/secrets.py): dialog users have no operator credential, so these
+# endpoints must be reachable without Basic auth.
+OPEN_PREFIXES = ("/api/secrets/",)
 
 
 def hash_password(password: str, *, iterations: int = HASH_ITERATIONS) -> str:
@@ -74,8 +78,11 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def is_open_path(path: str) -> bool:
-    """Whether the path is served without a credential (health probes only)."""
-    return path in OPEN_PATHS
+    """Whether the path is served without the operator credential.
+
+    Health probes plus the token-authenticated self-service secrets surface.
+    """
+    return path in OPEN_PATHS or path.startswith(OPEN_PREFIXES)
 
 
 def check_basic_auth(request: Request, username: str, password_hash: str) -> None:

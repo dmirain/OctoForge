@@ -75,9 +75,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from octoforge_web.api.admin import router as admin_router
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
+from octoforge_web.api.secrets import router as secrets_router
 from octoforge_web.auth import check_basic_auth, is_open_path
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
+from octoforge_web.secret_links import SecretLinkService
 from octoforge_web.skill_overlay import apply_overlay, load_overlay
 from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
 from octoforge_web.telegram.admin import AdminAccess, AdminManageTool, AdminStores
@@ -121,6 +123,7 @@ class Runtime:
     instructions: InstructionService
     admin_read_model: AdminReadModel
     secret_store: SecretStore | None
+    secret_links: SecretLinkService
 
 
 @asynccontextmanager
@@ -140,6 +143,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     task_store = SqlAlchemyTaskStore(session_factory)
     cron_store = SqlAlchemyCronStore(session_factory)
     secret_store = _build_secret_store(settings, session_factory)
+    secret_links = SecretLinkService()
     invites = await _build_invite_store(settings)
     try:
         async with (
@@ -265,6 +269,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     instructions=instructions,
                     admin_read_model=SqlAlchemyAdminStore(session_factory),
                     secret_store=secret_store,
+                    secret_links=secret_links,
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, telegram)
@@ -305,6 +310,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.instructions = rt.instructions
             app.state.admin_read_model = rt.admin_read_model
             app.state.secret_store = rt.secret_store
+            app.state.secret_links = rt.secret_links
             yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)
@@ -353,6 +359,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(dialog_router)
     app.include_router(cron_router)
     app.include_router(admin_router)
+    app.include_router(secrets_router)
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
 

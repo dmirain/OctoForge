@@ -8,10 +8,12 @@ from octoforge_core import ConversationManager
 from octoforge_core.admin.api import AdminReadModel
 from octoforge_core.cron.api import CronStore
 from octoforge_core.instructions.api import InstructionService
+from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
 
 from octoforge_web.auth import check_basic_auth
 from octoforge_web.config import Settings
+from octoforge_web.secret_links import SecretLinkService
 
 MISSING_USER_ID_MESSAGE = "X-User-Id header is required"
 
@@ -49,6 +51,16 @@ def get_admin_read_model(request: Request) -> AdminReadModel:
 def get_channel(request: Request) -> str:
     """Return the surface channel declared by the composition root."""
     return cast(str, request.app.state.channel)
+
+
+def get_secret_store(request: Request) -> SecretStore | None:
+    """Return the secret store built at startup (None: feature disabled)."""
+    return cast("SecretStore | None", request.app.state.secret_store)
+
+
+def get_secret_links(request: Request) -> "SecretLinkService":
+    """Return the one-time link service shared with the Telegram surface."""
+    return cast("SecretLinkService", request.app.state.secret_links)
 
 
 def require_admin(request: Request) -> None:
