@@ -108,14 +108,19 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
             )
             return int(count or 0)
 
-    async def tail_after(self, dialog_id: str, seq: int) -> list[ArchivedMessage]:
+    async def tail_after(
+        self, dialog_id: str, seq: int, limit: int | None = None
+    ) -> list[ArchivedMessage]:
         """Return the dialog messages with `seq >` the given one, ordered by seq."""
         async with self._session_factory() as session:
-            result = await session.scalars(
+            statement = (
                 select(MessageRow)
                 .where(MessageRow.dialog_id == dialog_id, MessageRow.seq > seq)
                 .order_by(MessageRow.seq)
             )
+            if limit is not None:
+                statement = statement.limit(limit)
+            result = await session.scalars(statement)
             return [_to_archived(row) for row in result.all()]
 
     async def latest_prompt_tokens(self, dialog_id: str, after_seq: int) -> int | None:

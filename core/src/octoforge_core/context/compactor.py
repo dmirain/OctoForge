@@ -49,6 +49,14 @@ TOPICS_BLOCK_HEADER = (
 )
 TOPIC_ENTRY_TEMPLATE = "[seq {seq_from}-{seq_to}] (topics: {topics}) {content}"
 NO_TOPICS = "-"
+# One compaction run consumes at most compact_target_chars from the head of
+# the tail, so reading more rows than could ever fill a segment is waste — and
+# on a long-uncompacted dialog (compaction disabled or broken for a while) an
+# unbounded read would pull the entire backlog into memory and spend the
+# event loop converting it. Generous vs a normal segment (~tens of messages);
+# with a partial window the keep-last rule doubles as the pair-split guard at
+# the window edge, and the next run continues from the advanced boundary.
+SEGMENT_FETCH_LIMIT = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,7 +207,7 @@ class LlmContextCompactor(ContextCompactor):
 
     async def _compact(self, dialog: Dialog) -> None:
         max_seq_to = await self._store.max_seq_to(dialog.id)
-        tail = await self._archive.tail_after(dialog.id, max_seq_to)
+        tail = await self._archive.tail_after(dialog.id, max_seq_to, limit=SEGMENT_FETCH_LIMIT)
         segment = select_compact_segment(tail, self._config.compact_target_chars)
         if not segment:
             return

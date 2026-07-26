@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.context.api import INTERRUPTED_NOTE, ArchivedMessage, DialogueSummary
 from octoforge_core.context.compactor import (
+    SEGMENT_FETCH_LIMIT,
     CompactorConfig,
     LlmContextCompactor,
     NoopContextCompactor,
@@ -786,3 +787,49 @@ async def test_start_compact_is_the_single_concurrency_guard(
 
     assert second is first  # the second caller joined the running compaction
     assert llm.calls == 1
+
+
+async def test_tail_after_respects_the_limit(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog = await make_dialog(session_factory)
+    await append_history(session_factory, dialog.id, ["one", "two", "three"])
+
+    limited = await store.tail_after(dialog.id, 0, limit=2)
+    unlimited = await store.tail_after(dialog.id, 0)
+
+    assert [m.content for m in limited] == ["one", "two"]  # the OLDEST head, in seq order
+    assert len(unlimited) == THREE_MESSAGES
+
+
+async def test_compaction_reads_a_bounded_window_of_the_backlog(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A long-uncompacted dialog must not be pulled into memory whole.
+
+    One run consumes at most compact_target_chars from the head of the tail,
+    so the archive read is capped at SEGMENT_FETCH_LIMIT rows; the next runs
+    continue from the advanced boundary.
+    """
+    dialog = await make_dialog(session_factory)
+    await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
+    fetch_limits: list[int | None] = []
+
+    class RecordingArchive(SqlAlchemySummaryStore):
+        async def tail_after(
+            self, dialog_id: str, seq: int, limit: int | None = None
+        ) -> list[ArchivedMessage]:
+            fetch_limits.append(limit)
+            return await super().tail_after(dialog_id, seq, limit)
+
+    compactor = LlmContextCompactor(
+        store=store,
+        archive=RecordingArchive(session_factory),
+        llm=SummarizingLLM([SUMMARY_REPLY]),
+        config=CompactorConfig(hot_max_chars=20, compact_target_chars=25),
+    )
+
+    assert await compactor.compact_now(dialog) is True
+    assert fetch_limits == [SEGMENT_FETCH_LIMIT]

@@ -160,8 +160,16 @@ class MessageArchive(Protocol):
         """Return how many messages the dialog has with `seq >` the given one."""
         ...
 
-    async def tail_after(self, dialog_id: str, seq: int) -> list[ArchivedMessage]:
-        """Return the dialog messages with `seq >` the given one, ordered by seq."""
+    async def tail_after(
+        self, dialog_id: str, seq: int, limit: int | None = None
+    ) -> list[ArchivedMessage]:
+        """Return the dialog messages with `seq >` the given one, ordered by seq.
+
+        `limit` caps the read to the oldest N of them: the compactor only
+        consumes the head of the tail (one segment per run), so an unbounded
+        read of a long-uncompacted dialog would load the whole backlog for
+        nothing.
+        """
         ...
 
     async def latest_prompt_tokens(self, dialog_id: str, after_seq: int) -> int | None:
