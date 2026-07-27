@@ -12,8 +12,9 @@ Most agent frameworks bake tools and prompts straight into source code: every ne
 
 ## Why
 
-- 🧠 **The agent grows itself.** Knowledge, skills, HTTP tool descriptors, user datasets, and memories are just rows in SQLite (async SQLAlchemy), ranked by embedding similarity plus an optional cross-encoder rerank. The agent saves new instructions on its own — ship it once, let it accumulate capability over time.
+- 🧠 **The agent grows itself.** Knowledge, skills, HTTP tool descriptors, user datasets, and memories are just rows in the database (async SQLAlchemy — Postgres in production, SQLite for tests and embedding), found by one ranked embedding search (`recall`) plus an optional cross-encoder rerank. The agent saves new instructions on its own — ship it once, let it accumulate capability over time. System skills can even be re-branded per deployment from a JSON overlay file, no code changes.
 - 🔀 **Long jobs don't block the conversation.** Every dialog is an actor with its own foreground/background processes. Work can be pushed to the background with a notification on completion, an LLM router classifies each incoming message (inject into the running process / start a new one / cancel), and a built-in cron scheduler wakes dialogs on a schedule — using the exact same task machinery.
+- 🔐 **Secrets never reach the LLM.** API keys live in an encrypted store (Fernet), added through a one-time web link (`/secrets` in Telegram) — never through the chat. The agent references a secret by code; a deterministic substitution injects the value into the outgoing HTTP call only, bound to one host, and scrubs it from anything flowing back into the context or logs.
 - 🐙 **One core, many surfaces.** A web chat UI and a Telegram bot run on the same conversation engine. The core (`octoforge-core`) never imports FastAPI — it's a plain, typed Python library you can embed anywhere.
 
 ## How it works
@@ -27,7 +28,7 @@ flowchart TB
     WEB --> CM
     TG --> CM
     CM["ConversationManager\none runner per (user_id, channel)"] --> CR
-    CR["ConversationRunner\ndialog actor: narrative (persisted in SQLite)\n+ processes (fg/bg, in memory)"] --> AL
+    CR["ConversationRunner\ndialog actor: narrative (persisted in the DB)\n+ processes (fg/bg, in memory)"] --> AL
     AL["AgentLoop.stream()\ntokens · tool calls · final · cancellation"] --> LLM["LLM client"]
     AL --> TOOLS["ToolRegistry"]
     TOOLS --> DB[("instructions · datasets\nmemory · cron · tasks")]
@@ -68,6 +69,9 @@ Full list with comments in [.env.example](.env.example). The essentials:
 | `OF_SERPER_TOKEN` | web search via serper.dev; empty disables the `web_search` tool |
 | `OF_MAX_PROCESSES` / `OF_ROUTER_TIMEOUT_SECONDS` | processes-per-dialog cap / router LLM timeout |
 | `OF_SYSTEM_PROMPT_SOURCE` / `OF_ROUTER_PROMPT_SOURCE` | override prompts from files (`file:`, re-read on every turn) |
+| `OF_SYSTEM_SKILLS_SOURCE` | JSON overlay applied to the built-in system skills at startup (`file:`) — append trigger phrases or replace content per deployment |
+| `OF_SECRETS_KEY` | Fernet key enabling the encrypted secret store; empty disables the feature |
+| `OF_PUBLIC_BASE_URL` | public origin used to build one-time secret-form links (e.g. `https://example.com`) |
 
 Without a working embedding backend the app still starts (instruction seeding is skipped), but instruction search/save and dataset search become unavailable.
 
@@ -78,9 +82,8 @@ The built-in tool surface (`ToolRegistry`), wired up in the composition root:
 | Tool | Does |
 |---|---|
 | `http_request` | Arbitrary outbound HTTP call |
-| `external_call` | Calls a saved, DB-backed endpoint descriptor, behind an SSRF guard |
 | `recall` / `instruction_save` | One ranked search over skills, knowledge, memories and dataset descriptors; saves new records |
-| `endpoint_get` / `external_call` | Resolves a named endpoint's contract, then executes it (SSRF-guarded) |
+| `endpoint_get` / `external_call` | Resolves a saved endpoint descriptor's contract, then executes it — SSRF-guarded, with declarative secret auth (the value is injected outside the LLM context and scrubbed from responses) |
 | `data_put` / `data_query` / `data_forget` | User datasets, validated against a JSON schema |
 | `memory_store` / `memory_delete` | Per-user memory, stored and searched with everything else |
 | `task_create` / `task_list` / `task_delete` | Background work — the same surface also creates cron jobs (just pass a `schedule`) |
@@ -116,11 +119,9 @@ import httpx
 from octoforge_core import (
     AgentLoop,
     ConversationManager,
-    DialogRepository,
     Failed,
     Finished,
     LLMConfig,
-    MessageRepository,
     ToolRegistry,
     SqlAlchemyTaskStore,
     TextDelta,
@@ -132,6 +133,7 @@ from octoforge_core.agent.prompts import StaticPromptProvider
 from octoforge_core.agent.router import LLMRouter
 from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.context.compactor import NoopContextCompactor
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.llm.openai import OpenAICompatibleClient
 
 BASE_URL = "https://api.openai.com/v1"
@@ -156,8 +158,8 @@ async def main() -> None:
                     max_processes=5,
                     compactor=NoopContextCompactor(),  # no history compaction
                 ),
-                dialogs=DialogRepository(session_factory),
-                messages=MessageRepository(session_factory),
+                dialogs=SqlAlchemyDialogRepository(session_factory),
+                messages=SqlAlchemyMessageRepository(session_factory),
                 tasks=SqlAlchemyTaskStore(session_factory),
             )
 
@@ -185,7 +187,7 @@ Notes on the example:
 
 - With an empty `ToolRegistry` the agent answers with text only — tools are registered one at a time (`registry.register(HttpRequestTool(...))`, etc.); see `runtime()` for the full set. Embeddings are only needed by the instruction and dataset tools.
 - A dialog survives a restart: the narrative is reloaded from the database on `get_or_create_runner` (processes are in-memory and don't survive).
-- The cron scheduler is a separate asyncio loop (`CronScheduler`) on top of `CronStore`; a fire is delivered through the `CronWaker` port (in-process: `ManagerCronWaker(manager)`).
+- The cron scheduler is a separate asyncio loop (`CronScheduler`) on top of `CronStore`; a fire is delivered through the `CronWaker` port — `ConversationManager` satisfies it structurally, so in-process you just pass the manager.
 
 ## Development
 
