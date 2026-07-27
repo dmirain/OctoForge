@@ -9,7 +9,7 @@ import pytest
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.tasks.models import TaskStatus
+from octoforge_core.tasks.api import TaskStatus
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 USER_A = "alice"

@@ -26,11 +26,12 @@ from octoforge_core.cron.models import CronJobRow
 from octoforge_core.datasets.api import Dataset, DatasetRecord
 from octoforge_core.datasets.models import DatasetRecordRow, DatasetRow
 from octoforge_core.datasets.validation import parse_schema
-from octoforge_core.db.models import DialogRow, MessageRow, TaskRow
+from octoforge_core.dialogs.models import DialogRow, MessageRow
 from octoforge_core.instructions.api import Instruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.memory.api import Memory
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.models import TaskRow
 
 
 class SqlAlchemyAdminStore:

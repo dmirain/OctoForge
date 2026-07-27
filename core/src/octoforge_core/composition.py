@@ -30,7 +30,7 @@ from octoforge_core.cron.tools import CronPauseTool, CronResumeTool
 from octoforge_core.datasets.api import DatasetService, DatasetStore
 from octoforge_core.datasets.service import LocalDatasetService
 from octoforge_core.datasets.tools import DataForgetTool, DataPutTool, DataQueryTool
-from octoforge_core.db.repositories import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import DialogRepository, MessageRepository
 from octoforge_core.instructions.api import InstructionService, InstructionStore
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES, LocalInstructionService
 from octoforge_core.instructions.tools import (

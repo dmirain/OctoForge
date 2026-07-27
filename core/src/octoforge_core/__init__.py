@@ -54,8 +54,8 @@ from octoforge_core.db.engine import (
     create_session_factory,
     init_db,
 )
-from octoforge_core.db.errors import DialogNotFoundError
-from octoforge_core.db.repositories import DialogRepository, MessageRepository, SqlAlchemyTaskStore
+from octoforge_core.dialogs.api import DialogNotFoundError
+from octoforge_core.dialogs.store import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import (
@@ -81,8 +81,8 @@ from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.memory.api import Memory
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.store import TaskStore
+from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.store import SqlAlchemyTaskStore, TaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import (
     TaskDeleteOutcome,

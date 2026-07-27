@@ -8,11 +8,6 @@ from alembic.runtime.migration import MigrationContext
 from sqlalchemy import Connection, inspect, text
 
 # Importing the models registers every table on Base.metadata for the drift check.
-import octoforge_core.context.models
-import octoforge_core.cron.models
-import octoforge_core.datasets.models
-import octoforge_core.db.models
-import octoforge_core.instructions.models  # noqa: F401
 from octoforge_core.db.base import Base
 from octoforge_core.db.engine import (
     _BASELINE_REVISION,

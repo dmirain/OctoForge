@@ -33,8 +33,7 @@ from octoforge_core.instructions.api import (
     SystemInstructionError,
 )
 from octoforge_core.memory.api import Memory
-from octoforge_core.tasks.errors import TaskNotFoundError
-from octoforge_core.tasks.models import Task
+from octoforge_core.tasks.api import Task, TaskNotFoundError
 from octoforge_core.tasks.store import TaskStore
 
 from octoforge_web.deps import (

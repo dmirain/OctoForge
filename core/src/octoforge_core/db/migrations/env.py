@@ -21,7 +21,8 @@ from octoforge_core.db.base import Base
 import octoforge_core.context.models  # noqa: E402,F401
 import octoforge_core.cron.models  # noqa: E402,F401
 import octoforge_core.datasets.models  # noqa: E402,F401
-import octoforge_core.db.models  # noqa: E402,F401
+import octoforge_core.dialogs.models  # noqa: E402,F401
+import octoforge_core.tasks.models  # noqa: E402,F401
 import octoforge_core.instructions.models  # noqa: E402,F401
 import octoforge_core.secrets.models  # noqa: E402,F401
 

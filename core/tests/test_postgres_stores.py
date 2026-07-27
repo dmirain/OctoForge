@@ -32,8 +32,8 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.api import DatasetSchema
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import bootstrap_schema, create_engine, create_session_factory
-from octoforge_core.db.models import DialogRow, MessageRow
-from octoforge_core.db.repositories import DialogRepository, MessageRepository
+from octoforge_core.dialogs.models import DialogRow, MessageRow
+from octoforge_core.dialogs.store import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import InstructionDraft, InstructionType
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore

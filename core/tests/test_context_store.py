@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_core.context.api import ArchiveFilter, DialogueSummary
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.db.models import MessageRow
-from octoforge_core.db.repositories import DialogRepository
+from octoforge_core.dialogs.models import MessageRow
+from octoforge_core.dialogs.store import DialogRepository
 from octoforge_core.domain import MessageRole
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"

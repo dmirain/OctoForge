@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
 
-from octoforge_core.tasks.models import TaskStatus
+from octoforge_core.tasks.api import TaskStatus
 
 MISSED_COUNT_DEFAULT_CAP = 100
 

@@ -1,50 +1,33 @@
-"""Domain objects for background tasks."""
+"""ORM model of the tasks module; the table is owned by this module."""
 
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime
-from enum import StrEnum
 from typing import Any
 
+from sqlalchemy import JSON, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from octoforge_core.db.base import Base, UTCDateTime
+from octoforge_core.tasks.api import TaskStatus
 from octoforge_core.time import utc_now
 
 
-class TaskKind(StrEnum):
-    """Kinds of background work.
+class TaskRow(Base):
+    """A background task belonging to a dialog and a user."""
 
-    RUN is user-visible deferred work; ANSWER is the internal mechanics of
-    answering a user message (hidden from the task tools).
-    """
+    __tablename__ = "tasks"
 
-    RUN = "run"
-    ANSWER = "answer"
-
-
-class TaskStatus(StrEnum):
-    """Lifecycle states of a task."""
-
-    PENDING = "pending"
-    RUNNING = "running"
-    DONE = "done"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-@dataclass(slots=True)
-class Task:
-    """A background unit of work spawned by the agent."""
-
-    dialog_id: str
-    user_id: str
-    channel: str
-    title: str
-    kind: TaskKind
-    input: dict[str, Any]
-    id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    status: TaskStatus = TaskStatus.PENDING
-    result: str | None = None
-    error: str | None = None
-    created_at: datetime = field(default_factory=utc_now)
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
-    delivered_at: datetime | None = None
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    channel: Mapped[str] = mapped_column(String)
+    kind: Mapped[str] = mapped_column(String)
+    title: Mapped[str] = mapped_column(String)
+    input: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String, default=TaskStatus.PENDING.value)
+    result: Mapped[str | None] = mapped_column(String, nullable=True)
+    error: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)

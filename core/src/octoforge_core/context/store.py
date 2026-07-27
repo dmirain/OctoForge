@@ -19,7 +19,7 @@ from octoforge_core.context.api import (
     SummaryStore,
 )
 from octoforge_core.context.models import SummaryRow
-from octoforge_core.db.models import MessageRow
+from octoforge_core.dialogs.models import MessageRow
 from octoforge_core.domain import MessageRole
 
 LIKE_ESCAPE = "\\"

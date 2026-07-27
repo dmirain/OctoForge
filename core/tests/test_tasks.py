@@ -6,8 +6,7 @@ from datetime import timedelta
 import pytest
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
-from octoforge_core.tasks.errors import TaskNotFoundError
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.tasks.tools import (
     NO_SPAWNER_MESSAGE,

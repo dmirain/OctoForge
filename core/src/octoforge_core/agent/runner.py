@@ -43,12 +43,11 @@ from octoforge_core.agent.router import (
     RouteOp,
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
-from octoforge_core.db.repositories import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
-from octoforge_core.tasks.errors import TaskNotFoundError
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import TaskDeleteOutcome, TaskDeleter, TaskSpawner, ToolContext

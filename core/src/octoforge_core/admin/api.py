@@ -20,7 +20,7 @@ from octoforge_core.cron.api import CronJob
 from octoforge_core.datasets.api import Dataset, DatasetRecord
 from octoforge_core.instructions.api import Instruction
 from octoforge_core.memory.api import Memory
-from octoforge_core.tasks.models import Task
+from octoforge_core.tasks.api import Task
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 500

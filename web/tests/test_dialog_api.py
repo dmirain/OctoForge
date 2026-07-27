@@ -26,7 +26,7 @@ from octoforge_core.agent.router import ProcessInfo, RouteDecision
 from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.db.models import DialogRow
+from octoforge_core.dialogs.models import DialogRow
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion

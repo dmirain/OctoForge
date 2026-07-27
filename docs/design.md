@@ -76,18 +76,21 @@ core/                          # библиотека octoforge-core — дом�
       base.py                  # Tool (Protocol), ToolSpec, ToolContext (+ опциональные task_spawner/task_deleter, owner_task_id)
       registry.py, errors.py   # реестр + ошибки
     tasks/
-      models.py                # Task, TaskKind (RUN|ANSWER), TaskStatus (PENDING|RUNNING|DONE|FAILED|CANCELLED)
-      store.py                 # InMemoryTaskStore (реализация порта TaskStore, для тестов)
-      spawner.py               # TaskSpawner (Protocol-порт спавна фоновых задач)
-      errors.py                # TaskNotFoundError
-    db/
+      api.py                   # граница модуля: Task, TaskKind (RUN|ANSWER), TaskStatus, TaskNotFoundError
+      models.py                # TaskRow — таблица tasks, собственность модуля
+      store.py                 # порт TaskStore + InMemoryTaskStore + SqlAlchemyTaskStore
+    dialogs/
+      api.py                   # граница модуля: DialogNotFoundError, MessageStats
+      models.py                # DialogRow + MessageRow — таблицы dialogs/messages, собственность модуля
+      store.py                 # DialogRepository, MessageRepository (atomic seq, append_pair, идемпотентность)
+    db/                        # ТОЛЬКО framework (аудит границ 2026-07-27): доменных таблиц здесь нет
       base.py                  # Declarative Base + UTCDateTime (aware UTC на чтении/записи)
-      models.py                # ORM-модели: DialogRow, MessageRow, TaskRow
       engine.py                # create_engine/create_session_factory (DI) + bootstrap_schema
                                #   (Alembic upgrade/stamp) + init_db (create_all, fallback/тесты)
-      migrations/              # Alembic env.py + baseline-ревизия (autogenerate из метаданных)
-      repositories.py          # DialogRepository, MessageRepository, SqlAlchemyTaskStore
-      errors.py                # DialogNotFoundError
+      migrations/              # Alembic: ЕДИНАЯ цепочка на базу (осознанно НЕ разложена по модулям:
+                               #   история глобальна и линейна, миграции пересекают границы модулей —
+                               #   f2a6c8d1e935 переносит memories→instructions; пер-модульные цепочки
+                               #   уместны только у модулей со СВОЕЙ базой, как telegram/invites)
     llm/
       events.py                # StreamEvent: TextDelta | StreamFinished
       openai.py                # OpenAI-совместимый клиент: complete() + stream() (SSE, tools)

@@ -7,7 +7,7 @@ import pytest
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
 from octoforge_core.cron.tools import CronPauseTool, CronResumeTool
-from octoforge_core.tasks.models import TaskStatus
+from octoforge_core.tasks.api import TaskStatus
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 

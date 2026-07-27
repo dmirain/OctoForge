@@ -45,15 +45,15 @@ from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.cron.api import CronWaker
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.db.models import MessageRow
-from octoforge_core.db.repositories import DialogRepository, MessageRepository
+from octoforge_core.dialogs.models import MessageRow
+from octoforge_core.dialogs.store import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore, TaskStore
 from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool
 from octoforge_core.time import utc_now

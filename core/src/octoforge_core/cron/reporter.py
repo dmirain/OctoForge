@@ -9,7 +9,7 @@ their single attempt (success or failure), keep the schedule otherwise.
 import logging
 
 from octoforge_core.cron.api import CronJobNotFoundError, CronStore
-from octoforge_core.tasks.models import Task, TaskStatus
+from octoforge_core.tasks.api import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 

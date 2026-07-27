@@ -10,17 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.context.api import INTERRUPTED_NOTE
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.db.errors import DialogNotFoundError
-from octoforge_core.db.models import MessageRow
-from octoforge_core.db.repositories import (
-    DialogRepository,
-    MessageRepository,
-    SqlAlchemyTaskStore,
-)
+from octoforge_core.dialogs.api import DialogNotFoundError
+from octoforge_core.dialogs.models import MessageRow
+from octoforge_core.dialogs.store import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.usage import Usage
-from octoforge_core.tasks.errors import TaskNotFoundError
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
+from octoforge_core.tasks.store import SqlAlchemyTaskStore
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 USER_ID = "user-1"

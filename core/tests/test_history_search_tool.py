@@ -11,8 +11,8 @@ from octoforge_core.context.api import DialogueSummary
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.context.tools import NO_HITS_MESSAGE, HistorySearchTool
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.db.models import MessageRow
-from octoforge_core.db.repositories import DialogRepository
+from octoforge_core.dialogs.models import MessageRow
+from octoforge_core.dialogs.store import DialogRepository
 from octoforge_core.domain import MessageRole
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError

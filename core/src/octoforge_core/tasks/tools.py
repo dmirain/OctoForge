@@ -23,8 +23,7 @@ from octoforge_core.cron.tools import (
     format_job,
     prompt_preview,
 )
-from octoforge_core.tasks.errors import TaskNotFoundError
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.tools.base import TaskDeleteOutcome, ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError

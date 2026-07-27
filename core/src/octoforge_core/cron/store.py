@@ -16,7 +16,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError, CronStore
 from octoforge_core.cron.models import CronJobRow
-from octoforge_core.tasks.models import TaskStatus
+from octoforge_core.tasks.api import TaskStatus
 
 
 class SqlAlchemyCronStore(CronStore):

@@ -51,3 +51,22 @@ def test_cron_never_imports_the_actor() -> None:
     offending = {(path, target) for path, target in imports_of("cron") if target == "agent"}
 
     assert offending == set()
+
+
+def test_db_is_framework_only() -> None:
+    """db/ holds Base, engine and migrations — domain tables live in their modules.
+
+    The one sanctioned exception: engine.py and migrations/env.py import the
+    model modules for their registration side effect (`Base.metadata` must
+    know every table before create_all / autogenerate).
+    """
+    registration_files = {"db/engine.py", "db/migrations/env.py"}
+    offending = set()
+    for path, target in imports_of("db"):
+        if target not in DOMAIN_MODULES:
+            continue
+        if path in registration_files:
+            continue
+        offending.add((path, target))
+
+    assert offending == set()

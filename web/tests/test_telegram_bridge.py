@@ -25,7 +25,7 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext

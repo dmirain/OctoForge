@@ -49,7 +49,7 @@ Take these from here, don't guess:
 
 **Monorepo of two independent Python projects**, each with its own `pyproject.toml`, deps and tests:
 
-- `core/` — library `octoforge-core` (src-layout). Domain, ports, services, LLM clients. **Never imports fastapi**; sqlalchemy appears only in `db/` and the SQL stores (`instructions/store.py`, `datasets/store.py`, `context/store.py`, `cron/store.py`).
+- `core/` — library `octoforge-core` (src-layout). Domain, ports, services, LLM clients. **Never imports fastapi**; sqlalchemy appears only in `db/` (framework: Base/engine/migrations) and the module SQL stores (`dialogs/store.py`, `tasks/store.py`, `instructions/store.py`, `datasets/store.py`, `context/store.py`, `cron/store.py`, `secrets/store.py`). Import boundaries are test-enforced (`core/tests/test_boundaries.py`): modules talk to neighbours through `api.py` only; `db/` and `tools/` are framework and import no domain module.
 - `web/` — app `octoforge-web` (src-layout). Thin FastAPI adapter + Telegram adapter. Depends on `octoforge-core`.
 
 Clean-architecture dependency rule: dependencies point inward. External clients (LLM, HTTP, DB) reach services through `Protocol` ports. Reusable builder functions (`build_llm_client`, `build_tool_registry`, `build_conversation_manager`, etc.) live in `core/composition.py` — ports and configs only, no fastapi; `web/src/octoforge_web/main.py:runtime()` is just the default assembly on top of them (shared by the HTTP app and the standalone Telegram surface), and an alternative composition root can reuse the same builders without copying code.

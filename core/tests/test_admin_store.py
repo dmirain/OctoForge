@@ -15,11 +15,12 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.api import DatasetSchema
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.db.repositories import DialogRepository, MessageRepository, SqlAlchemyTaskStore
+from octoforge_core.dialogs.store import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import InstructionDraft, InstructionType
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
-from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.store import SqlAlchemyTaskStore
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 USER_A = "alice"

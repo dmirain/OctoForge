@@ -15,12 +15,17 @@ from sqlalchemy.ext.asyncio import (
 # Imported for their side effect: every model module has to register its tables
 # on `Base.metadata` before `create_all` runs (same list as `migrations/env.py`).
 # The model modules only depend on `db.base`, so this cannot cycle back here.
+# Ruff quirk: all these bind one root name, so F401 fires only on the LAST
+# import — the single noqa below covers the block. An autofix once deleted
+# the whole cascade (caught by the Postgres bootstrap test): if you touch
+# this list, rerun `make test-pg`.
 import octoforge_core.context.models
 import octoforge_core.cron.models
 import octoforge_core.datasets.models
-import octoforge_core.db.models
+import octoforge_core.dialogs.models
 import octoforge_core.instructions.models
-import octoforge_core.secrets.models  # noqa: F401
+import octoforge_core.secrets.models
+import octoforge_core.tasks.models  # noqa: F401
 from octoforge_core.db.base import Base
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
