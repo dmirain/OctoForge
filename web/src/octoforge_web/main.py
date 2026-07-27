@@ -40,6 +40,7 @@ from octoforge_core.admin.store import SqlAlchemyAdminStore
 from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
 from octoforge_core.composition import RunnerOptions, ToolLimits, ToolServices, ToolStores
 from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
+from octoforge_core.context.api import SummaryStore
 from octoforge_core.context.compactor import CompactorConfig
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.api import CronStore
@@ -124,6 +125,8 @@ class Runtime:
     admin_read_model: AdminReadModel
     secret_store: SecretStore | None
     secret_links: SecretLinkService
+    dialogs: DialogRepository
+    summary_store: SummaryStore
 
 
 @asynccontextmanager
@@ -277,6 +280,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     admin_read_model=SqlAlchemyAdminStore(session_factory),
                     secret_store=secret_store,
                     secret_links=secret_links,
+                    dialogs=dialogs,
+                    summary_store=summary_store,
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, telegram)
@@ -318,6 +323,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.admin_read_model = rt.admin_read_model
             app.state.secret_store = rt.secret_store
             app.state.secret_links = rt.secret_links
+            app.state.dialogs = rt.dialogs
+            app.state.summary_store = rt.summary_store
             yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)

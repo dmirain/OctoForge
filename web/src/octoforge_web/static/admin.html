@@ -112,7 +112,8 @@ const VIEWS = {
     row: (d) => `${clip(d.user_id, "mono")}<td>${esc(d.channel)}</td><td>${d.message_count}</td>` +
       `<td>${d.task_count}</td><td class="mono">${time(d.last_message_at)}</td>` +
       `<td class="mono">${time(d.created_at)}</td>` +
-      `<td><button class="act" data-open-dialog="${esc(d.id)}">сообщения</button></td>`,
+      `<td><button class="act" data-open-dialog="${esc(d.id)}">сообщения</button> ` +
+      `<button class="act danger" data-delete="/api/admin/dialogs/${esc(d.id)}">удалить</button></td>`,
   },
   messages: {
     title: "Сообщения диалога", path: () => `/api/admin/dialogs/${state.dialogId}/messages`,

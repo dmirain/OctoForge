@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -63,6 +63,16 @@ class SqlAlchemyDialogRepository:
         async with self._session_factory() as session:
             result = await session.scalars(select(DialogRow).where(DialogRow.channel == channel))
             return [_to_dialog(row) for row in result.all()]
+
+    async def delete(self, dialog_id: str) -> None:
+        """Delete the dialog and its message log in one transaction."""
+        async with self._session_factory() as session:
+            row = await session.get(DialogRow, dialog_id)
+            if row is None:
+                raise DialogNotFoundError(dialog_id)
+            await session.execute(delete(MessageRow).where(MessageRow.dialog_id == dialog_id))
+            await session.delete(row)
+            await session.commit()
 
     @staticmethod
     async def _find_row(session: AsyncSession, user_id: str, channel: str) -> DialogRow | None:

@@ -139,6 +139,10 @@ class SummaryStore(Protocol):
         """Return the dialog's summaries whose tags match the topic (case-insensitive)."""
         ...
 
+    async def delete_for_dialog(self, dialog_id: str) -> None:
+        """Delete every summary of the dialog (admin dialog deletion); missing is a no-op."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class ArchiveFilter:

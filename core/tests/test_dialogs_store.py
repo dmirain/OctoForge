@@ -589,6 +589,47 @@ async def test_mark_delivered_unknown_task_raises(
         await store.mark_delivered("missing")
 
 
+async def test_delete_removes_the_dialog_and_its_messages(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+    other = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+    await messages.append(other.id, ChatMessage(role=MessageRole.USER, content="keep"))
+
+    await dialogs.delete(dialog.id)
+
+    with pytest.raises(DialogNotFoundError):
+        await dialogs.get(dialog.id)
+    assert await messages.list(dialog.id) == []
+    # the neighbour dialog and its log survived
+    assert [m.content for m in await messages.list(other.id)] == ["keep"]
+
+
+async def test_delete_unknown_dialog_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    with pytest.raises(DialogNotFoundError):
+        await SqlAlchemyDialogRepository(session_factory).delete("missing")
+
+
+async def test_delete_for_dialog_removes_only_that_dialogs_tasks(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyTaskStore(session_factory)
+    await store.add(make_task())
+    await store.add(make_task(title="second"))
+    await store.add(make_task(dialog_id=OTHER_DIALOG_ID, title="keep"))
+
+    removed = await store.delete_for_dialog(DIALOG_ID)
+
+    assert removed == OWN_TASK_COUNT
+    assert await store.list(DIALOG_ID) == []
+    assert [task.title for task in await store.list(OTHER_DIALOG_ID)] == ["keep"]
+
+
 async def test_sql_stores_satisfy_the_dialogs_ports(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

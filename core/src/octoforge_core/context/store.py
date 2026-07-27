@@ -75,6 +75,12 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
             )
             await session.commit()
 
+    async def delete_for_dialog(self, dialog_id: str) -> None:
+        """Delete every summary of the dialog (admin dialog deletion); missing is a no-op."""
+        async with self._session_factory() as session:
+            await session.execute(delete(SummaryRow).where(SummaryRow.dialog_id == dialog_id))
+            await session.commit()
+
     async def max_seq_to(self, dialog_id: str) -> int:
         """Return the highest covered seq; NO_COMPACTED_SEQ when nothing was compacted."""
         async with self._session_factory() as session:

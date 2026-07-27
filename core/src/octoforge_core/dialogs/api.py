@@ -55,6 +55,16 @@ class DialogRepository(Protocol):
         """Return the full dialogs of the given channel."""
         ...
 
+    async def delete(self, dialog_id: str) -> None:
+        """Delete the dialog and its message log in one transaction.
+
+        Only this module's tables go: rows of other modules referencing the
+        dialog (tasks, summaries) are their owners' business — the admin
+        deletion surface composes the per-module deletes. Raises
+        `DialogNotFoundError` when the id is unknown.
+        """
+        ...
+
 
 class MessageRepository(Protocol):
     """Port over the ordered message log of a dialog (seq grows monotonically)."""

@@ -159,6 +159,28 @@ def test_dialog_and_its_messages_are_visible(client: TestClient) -> None:
     assert [item["content"] for item in messages["items"]] == ["hi"]
 
 
+def test_dialog_deletion_cascades_and_survives_recreation(client: TestClient) -> None:
+    client.post("/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "alice"})
+    dialog_id = client.get("/api/admin/dialogs").json()["items"][0]["id"]
+
+    deleted = client.delete(f"/api/admin/dialogs/{dialog_id}")
+    listing = client.get("/api/admin/dialogs").json()
+    messages = client.get(f"/api/admin/dialogs/{dialog_id}/messages").json()
+
+    assert deleted.status_code == HTTPStatus.OK
+    assert listing["total"] == 0
+    assert messages["total"] == 0
+    # the user is not locked out: the next contact starts a fresh dialog
+    client.post("/api/dialog/messages", json={"content": "back"}, headers={USER_ID_HEADER: "alice"})
+    dialogs = client.get("/api/admin/dialogs").json()
+    assert dialogs["total"] == 1
+    assert dialogs["items"][0]["id"] != dialog_id
+
+
+def test_deleting_an_unknown_dialog_answers_404(client: TestClient) -> None:
+    assert client.delete("/api/admin/dialogs/nope").status_code == HTTPStatus.NOT_FOUND
+
+
 def test_paging_parameters_are_validated(client: TestClient) -> None:
     assert client.get("/api/admin/dialogs?limit=0").status_code == HTTPStatus.UNPROCESSABLE_ENTITY
     assert client.get("/api/admin/dialogs?offset=-1").status_code == HTTPStatus.UNPROCESSABLE_ENTITY

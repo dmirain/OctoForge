@@ -6,7 +6,9 @@ from typing import Annotated, cast
 from fastapi import Header, HTTPException, Request
 from octoforge_core import ConversationManager
 from octoforge_core.admin.api import AdminReadModel
+from octoforge_core.context.api import SummaryStore
 from octoforge_core.cron.api import CronStore
+from octoforge_core.dialogs.api import DialogRepository
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
@@ -46,6 +48,16 @@ def get_instruction_service(request: Request) -> InstructionService:
 def get_admin_read_model(request: Request) -> AdminReadModel:
     """Return the cross-user admin read model built at application startup."""
     return cast(AdminReadModel, request.app.state.admin_read_model)
+
+
+def get_dialog_repository(request: Request) -> DialogRepository:
+    """Return the dialog repository built at application startup."""
+    return cast(DialogRepository, request.app.state.dialogs)
+
+
+def get_summary_store(request: Request) -> SummaryStore:
+    """Return the dialog summary store built at application startup."""
+    return cast(SummaryStore, request.app.state.summary_store)
 
 
 def get_channel(request: Request) -> str:

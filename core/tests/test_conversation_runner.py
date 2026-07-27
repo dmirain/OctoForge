@@ -631,6 +631,25 @@ async def test_branch_keeps_system_prompt_stable_and_envelopes_last_message(
     assert stored[0] == ChatMessage(role=MessageRole.USER, content="hi")
 
 
+async def test_evict_stops_the_runner_and_the_next_contact_rebuilds(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = ScriptedLLM([reply(), reply(SECOND_REPLY)])
+    manager = make_manager(llm, ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    await runner.submit("hi")
+    await collect_until(queue, is_completed)
+
+    await manager.evict(USER_ID, CHANNEL)
+    await manager.evict("nobody", CHANNEL)  # nothing live: a no-op
+
+    fresh = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    assert fresh is not runner
+    # the fresh runner rebuilt its narrative from the persisted rows
+    assert [m.content for m in fresh.history()] == ["hi", REPLY]
+
+
 async def test_duplicate_client_message_id_is_skipped(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

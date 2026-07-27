@@ -85,6 +85,22 @@ def make_summary(
 # --- summaries ---------------------------------------------------------------
 
 
+async def test_delete_for_dialog_removes_only_that_dialogs_summaries(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog_id = await make_dialog(session_factory, USER_A)
+    other_id = await make_dialog(session_factory, USER_B)
+    await store.create(make_summary(dialog_id, 1, 2))
+    await store.create(make_summary(other_id, 1, 2, content="keep"))
+
+    await store.delete_for_dialog(dialog_id)
+    await store.delete_for_dialog("missing")  # a no-op, not an error
+
+    assert await store.list_for_dialog(dialog_id) == []
+    assert [s.content for s in await store.list_for_dialog(other_id)] == ["keep"]
+
+
 async def test_create_and_list_roundtrip(
     store: SqlAlchemySummaryStore,
     session_factory: async_sessionmaker[AsyncSession],

@@ -1254,6 +1254,31 @@ class ConversationManager:
         except Exception:
             logger.exception("undelivered task redelivery failed: task=%s", task.id)
 
+    async def evict(self, user_id: str, channel: str) -> None:
+        """Stop and deregister the dialog's runner, if any (admin dialog deletion).
+
+        The build memo and the live runner both go, so the next contact
+        rebuilds from the (freshly emptied) persisted state instead of
+        reusing an actor whose narrative outlived its rows. A dialog with
+        nothing live is a no-op.
+        """
+        async with self._lock:
+            build = self._builds.pop((user_id, channel), None)
+        if build is None:
+            return
+        if not build.done():
+            build.cancel()
+        runner = None
+        with suppress(asyncio.CancelledError, Exception):
+            runner = await build
+        if runner is None:
+            return
+        self._runners.pop(runner.dialog_id, None)
+        try:
+            await runner.stop()
+        except Exception:  # a failing runner must not block the deletion
+            logger.exception("runner stop failed: dialog=%s", runner.dialog_id)
+
     async def stop_all(self) -> None:
         """Stop and deregister every live runner (the app is shutting down)."""
         async with self._lock:

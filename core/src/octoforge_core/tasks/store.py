@@ -6,9 +6,10 @@ reached the user transport. `list_undelivered` therefore returns terminal
 tasks with `delivered_at IS NULL` — crash leftovers and fresh finals alike.
 """
 
-from typing import Protocol
+from typing import Any, Protocol, cast
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
@@ -49,6 +50,10 @@ class TaskStore(Protocol):
 
     async def delete(self, task_id: str) -> None:
         """Delete the task row or raise TaskNotFoundError."""
+        ...
+
+    async def delete_for_dialog(self, dialog_id: str) -> int:
+        """Delete every task row of the dialog; return the count (admin dialog deletion)."""
         ...
 
     async def list_orphaned(self) -> TaskList:
@@ -103,6 +108,12 @@ class InMemoryTaskStore:
     async def delete(self, task_id: str) -> None:
         task = await self.get(task_id)
         del self._tasks[task.id]
+
+    async def delete_for_dialog(self, dialog_id: str) -> int:
+        matched = [task_id for task_id, task in self._tasks.items() if task.dialog_id == dialog_id]
+        for task_id in matched:
+            del self._tasks[task_id]
+        return len(matched)
 
     async def list_orphaned(self) -> TaskList:
         active = (TaskStatus.PENDING, TaskStatus.RUNNING)
@@ -170,6 +181,16 @@ class SqlAlchemyTaskStore:
                 raise TaskNotFoundError(task_id)
             await session.delete(row)
             await session.commit()
+
+    async def delete_for_dialog(self, dialog_id: str) -> int:
+        async with self._session_factory() as session:
+            # DML executes into a CursorResult at runtime; narrow for rowcount.
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(delete(TaskRow).where(TaskRow.dialog_id == dialog_id)),
+            )
+            await session.commit()
+            return result.rowcount or 0
 
     async def list_orphaned(self) -> TaskList:
         async with self._session_factory() as session:

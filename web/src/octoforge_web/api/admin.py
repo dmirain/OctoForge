@@ -15,6 +15,7 @@ from http import HTTPStatus
 from typing import Annotated, Any, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from octoforge_core import ConversationManager
 from octoforge_core.admin.api import (
     AdminReadModel,
     DialogOverview,
@@ -22,9 +23,10 @@ from octoforge_core.admin.api import (
     Page,
     clamp_page,
 )
-from octoforge_core.context.api import DialogueSummary
+from octoforge_core.context.api import DialogueSummary, SummaryStore
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError, CronStore
 from octoforge_core.datasets.api import Dataset, DatasetRecord
+from octoforge_core.dialogs.api import DialogNotFoundError, DialogRepository
 from octoforge_core.instructions.api import (
     Instruction,
     InstructionNotFoundError,
@@ -38,8 +40,11 @@ from octoforge_core.tasks.store import TaskStore
 
 from octoforge_web.deps import (
     get_admin_read_model,
+    get_conversation_manager,
     get_cron_store,
+    get_dialog_repository,
     get_instruction_service,
+    get_summary_store,
     get_task_store,
     require_admin,
 )
@@ -50,6 +55,9 @@ ReadModelDep = Annotated[AdminReadModel, Depends(get_admin_read_model)]
 CronStoreDep = Annotated[CronStore, Depends(get_cron_store)]
 TaskStoreDep = Annotated[TaskStore, Depends(get_task_store)]
 InstructionsDep = Annotated[InstructionService, Depends(get_instruction_service)]
+ManagerDep = Annotated[ConversationManager, Depends(get_conversation_manager)]
+DialogsDep = Annotated[DialogRepository, Depends(get_dialog_repository)]
+SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
 LimitDep = Annotated[int | None, Query(ge=1)]
 OffsetDep = Annotated[int | None, Query(ge=0)]
 
@@ -96,6 +104,32 @@ async def dialog_messages(
     resolved_limit, resolved_offset = clamp_page(limit, offset)
     page = await read_model.list_messages(dialog_id, resolved_limit, resolved_offset)
     return _page_payload(page, _message_to_dict)
+
+
+@router.delete("/dialogs/{dialog_id}")
+async def delete_dialog(
+    dialog_id: str,
+    dialogs: DialogsDep,
+    manager: ManagerDep,
+    tasks_store: TaskStoreDep,
+    summaries_store: SummariesDep,
+) -> dict[str, str]:
+    """Delete a dialog with everything it owns: messages, tasks, summaries.
+
+    The live runner (if any) is stopped first, so no actor keeps writing
+    into rows that are about to disappear; the next contact of the same
+    (user, channel) starts a fresh dialog. Cron jobs survive: they belong
+    to the user, not to the dialog, and simply wake a new one.
+    """
+    try:
+        dialog = await dialogs.get(dialog_id)
+        await manager.evict(dialog.user_id, dialog.channel)
+        await summaries_store.delete_for_dialog(dialog_id)
+        await tasks_store.delete_for_dialog(dialog_id)
+        await dialogs.delete(dialog_id)
+    except DialogNotFoundError as exc:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    return DELETED_STATUS
 
 
 @router.get("/tasks")
