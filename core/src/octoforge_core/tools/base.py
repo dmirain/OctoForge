@@ -1,9 +1,45 @@
-"""Tool abstraction shared by all code tools."""
+"""Tool abstraction shared by all code tools.
+
+Also home of the dialog-bound background-task ports (`TaskSpawner`,
+`TaskDeleter`): they are capabilities of the actor exposed to tools through
+`ToolContext`, i.e. tool-framework vocabulary. Keeping them here points the
+dependency arrow the right way — domain modules (tasks, agent) import the
+framework, never the reverse (2026-07-27 boundary audit, item 2).
+"""
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Protocol
 
-from octoforge_core.tasks.spawner import TaskDeleter, TaskSpawner
+
+class TaskSpawner(Protocol):
+    """Creates a background task for the current dialog and starts its process."""
+
+    async def spawn(self, title: str, prompt: str) -> str:
+        """Spawn the task and return a confirmation text, or a refusal (e.g. limit)."""
+        ...
+
+
+class TaskDeleteOutcome(StrEnum):
+    """Result of a dialog-bound task stop request."""
+
+    # a live process was stopped; its finalization marks the row CANCELLED
+    DELETED = "deleted"
+    # no live process exists (terminal or orphaned row); the caller cancels it
+    NOT_RUNNING = "not_running"
+
+
+class TaskDeleter(Protocol):
+    """Stops a live task process of the current dialog so it reaches a terminal state."""
+
+    async def delete(self, task_id: str) -> TaskDeleteOutcome:
+        """Stop the task's process; the finalization that follows marks the row CANCELLED.
+
+        Callers must not pass the id of the very task they run in (the pump
+        cannot be awaited from within); `TaskDeleteTool` refuses that case
+        via `ToolContext.owner_task_id`.
+        """
+        ...
 
 
 @dataclass(frozen=True, slots=True)

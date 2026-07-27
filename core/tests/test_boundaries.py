@@ -1,0 +1,53 @@
+"""Import-boundary guards: framework packages must not depend on domain modules.
+
+The 2026-07-27 audit fixed the arrows (tools/ imported tasks/, cron/ imported
+agent/); these tests keep them fixed — a reintroduced framework→domain import
+fails here with a readable message instead of surfacing as a review comment.
+"""
+
+import re
+from pathlib import Path
+
+CORE = Path(__file__).resolve().parents[1] / "src" / "octoforge_core"
+IMPORT_PATTERN = re.compile(r"^\s*(?:from|import)\s+octoforge_core\.([a-z_]+)", re.MULTILINE)
+
+# shared vocabulary any package may use
+FRAMEWORK = {"domain", "ports", "time", "config", "errors", "db", "tools", "llm"}
+DOMAIN_MODULES = {
+    "admin",
+    "agent",
+    "context",
+    "cron",
+    "datasets",
+    "instructions",
+    "memory",
+    "net",
+    "search",
+    "secrets",
+    "tasks",
+}
+
+
+def imports_of(package: str) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    for path in (CORE / package).rglob("*.py"):
+        for target in IMPORT_PATTERN.findall(path.read_text(encoding="utf-8")):
+            found.add((str(path.relative_to(CORE)), target))
+    return found
+
+
+def test_tools_framework_imports_no_domain_module() -> None:
+    """tools/ is 'framework only' by its own charter — keep it that way."""
+    offending = {(path, target) for path, target in imports_of("tools") if target in DOMAIN_MODULES}
+
+    assert offending == set()
+
+
+def test_cron_never_imports_the_actor() -> None:
+    """cron knows its CronWaker port; the actor implementation satisfies it
+
+    from the composition root — the domain module must not reach into agent/.
+    """
+    offending = {(path, target) for path, target in imports_of("cron") if target == "agent"}
+
+    assert offending == set()

@@ -82,10 +82,16 @@ from octoforge_core.memory.api import Memory
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.spawner import TaskDeleteOutcome, TaskDeleter, TaskSpawner
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.time import utc_now
-from octoforge_core.tools.base import Tool, ToolContext, ToolSpec
+from octoforge_core.tools.base import (
+    TaskDeleteOutcome,
+    TaskDeleter,
+    TaskSpawner,
+    Tool,
+    ToolContext,
+    ToolSpec,
+)
 from octoforge_core.tools.errors import (
     DuplicateToolError,
     ToolArgumentsError,

@@ -54,11 +54,10 @@ from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.spawner import TaskDeleteOutcome
 from octoforge_core.tasks.store import InMemoryTaskStore, TaskStore
 from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool
 from octoforge_core.time import utc_now
-from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.base import TaskDeleteOutcome, ToolContext, ToolSpec
 from octoforge_core.tools.registry import ToolRegistry
 
 PROMPT = "test system prompt"

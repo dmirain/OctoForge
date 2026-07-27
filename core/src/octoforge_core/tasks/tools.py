@@ -25,9 +25,8 @@ from octoforge_core.cron.tools import (
 )
 from octoforge_core.tasks.errors import TaskNotFoundError
 from octoforge_core.tasks.models import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.spawner import TaskDeleteOutcome
 from octoforge_core.tasks.store import TaskStore
-from octoforge_core.tools.base import ToolContext, ToolSpec
+from octoforge_core.tools.base import TaskDeleteOutcome, ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
 
 CREATE_NAME = "task_create"
