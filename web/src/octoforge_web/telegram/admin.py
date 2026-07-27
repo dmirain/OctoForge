@@ -11,8 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from octoforge_core.cron.api import CronStore
-from octoforge_core.dialogs.api import MessageStats
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.api import DialogRepository, MessageRepository, MessageStats
 from octoforge_core.domain import Dialog
 from octoforge_core.instructions.api import (
     InstructionNotFoundError,

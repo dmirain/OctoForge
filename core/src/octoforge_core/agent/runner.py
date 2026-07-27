@@ -43,7 +43,7 @@ from octoforge_core.agent.router import (
     RouteOp,
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.api import DialogRepository, MessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage

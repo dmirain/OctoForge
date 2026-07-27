@@ -46,7 +46,7 @@ from octoforge_core.cron.api import CronWaker
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import MessageRow
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
@@ -448,14 +448,14 @@ def make_manager(
     )
     return ConversationManager(
         config=config,
-        dialogs=DialogRepository(session_factory),
-        messages=MessageRepository(session_factory),
+        dialogs=SqlAlchemyDialogRepository(session_factory),
+        messages=SqlAlchemyMessageRepository(session_factory),
         tasks=resolved.store if resolved.store is not None else InMemoryTaskStore(),
     )
 
 
 async def get_dialog(session_factory: async_sessionmaker[AsyncSession]) -> Dialog:
-    return await DialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
+    return await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
 
 
 async def single_task(store: TaskStore, dialog_id: str) -> Task:
@@ -574,7 +574,7 @@ async def test_submit_streams_events_and_updates_narrative(
         replace(reply(), task_id=task.id),
     ]
     dialog = await get_dialog(session_factory)
-    assert await MessageRepository(session_factory).list(dialog.id) == runner.history()
+    assert await SqlAlchemyMessageRepository(session_factory).list(dialog.id) == runner.history()
 
 
 async def test_finished_usage_is_persisted_on_the_assistant_message(
@@ -627,7 +627,7 @@ async def test_branch_keeps_system_prompt_stable_and_envelopes_last_message(
     # the envelope is branch-only: the narrative and the store keep the clean copy
     assert runner.history()[0] == ChatMessage(role=MessageRole.USER, content="hi")
     dialog = await get_dialog(session_factory)
-    stored = await MessageRepository(session_factory).list(dialog.id)
+    stored = await SqlAlchemyMessageRepository(session_factory).list(dialog.id)
     assert stored[0] == ChatMessage(role=MessageRole.USER, content="hi")
 
 
@@ -1336,7 +1336,7 @@ async def test_interrupted_turn_is_salvaged_into_the_narrative(
     assert task.status is TaskStatus.CANCELLED  # the row is kept, nothing delivered
     assert history[1].task_id == task.id
     dialog = await get_dialog(session_factory)
-    assert await MessageRepository(session_factory).list(dialog.id) == history
+    assert await SqlAlchemyMessageRepository(session_factory).list(dialog.id) == history
 
 
 async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
@@ -1367,7 +1367,7 @@ async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
     assert history[1].content == PARTIAL  # salvaged despite the trailing tool reply
     assert history[2].content == INTERRUPTED_NOTE
     dialog = await get_dialog(session_factory)
-    assert await MessageRepository(session_factory).list(dialog.id) == history
+    assert await SqlAlchemyMessageRepository(session_factory).list(dialog.id) == history
 
 
 async def test_narrative_is_rebuilt_after_manager_restart(
@@ -1927,7 +1927,7 @@ async def test_recover_interrupted_restarts_orphaned_answer_tasks(
     manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
     dialog = await get_dialog(session_factory)
     # the question lives in the narrative, persisted before the crash
-    await MessageRepository(session_factory).append(
+    await SqlAlchemyMessageRepository(session_factory).append(
         dialog.id, ChatMessage(role=MessageRole.USER, content="unanswered question")
     )
     task = orphaned_task(
@@ -2301,7 +2301,7 @@ async def test_cancel_bypasses_an_actor_stuck_in_routing(
 # --- per-dialog runner initialization (S2) -----------------------------------
 
 
-class SlowHistoryRepository(MessageRepository):
+class SlowHistoryRepository(SqlAlchemyMessageRepository):
     """MessageRepository whose history load blocks until released."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -2415,8 +2415,8 @@ async def test_initial_narrative_load_starts_after_the_compaction_boundary(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """A runner never loads compacted history into memory (S3)."""
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
     for content in ("old-1", "old-2", "hot-3"):
         await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content=content))
@@ -2461,7 +2461,7 @@ async def test_trim_narrative_remaps_watermarks_and_prunes_coverage(
     await manager.stop_all()
 
 
-class FailingAppendRepository(MessageRepository):
+class FailingAppendRepository(SqlAlchemyMessageRepository):
     """MessageRepository whose append always fails (a broken store)."""
 
     async def append(

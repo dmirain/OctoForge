@@ -26,7 +26,7 @@ from octoforge_core.time import utc_now
 MESSAGE_SEQ_RETRY_ATTEMPTS = 5
 
 
-class DialogRepository:
+class SqlAlchemyDialogRepository:
     """Dialogs keyed by the unique (user_id, channel) pair."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -72,7 +72,7 @@ class DialogRepository:
         return result.first()
 
 
-class MessageRepository:
+class SqlAlchemyMessageRepository:
     """Ordered message log of a dialog; seq grows monotonically per dialog."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:

@@ -33,7 +33,7 @@ from octoforge_core.datasets.api import DatasetSchema
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import bootstrap_schema, create_engine, create_session_factory
 from octoforge_core.dialogs.models import DialogRow, MessageRow
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import InstructionDraft, InstructionType
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
@@ -212,8 +212,8 @@ async def test_datetime_columns_are_timezone_aware(engine: AsyncEngine) -> None:
 async def test_datetimes_round_trip_as_aware_utc(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialog = await DialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
-    await MessageRepository(session_factory).append(
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
+    await SqlAlchemyMessageRepository(session_factory).append(
         dialog.id, ChatMessage(role=MessageRole.USER, content="hi")
     )
 
@@ -234,8 +234,8 @@ async def test_concurrent_appends_get_distinct_seq(
     On Postgres the losing INSERT aborts its transaction, so this only works
     because `MessageRepository.append` rolls back before retrying.
     """
-    dialog = await DialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
-    messages = MessageRepository(session_factory)
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
+    messages = SqlAlchemyMessageRepository(session_factory)
 
     await asyncio.gather(
         messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="one")),

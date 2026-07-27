@@ -21,7 +21,7 @@ from octoforge_core.context.api import DialogueSummary
 from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
@@ -115,16 +115,16 @@ def make_manager(
     )
     return ConversationManager(
         config=config,
-        dialogs=DialogRepository(session_factory),
-        messages=MessageRepository(session_factory),
+        dialogs=SqlAlchemyDialogRepository(session_factory),
+        messages=SqlAlchemyMessageRepository(session_factory),
         tasks=InMemoryTaskStore(),
     )
 
 
 async def prefill(session_factory: async_sessionmaker[AsyncSession], texts: list[str]) -> Dialog:
     """Persist a dialog with user messages, as a previous run would have left it."""
-    dialog = await DialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
-    repository = MessageRepository(session_factory)
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
+    repository = SqlAlchemyMessageRepository(session_factory)
     for text in texts:
         await repository.append(dialog.id, ChatMessage(role=MessageRole.USER, content=text))
     return dialog

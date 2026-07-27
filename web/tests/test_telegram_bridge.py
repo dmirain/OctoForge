@@ -9,8 +9,6 @@ from octoforge_core import (
     AgentLoop,
     ChatMessage,
     ConversationManager,
-    DialogRepository,
-    MessageRepository,
     MessageRole,
     ToolRegistry,
     ToolSpec,
@@ -20,6 +18,7 @@ from octoforge_core.agent.router import ProcessInfo, RouteDecision
 from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ToolCall
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
@@ -255,8 +254,8 @@ async def make_manager(
             max_processes=MAX_PROCESSES,
             compactor=NoopContextCompactor(),
         ),
-        dialogs=DialogRepository(session_factory),
-        messages=MessageRepository(session_factory),
+        dialogs=SqlAlchemyDialogRepository(session_factory),
+        messages=SqlAlchemyMessageRepository(session_factory),
         tasks=tasks if tasks is not None else InMemoryTaskStore(),
     )
 
@@ -299,7 +298,7 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     client = FakeTelegramClient()
     tasks = InMemoryTaskStore()
     manager = await make_manager(ScriptedLLM([]), session_factory, tasks=tasks)
-    dialog = await DialogRepository(session_factory).get_or_create(
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(
         TELEGRAM_USER_ID, TELEGRAM_CHANNEL
     )
     task = Task(

@@ -35,7 +35,7 @@ from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
@@ -357,8 +357,8 @@ async def test_build_conversation_manager_runs_a_dialog(
             NoopContextCompactor(),
             options=RunnerOptions(max_processes=MAX_PROCESSES),
         ),
-        dialogs=DialogRepository(session_factory),
-        messages=MessageRepository(session_factory),
+        dialogs=SqlAlchemyDialogRepository(session_factory),
+        messages=SqlAlchemyMessageRepository(session_factory),
         tasks=InMemoryTaskStore(),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)

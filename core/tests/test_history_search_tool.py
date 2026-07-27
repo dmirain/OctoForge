@@ -12,7 +12,7 @@ from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.context.tools import NO_HITS_MESSAGE, HistorySearchTool
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import MessageRow
-from octoforge_core.dialogs.store import DialogRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository
 from octoforge_core.domain import MessageRole
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
@@ -54,7 +54,7 @@ async def dialogs(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[ToolContext, ToolContext]:
     """Two dialogs with messages; the contexts carry the real dialog ids."""
-    repository = DialogRepository(session_factory)
+    repository = SqlAlchemyDialogRepository(session_factory)
     dialog_a = await repository.get_or_create(CTX_A.user_id, CHANNEL)
     dialog_b = await repository.get_or_create(CTX_B.user_id, CHANNEL)
     await _add_message(session_factory, dialog_a.id, 1, "we flew to Berlin", DAY_ONE)

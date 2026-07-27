@@ -15,7 +15,7 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.api import DatasetSchema
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import InstructionDraft, InstructionType
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
@@ -106,9 +106,9 @@ async def test_totals_counts_every_entity(
     session_factory: async_sessionmaker[AsyncSession],
     store: SqlAlchemyAdminStore,
 ) -> None:
-    dialogs = DialogRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_A, CHANNEL)
-    await MessageRepository(session_factory).append(
+    await SqlAlchemyMessageRepository(session_factory).append(
         dialog.id, ChatMessage(role=MessageRole.USER, content="hi")
     )
     await SqlAlchemyTaskStore(session_factory).add(task(dialog.id, USER_A, TaskStatus.DONE))
@@ -126,8 +126,8 @@ async def test_dialogs_carry_counters_and_newest_activity_first(
     session_factory: async_sessionmaker[AsyncSession],
     store: SqlAlchemyAdminStore,
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     first = await dialogs.get_or_create(USER_A, CHANNEL)
     second = await dialogs.get_or_create(USER_B, TELEGRAM)
     await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="one"))
@@ -149,8 +149,8 @@ async def test_messages_are_paginated_by_seq(
     session_factory: async_sessionmaker[AsyncSession],
     store: SqlAlchemyAdminStore,
 ) -> None:
-    dialog = await DialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
-    messages = MessageRepository(session_factory)
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
+    messages = SqlAlchemyMessageRepository(session_factory)
     for index in range(3):
         await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content=f"m{index}"))
 
@@ -167,7 +167,7 @@ async def test_tasks_filter_by_status_and_kind(
     session_factory: async_sessionmaker[AsyncSession],
     store: SqlAlchemyAdminStore,
 ) -> None:
-    dialog = await DialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
     tasks = SqlAlchemyTaskStore(session_factory)
     await tasks.add(task(dialog.id, USER_A, TaskStatus.DONE))
     await tasks.add(task(dialog.id, USER_A, TaskStatus.FAILED))
@@ -285,7 +285,7 @@ async def test_summaries_are_listed_across_dialogs(
     session_factory: async_sessionmaker[AsyncSession],
     store: SqlAlchemyAdminStore,
 ) -> None:
-    dialog = await DialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
     await SqlAlchemySummaryStore(session_factory).replace_for_dialog(
         dialog.id,
         DialogueSummary(

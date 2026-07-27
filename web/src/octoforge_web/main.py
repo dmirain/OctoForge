@@ -17,7 +17,6 @@ from fastapi.staticfiles import StaticFiles
 from octoforge_core import (
     ConversationManager,
     DialogRepository,
-    MessageRepository,
     SqlAlchemyTaskStore,
     bootstrap_schema,
     build_agent_loop,
@@ -47,6 +46,7 @@ from octoforge_core.cron.api import CronStore
 from octoforge_core.cron.scheduler import CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.registry import (
@@ -138,8 +138,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     engine = create_engine(settings.database_url)
     await _bootstrap_schema(engine)
     session_factory = create_session_factory(engine)
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     task_store = SqlAlchemyTaskStore(session_factory)
     cron_store = SqlAlchemyCronStore(session_factory)
     secret_store = _build_secret_store(settings, session_factory)

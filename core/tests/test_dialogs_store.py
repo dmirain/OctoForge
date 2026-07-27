@@ -10,9 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.context.api import INTERRUPTED_NOTE
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.api import DialogNotFoundError
+from octoforge_core.dialogs.api import DialogNotFoundError, DialogRepository, MessageRepository
 from octoforge_core.dialogs.models import MessageRow
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
@@ -73,7 +73,7 @@ def make_task(
 async def test_get_or_create_creates_then_reuses_dialog(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    repo = DialogRepository(session_factory)
+    repo = SqlAlchemyDialogRepository(session_factory)
 
     first = await repo.get_or_create(USER_ID, CHANNEL)
     second = await repo.get_or_create(USER_ID, CHANNEL)
@@ -86,7 +86,7 @@ async def test_get_or_create_creates_then_reuses_dialog(
 async def test_dialogs_are_unique_per_user_and_channel(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    repo = DialogRepository(session_factory)
+    repo = SqlAlchemyDialogRepository(session_factory)
 
     base = await repo.get_or_create(USER_ID, CHANNEL)
     other_user = await repo.get_or_create(OTHER_USER_ID, CHANNEL)
@@ -96,7 +96,7 @@ async def test_dialogs_are_unique_per_user_and_channel(
 
 
 async def test_get_returns_dialog_by_id(session_factory: async_sessionmaker[AsyncSession]) -> None:
-    repo = DialogRepository(session_factory)
+    repo = SqlAlchemyDialogRepository(session_factory)
     created = await repo.get_or_create(USER_ID, CHANNEL)
 
     fetched = await repo.get(created.id)
@@ -105,7 +105,7 @@ async def test_get_returns_dialog_by_id(session_factory: async_sessionmaker[Asyn
 
 
 async def test_get_unknown_dialog_raises(session_factory: async_sessionmaker[AsyncSession]) -> None:
-    repo = DialogRepository(session_factory)
+    repo = SqlAlchemyDialogRepository(session_factory)
 
     with pytest.raises(DialogNotFoundError):
         await repo.get("missing")
@@ -114,7 +114,7 @@ async def test_get_unknown_dialog_raises(session_factory: async_sessionmaker[Asy
 async def test_dialog_timestamps_round_trip_as_utc(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    repo = DialogRepository(session_factory)
+    repo = SqlAlchemyDialogRepository(session_factory)
     created = await repo.get_or_create(USER_ID, CHANNEL)
 
     fetched = await repo.get(created.id)
@@ -126,7 +126,7 @@ async def test_dialog_timestamps_round_trip_as_utc(
 async def test_list_user_ids_by_channel(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    repo = DialogRepository(session_factory)
+    repo = SqlAlchemyDialogRepository(session_factory)
     await repo.get_or_create(USER_ID, CHANNEL)
     await repo.get_or_create(OTHER_USER_ID, CHANNEL)
     await repo.get_or_create(USER_ID, OTHER_CHANNEL)
@@ -141,7 +141,7 @@ async def test_list_user_ids_by_channel(
 async def test_list_by_channel_returns_full_dialogs(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    repo = DialogRepository(session_factory)
+    repo = SqlAlchemyDialogRepository(session_factory)
     first = await repo.get_or_create(USER_ID, CHANNEL)
     second = await repo.get_or_create(OTHER_USER_ID, CHANNEL)
     await repo.get_or_create(USER_ID, OTHER_CHANNEL)
@@ -155,8 +155,8 @@ async def test_list_by_channel_returns_full_dialogs(
 async def test_message_stats_by_channel(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     first = await dialogs.get_or_create(USER_ID, CHANNEL)
     second = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
     other_channel = await dialogs.get_or_create(USER_ID, OTHER_CHANNEL)
@@ -176,8 +176,8 @@ async def test_message_stats_by_channel(
 async def test_messages_get_monotonic_seq_and_order(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
@@ -200,8 +200,8 @@ async def test_messages_get_monotonic_seq_and_order(
 async def test_append_returns_and_round_trips_the_row_id(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     message_id = await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
@@ -224,8 +224,8 @@ async def test_append_pair_writes_both_messages_in_one_transaction() -> None:
     event.listen(engine.sync_engine, "commit", _count_commit)
     try:
         factory = create_session_factory(engine)
-        dialogs = DialogRepository(factory)
-        messages = MessageRepository(factory)
+        dialogs = SqlAlchemyDialogRepository(factory)
+        messages = SqlAlchemyMessageRepository(factory)
         dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
         await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="question"))
         commits_before = commits
@@ -255,8 +255,8 @@ async def test_append_pair_writes_both_messages_in_one_transaction() -> None:
 async def test_message_usage_round_trip(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     await messages.append(
@@ -281,8 +281,8 @@ async def test_message_usage_round_trip(
 async def test_message_task_id_round_trip(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     await messages.append(
@@ -307,8 +307,8 @@ async def test_message_task_id_round_trip(
 async def test_client_message_id_dedup_round_trip(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     assert not await messages.find_by_client_id(dialog.id, CLIENT_MESSAGE_ID)
@@ -335,8 +335,8 @@ async def test_client_message_id_dedup_round_trip(
 async def test_message_tool_calls_round_trip(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     await messages.append(
@@ -363,8 +363,8 @@ async def test_append_retries_a_transient_seq_conflict(
     surfaces as an IntegrityError on the loser's commit; `append` must retry
     with a freshly recomputed seq rather than lose the message.
     """
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     original_commit = AsyncSession.commit
@@ -390,8 +390,8 @@ async def test_append_pair_retries_a_transient_seq_conflict(
     session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     original_commit = AsyncSession.commit
@@ -420,8 +420,8 @@ async def test_append_pair_retries_a_transient_seq_conflict(
 async def test_messages_are_isolated_per_dialog(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    dialogs = DialogRepository(session_factory)
-    messages = MessageRepository(session_factory)
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
     first = await dialogs.get_or_create(USER_ID, CHANNEL)
     second = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
 
@@ -587,3 +587,23 @@ async def test_mark_delivered_unknown_task_raises(
 
     with pytest.raises(TaskNotFoundError):
         await store.mark_delivered("missing")
+
+
+async def test_sql_stores_satisfy_the_dialogs_ports(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The SQL implementations must keep matching the api.py Protocols.
+
+    The annotations make mypy verify the structural match; the calls keep the
+    port surface exercised through the protocol type, so a signature drift
+    fails both ways (audit item 5 — the actor now types against the ports).
+    """
+    dialogs: DialogRepository = SqlAlchemyDialogRepository(session_factory)
+    messages: MessageRepository = SqlAlchemyMessageRepository(session_factory)
+
+    dialog = await dialogs.get_or_create("port-user", "web")
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+
+    assert [m.content for m in await messages.list(dialog.id)] == ["hi"]
+    assert await messages.list_after(dialog.id, 1) == []
+    assert (await dialogs.get(dialog.id)).id == dialog.id

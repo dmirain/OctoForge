@@ -26,7 +26,7 @@ from octoforge_core.context.prompts import (
 )
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.store import DialogRepository, MessageRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent
 from octoforge_core.llm.usage import Completion, Usage
@@ -67,7 +67,7 @@ def store(session_factory: async_sessionmaker[AsyncSession]) -> SqlAlchemySummar
 
 
 async def make_dialog(session_factory: async_sessionmaker[AsyncSession]) -> Dialog:
-    return await DialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
+    return await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
 
 
 async def append_history(
@@ -76,7 +76,7 @@ async def append_history(
     texts: list[str],
 ) -> list[ChatMessage]:
     """Persist user messages (the actor's order: store first, narrative second)."""
-    repository = MessageRepository(session_factory)
+    repository = SqlAlchemyMessageRepository(session_factory)
     history: list[ChatMessage] = []
     for text in texts:
         message = ChatMessage(role=MessageRole.USER, content=text)
@@ -543,7 +543,7 @@ async def append_assistant_with_usage(
     prompt_tokens: int,
 ) -> ChatMessage:
     message = ChatMessage(role=MessageRole.ASSISTANT, content="answer")
-    await MessageRepository(session_factory).append(
+    await SqlAlchemyMessageRepository(session_factory).append(
         dialog_id,
         message,
         usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=USAGE_COMPLETION_TOKENS),
@@ -745,7 +745,7 @@ async def test_aclose_leaves_other_dialogs_compactions_running(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     dialog = await make_dialog(session_factory)
-    other = await DialogRepository(session_factory).get_or_create("user-2", CHANNEL)
+    other = await SqlAlchemyDialogRepository(session_factory).get_or_create("user-2", CHANNEL)
     llm = GatedSummarizingLLM([SUMMARY_REPLY, SECOND_SUMMARY_REPLY])
     compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * THREE_MESSAGES)

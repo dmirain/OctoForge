@@ -11,7 +11,7 @@ from octoforge_core.context.api import ArchiveFilter, DialogueSummary
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import MessageRow
-from octoforge_core.dialogs.store import DialogRepository
+from octoforge_core.dialogs.store import SqlAlchemyDialogRepository
 from octoforge_core.domain import MessageRole
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -39,7 +39,7 @@ def store(session_factory: async_sessionmaker[AsyncSession]) -> SqlAlchemySummar
 
 
 async def make_dialog(session_factory: async_sessionmaker[AsyncSession], user_id: str) -> str:
-    dialog = await DialogRepository(session_factory).get_or_create(user_id, CHANNEL)
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(user_id, CHANNEL)
     return dialog.id
 
 
