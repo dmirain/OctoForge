@@ -88,14 +88,6 @@ class RetryScheduled:
 
 
 @dataclass(frozen=True, slots=True)
-class ProcessSuspended:
-    """Actor marker: the foreground process moved to the background."""
-
-    process_id: str
-    title: str
-
-
-@dataclass(frozen=True, slots=True)
 class ProcessStarted:
     """Actor marker: the text of this answer is about to begin.
 
@@ -130,7 +122,6 @@ LoopEvent = (
     | Cancelled
     | Failed
     | RetryScheduled
-    | ProcessSuspended
     | ProcessStarted
     | ProcessCompleted
 )

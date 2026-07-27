@@ -17,7 +17,6 @@ from octoforge_core.agent.events import (
     Finished,
     ProcessCompleted,
     ProcessStarted,
-    ProcessSuspended,
     TextDelta,
     ToolCallRequested,
 )
@@ -787,8 +786,6 @@ async def test_start_new_queues_behind_the_busy_foreground(
     await runner.submit("second", client_message_id="102")
     events += await collect_completions(queue, 1)  # "second" finishes in the background
 
-    suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
-    assert suspended == []  # the foreground kept its slot
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
     assert finished == []  # the queued answer is not streamed and not delivered yet
 
@@ -862,6 +859,78 @@ async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     # a message the process did sync is not re-routed at finalize: one process only
     assert len(llm.requests) == RETRIED_CALLS
     assert [m.content for m in runner.history()] == ["start", "extra context", "after"]
+
+
+async def test_wrap_epoch_lifts_a_stale_mid_run_note(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """White-box: a routing decision can cover a message WITHOUT growing the
+    narrative (START_NEW appends nothing); the wrap epoch makes the next sync
+    re-derive the envelopes instead of freezing a stale "account for this"
+    note past the decision (2026-07-27 audit, finding 1)."""
+    tool = BlockingTool()
+    llm = ScriptedLLM([blocking_call()])
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    runner.subscribe()
+    await runner.submit("first")
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    process = next(iter(runner._processes.values()))
+
+    # simulate the routing window: the message is in the narrative and marked
+    # injected, the router has not decided yet
+    extra = ChatMessage(role=MessageRole.USER, content="extra", id="row-extra")
+    runner._narrative.append(extra)
+    runner._injected_ids.add("row-extra")
+    await runner._sync_branch(process)
+    assert any(MID_RUN_NOTE_TEMPLATE.format(content="extra") in m.content for m in process.branch)
+
+    # the decision lands: the message is covered elsewhere, narrative unchanged
+    runner._covered_ids.add("row-extra")
+    runner._wrap_epoch += 1  # what _apply_decision does after any package
+    await runner._sync_branch(process)
+
+    assert not any(
+        MID_RUN_NOTE_TEMPLATE.format(content="extra") in m.content for m in process.branch
+    )
+    # plain history now (as the branch tail it still carries the date envelope)
+    assert any(m.content.endswith("\nextra") for m in process.branch)
+    tool.release.set()
+    await manager.stop_all()
+
+
+async def test_mid_run_note_is_foreground_only(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A clarification belongs to the run the user watches: the queued
+    background answer sees it as plain history, not as an "account for this"
+    instruction (2026-07-27 audit, finding 2)."""
+    tool = BlockingTool()
+    llm = ScriptedLLM([blocking_call(), blocking_call(), reply("first final"), reply("second")])
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    runner.subscribe()
+    await runner.submit("first")
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit("second")  # queues behind the foreground
+    await wait_for_condition(lambda: len(runner._processes) == TWO_PROCESSES)
+    processes = {
+        ("fg" if runner._foreground_id == p.id else "queued"): p for p in runner._processes.values()
+    }
+
+    extra = ChatMessage(role=MessageRole.USER, content="extra", id="row-extra")
+    runner._narrative.append(extra)
+    runner._injected_ids.add("row-extra")
+    await runner._sync_branch(processes["fg"])
+    await runner._sync_branch(processes["queued"])
+
+    wrapped = MID_RUN_NOTE_TEMPLATE.format(content="extra")
+    assert any(wrapped in m.content for m in processes["fg"].branch)
+    assert not any(wrapped in m.content for m in processes["queued"].branch)
+    # plain history in the queued branch (date-enveloped as the tail)
+    assert any(m.content.endswith("\nextra") for m in processes["queued"].branch)
+    tool.release.set()
+    await manager.stop_all()
 
 
 async def test_answer_events_carry_the_source_client_key(
@@ -1040,10 +1109,9 @@ async def test_bring_back_starts_a_new_answer_process(
     events += await collect_completions(queue, 1)
 
     # there is no promote route: a "bring back" request is a plain START_NEW —
-    # it queues behind the busy foreground like any other question, and its
-    # branch sees the whole narrative, including the other queued answer
-    suspended = [e.payload.title for e in events if isinstance(e.payload, ProcessSuspended)]
-    assert suspended == []  # nobody takes the slot away from "first"
+    # it queues behind the busy foreground like any other question (nobody
+    # takes the slot away from "first"), and its branch sees the whole
+    # narrative, including the other queued answer
     bring_back_request = llm.requests[2]
     # "first" is still being answered by the live foreground -> marked taken;
     # "second" already finished, so its question is plain history
@@ -2139,6 +2207,92 @@ async def test_recover_interrupted_reports_cron_outcome_after_the_restart(
     assert [(task.id, status) for task, status in listener.calls] == [
         (cron_task.id, TaskStatus.DONE)
     ]
+
+
+async def test_router_cancel_targets_a_queued_background_answer(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CANCEL(target_id) can stop a queued answer while the foreground streams on."""
+    tool = BlockingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call(), blocking_call(), reply("first final")])
+    router = FakeRouter()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await runner.submit("second")
+    await wait_for_condition(lambda: len(runner._processes) == TWO_PROCESSES)
+    queued_id = next(pid for pid in runner._processes if pid != runner._foreground_id)
+
+    router.decide(RouteOp(action=RouteAction.CANCEL, target_id=queued_id))
+    await runner.submit("cancel the queued one")
+    await wait_for_condition(lambda: len(runner._processes) == 1)
+    tool.release.set()
+    events = await collect_until(queue, is_delivered("first final"))
+
+    tasks = {task.title: task for task in await store.list(runner.dialog_id)}
+    assert tasks["second"].status is TaskStatus.CANCELLED
+    # the store write lands after the terminal broadcast: wait, not assert
+    await wait_for_condition(lambda: tasks["first"].status is TaskStatus.DONE)
+    # the foreground never lost its slot and streamed its own answer
+    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
+    assert deltas == ["first final"]
+
+
+async def test_redelivery_threads_the_reply_and_skips_silent_results(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Recovery redeliveries keep reply threading and never redeliver emptiness."""
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([])
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    dialog = await get_dialog(session_factory)
+    threaded = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
+    threaded.input["source_client_message_id"] = "777"
+    silent = orphaned_task(dialog, status=TaskStatus.DONE, result="", title="silent")
+    await store.add(threaded)
+    await store.add(silent)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.recover_interrupted()
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
+
+    started = [e.payload for e in events if isinstance(e.payload, ProcessStarted)]
+    assert [item.source_client_message_id for item in started] == ["777"]
+    # the empty result was stamped delivered without any delivery events
+    await wait_for_condition(lambda: silent.delivered_at is not None)
+    assert not any(isinstance(e.payload, TextDelta) and e.payload.text == "" for e in events)
+    assert not runner._pending_deliveries
+
+
+async def test_failed_delivery_carries_the_reply_target(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A FAILED redelivery opens with ProcessStarted too: errors thread like answers."""
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+    )
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog, status=TaskStatus.FAILED, error=PROVIDER_ERROR_MESSAGE)
+    task.input["source_client_message_id"] = "888"
+    await store.add(task)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await manager.recover_interrupted()
+    events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
+
+    kinds = [type(e.payload) for e in events]
+    assert kinds.index(ProcessStarted) < kinds.index(Failed)
+    started = next(e.payload for e in events if isinstance(e.payload, ProcessStarted))
+    assert started.source_client_message_id == "888"
 
 
 async def test_recover_interrupted_redelivers_undelivered_results(

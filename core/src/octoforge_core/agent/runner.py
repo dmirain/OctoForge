@@ -30,7 +30,6 @@ from octoforge_core.agent.events import (
     LoopEvent,
     ProcessCompleted,
     ProcessStarted,
-    ProcessSuspended,
     TextDelta,
 )
 from octoforge_core.agent.loop import AgentLoop, format_error
@@ -59,7 +58,7 @@ SUBSCRIBER_QUEUE_SIZE = 100
 # events a transport must never miss: terminals close a streamed message and
 # gate `delivered_at`, process markers drive the surface's UI state. Stream
 # chatter (TextDelta, tool events) may drop on a lagging subscriber instead.
-_CRITICAL_EVENTS = (Finished, Failed, Cancelled, ProcessSuspended, ProcessStarted, ProcessCompleted)
+_CRITICAL_EVENTS = (Finished, Failed, Cancelled, ProcessStarted, ProcessCompleted)
 TITLE_MAX_LENGTH = 60
 SPAWN_REFUSAL_TEMPLATE = (
     "cannot spawn: process limit ({limit}) reached; active: {titles} — ask the user what to cancel"
@@ -254,6 +253,9 @@ class _Process:
     source_message_id: str | None = None
     # its transport-level id (reply threading); rides task.input like the above
     source_client_message_id: str | None = None
+    # the runner's wrap epoch this branch was last assembled under: envelope
+    # inputs can change without the narrative growing (see _sync_branch)
+    synced_epoch: int = -1
     overflow_retried: bool = False
 
 
@@ -312,6 +314,11 @@ class ConversationRunner:
         # the decision lands); messages later covered by START_NEW/CANCEL
         # packages are excluded at wrap time via _covered_ids
         self._injected_ids: set[str] = set()
+        # bumped whenever envelope inputs change without a narrative append:
+        # coverage marked after routing, a process created (its source becomes
+        # foreign to siblings — including requeue-born processes, which append
+        # nothing) or removed. _sync_branch re-assembles when it moved.
+        self._wrap_epoch = 0
         # serializes the limit-check → process-create sequence between the
         # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
         # which run in pump/scheduler tasks outside the actor's inbox
@@ -705,7 +712,10 @@ class ConversationRunner:
         elif task.status is TaskStatus.FAILED:
             self._pending_deliveries.append(
                 _Delivery(
-                    events=(Failed(error=task.error or DEFAULT_TASK_ERROR),),
+                    events=(
+                        _delivery_started(task),
+                        Failed(error=task.error or DEFAULT_TASK_ERROR),
+                    ),
                     task_id=task.id,
                 )
             )
@@ -730,7 +740,10 @@ class ConversationRunner:
             )
         else:
             self._pending_deliveries.append(
-                _Delivery(events=(Failed(error=terminal.error),), task_id=task.id)
+                _Delivery(
+                    events=(_delivery_started(task), Failed(error=terminal.error)),
+                    task_id=task.id,
+                )
             )
 
     async def _mark_streamed_delivered(self, task: Task) -> None:
@@ -808,6 +821,9 @@ class ConversationRunner:
             # a package without inject is fully handled here: start_new covers
             # the message itself, bare cancel packages are pure commands
             self._covered_ids.add(message.id)
+        # coverage and the process set may have changed without a narrative
+        # append: nudge every branch to re-derive its envelopes
+        self._wrap_epoch += 1
 
     async def _apply_inject(
         self, message: ChatMessage, cancelled: set[str], client_key: str | None
@@ -976,6 +992,9 @@ class ConversationRunner:
         )
         process.pump = asyncio.create_task(self._pump_process(process))
         self._processes[process.id] = process
+        # a new source message becomes foreign to sibling branches; requeue-born
+        # processes append nothing to the narrative, so the epoch is the only signal
+        self._wrap_epoch += 1
         return process
 
     async def _pump_process(self, process: _Process) -> None:
@@ -1035,29 +1054,41 @@ class ConversationRunner:
         Runs at every iteration boundary for narrative-built processes (the
         pull model): messages appended to the narrative since the last sync —
         user messages, finals of other tasks, broker notes — become visible
-        to the run. User messages that arrived after the process started are
-        wrapped with the mid-run note (branch copy only): pulled-in text sits
+        to the run. Mid-run user arrivals are wrapped with the mid-run note
+        in the FOREGROUND branch only (branch copy only): pulled-in text sits
         before the run's private tool suffix, and without the note the model
         tends to ignore it mid-task — and the requeue net at termination only
-        catches what arrived after the LAST sync. An unchanged narrative
-        leaves the branch byte-identical (prefix cache), unless the sync is
-        `force`d (reactive compaction).
+        catches what arrived after the LAST sync. Queued background answers
+        see such arrivals as plain history: the clarification belongs to the
+        run the user is watching. An unchanged state leaves the branch
+        byte-identical (prefix cache). Staleness gate: the narrative length
+        AND the wrap epoch — coverage/process changes (START_NEW covering a
+        message, a process appearing or dying) alter the envelopes without
+        growing the narrative, and a length-only gate froze a stale
+        "account for this" note past the routing decision (2026-07-27 audit).
         """
         if not process.narrative_built:
             return
-        if not force and len(self._narrative) == process.watermark:
+        if (
+            not force
+            and len(self._narrative) == process.watermark
+            and process.synced_epoch == self._wrap_epoch
+        ):
             return
         # ids are stable across the trim inside assemble, so the set can be
         # computed up front; covered ids (START_NEW/CANCEL packages) are
         # excluded — their answer lives elsewhere, a note would double it
-        mid_run_ids = frozenset(
-            message.id
-            for message in self._narrative[process.start_watermark :]
-            if message.id is not None
-            and message.id in self._injected_ids
-            and message.id not in self._covered_ids
-            and message.role is MessageRole.USER
-        )
+        if self._foreground_id == process.id:
+            mid_run_ids = frozenset(
+                message.id
+                for message in self._narrative[process.start_watermark :]
+                if message.id is not None
+                and message.id in self._injected_ids
+                and message.id not in self._covered_ids
+                and message.role is MessageRole.USER
+            )
+        else:
+            mid_run_ids = frozenset()
         narrative = await self._assemble_narrative(
             mid_run_ids, foreign_ids=self._foreign_source_ids(own_id=process.id)
         )
@@ -1065,6 +1096,7 @@ class ConversationRunner:
         process.branch[:] = [self._system_message(), *narrative, *private]
         process.synced_len = 1 + len(narrative)
         process.watermark = len(self._narrative)
+        process.synced_epoch = self._wrap_epoch
 
     def _fail_run(self, process: _Process, error: str) -> LoopEvent:
         """Broadcast and return a Failed terminal for the process."""
@@ -1200,6 +1232,8 @@ class ConversationRunner:
         self._processes.pop(process.id, None)
         if self._foreground_id == process.id:
             self._foreground_id = None
+        # its source message stops being foreign to sibling branches
+        self._wrap_epoch += 1
 
     def _foreground(self) -> _Process | None:
         if self._foreground_id is None:

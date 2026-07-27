@@ -13,7 +13,6 @@ from octoforge_core.agent.events import (
     IterationStarted,
     ProcessCompleted,
     ProcessStarted,
-    ProcessSuspended,
     RetryScheduled,
     TextDelta,
     ToolCallCompleted,
@@ -99,12 +98,6 @@ def _terminal_event_details(payload: LoopEvent) -> dict[str, Any] | None:
 
 
 def _process_event_details(payload: LoopEvent) -> dict[str, Any] | None:
-    if isinstance(payload, ProcessSuspended):
-        return {
-            "type": "process_suspended",
-            "process_id": payload.process_id,
-            "title": payload.title,
-        }
     if isinstance(payload, ProcessStarted):
         return {
             "type": "process_started",

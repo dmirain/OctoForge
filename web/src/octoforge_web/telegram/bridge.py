@@ -14,7 +14,6 @@ from octoforge_core.agent.events import (
     Finished,
     LoopEvent,
     ProcessStarted,
-    ProcessSuspended,
     RetryScheduled,
     TextDelta,
     ToolCallFailed,
@@ -39,7 +38,6 @@ RunnerProvider = Callable[[str, str], Awaitable[ConversationRunner]]
 
 TOOL_LINE_TEMPLATE = "⚙️ {name}"
 TOOL_FAIL_LINE_TEMPLATE = "⚠️ {name}: {error}"
-SUSPENDED_LINE_TEMPLATE = "⏸️ «{title}» ушёл в фон"
 CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
 RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
@@ -101,8 +99,9 @@ class TelegramBridge:
     async def handle_text(self, content: str, client_message_id: str | None = None) -> None:
         """Submit user text into the dialog, starting the forwarder on first contact.
 
-        `client_message_id` (Telegram update_id) deduplicates delivery
-        retries: Telegram re-sends an update until it gets a 200.
+        `client_message_id` (the chat-level Telegram message id) deduplicates
+        delivery retries — Telegram re-sends an update until it gets a 200 —
+        and doubles as the reply target the answer threads back to.
         """
         runner = await self._ensure_runner()
         await self.start()
@@ -247,8 +246,6 @@ def _status_line(event: LoopEvent) -> str | None:
         return TOOL_LINE_TEMPLATE.format(name=event.call.name)
     if isinstance(event, ToolCallFailed):
         return TOOL_FAIL_LINE_TEMPLATE.format(name=event.call.name, error=event.error)
-    if isinstance(event, ProcessSuspended):
-        return SUSPENDED_LINE_TEMPLATE.format(title=event.title)
     if isinstance(event, RetryScheduled):
         return RETRY_LINE_TEMPLATE.format(
             reason=event.reason, attempt=event.attempt, delay=event.delay_seconds

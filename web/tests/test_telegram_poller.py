@@ -83,6 +83,7 @@ class FakeTelegramClient:
         self.poll_calls: list[tuple[int | None, float]] = []
         self.failures: list[Exception] = []
         self.sent: list[tuple[int, str, str | None]] = []
+        self.replies: list[int | None] = []
         self.edited: list[tuple[int, int, str, str | None]] = []
         self._next_message_id = 0
 
@@ -104,6 +105,7 @@ class FakeTelegramClient:
     ) -> int:
         self._next_message_id += 1
         self.sent.append((chat_id, text, parse_mode))
+        self.replies.append(reply_to_message_id)
         return self._next_message_id
 
     async def edit_message_text(
@@ -155,11 +157,14 @@ def make_update(
     update_id: int,
     text: str | None = "hi",
     chat_type: TelegramChatType = TelegramChatType.PRIVATE,
+    message_id: int | None = None,
 ) -> TelegramUpdate:
+    # message_id defaults to update_id for convenience but is an INDEPENDENT
+    # value in Telegram: tests probing the dedup/reply key pass it explicitly
     return TelegramUpdate(
         update_id=update_id,
         message=TelegramMessage(
-            message_id=update_id,
+            message_id=message_id if message_id is not None else update_id,
             from_user=TelegramUser(id=TELEGRAM_USER_ID),
             chat=TelegramChat(id=TELEGRAM_USER_ID, type=chat_type),
             text=text,
@@ -287,13 +292,17 @@ async def test_redelivered_update_is_not_answered_twice(
     client = FakeTelegramClient()
     poller = make_poller(client, manager.get_or_create_runner)
 
-    await poller.dispatch(make_update(FIRST_UPDATE_ID, text="ping"))
+    await poller.dispatch(make_update(FIRST_UPDATE_ID, text="ping", message_id=1001))
     await wait_until(lambda: len(client.sent) == 1)
-    await poller.dispatch(make_update(FIRST_UPDATE_ID, text="ping"))  # redelivery
-    await poller.dispatch(make_update(SECOND_UPDATE_ID, text="ping"))
+    # a Telegram redelivery carries a NEW update_id but the SAME message_id:
+    # the chat-level message id is the idempotency key now
+    await poller.dispatch(make_update(FIRST_UPDATE_ID + 7, text="ping", message_id=1001))
+    await poller.dispatch(make_update(SECOND_UPDATE_ID, text="ping", message_id=1002))
     await wait_until(lambda: len(client.sent) == EXPECTED_TWO_REPLIES)
 
     assert len(client.sent) == EXPECTED_TWO_REPLIES
+    # end-to-end: each answer replies to the message that asked it
+    assert client.replies == [1001, 1002]
 
 
 async def test_cancel_command_is_accepted(

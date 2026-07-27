@@ -253,12 +253,6 @@
         case "retry_scheduled":
           addStep(`🔁 повтор ${event.attempt} через ${Math.round(event.delay_seconds)}с (${event.reason})`);
           break;
-        case "process_suspended":
-          addMarker(`процесс отложен: ${event.title}`);
-          break;
-        case "process_resumed":
-          addMarker(`процесс возобновлён: ${event.title}`);
-          break;
         case "process_completed":
           addMarker(`процесс завершён (${event.status}): ${event.title}`);
           break;

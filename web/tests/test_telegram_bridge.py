@@ -62,6 +62,7 @@ LONG_REPLY_TAIL = "x" * 100
 CRON_TITLE = "morning report"
 CRON_RESULT = "the report is ready"
 EXPECTED_MESSAGE_COUNT = 2
+QUESTION_MESSAGE_ID = 777
 
 
 class FakeTelegramClient:
@@ -368,6 +369,23 @@ async def test_answer_replies_to_its_question(
     await bridge.aclose()
 
 
+async def test_empty_final_renders_nothing(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A deliberately silent answer must not produce an empty Telegram message."""
+    client = FakeTelegramClient()
+    manager = await make_manager(ScriptedLLM([reply("")]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge.handle_text("hi")
+    runner = await manager.get_or_create_runner(TELEGRAM_USER_ID, TELEGRAM_CHANNEL)
+    await wait_until(lambda: not runner._processes)
+
+    assert client.sent == []
+    assert client.edited == []
+    await bridge.aclose()
+
+
 async def test_keyless_submit_sends_a_plain_message(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -496,11 +514,13 @@ async def test_table_reply_is_upgraded_to_a_rich_message(
     manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
+    await bridge.handle_text("hi", client_message_id="777")
     await wait_until(lambda: bool(client.rich_edited))
 
     assert client.rich_edited == [(CHAT_ID, 1, content)]
     assert client.sent[0][2] == PARSE_MODE_HTML  # the draft streamed as HTML first
+    # the in-place rich upgrade edits the same message: threading survives
+    assert client.replies[0] == QUESTION_MESSAGE_ID
     await bridge.aclose()
 
 
