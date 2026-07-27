@@ -31,6 +31,7 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
+    MID_RUN_NOTE_TEMPLATE,
     RESTART_LIMIT_ERROR,
     SUBMIT_FAILED_ERROR,
     SUBSCRIBER_QUEUE_SIZE,
@@ -837,9 +838,76 @@ async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     assert contents.index("start") < next(
         i for i, content in enumerate(contents) if "extra context" in content
     )
+    # the mid-run arrival carries the note (the model is told to fold it into
+    # the answer); the process's own source message stays clean
+    wrapped = MID_RUN_NOTE_TEMPLATE.format(content="extra context")
+    assert any(wrapped in m.content for m in second_request)
+    assert "start" in contents  # exact: no note on the source message
     # a message the process did sync is not re-routed at finalize: one process only
     assert len(llm.requests) == RETRIED_CALLS
     assert [m.content for m in runner.history()] == ["start", "extra context", "after"]
+
+
+async def test_prior_era_injection_is_not_wrapped_in_a_new_process(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The mid-run note is scoped to the run it joined: history stays clean after."""
+    tool = BlockingTool()
+    llm = ScriptedLLM([blocking_call(), reply("after"), reply(SECOND_REPLY)])
+    router = FakeRouter()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("start")
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    router.decide(RouteOp(action=RouteAction.INJECT))
+    await runner.submit("extra context")
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+    tool.release.set()
+    await collect_until(queue, is_completed)
+    router.decide(RouteOp(action=RouteAction.START_NEW))
+    await runner.submit("next question")
+    await collect_until(queue, is_completed)
+
+    # the new process's branch carries the old injection as plain history
+    third_request = llm.requests[-1]
+    assert any(m.content == "extra context" for m in third_request)
+    assert not any(
+        MID_RUN_NOTE_TEMPLATE.format(content="extra context") in m.content for m in third_request
+    )
+
+
+async def test_orphan_restart_sets_the_mid_run_boundary(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """White-box: an orphan-recovered ANSWER process treats pre-restart history
+    as plain context, not as mid-run arrivals (start_watermark is set on the
+    second narrative-built creation path too)."""
+    tool = BlockingTool()
+    llm = ScriptedLLM([reply("old answer"), blocking_call(), reply("after")])
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    await runner.submit("old question")
+    await collect_until(queue, is_completed)
+
+    dialog = await get_dialog(session_factory)
+    orphan = orphaned_task(dialog, kind=TaskKind.ANSWER)
+    await store.add(orphan)
+    await runner.restart_task(orphan)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    process = next(iter(runner._processes.values()))
+    assert process.start_watermark == len(runner.history())
+    assert process.start_watermark > 0
+    tool.release.set()
+    await collect_until(queue, is_completed)
 
 
 async def test_unseen_message_is_requeued_at_finalize(
@@ -2466,15 +2534,19 @@ async def test_trim_narrative_remaps_watermarks_and_prunes_coverage(
 
     process = next(iter(runner._processes.values()))
     watermark_before = process.watermark
+    start_watermark_before = process.start_watermark
     (first_message,) = runner.history()
     assert first_message.id is not None
     assert first_message.id in runner._covered_ids
+    assert first_message.id in runner._injected_ids
 
     runner._trim_narrative(0)  # everything compacted away
 
     assert runner.history() == []
     assert process.watermark == 0 and watermark_before > 0
+    assert process.start_watermark == 0 and start_watermark_before > 0
     assert first_message.id not in runner._covered_ids
+    assert first_message.id not in runner._injected_ids
 
     tool.release.set()
     await manager.stop_all()

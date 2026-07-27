@@ -81,6 +81,10 @@ BACKGROUND_TASK_PROMPT = (
 )
 DATE_ENVELOPE_TEMPLATE = "[Current date and time: {now} (UTC)]\n{content}"
 CURRENT_DATE_FORMAT = "%Y-%m-%d %H:%M"
+MID_RUN_NOTE_TEMPLATE = (
+    "[Received while you were working: account for this user clarification/addition "
+    "in your current answer]\n{content}"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +127,18 @@ def _with_date_envelope(message: ChatMessage) -> ChatMessage:
         tool_calls=message.tool_calls,
         tool_call_id=message.tool_call_id,
     )
+
+
+def _with_mid_run_note(message: ChatMessage) -> ChatMessage:
+    """Mark a branch copy of a user message that joined a run already in flight.
+
+    Pulled-in messages sit BEFORE the run's private tool suffix, where the
+    model tends to ignore them mid-task; the note tells it to fold them into
+    the answer it is composing. Branch-only, like the date envelope: the
+    narrative and the store keep the clean copy. `replace` keeps the id — the
+    wrap must happen before `_with_date_envelope`, which drops it.
+    """
+    return replace(message, content=MID_RUN_NOTE_TEMPLATE.format(content=message.content))
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +202,9 @@ class _Process:
     narrative_built: bool = False
     synced_len: int = 0
     watermark: int = 0
+    # narrative length at process birth: user messages past it are mid-run
+    # arrivals — sync wraps them with MID_RUN_NOTE_TEMPLATE in the branch copy
+    start_watermark: int = 0
     overflow_retried: bool = False
 
 
@@ -238,6 +257,12 @@ class ConversationRunner:
         # narrative indices — the narrative is trimmed to the hot tail as
         # compaction advances, and indices would shift under a queued command
         self._covered_ids: set[str] = set()
+        # row ids of user messages that entered the narrative while a process
+        # could be running. Marked eagerly at append time (not after routing:
+        # the router is an LLM call, and a sync can pull the message before
+        # the decision lands); messages later covered by START_NEW/CANCEL
+        # packages are excluded at wrap time via _covered_ids
+        self._injected_ids: set[str] = set()
         # serializes the limit-check → process-create sequence between the
         # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
         # which run in pump/scheduler tasks outside the actor's inbox
@@ -389,6 +414,7 @@ class ConversationRunner:
             )
             process.synced_len = len(process.branch)
             process.watermark = len(self._narrative)
+            process.start_watermark = len(self._narrative)
         else:
             self._start_process(task)
 
@@ -559,6 +585,12 @@ class ConversationRunner:
             # coverage tracking keys on it
             message = replace(message, id=message_id)
             self._narrative.append(message)
+            if message.id is not None:
+                # mark BEFORE routing: the router call below suspends, and a
+                # running process can sync the message in meanwhile — it must
+                # already count as a mid-run arrival (covered ids are excluded
+                # at wrap time once the routing decision lands)
+                self._injected_ids.add(message.id)
         decision = await self._router.route(self._snapshot(), message.content, self._max_processes)
         await self._apply_decision(message, decision)
 
@@ -760,6 +792,7 @@ class ConversationRunner:
         )
         process.synced_len = len(process.branch)
         process.watermark = len(self._narrative)
+        process.start_watermark = len(self._narrative)
         self._foreground_id = process.id
         if message.id is not None:
             self._covered_ids.add(message.id)
@@ -767,17 +800,28 @@ class ConversationRunner:
     def _system_message(self) -> ChatMessage:
         return ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME))
 
-    async def _assemble_narrative(self) -> list[ChatMessage]:
+    async def _assemble_narrative(
+        self, mid_run_ids: frozenset[str] = frozenset()
+    ) -> list[ChatMessage]:
         """Assemble the narrative part of a branch, date-enveloping its tail copy.
 
         The assembled tail size also drives the memory diet: once compaction
         has advanced, everything before the hot tail is dropped from the
         in-memory narrative (S3, 2026-07-26 audit) — it stays reachable
         through the topics block and history_search, exactly like the prompt.
+
+        `mid_run_ids` (sync path only) marks user messages that joined the
+        run in flight: they get the mid-run note before the date envelope
+        (which drops ids); a message that is also last simply carries both
+        envelopes nested.
         """
         assembled = await self._compactor.assemble(self._dialog, self._narrative)
         self._trim_narrative(assembled.tail_count)
         narrative = assembled.messages
+        if mid_run_ids:
+            for index, message in enumerate(narrative):
+                if message.id in mid_run_ids and message.role is MessageRole.USER:
+                    narrative[index] = _with_mid_run_note(message)
         if narrative:
             narrative[-1] = _with_date_envelope(narrative[-1])
         return narrative
@@ -795,8 +839,10 @@ class ConversationRunner:
         dropped_ids = {message.id for message in self._narrative[:drop] if message.id is not None}
         del self._narrative[:drop]
         self._covered_ids -= dropped_ids
+        self._injected_ids -= dropped_ids
         for process in self._processes.values():
             process.watermark = max(0, process.watermark - drop)
+            process.start_watermark = max(0, process.start_watermark - drop)
 
     def _suspend_foreground(self) -> None:
         foreground = self._foreground()
@@ -888,14 +934,30 @@ class ConversationRunner:
         Runs at every iteration boundary for narrative-built processes (the
         pull model): messages appended to the narrative since the last sync —
         user messages, finals of other tasks, broker notes — become visible
-        to the run. An unchanged narrative leaves the branch byte-identical
-        (prefix cache), unless the sync is `force`d (reactive compaction).
+        to the run. User messages that arrived after the process started are
+        wrapped with the mid-run note (branch copy only): pulled-in text sits
+        before the run's private tool suffix, and without the note the model
+        tends to ignore it mid-task — and the requeue net at termination only
+        catches what arrived after the LAST sync. An unchanged narrative
+        leaves the branch byte-identical (prefix cache), unless the sync is
+        `force`d (reactive compaction).
         """
         if not process.narrative_built:
             return
         if not force and len(self._narrative) == process.watermark:
             return
-        narrative = await self._assemble_narrative()
+        # ids are stable across the trim inside assemble, so the set can be
+        # computed up front; covered ids (START_NEW/CANCEL packages) are
+        # excluded — their answer lives elsewhere, a note would double it
+        mid_run_ids = frozenset(
+            message.id
+            for message in self._narrative[process.start_watermark :]
+            if message.id is not None
+            and message.id in self._injected_ids
+            and message.id not in self._covered_ids
+            and message.role is MessageRole.USER
+        )
+        narrative = await self._assemble_narrative(mid_run_ids)
         private = process.branch[process.synced_len :]
         process.branch[:] = [self._system_message(), *narrative, *private]
         process.synced_len = 1 + len(narrative)

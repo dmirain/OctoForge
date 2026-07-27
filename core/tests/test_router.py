@@ -412,7 +412,7 @@ async def test_prompt_prefers_inject_and_forbids_combining() -> None:
     await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
 
     system = llm.last_messages[0]
-    assert "inject is the default" in system.content
+    assert "When unsure, prefer inject" in system.content
     assert "Never combine inject and start_new" in system.content
 
 
