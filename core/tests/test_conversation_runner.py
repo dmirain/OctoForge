@@ -31,6 +31,7 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
+    HANDLED_ELSEWHERE_NOTE_TEMPLATE,
     MID_RUN_NOTE_TEMPLATE,
     RESTART_LIMIT_ERROR,
     SUBMIT_FAILED_ERROR,
@@ -797,6 +798,12 @@ async def test_start_new_queues_behind_the_busy_foreground(
     # whole (TextDelta + Finished) strictly after it
     deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
     assert deltas == ["first final", "second final"]
+    # the queued process's branch marks the foreground's question as taken:
+    # each question is answered by exactly one process
+    queued_branch = llm.requests[1]
+    assert any(
+        HANDLED_ELSEWHERE_NOTE_TEMPLATE.format(content="first") in m.content for m in queued_branch
+    )
     done = completions(events)
     assert {item.title for item in done} == {"first", "second"}
     assert all(item.status == TaskStatus.DONE.value for item in done)
@@ -981,7 +988,13 @@ async def test_bring_back_starts_a_new_answer_process(
     suspended = [e.payload.title for e in events if isinstance(e.payload, ProcessSuspended)]
     assert suspended == []  # nobody takes the slot away from "first"
     bring_back_request = llm.requests[2]
-    assert [m.content for m in bring_back_request[1:-1]] == ["first", "second", "second final"]
+    # "first" is still being answered by the live foreground -> marked taken;
+    # "second" already finished, so its question is plain history
+    assert [m.content for m in bring_back_request[1:-1]] == [
+        HANDLED_ELSEWHERE_NOTE_TEMPLATE.format(content="first"),
+        "second",
+        "second final",
+    ]
     assert "bring back the first one" in bring_back_request[-1].content
 
     tool.release.set()

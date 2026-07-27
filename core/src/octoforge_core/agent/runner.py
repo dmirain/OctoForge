@@ -85,6 +85,9 @@ MID_RUN_NOTE_TEMPLATE = (
     "[Received while you were working: account for this user clarification/addition "
     "in your current answer]\n{content}"
 )
+HANDLED_ELSEWHERE_NOTE_TEMPLATE = (
+    "[A separate process is already answering this message — do not answer it here]\n{content}"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +142,18 @@ def _with_mid_run_note(message: ChatMessage) -> ChatMessage:
     wrap must happen before `_with_date_envelope`, which drops it.
     """
     return replace(message, content=MID_RUN_NOTE_TEMPLATE.format(content=message.content))
+
+
+def _with_handled_elsewhere_note(message: ChatMessage) -> ChatMessage:
+    """Mark a branch copy of a user message another live process is answering.
+
+    Every answer process sees the shared narrative, so without the note two
+    concurrent processes each see the other's still-unanswered question and
+    both answer both (measured on the queue rollout: the queued «17*23»
+    process answered the capabilities question too, and vice versa). Same
+    branch-only mechanics as the other envelopes.
+    """
+    return replace(message, content=HANDLED_ELSEWHERE_NOTE_TEMPLATE.format(content=message.content))
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +220,9 @@ class _Process:
     # narrative length at process birth: user messages past it are mid-run
     # arrivals — sync wraps them with MID_RUN_NOTE_TEMPLATE in the branch copy
     start_watermark: int = 0
+    # the user message an ANSWER process answers; other processes wrap it
+    # with the handled-elsewhere note so exactly one process answers it
+    source_message_id: str | None = None
     overflow_retried: bool = False
 
 
@@ -406,7 +424,7 @@ class ConversationRunner:
     async def _start_orphaned(self, task: Task) -> None:
         """Start the replacement background process of an orphaned task."""
         if task.kind is TaskKind.ANSWER:
-            narrative = await self._assemble_narrative()
+            narrative = await self._assemble_narrative(foreign_ids=self._foreign_source_ids())
             process = self._create_process(
                 task=task,
                 branch=[self._system_message(), *narrative],
@@ -792,7 +810,7 @@ class ConversationRunner:
             cron_job_id=None,
             source_message_id=message.id,
         )
-        narrative = await self._assemble_narrative()
+        narrative = await self._assemble_narrative(foreign_ids=self._foreign_source_ids())
         process = self._create_process(
             task=task,
             branch=[self._system_message(), *narrative],
@@ -810,7 +828,9 @@ class ConversationRunner:
         return ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME))
 
     async def _assemble_narrative(
-        self, mid_run_ids: frozenset[str] = frozenset()
+        self,
+        mid_run_ids: frozenset[str] = frozenset(),
+        foreign_ids: frozenset[str] = frozenset(),
     ) -> list[ChatMessage]:
         """Assemble the narrative part of a branch, date-enveloping its tail copy.
 
@@ -820,20 +840,35 @@ class ConversationRunner:
         through the topics block and history_search, exactly like the prompt.
 
         `mid_run_ids` (sync path only) marks user messages that joined the
-        run in flight: they get the mid-run note before the date envelope
-        (which drops ids); a message that is also last simply carries both
+        run in flight: they get the mid-run note. `foreign_ids` marks user
+        messages that are the source of ANOTHER live answer process: they get
+        the handled-elsewhere note, so concurrent processes don't answer each
+        other's questions. Both wraps happen before the date envelope (which
+        drops ids); a wrapped message that is also last simply carries both
         envelopes nested.
         """
         assembled = await self._compactor.assemble(self._dialog, self._narrative)
         self._trim_narrative(assembled.tail_count)
         narrative = assembled.messages
-        if mid_run_ids:
+        if mid_run_ids or foreign_ids:
             for index, message in enumerate(narrative):
-                if message.id in mid_run_ids and message.role is MessageRole.USER:
+                if message.role is not MessageRole.USER:
+                    continue
+                if message.id in foreign_ids:
+                    narrative[index] = _with_handled_elsewhere_note(message)
+                elif message.id in mid_run_ids:
                     narrative[index] = _with_mid_run_note(message)
         if narrative:
             narrative[-1] = _with_date_envelope(narrative[-1])
         return narrative
+
+    def _foreign_source_ids(self, own_id: str | None = None) -> frozenset[str]:
+        """Source-message ids of live answer processes other than `own_id`."""
+        return frozenset(
+            process.source_message_id
+            for process in self._processes.values()
+            if process.id != own_id and process.source_message_id is not None
+        )
 
     def _trim_narrative(self, tail_count: int) -> None:
         """Drop compacted messages from memory, keeping bookkeeping consistent.
@@ -867,6 +902,7 @@ class ConversationRunner:
         branch: list[ChatMessage],
         narrative_built: bool,
     ) -> _Process:
+        raw_source = task.input.get("source_message_id")
         process = _Process(
             id=task.id,
             title=task.title,
@@ -874,6 +910,7 @@ class ConversationRunner:
             control=LoopControl(),
             branch=branch,
             narrative_built=narrative_built,
+            source_message_id=raw_source if isinstance(raw_source, str) else None,
         )
         process.pump = asyncio.create_task(self._pump_process(process))
         self._processes[process.id] = process
@@ -959,7 +996,9 @@ class ConversationRunner:
             and message.id not in self._covered_ids
             and message.role is MessageRole.USER
         )
-        narrative = await self._assemble_narrative(mid_run_ids)
+        narrative = await self._assemble_narrative(
+            mid_run_ids, foreign_ids=self._foreign_source_ids(own_id=process.id)
+        )
         private = process.branch[process.synced_len :]
         process.branch[:] = [self._system_message(), *narrative, *private]
         process.synced_len = 1 + len(narrative)
