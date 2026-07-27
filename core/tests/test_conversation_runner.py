@@ -857,6 +857,30 @@ async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     assert [m.content for m in runner.history()] == ["start", "extra context", "after"]
 
 
+async def test_empty_final_is_silence_not_an_empty_bubble(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A process may deliberately answer nothing (its question was taken over):
+    the task completes and is stamped delivered, but no empty message enters
+    the narrative and nothing is queued for delivery."""
+    llm = ScriptedLLM([reply("")])
+    store = InMemoryTaskStore()
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    await collect_until(queue, is_completed)
+
+    (task,) = await store.list(runner.dialog_id)
+    assert task.status is TaskStatus.DONE
+    # the delivered stamp lands when the actor drains _ProcessTerminated,
+    # slightly after the ProcessCompleted broadcast
+    await wait_for_condition(lambda: task.delivered_at is not None)
+    assert not runner._pending_deliveries
+    assert [m.content for m in runner.history()] == ["hi"]
+
+
 async def test_prior_era_injection_is_not_wrapped_in_a_new_process(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

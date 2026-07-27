@@ -144,6 +144,11 @@ def _with_mid_run_note(message: ChatMessage) -> ChatMessage:
     return replace(message, content=MID_RUN_NOTE_TEMPLATE.format(content=message.content))
 
 
+def _silent_done(task: Task) -> bool:
+    """Whether the task finished with a deliberately empty result (nothing to show)."""
+    return task.status is TaskStatus.DONE and not (task.result or "").strip()
+
+
 def _with_handled_elsewhere_note(message: ChatMessage) -> ChatMessage:
     """Mark a branch copy of a user message another live process is answering.
 
@@ -635,7 +640,11 @@ class ConversationRunner:
             task = await self._tasks.get(command.task_id)
         except TaskNotFoundError:
             return  # the user deleted the row (task_delete); nothing to deliver
-        if command.terminal is None:
+        if _silent_done(task):
+            # a deliberately empty result: stamp delivered, never enqueue —
+            # otherwise the startup sweep would redeliver emptiness forever
+            await self._mark_streamed_delivered(task)
+        elif command.terminal is None:
             self._enqueue_redelivery(task)
         elif command.streamed:
             await self._mark_streamed_delivered(task)
@@ -1077,13 +1086,20 @@ class ConversationRunner:
                 self._inbox.put_nowait(_Submit(message, recorded=True))
 
     async def _finalize(self, process: _Process, terminal: LoopEvent) -> TaskStatus:
-        """Fold the run outcome into the narrative and the task store."""
+        """Fold the run outcome into the narrative and the task store.
+
+        An empty final is a process choosing silence (e.g. its question was
+        taken over by another process, or the user said to drop it): the task
+        completes, but no empty bubble enters the narrative and nothing is
+        delivered — an empty draft edit would even fail on the Telegram side.
+        """
         task = await self._tasks.get(process.task_id)
         if isinstance(terminal, Finished):
-            message = replace(terminal.message, task_id=process.task_id)
-            await self._persist(message, usage=terminal.usage)
-            self._narrative.append(message)
-            await self._tasks.mark_done(task, message.content)
+            if terminal.message.content.strip():
+                message = replace(terminal.message, task_id=process.task_id)
+                await self._persist(message, usage=terminal.usage)
+                self._narrative.append(message)
+            await self._tasks.mark_done(task, terminal.message.content)
             status = TaskStatus.DONE
         elif isinstance(terminal, Failed):
             await self._tasks.mark_failed(task, terminal.error)
