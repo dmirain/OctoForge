@@ -70,3 +70,22 @@ def test_db_is_framework_only() -> None:
         offending.add((path, target))
 
     assert offending == set()
+
+
+def test_no_module_imports_a_neighbours_tools() -> None:
+    """Tool implementations are per-module; the cross-module contract is api.py.
+
+    tasks/tools.py used to import 12 names from cron/tools.py — the coupling
+    the audit moved onto the cron.api boundary (create_job, format_job, the
+    shared schema fragments). Composition assembles tools from every module;
+    modules themselves never reach into a neighbour's tool implementation.
+    """
+    offending = set()
+    for module in sorted(DOMAIN_MODULES):
+        for path, target in imports_of(module):
+            if target in DOMAIN_MODULES and target != module:
+                text = (CORE / path).read_text(encoding="utf-8")
+                if re.search(rf"from octoforge_core\.{target}\.tools import", text):
+                    offending.add((path, target))
+
+    assert offending == set()
