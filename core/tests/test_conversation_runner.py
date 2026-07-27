@@ -765,9 +765,11 @@ async def test_compaction_crash_fails_the_run_and_releases_the_slot(
     assert finished[0].message.content == REPLY
 
 
-async def test_suspended_process_final_is_delivered_whole_after_the_foreground(
+async def test_start_new_queues_behind_the_busy_foreground(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """A new question never takes over the stream: the first answer finishes
+    in its own message, the queued answer arrives whole as the next one."""
     tool = BlockingTool()
     store = InMemoryTaskStore()
     llm = ScriptedLLM([blocking_call(), reply("second final"), reply("first final")])
@@ -781,20 +783,20 @@ async def test_suspended_process_final_is_delivered_whole_after_the_foreground(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("second")
-    events = await collect_completions(queue, 1)
+    events = await collect_completions(queue, 1)  # "second" finishes in the background
 
     suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
-    assert [(item.title) for item in suspended] == ["first"]
+    assert suspended == []  # the foreground kept its slot
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert [item.message.content for item in finished] == ["second final"]
+    assert finished == []  # the queued answer is not streamed and not delivered yet
 
     tool.release.set()
-    events += await collect_until(queue, is_delivered("first final"))
+    events += await collect_until(queue, is_delivered("second final"))
 
-    # the suspended process finished in the background: its final arrives whole
-    # (TextDelta + Finished) after the foreground's events
+    # the foreground streamed to completion first; the queued final arrived
+    # whole (TextDelta + Finished) strictly after it
     deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
-    assert deltas == ["second final", "first final"]
+    assert deltas == ["first final", "second final"]
     done = completions(events)
     assert {item.title for item in done} == {"first", "second"}
     assert all(item.status == TaskStatus.DONE.value for item in done)
@@ -974,16 +976,16 @@ async def test_bring_back_starts_a_new_answer_process(
     events += await collect_completions(queue, 1)
 
     # there is no promote route: a "bring back" request is a plain START_NEW —
-    # the fresh foreground process sees the whole narrative, including the
-    # suspended task's question and the other answer
+    # it queues behind the busy foreground like any other question, and its
+    # branch sees the whole narrative, including the other queued answer
     suspended = [e.payload.title for e in events if isinstance(e.payload, ProcessSuspended)]
-    assert suspended == ["first"]  # "second" already finished when "bring back" arrived
+    assert suspended == []  # nobody takes the slot away from "first"
     bring_back_request = llm.requests[2]
     assert [m.content for m in bring_back_request[1:-1]] == ["first", "second", "second final"]
     assert "bring back the first one" in bring_back_request[-1].content
 
     tool.release.set()
-    events += await collect_until(queue, is_delivered("first final"))
+    events += await collect_until(queue, is_delivered("bring-back answer"))
 
     done = completions(events)
     assert {item.title for item in done} == {"first", "second", "bring back the first one"}
@@ -1048,7 +1050,7 @@ async def test_cancel_api_cancels_only_the_foreground(
 ) -> None:
     tool = BlockingTool()
     store = InMemoryTaskStore()
-    llm = ScriptedLLM([blocking_call(), blocking_call(), reply("first final")])
+    llm = ScriptedLLM([blocking_call(), blocking_call(), reply("second final")])
     manager = make_manager(
         llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
     )
@@ -1058,23 +1060,24 @@ async def test_cancel_api_cancels_only_the_foreground(
     await runner.submit("first")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await runner.submit("second")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    # the queued process streams nothing: wait for its existence, not its events
+    await wait_for_condition(lambda: len(runner._processes) == TWO_PROCESSES)
 
-    await runner.cancel()
+    await runner.cancel()  # hits the foreground "first"; the queued "second" survives
     tool.release.set()
     events = await collect_completions(queue, 2)
-    events += await collect_until(queue, is_delivered("first final"))
+    events += await collect_until(queue, is_delivered("second final"))
 
     by_title = {item.title: item.status for item in completions(events)}
-    assert by_title == {"second": TaskStatus.CANCELLED.value, "first": TaskStatus.DONE.value}
+    assert by_title == {"first": TaskStatus.CANCELLED.value, "second": TaskStatus.DONE.value}
     assert any(isinstance(e.payload, Cancelled) for e in events)
-    # the cancelled process delivers nothing; the background one comes via the outbox
+    # the cancelled process delivers nothing; the queued one comes via the outbox
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert [item.message.content for item in finished] == ["first final"]
+    assert [item.message.content for item in finished] == ["second final"]
     tasks = {task.title: task for task in await store.list(runner.dialog_id)}
-    assert tasks["second"].status is TaskStatus.CANCELLED  # the row is kept
-    assert tasks["first"].status is TaskStatus.DONE
-    assert [m.content for m in runner.history()] == ["first", "second", "first final"]
+    assert tasks["first"].status is TaskStatus.CANCELLED  # the row is kept
+    assert tasks["second"].status is TaskStatus.DONE
+    assert [m.content for m in runner.history()] == ["first", "second", "second final"]
 
 
 async def test_process_limit_delivers_a_canned_notice_without_an_llm_run(

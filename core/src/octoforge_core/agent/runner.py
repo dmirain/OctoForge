@@ -775,8 +775,16 @@ class ConversationRunner:
         await self._deliver_notice(notice)
 
     async def _start_new(self, message: ChatMessage) -> None:
-        """Start the foreground answer process of a narrative user message."""
-        self._suspend_foreground()
+        """Start the answer process of a narrative user message.
+
+        A busy foreground is never taken over: the current answer keeps
+        streaming into its own message, and the new process queues as a
+        background answer — its final arrives whole through the outbox once
+        the foreground frees. Both transports render the event stream into
+        ONE current draft, so a takeover used to splice the new answer into
+        the previous answer's message (and starve the cancelled foreground's
+        terminal line, which only broadcasts while it holds the slot).
+        """
         task = await self._prepare_process_task(
             message.content[:TITLE_MAX_LENGTH],
             message.content,
@@ -793,7 +801,8 @@ class ConversationRunner:
         process.synced_len = len(process.branch)
         process.watermark = len(self._narrative)
         process.start_watermark = len(self._narrative)
-        self._foreground_id = process.id
+        if self._foreground() is None:
+            self._foreground_id = process.id
         if message.id is not None:
             self._covered_ids.add(message.id)
 
@@ -843,13 +852,6 @@ class ConversationRunner:
         for process in self._processes.values():
             process.watermark = max(0, process.watermark - drop)
             process.start_watermark = max(0, process.start_watermark - drop)
-
-    def _suspend_foreground(self) -> None:
-        foreground = self._foreground()
-        if foreground is None:
-            return
-        self._foreground_id = None
-        self._broadcast(ProcessSuspended(process_id=foreground.id, title=foreground.title))
 
     def _cancel_process(self, target_id: str) -> bool:
         process = self._processes.get(target_id)
