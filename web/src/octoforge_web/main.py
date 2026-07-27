@@ -46,7 +46,6 @@ from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.api import CronStore
 from octoforge_core.cron.scheduler import CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
-from octoforge_core.cron.waker import ManagerCronWaker
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
@@ -513,7 +512,9 @@ def _start_cron_scheduler(
     """Build the cron scheduler of this instance and start its poll loop."""
     scheduler = build_cron_scheduler(
         store,
-        ManagerCronWaker(manager),
+        # ConversationManager satisfies the CronWaker port structurally
+        # (identical wake() signature) — no adapter needed
+        manager,
         owner=uuid.uuid4().hex,
         config=CronSchedulerConfig(
             poll_interval_seconds=settings.cron_poll_interval_seconds,

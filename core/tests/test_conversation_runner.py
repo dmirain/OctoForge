@@ -1,6 +1,7 @@
 """Tests for ConversationRunner processes and ConversationManager."""
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -41,6 +42,7 @@ from octoforge_core.agent.runner import (
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, AssembledContext, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
+from octoforge_core.cron.api import CronWaker
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.models import MessageRow
@@ -2524,3 +2526,18 @@ async def test_covered_requeue_is_not_routed_twice(
     assert len(router.calls) == routed_before  # the duplicate was dropped, not routed
     assert [m.content for m in runner.history() if m.role is MessageRole.USER] == ["question"]
     await manager.stop_all()
+
+
+def test_manager_satisfies_the_cron_waker_port() -> None:
+    """The scheduler wakes dialogs through the manager directly (no adapter).
+
+    Guards the structural match: if ConversationManager.wake ever drifts from
+    the CronWaker protocol, this assignment stops type-checking and this
+    runtime check fails — before the composition root finds out in prod.
+    """
+    waker_method = ConversationManager.wake
+    port_method = CronWaker.wake
+    waker_params = list(inspect.signature(waker_method).parameters)
+    port_params = list(inspect.signature(port_method).parameters)
+
+    assert waker_params == port_params
