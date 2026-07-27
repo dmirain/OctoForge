@@ -101,6 +101,12 @@ class SqlAlchemyInstructionStore:
             row = (await session.scalars(statement)).first()
             return None if row is None else _to_instruction(row)
 
+    async def get(self, instruction_id: str) -> Instruction | None:
+        """Return the record by id, or None when the id is unknown."""
+        async with self._session_factory() as session:
+            row = await session.get(InstructionRow, instruction_id)
+            return None if row is None else _to_instruction(row)
+
     async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
         """Return records visible to `user_id` (None = the whole table)."""
         async with self._session_factory() as session:

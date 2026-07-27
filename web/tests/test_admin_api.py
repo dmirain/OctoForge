@@ -5,9 +5,16 @@ import logging
 from collections.abc import Iterator
 from http import HTTPStatus
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
+from octoforge_core.instructions.api import (
+    InstructionDraft,
+    InstructionService,
+    InstructionType,
+)
+from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 
 from octoforge_web.auth import hash_password, verify_password
 from octoforge_web.config import Settings
@@ -161,9 +168,63 @@ def test_missing_entities_answer_404(client: TestClient) -> None:
     assert client.delete("/api/admin/tasks/nope").status_code == HTTPStatus.NOT_FOUND
     assert client.delete("/api/admin/cron/nope").status_code == HTTPStatus.NOT_FOUND
     assert client.post("/api/admin/instructions/nope/publish").status_code == HTTPStatus.NOT_FOUND
+    assert client.delete("/api/admin/instructions/nope").status_code == HTTPStatus.NOT_FOUND
     assert (
         client.delete("/api/admin/memories/nope?user_id=alice").status_code == HTTPStatus.NOT_FOUND
     )
+
+
+def app_instructions(client: TestClient) -> InstructionService:
+    return cast(InstructionService, client.app.state.instructions)  # type: ignore[attr-defined]
+
+
+def test_public_instruction_is_deletable_without_owner(client: TestClient) -> None:
+    """The console can drop a public record: owner_id NULL used to be unreachable."""
+    service = app_instructions(client)
+    assert client.portal is not None
+    saved = client.portal.call(service.save, "alice", InstructionType.SKILL, "temp skill", "steps")
+    published = client.portal.call(service.publish, saved.id)
+
+    deleted = client.delete(f"/api/admin/instructions/{published.id}")
+    listing = client.get("/api/admin/instructions").json()
+
+    assert deleted.status_code == HTTPStatus.OK
+    assert listing["total"] == 0
+
+
+def test_private_instruction_needs_its_owner(client: TestClient) -> None:
+    service = app_instructions(client)
+    assert client.portal is not None
+    saved = client.portal.call(service.save, "alice", InstructionType.SKILL, "own skill", "steps")
+
+    without_owner = client.delete(f"/api/admin/instructions/{saved.id}")
+    with_owner = client.delete(f"/api/admin/instructions/{saved.id}?owner_id=alice")
+
+    assert without_owner.status_code == HTTPStatus.NOT_FOUND
+    assert with_owner.status_code == HTTPStatus.OK
+    assert client.get("/api/admin/instructions").json()["total"] == 0
+
+
+def test_system_instruction_refuses_deletion(client: TestClient) -> None:
+    # seed through the store: save_system embeds strictly and the test app
+    # has no embedding backend (the lenient agent-facing save defers instead)
+    store = SqlAlchemyInstructionStore(client.app.state.session_factory)  # type: ignore[attr-defined]
+    draft = InstructionDraft(
+        kind=InstructionType.SKILL,
+        title="sys skill",
+        content="steps",
+        tags=(),
+        embedding=(),
+        system=True,
+        owner_id=None,
+    )
+    assert client.portal is not None
+    saved = client.portal.call(store.upsert, draft)
+
+    response = client.delete(f"/api/admin/instructions/{saved.id}")
+
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert client.get("/api/admin/instructions").json()["total"] == 1
 
 
 def test_httpx_logging_never_carries_the_bot_token(tmp_path: Path) -> None:

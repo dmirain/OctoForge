@@ -93,6 +93,12 @@ class InMemoryInstructionStore:
             return None
         return min(matches, key=lambda record: (record.created_at, record.id))
 
+    async def get(self, instruction_id: str) -> Instruction | None:
+        for record in self.records.values():
+            if record.id == instruction_id:
+                return record
+        return None
+
     async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
         self.list_calls += 1
         return [

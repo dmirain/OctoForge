@@ -325,6 +325,43 @@ async def test_delete_raises_for_a_missing_record(
         await service.delete(USER_ID, "missing-id")
 
 
+async def test_delete_public_removes_a_public_record(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    published = await service.publish(saved.id)
+
+    await service.delete_public(published.id)
+
+    with pytest.raises(InstructionNotFoundError):
+        await service.get_by_name(TITLE_ALPHA, InstructionType.KNOWLEDGE)
+
+
+async def test_delete_public_ignores_private_and_missing_records(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+
+    with pytest.raises(InstructionNotFoundError):
+        await service.delete_public(saved.id)  # private: not this surface's business
+    with pytest.raises(InstructionNotFoundError):
+        await service.delete_public("missing-id")
+    assert await service.get_by_name(TITLE_ALPHA, user_id=USER_ID) == saved
+
+
+async def test_delete_public_refuses_a_system_record(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = make_lenient_service(session_factory)
+    saved = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+
+    with pytest.raises(SystemInstructionError):
+        await service.delete_public(saved.id)
+    assert (await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL)).system is True
+
+
 async def test_delete_ignores_another_users_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

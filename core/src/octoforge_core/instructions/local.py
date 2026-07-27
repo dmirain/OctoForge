@@ -224,6 +224,22 @@ class LocalInstructionService:
             raise InstructionNotFoundError(instruction_id)
         return instruction
 
+    async def delete_public(self, instruction_id: str) -> None:
+        """Delete a public non-system record by id; admin surface, not an agent tool.
+
+        A private id answers NotFound (private deletion stays owner-scoped);
+        a system record refuses — the startup registry sync owns it and would
+        recreate it on the next boot anyway.
+        """
+        record = await self._store.get(instruction_id)
+        if record is None or record.owner_id is not None:
+            raise InstructionNotFoundError(instruction_id)
+        if record.system:
+            raise SystemInstructionError(SYSTEM_RECORD_MESSAGE.format(title=record.title))
+        # the public (kind, title) pair is unique, so this hits exactly our record
+        if not await self._store.delete_by_title(record.title, record.type):
+            raise InstructionNotFoundError(instruction_id)
+
     async def delete_system(self, name: str, kind: InstructionType) -> None:
         """Delete a public/system record regardless of the flag (registry sync only)."""
         if not await self._store.delete_by_title(name, kind):

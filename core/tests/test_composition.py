@@ -156,6 +156,12 @@ class InMemoryInstructionStore:
             None,
         )
 
+    async def get(self, instruction_id: str) -> Instruction | None:
+        for record in self.records.values():
+            if record.id == instruction_id:
+                return record
+        return None
+
     async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
         return [
             EmbeddedInstruction(instruction=record, embedding=self.embeddings[record.id])

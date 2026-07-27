@@ -143,6 +143,10 @@ class InstructionStore(Protocol):
         """
         ...
 
+    async def get(self, instruction_id: str) -> Instruction | None:
+        """Return the record by id, or None when the id is unknown."""
+        ...
+
     async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
         """Return records visible to `user_id` with their embeddings.
 
@@ -305,6 +309,16 @@ class InstructionService(Protocol):
         Raises `InstructionNotFoundError` when no own record matches the id —
         a public or someone else's record looks the same as a missing one to
         the agent-facing caller (publishing is the admin surface).
+        """
+        ...
+
+    async def delete_public(self, instruction_id: str) -> None:
+        """Delete a public non-system record by id; admin surface, not an agent tool.
+
+        Raises `InstructionNotFoundError` when the id is unknown or names a
+        private record, and `SystemInstructionError` for a system record —
+        those belong to the startup registry sync, which would resurrect
+        them anyway.
         """
         ...
 

@@ -181,12 +181,19 @@ async def publish_instruction(instruction_id: str, service: InstructionsDep) -> 
 @router.delete("/instructions/{instruction_id}")
 async def delete_instruction(
     instruction_id: str,
-    owner_id: str,
     service: InstructionsDep,
+    owner_id: str | None = None,
 ) -> dict[str, str]:
-    """Delete an owned record; system records refuse deletion, as for the agent."""
+    """Delete a record: `owner_id` targets a private one, omitted — a public one.
+
+    System records refuse deletion (409): the startup registry sync owns them
+    and would recreate them on the next boot.
+    """
     try:
-        await service.delete(owner_id, instruction_id)
+        if owner_id is not None:
+            await service.delete(owner_id, instruction_id)
+        else:
+            await service.delete_public(instruction_id)
     except InstructionNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
     except SystemInstructionError as exc:
