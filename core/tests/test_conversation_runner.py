@@ -382,6 +382,41 @@ class BlockingTool:
         return UNBLOCKED_OUTPUT
 
 
+class TwoPhaseBlockingTool:
+    """Tool stub blocking each call on its own gate (multi-iteration scenarios)."""
+
+    def __init__(self, phases: int = 2) -> None:
+        self.started = [asyncio.Event() for _ in range(phases)]
+        self.release = [asyncio.Event() for _ in range(phases)]
+        self._calls = 0
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=BLOCKING_TOOL, description="blocks per call", parameters_schema={})
+
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        phase = self._calls
+        self._calls += 1
+        self.started[phase].set()
+        await self.release[phase].wait()
+        return UNBLOCKED_OUTPUT
+
+
+class ExhaustedFailsLLM(ScriptedLLM):
+    """ScriptedLLM that fails with a provider error once the script runs dry."""
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        if not self._replies:
+            self.requests.append(list(messages))
+            raise RuntimeError(PROVIDER_ERROR_MESSAGE)
+        async for event in super().stream(messages, tools):
+            yield event
+
+
 class QuickTool:
     """Tool stub completing immediately."""
 
@@ -2207,6 +2242,77 @@ async def test_recover_interrupted_reports_cron_outcome_after_the_restart(
     assert [(task.id, status) for task, status in listener.calls] == [
         (cron_task.id, TaskStatus.DONE)
     ]
+
+
+async def test_cancel_takes_absorbed_clarifications_with_it(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Characterization of the documented tradeoff: a clarification the run
+    already absorbed (synced with the mid-run note) dies with a cancel — the
+    user cancelled the whole exchange, and the requeue net only covers what
+    arrived after the LAST sync."""
+    tool = TwoPhaseBlockingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call(), blocking_call(), reply("never")])
+    router = FakeRouter()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await asyncio.wait_for(tool.started[0].wait(), timeout=TIMEOUT_SECONDS)
+    router.decide(RouteOp(action=RouteAction.INJECT))
+    await runner.submit("уточнение")
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+    tool.release[0].set()  # iteration 2: the sync absorbs the clarification
+    await asyncio.wait_for(tool.started[1].wait(), timeout=TIMEOUT_SECONDS)
+    assert any(
+        MID_RUN_NOTE_TEMPLATE.format(content="уточнение") in m.content for m in llm.requests[1]
+    )
+
+    await runner.cancel()
+    events = await collect_until(queue, is_completed)
+    tool.release[1].set()
+
+    (task,) = await store.list(runner.dialog_id)
+    assert task.status is TaskStatus.CANCELLED
+    # the absorbed clarification is NOT re-routed: no second answer process
+    completed = completions(events)
+    assert [item.status for item in completed] == [TaskStatus.CANCELLED.value]
+    assert len(router.calls) == RETRIED_CALLS  # first + clarification, no requeue
+    assert not any(isinstance(e.payload, Finished) for e in events)
+
+
+async def test_failed_foreground_still_drains_the_queue(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A provider failure in the foreground must not wedge queued answers."""
+    tool = BlockingTool()
+    store = InMemoryTaskStore()
+    llm = ExhaustedFailsLLM([blocking_call(), reply("second final")])
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit("second")
+    # wait for the queued answer to consume its scripted reply and finish:
+    # releasing earlier would race it for the script with the foreground
+    await collect_completions(queue, 1)
+    tool.release.set()  # foreground iteration 2 hits the dry script -> Failed
+
+    events = await collect_until(queue, is_delivered("second final"))
+
+    tasks = {task.title: task for task in await store.list(runner.dialog_id)}
+    assert tasks["first"].status is TaskStatus.FAILED
+    assert tasks["second"].status is TaskStatus.DONE
+    assert any(isinstance(e.payload, Failed) for e in events)
 
 
 async def test_router_cancel_targets_a_queued_background_answer(

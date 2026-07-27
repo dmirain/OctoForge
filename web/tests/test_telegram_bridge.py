@@ -13,6 +13,7 @@ from octoforge_core import (
     ToolRegistry,
     ToolSpec,
 )
+from octoforge_core.agent.events import ProcessStarted, TextDelta
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ProcessInfo, RouteDecision
 from octoforge_core.agent.runner import RunnerConfig
@@ -384,6 +385,27 @@ async def test_empty_final_renders_nothing(
     assert client.sent == []
     assert client.edited == []
     await bridge.aclose()
+
+
+async def test_process_started_does_not_retarget_a_live_draft(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """White-box: once the draft message exists, a later ProcessStarted must
+    not change what it replies to (a reply is fixed at creation time)."""
+    client = FakeTelegramClient()
+    manager = await make_manager(ScriptedLLM([]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge._render(
+        ProcessStarted(process_id="p1", title="one", source_client_message_id="777")
+    )
+    await bridge._render(TextDelta(text="draft text"))
+    assert client.replies == [QUESTION_MESSAGE_ID]
+    await bridge._render(
+        ProcessStarted(process_id="p2", title="two", source_client_message_id="888")
+    )
+
+    assert bridge._draft.reply_to == QUESTION_MESSAGE_ID  # unchanged
 
 
 async def test_keyless_submit_sends_a_plain_message(

@@ -1180,7 +1180,8 @@ class ConversationRunner:
         An empty final is a process choosing silence (e.g. its question was
         taken over by another process, or the user said to drop it): the task
         completes, but no empty bubble enters the narrative and nothing is
-        delivered — an empty draft edit would even fail on the Telegram side.
+        delivered — an undelivered empty result would otherwise be redelivered
+        by the startup sweep forever (see _handle_terminated's silent-done stamp).
         """
         task = await self._tasks.get(process.task_id)
         if isinstance(terminal, Finished):
