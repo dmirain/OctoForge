@@ -69,6 +69,8 @@ class FakeTelegramClient:
 
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, str | None]] = []
+        # reply targets, one per send (None = plain message)
+        self.replies: list[int | None] = []
         self.edited: list[tuple[int, int, str, str | None]] = []
         self.rich_edited: list[tuple[int, int, str]] = []
         self.actions: list[tuple[int, str]] = []
@@ -78,9 +80,16 @@ class FakeTelegramClient:
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[Any]:
         raise NotImplementedError
 
-    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> int:
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> int:
         self._next_message_id += 1
         self.sent.append((chat_id, text, parse_mode))
+        self.replies.append(reply_to_message_id)
         return self._next_message_id
 
     async def edit_message_text(
@@ -344,6 +353,35 @@ async def test_single_delta_sends_one_message(
     await bridge.aclose()
 
 
+async def test_answer_replies_to_its_question(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The draft is created as a reply to the Telegram message it answers."""
+    client = FakeTelegramClient()
+    manager = await make_manager(ScriptedLLM([reply()]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge.handle_text("hi", client_message_id="777")
+    await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
+
+    assert client.replies == [777]
+    await bridge.aclose()
+
+
+async def test_keyless_submit_sends_a_plain_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    manager = await make_manager(ScriptedLLM([reply()]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge.handle_text("hi")
+    await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
+
+    assert client.replies == [None]
+    await bridge.aclose()
+
+
 async def test_deltas_stream_into_one_edited_message(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -367,13 +405,15 @@ async def test_long_reply_is_split_into_telegram_sized_messages(
     manager = await make_manager(ScriptedLLM([reply(long_reply)]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
+    await bridge.handle_text("hi", client_message_id="555")
     await wait_until(lambda: len(client.sent) == EXPECTED_MESSAGE_COUNT)
 
     head, tail = client.sent
     assert head == (CHAT_ID, "x" * MAX_MESSAGE_LENGTH, PARSE_MODE_HTML)
     assert tail == (CHAT_ID, LONG_REPLY_TAIL, PARSE_MODE_HTML)
     assert client.edited == []
+    # only the head of a split answer replies; continuations are plain
+    assert client.replies == [555, None]
     await bridge.aclose()
 
 

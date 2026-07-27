@@ -16,6 +16,7 @@ from octoforge_core.agent.events import (
     Failed,
     Finished,
     ProcessCompleted,
+    ProcessStarted,
     ProcessSuspended,
     TextDelta,
     ToolCallRequested,
@@ -780,11 +781,11 @@ async def test_start_new_queues_behind_the_busy_foreground(
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await runner.submit("first", client_message_id="101")
+    events = await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")
-    events = await collect_completions(queue, 1)  # "second" finishes in the background
+    await runner.submit("second", client_message_id="102")
+    events += await collect_completions(queue, 1)  # "second" finishes in the background
 
     suspended = [e.payload for e in events if isinstance(e.payload, ProcessSuspended)]
     assert suspended == []  # the foreground kept its slot
@@ -793,6 +794,12 @@ async def test_start_new_queues_behind_the_busy_foreground(
 
     tool.release.set()
     events += await collect_until(queue, is_delivered("second final"))
+
+    # the queued delivery opens with its own reply target, not the foreground's
+    started_keys = [
+        e.payload.source_client_message_id for e in events if isinstance(e.payload, ProcessStarted)
+    ]
+    assert started_keys == ["101", "102"]
 
     # the foreground streamed to completion first; the queued final arrived
     # whole (TextDelta + Finished) strictly after it
@@ -855,6 +862,32 @@ async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     # a message the process did sync is not re-routed at finalize: one process only
     assert len(llm.requests) == RETRIED_CALLS
     assert [m.content for m in runner.history()] == ["start", "extra context", "after"]
+
+
+async def test_answer_events_carry_the_source_client_key(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Reply threading: ProcessStarted precedes the stream and both it and the
+    Finished terminal carry the submit's client_message_id."""
+    llm = ScriptedLLM([reply()])
+    store = InMemoryTaskStore()
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi", client_message_id="777")
+    events = await collect_until(queue, is_completed)
+
+    started = [e.payload for e in events if isinstance(e.payload, ProcessStarted)]
+    assert [item.source_client_message_id for item in started] == ["777"]
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert [item.source_client_message_id for item in finished] == ["777"]
+    # the key is persisted with the task: recovery redelivery keeps threading
+    (task,) = await store.list(runner.dialog_id)
+    assert task.input["source_client_message_id"] == "777"
+    # ProcessStarted arrived before the first delta
+    kinds = [type(e.payload) for e in events]
+    assert kinds.index(ProcessStarted) < kinds.index(TextDelta)
 
 
 async def test_empty_final_is_silence_not_an_empty_bubble(

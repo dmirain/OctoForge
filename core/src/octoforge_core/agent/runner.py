@@ -29,6 +29,7 @@ from octoforge_core.agent.events import (
     IterationStarted,
     LoopEvent,
     ProcessCompleted,
+    ProcessStarted,
     ProcessSuspended,
     TextDelta,
 )
@@ -58,7 +59,7 @@ SUBSCRIBER_QUEUE_SIZE = 100
 # events a transport must never miss: terminals close a streamed message and
 # gate `delivered_at`, process markers drive the surface's UI state. Stream
 # chatter (TextDelta, tool events) may drop on a lagging subscriber instead.
-_CRITICAL_EVENTS = (Finished, Failed, Cancelled, ProcessSuspended, ProcessCompleted)
+_CRITICAL_EVENTS = (Finished, Failed, Cancelled, ProcessSuspended, ProcessStarted, ProcessCompleted)
 TITLE_MAX_LENGTH = 60
 SPAWN_REFUSAL_TEMPLATE = (
     "cannot spawn: process limit ({limit}) reached; active: {titles} — ask the user what to cancel"
@@ -149,6 +150,21 @@ def _silent_done(task: Task) -> bool:
     return task.status is TaskStatus.DONE and not (task.result or "").strip()
 
 
+def _task_client_source(task: Task) -> str | None:
+    """The transport-level id of the task's source message, if recorded."""
+    raw = task.input.get("source_client_message_id")
+    return raw if isinstance(raw, str) else None
+
+
+def _delivery_started(task: Task) -> ProcessStarted:
+    """The delivery-opening marker: carries the reply target ahead of the text."""
+    return ProcessStarted(
+        process_id=task.id,
+        title=task.title,
+        source_client_message_id=_task_client_source(task),
+    )
+
+
 def _with_handled_elsewhere_note(message: ChatMessage) -> ChatMessage:
     """Mark a branch copy of a user message another live process is answering.
 
@@ -159,6 +175,14 @@ def _with_handled_elsewhere_note(message: ChatMessage) -> ChatMessage:
     branch-only mechanics as the other envelopes.
     """
     return replace(message, content=HANDLED_ELSEWHERE_NOTE_TEMPLATE.format(content=message.content))
+
+
+@dataclass(frozen=True, slots=True)
+class _AnswerSource:
+    """The user message an ANSWER task answers: narrative row id + transport id."""
+
+    message_id: str | None
+    client_message_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +252,8 @@ class _Process:
     # the user message an ANSWER process answers; other processes wrap it
     # with the handled-elsewhere note so exactly one process answers it
     source_message_id: str | None = None
+    # its transport-level id (reply threading); rides task.input like the above
+    source_client_message_id: str | None = None
     overflow_retried: bool = False
 
 
@@ -472,7 +498,7 @@ class ConversationRunner:
         *,
         kind: TaskKind,
         cron_job_id: str | None,
-        source_message_id: str | None = None,
+        source: _AnswerSource | None = None,
     ) -> Task:
         """Create and store the task backing a new process."""
         task_input: dict[str, Any] = {"prompt": prompt}
@@ -483,7 +509,10 @@ class ConversationRunner:
             task_input["fired_at"] = utc_now().isoformat()
         if kind is TaskKind.ANSWER:
             # the parent linkage of an answer task: the user message it answers
-            task_input["source_message_id"] = source_message_id
+            task_input["source_message_id"] = source.message_id if source else None
+            if source is not None and source.client_message_id is not None:
+                # the transport-level id of that message (reply threading)
+                task_input["source_client_message_id"] = source.client_message_id
         task = Task(
             dialog_id=self._dialog.id,
             user_id=self._dialog.user_id,
@@ -615,7 +644,7 @@ class ConversationRunner:
                 # at wrap time once the routing decision lands)
                 self._injected_ids.add(message.id)
         decision = await self._router.route(self._snapshot(), message.content, self._max_processes)
-        await self._apply_decision(message, decision)
+        await self._apply_decision(message, decision, command.client_message_id)
 
     async def _is_duplicate(self, client_message_id: str | None) -> bool:
         """Whether a submit with this idempotency key was already recorded."""
@@ -661,11 +690,13 @@ class ConversationRunner:
             self._pending_deliveries.append(
                 _Delivery(
                     events=(
+                        _delivery_started(task),
                         TextDelta(text=content),
                         Finished(
                             message=ChatMessage(
                                 role=MessageRole.ASSISTANT, content=content, task_id=task.id
-                            )
+                            ),
+                            source_client_message_id=_task_client_source(task),
                         ),
                     ),
                     task_id=task.id,
@@ -686,8 +717,13 @@ class ConversationRunner:
             self._pending_deliveries.append(
                 _Delivery(
                     events=(
+                        _delivery_started(task),
                         TextDelta(text=message.content),
-                        Finished(message=message, usage=terminal.usage),
+                        Finished(
+                            message=message,
+                            usage=terminal.usage,
+                            source_client_message_id=terminal.source_client_message_id,
+                        ),
                     ),
                     task_id=task.id,
                 )
@@ -753,7 +789,9 @@ class ConversationRunner:
             for process in self._processes.values()
         )
 
-    async def _apply_decision(self, message: ChatMessage, decision: RouteDecision) -> None:
+    async def _apply_decision(
+        self, message: ChatMessage, decision: RouteDecision, client_key: str | None = None
+    ) -> None:
         ops = decision.ops or (RouteOp(action=RouteAction.START_NEW),)
         cancelled: set[str] = set()
         inject = False
@@ -763,15 +801,17 @@ class ConversationRunner:
                     cancelled.add(op.target_id)
             elif op.action is RouteAction.INJECT:
                 inject = True
-                await self._apply_inject(message, cancelled)
+                await self._apply_inject(message, cancelled, client_key)
             elif op.action is RouteAction.START_NEW:
-                await self._apply_start_new(message, cancelled)
+                await self._apply_start_new(message, cancelled, client_key)
         if not inject and message.id is not None:
             # a package without inject is fully handled here: start_new covers
             # the message itself, bare cancel packages are pure commands
             self._covered_ids.add(message.id)
 
-    async def _apply_inject(self, message: ChatMessage, cancelled: set[str]) -> None:
+    async def _apply_inject(
+        self, message: ChatMessage, cancelled: set[str], client_key: str | None
+    ) -> None:
         """No-op for process control: the message already lives in the narrative.
 
         A running process picks it up at its next iteration sync; without a
@@ -779,12 +819,14 @@ class ConversationRunner:
         """
         if self._foreground() is not None:
             return
-        await self._apply_start_new(message, cancelled)
+        await self._apply_start_new(message, cancelled, client_key)
 
-    async def _apply_start_new(self, message: ChatMessage, cancelled: set[str]) -> None:
+    async def _apply_start_new(
+        self, message: ChatMessage, cancelled: set[str], client_key: str | None
+    ) -> None:
         async with self._spawn_lock:
             if not self._exceeds_limit(cancelled):
-                await self._start_new(message)
+                await self._start_new(message, client_key)
                 return
         await self._reject_for_limit(message)
 
@@ -801,7 +843,7 @@ class ConversationRunner:
         )
         await self._deliver_notice(notice)
 
-    async def _start_new(self, message: ChatMessage) -> None:
+    async def _start_new(self, message: ChatMessage, client_key: str | None = None) -> None:
         """Start the answer process of a narrative user message.
 
         A busy foreground is never taken over: the current answer keeps
@@ -817,7 +859,7 @@ class ConversationRunner:
             message.content,
             kind=TaskKind.ANSWER,
             cron_job_id=None,
-            source_message_id=message.id,
+            source=_AnswerSource(message_id=message.id, client_message_id=client_key),
         )
         narrative = await self._assemble_narrative(foreign_ids=self._foreign_source_ids())
         process = self._create_process(
@@ -830,6 +872,15 @@ class ConversationRunner:
         process.start_watermark = len(self._narrative)
         if self._foreground() is None:
             self._foreground_id = process.id
+            # the reply target must reach the transport BEFORE the first
+            # token: a reply can only be set when the message is created
+            self._broadcast(
+                ProcessStarted(
+                    process_id=process.id,
+                    title=process.title,
+                    source_client_message_id=process.source_client_message_id,
+                )
+            )
         if message.id is not None:
             self._covered_ids.add(message.id)
 
@@ -912,6 +963,7 @@ class ConversationRunner:
         narrative_built: bool,
     ) -> _Process:
         raw_source = task.input.get("source_message_id")
+        raw_client = task.input.get("source_client_message_id")
         process = _Process(
             id=task.id,
             title=task.title,
@@ -920,6 +972,7 @@ class ConversationRunner:
             branch=branch,
             narrative_built=narrative_built,
             source_message_id=raw_source if isinstance(raw_source, str) else None,
+            source_client_message_id=raw_client if isinstance(raw_client, str) else None,
         )
         process.pump = asyncio.create_task(self._pump_process(process))
         self._processes[process.id] = process
@@ -1037,10 +1090,14 @@ class ConversationRunner:
                     # pull model: re-sync the narrative part of the branch
                     # before the loop's next LLM call reads it
                     await self._sync_branch(process)
+                out: LoopEvent = event
+                if isinstance(event, Finished):
+                    # reply threading: the loop knows nothing about tasks
+                    out = replace(event, source_client_message_id=process.source_client_message_id)
                 if self._foreground_id == process.id:
-                    self._broadcast(event)
-                if isinstance(event, (Finished, Cancelled, Failed)):
-                    terminal = event
+                    self._broadcast(out)
+                if isinstance(out, (Finished, Cancelled, Failed)):
+                    terminal = out
         except ContextOverflowError:
             raise  # the reactive-compaction retry handles it one level up
         except Exception as exc:  # loop failures are broadcast, not raised

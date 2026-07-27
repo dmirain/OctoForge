@@ -34,8 +34,14 @@ class TelegramClient(Protocol):
         """Fetch updates after `offset`, long-polling up to `timeout_seconds`."""
         ...
 
-    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> int:
-        """Send a text message; return its message id."""
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> int:
+        """Send a text message, optionally as a reply; return its message id."""
         ...
 
     async def edit_message_text(
@@ -73,10 +79,22 @@ class TelegramBotClient:
             raise TelegramApiError("getUpdates: unexpected result shape")
         return _parse_updates(result)
 
-    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> int:
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> int:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if parse_mode is not None:
             payload["parse_mode"] = parse_mode
+        if reply_to_message_id is not None:
+            # allow_sending_without_reply: a deleted question must not fail the answer
+            payload["reply_parameters"] = {
+                "message_id": reply_to_message_id,
+                "allow_sending_without_reply": True,
+            }
         result = await self._call_with_parse_fallback("sendMessage", payload)
         if not isinstance(result, dict) or "message_id" not in result:
             raise TelegramApiError("sendMessage: unexpected result shape")

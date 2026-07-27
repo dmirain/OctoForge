@@ -95,7 +95,13 @@ class FakeTelegramClient:
         await asyncio.sleep(IDLE_BATCH_SECONDS)
         return []
 
-    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> int:
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> int:
         self._next_message_id += 1
         self.sent.append((chat_id, text, parse_mode))
         return self._next_message_id

@@ -13,6 +13,7 @@ from octoforge_core.agent.events import (
     Failed,
     Finished,
     LoopEvent,
+    ProcessStarted,
     ProcessSuspended,
     RetryScheduled,
     TextDelta,
@@ -61,6 +62,10 @@ class _Draft:
     buffer: str = ""
     delivered_text: str = ""
     sealed_chunks: int = 0
+    # the question this draft replies to (its chat-level message id); set
+    # from ProcessStarted BEFORE the first send — Telegram can only thread
+    # a reply at message creation, never on a later edit
+    reply_to: int | None = None
 
 
 class TelegramBridge:
@@ -138,6 +143,10 @@ class TelegramBridge:
             logger.warning("Telegram render failed for %s", self._user_id, exc_info=True)
 
     async def _render(self, event: LoopEvent) -> None:
+        if isinstance(event, ProcessStarted):
+            if self._draft.message_id is None:
+                self._draft.reply_to = _reply_target(event.source_client_message_id)
+            return
         if isinstance(event, TextDelta):
             self._draft.buffer += event.text
             await self._flush_throttled()
@@ -207,14 +216,30 @@ class TelegramBridge:
 
     async def _deliver(self, html: str) -> None:
         if self._draft.message_id is None:
+            # only the head of the answer replies; continuation chunks of a
+            # long answer (sealed_chunks > 0) are plain follow-ups
+            reply_to = self._draft.reply_to if self._draft.sealed_chunks == 0 else None
             self._draft.message_id = await self._client.send_message(
-                self._chat_id, html, parse_mode=PARSE_MODE_HTML
+                self._chat_id, html, parse_mode=PARSE_MODE_HTML, reply_to_message_id=reply_to
             )
         else:
             await self._client.edit_message_text(
                 self._chat_id, self._draft.message_id, html, parse_mode=PARSE_MODE_HTML
             )
         self._draft.delivered_text = html
+
+
+def _reply_target(source_client_message_id: str | None) -> int | None:
+    """Parse the source key into a chat message id; non-numeric keys mean no reply.
+
+    The poller keys Telegram submits by the chat-level message id, so a
+    numeric key is a valid reply target. None (requeued messages, tasks
+    created before the key existed) and non-numeric keys (other transports)
+    simply fall back to a plain, unthreaded message.
+    """
+    if source_client_message_id is None or not source_client_message_id.isdigit():
+        return None
+    return int(source_client_message_id)
 
 
 def _status_line(event: LoopEvent) -> str | None:

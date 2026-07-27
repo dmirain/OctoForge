@@ -12,6 +12,7 @@ from octoforge_core.agent.events import (
     Finished,
     IterationStarted,
     ProcessCompleted,
+    ProcessStarted,
     ProcessSuspended,
     RetryScheduled,
     TextDelta,
@@ -103,6 +104,13 @@ def _process_event_details(payload: LoopEvent) -> dict[str, Any] | None:
             "type": "process_suspended",
             "process_id": payload.process_id,
             "title": payload.title,
+        }
+    if isinstance(payload, ProcessStarted):
+        return {
+            "type": "process_started",
+            "process_id": payload.process_id,
+            "title": payload.title,
+            "source_client_message_id": payload.source_client_message_id,
         }
     if isinstance(payload, ProcessCompleted):
         return {
