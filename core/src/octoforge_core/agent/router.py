@@ -124,6 +124,7 @@ class LLMRouter:
         """Route the message; fall back to a new exchange on LLM trouble."""
         if not exchanges:
             # nothing to belong to: a new exchange is the only possible answer
+            logger.debug("routed: no live exchanges, new exchange")
             return RouteDecision()
         try:
             completion = await asyncio.wait_for(

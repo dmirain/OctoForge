@@ -4,10 +4,11 @@ import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.branch import CLARIFICATION_NOTE_TEMPLATE, TASK_NOTE_TEMPLATE
@@ -31,6 +32,8 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
+    NUDGE_AFTER_SECONDS,
+    NUDGE_TEMPLATE,
     RESTART_LIMIT_ERROR,
     SUBMIT_FAILED_ERROR,
     SUBSCRIBER_QUEUE_SIZE,
@@ -38,6 +41,7 @@ from octoforge_core.agent.runner import (
     ConversationManager,
     RunnerConfig,
     TaskOutcomeListener,
+    _ProcessTerminated,
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, AssembledContext, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
@@ -45,7 +49,7 @@ from octoforge_core.cron.api import CronWaker
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.api import ExchangeStatus
-from octoforge_core.dialogs.models import MessageRow
+from octoforge_core.dialogs.models import ExchangeRow, MessageRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
@@ -95,6 +99,10 @@ SECOND_CALL = 2
 EXPECTED_LLM_CALLS = 3
 MESSAGES_AFTER_REFUSAL = 3
 MESSAGES_AFTER_INJECT = 2
+MESSAGES_AFTER_STRAY_REPLY = 3
+OTHER_TASK_ID = "other"
+DEAD_TASK_ID = "dead"
+NUDGE_STALE_SECONDS = NUDGE_AFTER_SECONDS + 100.0
 
 
 @pytest.fixture
@@ -995,6 +1003,27 @@ async def _only_first_is_live(exchanges: SqlAlchemyExchangeRepository, dialog_id
 
 async def _is_answered(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
     return (await exchanges.get(exchange_id)).status is ExchangeStatus.ANSWERED
+
+
+async def _is_cancelled(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
+    return (await exchanges.get(exchange_id)).status is ExchangeStatus.CANCELLED
+
+
+async def _is_failed(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
+    return (await exchanges.get(exchange_id)).status is ExchangeStatus.FAILED
+
+
+async def _backdate_exchange(
+    session_factory: async_sessionmaker[AsyncSession], exchange_id: str, seconds: float
+) -> None:
+    """Push an exchange's `updated_at` into the past (nudge staleness needs it)."""
+    async with session_factory() as session:
+        await session.execute(
+            update(ExchangeRow)
+            .where(ExchangeRow.id == exchange_id)
+            .values(updated_at=utc_now() - timedelta(seconds=seconds))
+        )
+        await session.commit()
 
 
 async def wait_for_async_condition(
@@ -2948,6 +2977,222 @@ async def test_failed_submit_persist_reports_to_the_transport(
     assert failed.error == SUBMIT_FAILED_ERROR
     assert runner.history() == []  # nothing was recorded, nothing routed
     await manager.stop_all()
+
+
+# --- exchange settlement guards, recovery and reply routing ------------------
+
+
+async def test_settle_skips_when_the_exchange_changed_hands(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A termination from a task that no longer owns the exchange must not
+    clobber the new owner's IN_PROGRESS state (`_settle_exchange`'s owner guard)."""
+    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    exchange = await exchanges.create(runner.dialog_id, "title")
+    await exchanges.set_status(exchange.id, ExchangeStatus.IN_PROGRESS, owner_task_id=OTHER_TASK_ID)
+
+    await runner._settle_exchange(
+        _ProcessTerminated(
+            task_id=DEAD_TASK_ID,
+            exchange_id=exchange.id,
+            exchange_status=ExchangeStatus.ANSWERED,
+            unseen_messages=True,
+        )
+    )
+
+    settled = await exchanges.get(exchange.id)
+    assert settled.status is ExchangeStatus.IN_PROGRESS
+    assert settled.owner_task_id == OTHER_TASK_ID
+    assert runner._processes == {}  # no reopen, no new process
+    await manager.stop_all()
+
+
+async def test_settle_does_not_resurrect_a_cancelled_exchange(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A dead task's late termination, even with unseen messages, must not
+    bring a CANCELLED exchange back to life."""
+    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    exchange = await exchanges.create(runner.dialog_id, "title")
+    await exchanges.set_status(exchange.id, ExchangeStatus.CANCELLED)
+
+    await runner._settle_exchange(
+        _ProcessTerminated(
+            task_id=DEAD_TASK_ID,
+            exchange_id=exchange.id,
+            exchange_status=ExchangeStatus.ANSWERED,
+            unseen_messages=True,
+        )
+    )
+
+    settled = await exchanges.get(exchange.id)
+    assert settled.status is ExchangeStatus.CANCELLED
+    assert runner._processes == {}
+    await manager.stop_all()
+
+
+async def test_router_cancel_settles_the_exchange_as_cancelled(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tool = BlockingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call()])
+    router = FakeRouter()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("start")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    router.action = RouteAction.COMMAND
+    router.decide_cancel_all()
+    await runner.submit("stop it")
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+
+    maybe_exchange_id = runner.history()[0].exchange_id
+    assert maybe_exchange_id is not None
+    exchange_id: str = maybe_exchange_id
+    await wait_for_async_condition(lambda: _is_cancelled(exchanges, exchange_id))
+
+    tool.release.set()
+    await collect_until(queue, is_completed)
+
+
+async def test_failed_run_settles_its_exchange_as_failed(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = InMemoryTaskStore()
+    llm = ExhaustedFailsLLM([])  # the very first stream call fails
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("boom")
+    await collect_until(queue, lambda e: isinstance(e.payload, Failed))
+
+    maybe_exchange_id = runner.history()[0].exchange_id
+    assert maybe_exchange_id is not None
+    exchange_id: str = maybe_exchange_id
+    await wait_for_async_condition(lambda: _is_failed(exchanges, exchange_id))
+
+
+async def test_recover_interrupted_reopens_a_stranded_in_progress_exchange(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    dialog = await get_dialog(session_factory)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    exchange = await exchanges.create(dialog.id, "stranded", owner_task_id=OTHER_TASK_ID)
+    assert exchange.status is ExchangeStatus.IN_PROGRESS  # sanity: an owner was given
+
+    await manager.recover_interrupted()
+
+    reopened = await exchanges.get(exchange.id)
+    assert reopened.status is ExchangeStatus.OPEN
+    assert reopened.owner_task_id is None
+
+
+async def test_recover_interrupted_leaves_an_awaiting_user_answer_task_silently_done(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An ANSWER task that died right after `ask_user` (the ask went out, the
+    exchange is AWAITING_USER) must not be restarted: a restarted run would
+    duplicate the work and clobber the parked question. `_start_orphaned`
+    closes the row silently instead; the user's reply resumes the exchange."""
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+    )
+    dialog = await get_dialog(session_factory)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    exchange = await exchanges.create(dialog.id, "which city?")
+    await exchanges.set_status(
+        exchange.id, ExchangeStatus.AWAITING_USER, pending_question="Which city?"
+    )
+    task = orphaned_task(
+        dialog,
+        kind=TaskKind.ANSWER,
+        title="which city?",
+        input={"prompt": "which city?", "exchange_id": exchange.id},
+    )
+    await store.add(task)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    await manager.recover_interrupted()
+
+    assert task.status is TaskStatus.DONE
+    assert task.result == ""
+    assert runner._processes == {}  # no replacement run was started
+    settled = await exchanges.get(exchange.id)
+    assert settled.status is ExchangeStatus.AWAITING_USER
+    assert settled.pending_question == "Which city?"
+
+
+async def test_stale_awaiting_exchange_triggers_a_nudge_on_a_new_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = ScriptedLLM([reply("answer to new")])
+    manager = make_manager(llm, ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    stale = await exchanges.create(runner.dialog_id, "old question")
+    await exchanges.set_status(
+        stale.id, ExchangeStatus.AWAITING_USER, pending_question="Which city?"
+    )
+    await _backdate_exchange(session_factory, stale.id, NUDGE_STALE_SECONDS)
+
+    await runner.submit("new question")
+    nudge_content = NUDGE_TEMPLATE.format(title="old question", question="Which city?")
+    events = await collect_until(queue, is_delivered(nudge_content))
+
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert any(item.message.content == nudge_content for item in finished)
+    await manager.stop_all()
+
+
+async def test_explicit_reply_joins_the_named_exchange_without_routing(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tool = BlockingTool()
+    router = FakeRouter()
+    llm = ScriptedLLM([blocking_call(), reply("second reply"), reply("third reply")])
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    live_exchange_id = runner.history()[0].exchange_id
+    assert live_exchange_id is not None
+
+    # a known, live exchange named explicitly: the deterministic shortcut, no LLM
+    await runner.submit("clarification", reply_to_exchange_id=live_exchange_id)
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+    assert runner.history()[1].exchange_id == live_exchange_id
+    assert router.calls == []
+
+    # a reply_to naming an exchange that is not live falls back to the router
+    await runner.submit("stray reply", reply_to_exchange_id="not-a-live-exchange")
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_STRAY_REPLY)
+    assert len(router.calls) == 1
+
+    tool.release.set()
+    await collect_completions(queue, TWO_PROCESSES)
 
 
 def test_manager_satisfies_the_cron_waker_port() -> None:

@@ -88,10 +88,6 @@ class ExchangeRepository(Protocol):
         """Return the dialog's non-terminal exchanges, oldest first."""
         ...
 
-    async def list_unowned_open(self) -> ExchangeList:
-        """Return every OPEN exchange without an owner (restart recovery)."""
-        ...
-
     async def reopen_in_progress(self) -> int:
         """Reset every IN_PROGRESS exchange to OPEN; return how many.
 

@@ -1,7 +1,8 @@
 """Tests for the SQLAlchemy persistence layer on in-memory SQLite."""
 
+import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import event, select
@@ -10,9 +11,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.context.api import INTERRUPTED_NOTE
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.api import DialogNotFoundError, DialogRepository, MessageRepository
-from octoforge_core.dialogs.models import MessageRow
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.api import (
+    DialogNotFoundError,
+    DialogRepository,
+    ExchangeNotFoundError,
+    ExchangeStatus,
+    MessageRepository,
+)
+from octoforge_core.dialogs.models import ExchangeRow, MessageRow
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
@@ -41,6 +52,13 @@ EXPECTED_RETRY_COMMIT_ATTEMPTS = 2
 EXPECTED_STATS_MESSAGE_COUNT = 2
 CREATED_EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
 TOOL_CALL = ToolCall(id="call-1", name="http_request", arguments={"url": "https://example.com"})
+EXCHANGE_TITLE = "the budget report"
+OWNER_TASK_ID = "task-1"
+OTHER_OWNER_TASK_ID = "task-2"
+PENDING_QUESTION = "which quarter?"
+OTHER_PENDING_QUESTION = "which city?"
+EXPECTED_LIVE_EXCHANGE_COUNT = 3
+EXPECTED_REOPENED_COUNT = 2
 
 
 @pytest.fixture
@@ -628,6 +646,197 @@ async def test_delete_for_dialog_removes_only_that_dialogs_tasks(
     assert removed == OWN_TASK_COUNT
     assert await store.list(DIALOG_ID) == []
     assert [task.title for task in await store.list(OTHER_DIALOG_ID)] == ["keep"]
+
+
+async def _insert_exchange(  # noqa: PLR0913 — mirrors the ExchangeRow columns it sets
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    dialog_id: str = DIALOG_ID,
+    title: str = EXCHANGE_TITLE,
+    status: ExchangeStatus,
+    created_at: datetime,
+    owner_task_id: str | None = None,
+    pending_question: str | None = None,
+) -> str:
+    """Insert an ExchangeRow directly, controlling `created_at` for ordering tests."""
+    row_id = uuid.uuid4().hex
+    async with session_factory() as session:
+        session.add(
+            ExchangeRow(
+                id=row_id,
+                dialog_id=dialog_id,
+                status=status.value,
+                title=title,
+                owner_task_id=owner_task_id,
+                pending_question=pending_question,
+                created_at=created_at,
+            )
+        )
+        await session.commit()
+    return row_id
+
+
+# --- SqlAlchemyExchangeRepository ------------------------------------------
+
+
+async def test_exchange_create_defaults_to_open_and_unowned(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+
+    exchange = await repo.create(DIALOG_ID, EXCHANGE_TITLE)
+
+    assert exchange.status is ExchangeStatus.OPEN
+    assert exchange.owner_task_id is None
+    assert exchange.pending_question is None
+    assert exchange.title == EXCHANGE_TITLE
+    assert exchange.created_at.tzinfo == UTC
+    assert exchange.updated_at.tzinfo == UTC
+
+
+async def test_exchange_create_with_an_owner_is_in_progress(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+
+    exchange = await repo.create(DIALOG_ID, EXCHANGE_TITLE, owner_task_id=OWNER_TASK_ID)
+
+    assert exchange.status is ExchangeStatus.IN_PROGRESS
+    assert exchange.owner_task_id == OWNER_TASK_ID
+
+
+async def test_exchange_get_returns_the_created_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    created = await repo.create(DIALOG_ID, EXCHANGE_TITLE)
+
+    fetched = await repo.get(created.id)
+
+    assert fetched == created
+
+
+async def test_exchange_get_unknown_id_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+
+    with pytest.raises(ExchangeNotFoundError):
+        await repo.get("missing")
+
+
+async def test_exchange_list_live_excludes_terminal_statuses_and_orders_oldest_first(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    open_id = await _insert_exchange(
+        session_factory,
+        title="open",
+        status=ExchangeStatus.OPEN,
+        created_at=CREATED_EARLIER,
+    )
+    in_progress_id = await _insert_exchange(
+        session_factory,
+        title="in progress",
+        status=ExchangeStatus.IN_PROGRESS,
+        created_at=CREATED_EARLIER + timedelta(seconds=1),
+    )
+    awaiting_id = await _insert_exchange(
+        session_factory,
+        title="awaiting",
+        status=ExchangeStatus.AWAITING_USER,
+        created_at=CREATED_EARLIER + timedelta(seconds=2),
+    )
+    for terminal_title, status, offset in (
+        ("answered", ExchangeStatus.ANSWERED, 3),
+        ("cancelled", ExchangeStatus.CANCELLED, 4),
+        ("failed", ExchangeStatus.FAILED, 5),
+    ):
+        await _insert_exchange(
+            session_factory,
+            title=terminal_title,
+            status=status,
+            created_at=CREATED_EARLIER + timedelta(seconds=offset),
+        )
+    repo = SqlAlchemyExchangeRepository(session_factory)
+
+    live = await repo.list_live(DIALOG_ID)
+
+    assert len(live) == EXPECTED_LIVE_EXCHANGE_COUNT
+    assert [item.id for item in live] == [open_id, in_progress_id, awaiting_id]
+
+
+async def test_exchange_set_status_clears_owner_and_question_when_omitted(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    exchange = await repo.create(DIALOG_ID, EXCHANGE_TITLE, owner_task_id=OWNER_TASK_ID)
+
+    # a question is given but the owner is omitted: the owner must be cleared
+    await repo.set_status(
+        exchange.id, ExchangeStatus.AWAITING_USER, pending_question=PENDING_QUESTION
+    )
+    parked = await repo.get(exchange.id)
+    assert parked.status is ExchangeStatus.AWAITING_USER
+    assert parked.owner_task_id is None
+    assert parked.pending_question == PENDING_QUESTION
+
+    # a fresh owner is given but the question is omitted: the question must be cleared
+    await repo.set_status(
+        exchange.id, ExchangeStatus.IN_PROGRESS, owner_task_id=OTHER_OWNER_TASK_ID
+    )
+    resumed = await repo.get(exchange.id)
+    assert resumed.status is ExchangeStatus.IN_PROGRESS
+    assert resumed.owner_task_id == OTHER_OWNER_TASK_ID
+    assert resumed.pending_question is None
+
+
+async def test_exchange_set_status_unknown_id_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+
+    with pytest.raises(ExchangeNotFoundError):
+        await repo.set_status("missing", ExchangeStatus.ANSWERED)
+
+
+async def test_exchange_reopen_in_progress_resets_only_those_rows(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    open_exchange = await repo.create(DIALOG_ID, "open")
+    stranded_one = await repo.create(DIALOG_ID, "stranded one", owner_task_id=OWNER_TASK_ID)
+    stranded_two = await repo.create(DIALOG_ID, "stranded two", owner_task_id=OTHER_OWNER_TASK_ID)
+    awaiting = await repo.create(DIALOG_ID, "awaiting")
+    await repo.set_status(
+        awaiting.id, ExchangeStatus.AWAITING_USER, pending_question=OTHER_PENDING_QUESTION
+    )
+
+    reopened_count = await repo.reopen_in_progress()
+
+    assert reopened_count == EXPECTED_REOPENED_COUNT
+    for exchange_id in (stranded_one.id, stranded_two.id):
+        reopened = await repo.get(exchange_id)
+        assert reopened.status is ExchangeStatus.OPEN
+        assert reopened.owner_task_id is None
+    # untouched rows keep their status and fields
+    assert (await repo.get(open_exchange.id)).status is ExchangeStatus.OPEN
+    still_awaiting = await repo.get(awaiting.id)
+    assert still_awaiting.status is ExchangeStatus.AWAITING_USER
+    assert still_awaiting.pending_question == OTHER_PENDING_QUESTION
+
+
+async def test_exchange_delete_for_dialog_scopes_to_one_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    own = await repo.create(DIALOG_ID, "own")
+    other = await repo.create(OTHER_DIALOG_ID, "keep")
+
+    await repo.delete_for_dialog(DIALOG_ID)
+
+    with pytest.raises(ExchangeNotFoundError):
+        await repo.get(own.id)
+    assert (await repo.get(other.id)).id == other.id
 
 
 async def test_sql_stores_satisfy_the_dialogs_ports(

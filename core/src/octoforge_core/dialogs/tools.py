@@ -12,6 +12,11 @@ ASK_ACK = (
 )
 NO_PROMPTER_ERROR = "asking the user is not available in this context"
 EMPTY_QUESTION_ERROR = "question must not be empty"
+NO_EXCHANGE_ERROR = (
+    "asking the user is unavailable here: this run is a background task, not an "
+    "answer to a user question, so a reply would never resume it. The question was "
+    "NOT delivered. Finish the task with your best result instead."
+)
 
 
 class AskUserTool:
@@ -50,5 +55,6 @@ class AskUserTool:
         question = str(arguments.get(QUESTION_PARAM, "")).strip()
         if not question:
             return EMPTY_QUESTION_ERROR
-        await context.user_prompter.ask(question)
+        if not await context.user_prompter.ask(question):
+            return NO_EXCHANGE_ERROR
         return ASK_ACK

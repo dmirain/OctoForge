@@ -91,7 +91,7 @@ class RetryScheduled:
 class ProcessStarted:
     """Actor marker: the text of this answer is about to begin.
 
-    Broadcast before the first token of a foreground stream and at the head
+    Broadcast before the first token of every answer stream and at the head
     of a whole-message outbox delivery, so a transport that threads replies
     knows the target BEFORE it has to create the message (a reply can only be
     set at creation time). `source_client_message_id` mirrors `Finished`'s.

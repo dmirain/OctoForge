@@ -31,10 +31,20 @@ ROUTER_LOGGER = "octoforge_core.agent.router"
 
 
 PENDING_QUESTION = "In which city?"
+STALE_AGE_SECONDS = 90.0
 
 
 def in_progress() -> ExchangeInfo:
     return ExchangeInfo(id=OPEN_ID, title="the budget report", status=ExchangeStatus.IN_PROGRESS)
+
+
+def stale_in_progress() -> ExchangeInfo:
+    return ExchangeInfo(
+        id=OPEN_ID,
+        title="the budget report",
+        status=ExchangeStatus.IN_PROGRESS,
+        age_seconds=STALE_AGE_SECONDS,
+    )
 
 
 def awaiting_user() -> ExchangeInfo:
@@ -235,6 +245,17 @@ async def test_prompt_describes_the_exchanges_in_human_terms() -> None:
     assert PENDING_QUESTION in system  # the reply target is obvious to the model
     assert "When you are unsure, choose new" in system
     assert llm.last_messages[1] == ChatMessage(role=MessageRole.USER, content=MESSAGE)
+
+
+async def test_prompt_renders_the_exchanges_staleness_in_seconds() -> None:
+    """`_describe` (the router's whole view of an exchange) states its age."""
+    llm = ScriptedLLM(reply=route_reply())
+    router = make_router(llm)
+
+    await router.route((stale_in_progress(),), MESSAGE, MAX_EXCHANGES)
+
+    system = llm.last_messages[0].content
+    assert f"{int(STALE_AGE_SECONDS)}s ago" in system
 
 
 async def test_router_prompt_comes_from_the_prompt_provider() -> None:

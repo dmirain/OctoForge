@@ -23,8 +23,12 @@ class TaskSpawner(Protocol):
 class UserPrompter(Protocol):
     """Asks the user a question on behalf of the run that needs an answer."""
 
-    async def ask(self, question: str) -> None:
-        """Deliver the question and leave the run's exchange awaiting the user."""
+    async def ask(self, question: str) -> bool:
+        """Deliver the question and leave the run's exchange awaiting the user.
+
+        Returns False when the run has no exchange to park (RUN/cron work):
+        the question was NOT delivered and the caller must not promise a reply.
+        """
         ...
 
 
@@ -66,8 +70,8 @@ class ToolContext:
     task_spawner/task_deleter are optional: contexts built outside the dialog
     actor (unit tests, one-off executions) simply have neither, and the task
     tools report that instead of failing to construct the context.
-    owner_task_id is the background task the invocation belongs to (None for
-    the foreground): it lets a tool recognize acting upon itself.
+    owner_task_id is the task the invocation belongs to (None outside the
+    dialog actor): it lets a tool recognize acting upon itself.
     """
 
     user_id: str
