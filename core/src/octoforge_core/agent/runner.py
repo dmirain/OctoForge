@@ -225,6 +225,9 @@ class _Submit:
     message: ChatMessage
     client_message_id: str | None = None
     reply_to_exchange_id: str | None = None
+    # the runner's cancel epoch at enqueue time: a stop pressed while this
+    # message was still being routed must cover it (see _start_answer)
+    cancel_epoch: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,6 +358,10 @@ class ConversationRunner:
         # indices, so two interleaved assembles with stale snapshot coordinates
         # would evict live messages (lock order: spawn_lock -> assemble_lock)
         self._assemble_lock = asyncio.Lock()
+        # bumped by every user cancel: a submit carrying an older epoch was
+        # sent before the stop, so the stop covers it even if it was still
+        # inside the router when the button was pressed
+        self._cancel_epoch = 0
         # serializes outbox flushes between the actor and wake()/restart_task()
         self._flush_lock = asyncio.Lock()
         self._spawner: TaskSpawner = _DialogTaskSpawner(self)
@@ -420,6 +427,7 @@ class ConversationRunner:
                 ChatMessage(role=MessageRole.USER, content=content),
                 client_message_id=client_message_id,
                 reply_to_exchange_id=reply_to_exchange_id,
+                cancel_epoch=self._cancel_epoch,
             )
         )
 
@@ -805,7 +813,10 @@ class ConversationRunner:
 
         RUN tasks (spawned/cron work) keep going: they are background jobs
         with their own lifecycle, cancellable via task_delete or the router.
+        Bumping the epoch covers the message the actor is still routing: its
+        run starts already-cancelled instead of answering a stopped request.
         """
+        self._cancel_epoch += 1
         for process in self._processes.values():
             if process.exchange_id is not None:
                 process.control.cancel()
@@ -1104,7 +1115,13 @@ class ConversationRunner:
         # between exchange creation and owner assignment — a failure inside
         # it would strand the fresh exchange unowned
         if exchange_id is not None:
-            await self._ensure_owner(exchange_id, message, command.client_message_id, cancelled)
+            await self._ensure_owner(
+                exchange_id,
+                message,
+                command.client_message_id,
+                cancelled,
+                cancel_epoch=command.cancel_epoch,
+            )
         await self._nudge_stale_exchanges(exchange_id)
 
     async def _cancel_exchanges(self, exchange_ids: tuple[str, ...]) -> set[str]:
@@ -1125,6 +1142,7 @@ class ConversationRunner:
         message: ChatMessage,
         client_key: str | None,
         cancelled: set[str] | None = None,
+        cancel_epoch: int | None = None,
     ) -> None:
         """Make sure a live run owes this exchange an answer.
 
@@ -1145,7 +1163,7 @@ class ConversationRunner:
                 if self._exceeds_limit(self._cancelled_tasks(cancelled or set())):
                     await self._reject_for_limit(message)
                     return
-                await self._start_answer(exchange, message, client_key)
+                await self._start_answer(exchange, message, client_key, cancel_epoch=cancel_epoch)
 
     async def _nudge_stale_exchanges(self, current_exchange_id: str | None) -> None:
         """Remind the user about a question they left hanging (event-driven).
@@ -1196,12 +1214,19 @@ class ConversationRunner:
         await self._deliver_notice(notice)
 
     async def _start_answer(
-        self, exchange: Exchange, message: ChatMessage, client_key: str | None = None
+        self,
+        exchange: Exchange,
+        message: ChatMessage,
+        client_key: str | None = None,
+        cancel_epoch: int | None = None,
     ) -> None:
         """Start the run that owes `exchange` an answer.
 
         Every answer run streams live into its own per-exchange message;
-        starting one never disturbs the others.
+        starting one never disturbs the others. A run whose submit predates
+        the last user cancel starts already-cancelled: the stop button was
+        pressed while the message was still being routed, and "I pressed
+        stop and it answered anyway" is a broken stop.
         """
         task = await self._prepare_process_task(
             exchange.title,
@@ -1225,6 +1250,8 @@ class ConversationRunner:
         )
         process.synced_len = len(process.branch)
         process.watermark = watermark
+        if cancel_epoch is not None and cancel_epoch < self._cancel_epoch:
+            process.control.cancel()
         # the reply target must reach the transport BEFORE the first token:
         # a reply can only be set when the message is created. Every answer
         # run streams into its own per-exchange draft — there is no
@@ -1650,14 +1677,32 @@ class ConversationRunner:
     def _evict_and_put(
         queue: asyncio.Queue[ConversationEvent], envelope: ConversationEvent
     ) -> bool:
-        """Make room for a critical event by evicting the oldest queued one."""
-        with suppress(asyncio.QueueEmpty):
-            queue.get_nowait()
-        try:
-            queue.put_nowait(envelope)
-        except asyncio.QueueFull:  # only full again if maxsize is 0
-            return False
-        return True
+        """Make room for a critical event by evicting the oldest DROPPABLE one.
+
+        Blind head-eviction could evict an earlier critical event (a terminal
+        whose delivery the store already recorded) to admit a later one. The
+        queue is drained, the oldest non-critical entry is dropped, order is
+        preserved. With nothing droppable the put is refused: the caller
+        counts the event as not accepted, so the outbox keeps the delivery
+        queued instead of stamping it delivered.
+        """
+        drained: list[ConversationEvent] = []
+        while True:
+            try:
+                drained.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        victim = next(
+            (i for i, item in enumerate(drained) if not isinstance(item.payload, _CRITICAL_EVENTS)),
+            None,
+        )
+        if victim is not None:
+            del drained[victim]
+            drained.append(envelope)
+        for item in drained:  # order preserved; refused put restores untouched
+            with suppress(asyncio.QueueFull):
+                queue.put_nowait(item)
+        return victim is not None
 
 
 class _DialogTaskSpawner:

@@ -17,6 +17,7 @@ from octoforge_core.agent.events import (
     Cancelled,
     Failed,
     Finished,
+    LoopEvent,
     ProcessCompleted,
     ProcessStarted,
     TextDelta,
@@ -39,6 +40,7 @@ from octoforge_core.agent.runner import (
     SUBSCRIBER_QUEUE_SIZE,
     ConversationEvent,
     ConversationManager,
+    ConversationRunner,
     RunnerConfig,
     TaskOutcomeListener,
     _ProcessTerminated,
@@ -3663,3 +3665,60 @@ async def test_recover_interrupted_revives_an_unowned_open_exchange(
 
     assert any(isinstance(e.payload, Finished) for e in events)
     await wait_for_async_condition(lambda: _is_answered(exchanges, exchange.id))
+
+
+async def test_stop_pressed_while_the_message_is_still_routing_cancels_its_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The stop button covers a submit the actor has not finished routing yet."""
+    router = GatedRouter()
+    tool = BlockingTool()
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        ScriptedLLM([blocking_call(), reply("late answer")]),
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(router=router, store=store),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    runner.subscribe()
+
+    await runner.submit("first")  # no live exchange: routed without the router
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    router.gate_armed = True
+    await runner.submit("second")  # the actor blocks inside the router
+    await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.cancel()  # stop pressed while "second" is mid-routing
+    tool.release.set()
+    router.release.set()
+
+    async def second_run_cancelled() -> bool:
+        tasks = await store.list(runner.dialog_id)
+        return any("second" in task.title and task.status is TaskStatus.CANCELLED for task in tasks)
+
+    await wait_for_async_condition(second_run_cancelled)
+    await manager.stop_all()
+
+
+def test_critical_events_are_never_evicted_by_a_later_critical_event() -> None:
+    """A full queue admits a critical event only by dropping stream chatter."""
+
+    def envelope(payload: LoopEvent, seq: int) -> ConversationEvent:
+        return ConversationEvent(dialog_id="d", seq=seq, payload=payload)
+
+    final = ChatMessage(role=MessageRole.ASSISTANT, content="a")
+    queue: asyncio.Queue[ConversationEvent] = asyncio.Queue(maxsize=3)
+    queue.put_nowait(envelope(Finished(message=final), 1))
+    queue.put_nowait(envelope(TextDelta(text="chatter"), 2))
+    queue.put_nowait(envelope(Failed(error="boom"), 3))
+    incoming = envelope(Finished(message=replace(final, content="b")), 4)
+
+    assert ConversationRunner._evict_and_put(queue, incoming) is True
+    kept = [queue.get_nowait().seq for _ in range(3)]
+    assert kept == [1, 3, 4]  # the delta is the victim; order preserved
+
+    only_criticals: asyncio.Queue[ConversationEvent] = asyncio.Queue(maxsize=2)
+    only_criticals.put_nowait(envelope(Finished(message=final), 1))
+    only_criticals.put_nowait(envelope(Failed(error="x"), 2))
+    assert ConversationRunner._evict_and_put(only_criticals, incoming) is False
+    assert [only_criticals.get_nowait().seq for _ in range(2)] == [1, 2]
