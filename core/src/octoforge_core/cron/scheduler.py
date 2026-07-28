@@ -3,8 +3,11 @@
 One shot per due job per tick: missed runs are coalesced into a single wake
 whose prompt carries the missed-run count, and `next_fire_at` is recomputed
 from the fire time, so a long downtime never turns into a burst. Catching up
-is additionally paced by a stagger between shots and bounded by the replay
-limit (openclaw-review item 5).
+is additionally paced by a stagger before each job that itself missed one or
+more runs, and bounded by the replay limit (openclaw-review item 5).
+`REPLAY_STAGGER_SECONDS` is scoped to that catch-up case on purpose: several
+independent jobs simply due at the same on-time tick (e.g. minute-aligned
+schedules lining up) are not a downtime burst and fire back-to-back.
 """
 
 import asyncio
@@ -79,8 +82,11 @@ class CronScheduler:
         stale_before = fired_at - timedelta(seconds=self._lease_ttl_seconds)
         due = await self._store.list_due(fired_at, stale_before, self._replay_limit)
         for index, job in enumerate(due):
-            if index > 0:
-                await asyncio.sleep(REPLAY_STAGGER_SECONDS)  # pace the catch-up burst
+            # pace only a downtime catch-up burst (this job itself missed one
+            # or more runs) — several independent jobs simply due at the same
+            # on-time tick must fire back-to-back, no tax for coinciding
+            if index > 0 and _has_missed_runs(job, fired_at):
+                await asyncio.sleep(REPLAY_STAGGER_SECONDS)
             await self._fire(job, fired_at, stale_before)
 
     async def _fire(self, job: CronJob, now: datetime, stale_before: datetime) -> None:
@@ -127,8 +133,17 @@ class CronScheduler:
             )
 
     def _prompt_for(self, job: CronJob, now: datetime) -> str:
-        since = job.last_fire_at if job.last_fire_at is not None else job.created_at
-        missed = count_missed(job.schedule, job.timezone, since, now)
+        missed = _missed_run_count(job, now)
         if missed == 0:
             return job.prompt
         return job.prompt + MISSED_RUNS_SUFFIX_TEMPLATE.format(count=missed)
+
+
+def _missed_run_count(job: CronJob, now: datetime) -> int:
+    since = job.last_fire_at if job.last_fire_at is not None else job.created_at
+    return count_missed(job.schedule, job.timezone, since, now)
+
+
+def _has_missed_runs(job: CronJob, now: datetime) -> bool:
+    """Whether this job's fire is a downtime catch-up (it missed one or more runs)."""
+    return _missed_run_count(job, now) > 0

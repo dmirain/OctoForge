@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from octoforge_core.db.base import Base, UTCDateTime
@@ -67,6 +67,9 @@ class ExchangeRow(Base):
     """
 
     __tablename__ = "exchanges"
+    # the composite backs list_live, the hottest query in the runtime: it
+    # filters by both columns on every message and every loop iteration
+    __table_args__ = (Index("ix_exchanges_dialog_status", "dialog_id", "status"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
     dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), index=True)

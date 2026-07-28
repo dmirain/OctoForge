@@ -79,7 +79,9 @@ class NoopContextCompactor(ContextCompactor):
 
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
         """Return the history unchanged (everything is the hot tail)."""
-        return AssembledContext(messages=list(history), tail_count=len(history))
+        return AssembledContext(
+            messages=list(history), tail_count=len(history), snapshot_len=len(history)
+        )
 
     async def compacted_boundary(self, dialog_id: str) -> int:
         """Nothing is ever compacted: the narrative starts at the beginning."""
@@ -113,6 +115,10 @@ class LlmContextCompactor(ContextCompactor):
         """Return `[topics block?] + hot tail`; trigger compaction on overflow."""
         max_seq_to = await self._store.max_seq_to(dialog.id)
         tail_count = await self._archive.count_after(dialog.id, max_seq_to)
+        # the snapshot moment: everything below is computed from `tail` and
+        # `snapshot_len`, never from the live list again — the awaits that
+        # follow may interleave with appends to `history`
+        snapshot_len = len(history)
         tail = _tail_of(history, tail_count)
         if _chars(tail) > self._config.hot_max_chars or await self._token_overflow(
             dialog, max_seq_to
@@ -120,8 +126,12 @@ class LlmContextCompactor(ContextCompactor):
             self._trigger_compact(dialog)
         summaries = await self._store.list_for_dialog(dialog.id)
         if not summaries:
-            return AssembledContext(messages=tail, tail_count=len(tail))
-        return AssembledContext(messages=[_topics_block(summaries), *tail], tail_count=len(tail))
+            return AssembledContext(messages=tail, tail_count=len(tail), snapshot_len=snapshot_len)
+        return AssembledContext(
+            messages=[_topics_block(summaries), *tail],
+            tail_count=len(tail),
+            snapshot_len=snapshot_len,
+        )
 
     async def compacted_boundary(self, dialog_id: str) -> int:
         """The narrative's hot slice starts right after the last compacted seq."""

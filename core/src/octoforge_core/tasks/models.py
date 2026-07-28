@@ -24,7 +24,9 @@ class TaskRow(Base):
     kind: Mapped[str] = mapped_column(String)
     title: Mapped[str] = mapped_column(String)
     input: Mapped[dict[str, Any]] = mapped_column(JSON)
-    status: Mapped[str] = mapped_column(String, default=TaskStatus.PENDING.value)
+    # indexed: the startup sweeps (list_orphaned, list_undelivered) filter by
+    # status over a table that never deletes rows
+    status: Mapped[str] = mapped_column(String, default=TaskStatus.PENDING.value, index=True)
     result: Mapped[str | None] = mapped_column(String, nullable=True)
     error: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)

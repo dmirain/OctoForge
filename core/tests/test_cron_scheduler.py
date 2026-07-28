@@ -355,6 +355,59 @@ async def test_run_forever_survives_a_tick_failure(
         await task
 
 
+def _spy_on_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record every `asyncio.sleep` delay the scheduler asks for, without actually waiting."""
+    calls: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def spy(delay: float) -> None:
+        calls.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(scheduler_module.asyncio, "sleep", spy)
+    return calls
+
+
+async def test_two_distinct_due_jobs_fire_without_a_stagger(
+    store: SqlAlchemyCronStore,
+    waker: RecordingWaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two independent, on-time jobs due on the same tick pay no catch-up tax.
+
+    Regression: the stagger used to sit between every pair of due jobs
+    regardless of why they were due, so two unrelated jobs whose schedules
+    simply lined up on the same tick paid the 0.5s catch-up tax for nothing.
+    """
+    sleep_calls = _spy_on_sleep(monkeypatch)
+    await store.create(make_job(id="due-a"))
+    await store.create(make_job(id="due-b"))
+
+    await make_scheduler(store, waker).tick(now=NOW)
+
+    assert len(waker.calls) == TWO_CALLS
+    assert sleep_calls == []  # neither job missed a run: no stagger was needed
+
+
+async def test_missed_run_catch_up_is_staggered_between_jobs(
+    store: SqlAlchemyCronStore,
+    waker: RecordingWaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A downtime catch-up burst (jobs with missed runs) is still paced."""
+    sleep_calls = _spy_on_sleep(monkeypatch)
+    last_fire = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
+    next_fire = datetime(2026, 7, 16, 9, 0, tzinfo=UTC)
+    await store.create(make_job(id="due-a", last_fire_at=last_fire, next_fire_at=next_fire))
+    await store.create(make_job(id="due-b", last_fire_at=last_fire, next_fire_at=next_fire))
+
+    await make_scheduler(store, waker).tick(now=NOW)
+
+    assert len(waker.calls) == TWO_CALLS
+    # staggered once: before the second job's catch-up fire, not the first
+    assert sleep_calls == [scheduler_module.REPLAY_STAGGER_SECONDS]
+
+
 async def test_a_fresh_claim_by_another_owner_skips_the_job(
     store: SqlAlchemyCronStore,
     waker: RecordingWaker,

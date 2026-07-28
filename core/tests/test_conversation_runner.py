@@ -103,6 +103,7 @@ MESSAGES_AFTER_STRAY_REPLY = 3
 OTHER_TASK_ID = "other"
 DEAD_TASK_ID = "dead"
 NUDGE_STALE_SECONDS = NUDGE_AFTER_SECONDS + 100.0
+TWO_PENDING_DELIVERIES = 2
 
 
 @pytest.fixture
@@ -232,7 +233,9 @@ class FakeCompactor:
         self.closed: list[str] = []
 
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
-        return AssembledContext(messages=list(history), tail_count=len(history))
+        return AssembledContext(
+            messages=list(history), tail_count=len(history), snapshot_len=len(history)
+        )
 
     async def compacted_boundary(self, dialog_id: str) -> int:
         return 0
@@ -2050,7 +2053,9 @@ class GatedCompactor:
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
         self.entered.set()
         await self.release.wait()
-        return AssembledContext(messages=list(history), tail_count=len(history))
+        return AssembledContext(
+            messages=list(history), tail_count=len(history), snapshot_len=len(history)
+        )
 
     async def compacted_boundary(self, dialog_id: str) -> int:
         return 0
@@ -2857,7 +2862,7 @@ class TailCompactor:
 
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
         kept = list(history[-self.tail :]) if self.tail else []
-        return AssembledContext(messages=kept, tail_count=len(kept))
+        return AssembledContext(messages=kept, tail_count=len(kept), snapshot_len=len(history))
 
     async def compacted_boundary(self, dialog_id: str) -> int:
         return self.boundary
@@ -2934,7 +2939,7 @@ async def test_trim_narrative_remaps_watermarks(
     (first_message,) = runner.history()
     assert first_message.id is not None
 
-    runner._trim_narrative(0)  # everything compacted away
+    runner._trim_narrative(len(runner.history()))  # everything compacted away
 
     assert runner.history() == []
     assert process.watermark == 0 and watermark_before > 0
@@ -3208,3 +3213,453 @@ def test_manager_satisfies_the_cron_waker_port() -> None:
     port_params = list(inspect.signature(port_method).parameters)
 
     assert waker_params == port_params
+
+
+# --- 2026-07-28 race fixes: watermark, outbox identity, delivery, ask_user, sweep ---
+
+
+class GatedAssembleCompactor:
+    """ContextCompactor stub: full-history passthrough whose RETURN can be
+    delayed on a chosen call, mirroring the production snapshot-then-await
+    shape (`assemble` freezes `snapshot_len` and the message list the instant
+    it is entered; only the caller sees the result later). A message
+    appended to the live narrative during that delay must land past the
+    frozen boundary and reach the run on a LATER sync instead of vanishing.
+    """
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.gate_on_call = 0
+        self.calls = 0
+
+    async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
+        self.calls += 1
+        snapshot = list(history)  # frozen before any await, like the real compactor
+        if self.calls == self.gate_on_call:
+            self.entered.set()
+            await self.gate.wait()
+        return AssembledContext(
+            messages=snapshot, tail_count=len(snapshot), snapshot_len=len(snapshot)
+        )
+
+    async def compacted_boundary(self, dialog_id: str) -> int:
+        return 0
+
+    async def compact_now(self, dialog: Dialog) -> bool:
+        return True
+
+    async def aclose(self, dialog_id: str) -> None:
+        pass
+
+
+async def test_message_appended_during_a_stalled_assemble_is_never_lost(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The watermark a process records comes from the compactor's snapshot,
+    never from the live narrative length read after the assemble returns.
+
+    Iteration 2's pull-model re-sync (`IterationStarted` -> `_sync_branch`)
+    calls `_assemble_narrative` from inside the PUMP task, not the actor: a
+    "setup" clarification submitted while the run's tool call was still
+    blocking is what makes that sync call `assemble` at all (nothing pulls
+    it otherwise); a SECOND message ("clarification") submitted while THAT
+    call is stalled is invisible to the branch this run is about to answer
+    with — but it must not be lost. It stays above the recorded watermark
+    (taken from the compactor's frozen snapshot, not the live list), so once
+    this run finishes without having seen it, the exchange reopens and a
+    fresh run answers it. `_trim_narrative`'s drop is computed from the same
+    frozen snapshot, so the message is never evicted from the in-memory
+    narrative either.
+    """
+    tool = BlockingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call(), reply("first answer"), reply("final answer")])
+    compactor = GatedAssembleCompactor()
+    compactor.gate_on_call = 2  # iteration 2's sync, forced to run by "setup"
+    router = FakeRouter()
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(compactor=compactor, router=router, store=store),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("first")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    exchange_id = runner.history()[0].exchange_id
+    assert exchange_id is not None
+
+    # picked up normally at the next sync: this is what makes iteration 2's
+    # sync actually call assemble (nothing changed otherwise)
+    router.decide_continue()
+    await runner.submit("setup")
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+
+    tool.release.set()  # iteration 2 begins: its sync stalls inside assemble
+    await asyncio.wait_for(compactor.entered.wait(), timeout=TIMEOUT_SECONDS)
+
+    # the actor is free (the stall sits in the PUMP task): a second reply is
+    # persisted and routed while the frozen snapshot is stuck mid-return
+    await runner.submit("clarification")
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_STRAY_REPLY)
+
+    compactor.gate.set()  # release the stale (pre-clarification) snapshot
+    await collect_completions(queue, TWO_PROCESSES)  # this run, then the reopened fresh run
+    await wait_for_async_condition(lambda: _is_answered(exchanges, exchange_id))
+
+    # never evicted from the in-memory narrative, and eventually reaches the model
+    assert "clarification" in [m.content for m in runner.history()]
+    assert any(
+        CLARIFICATION_NOTE_TEMPLATE.format(content="clarification") in m.content
+        for m in llm.requests[-1]
+    )
+    # the run that raced it never saw it: proof the loss would have been
+    # silent without the fix (the message just did not exist for that call)
+    assert not any("clarification" in m.content for m in llm.requests[1])
+
+
+class GatedMarkDeliveredStore(InMemoryTaskStore):
+    """TaskStore whose mark_delivered pauses until released.
+
+    Freezes `_flush_deliveries` mid-loop: after it has peeked the head
+    delivery and broadcast its events, but before it removes that delivery
+    from the deque — the exact window in which an `ask_user` question can
+    jump the queue via `appendleft`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def mark_delivered(self, task_id: str) -> None:
+        self.entered.set()
+        await self.gate.wait()
+        await super().mark_delivered(task_id)
+
+
+async def test_appendleft_during_a_stalled_flush_survives_identity_removal(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`_flush_deliveries` removes the delivery it just sent by identity, not
+    position: an `ask_user` question appendlefted while `mark_delivered`
+    awaits must not be popped instead of the delivery that actually
+    finished — both must reach the subscriber.
+    """
+    store = GatedMarkDeliveredStore()
+    manager = make_manager(
+        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    dialog = await get_dialog(session_factory)
+    task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
+    await store.add(task)
+
+    runner.request_result_delivery(task.id)
+    await asyncio.wait_for(store.entered.wait(), timeout=TIMEOUT_SECONDS)
+    # the head delivery's events already reached the subscriber; only the
+    # store write (mark_delivered) is stalled
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
+
+    notice_call = asyncio.create_task(runner._deliver_notice("the question", exchange_id="ex-fake"))
+    await wait_for_condition(lambda: len(runner._pending_deliveries) == TWO_PENDING_DELIVERIES)
+
+    store.gate.set()
+    await notice_call
+    events += await collect_until(queue, is_delivered("the question"))
+
+    assert task.delivered_at is not None  # the original delivery was still stamped
+    assert not runner._pending_deliveries  # nothing left stuck behind the question
+    finished_contents = [
+        e.payload.message.content for e in events if isinstance(e.payload, Finished)
+    ]
+    assert "the question" in finished_contents
+    assert TASK_RESULT in finished_contents
+
+
+async def test_answer_finished_with_zero_subscribers_waits_for_the_first_one(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An ANSWER run finishing with nobody watching must not be stamped
+    delivered on the strength of the live stream alone: the terminal reached
+    zero subscriber queues, so it goes through the outbox exactly like an
+    unwatched RUN task's result and reaches the FIRST later subscriber.
+    """
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([reply()])
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    await runner.submit("hi")  # no subscriber attached at all
+
+    async def has_a_task() -> bool:
+        return len(await store.list(runner.dialog_id)) == 1
+
+    await wait_for_async_condition(has_a_task)
+    task = await single_task(store, runner.dialog_id)
+    await wait_for_condition(lambda: task.status is TaskStatus.DONE)
+    await asyncio.sleep(POLL_SECONDS * 5)  # give the actor a chance to misbehave
+
+    assert task.delivered_at is None
+    assert runner._pending_deliveries != []
+
+    queue = runner.subscribe()
+    events = await collect_until(queue, is_delivered(REPLY))
+
+    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
+    assert finished[0].message.content == REPLY
+    await wait_for_condition(lambda: task.delivered_at is not None)
+    assert not runner._pending_deliveries
+
+
+class AskThenStallLLM:
+    """LLMClient stub: iteration 1 triggers the asking tool call; iteration 2
+    streams partial text and then stalls until released, answering with
+    `final_content` once resumed (empty models the asker ending in silence,
+    having never synced a reply that arrived during the stall). Any later
+    call (a reopened exchange's fresh run) answers immediately with
+    `next_content`.
+    """
+
+    def __init__(self, final_content: str = "", next_content: str = REPLY) -> None:
+        self.requests: list[list[ChatMessage]] = []
+        self.release = asyncio.Event()
+        self._final_content = final_content
+        self._next_content = next_content
+
+    async def complete(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec] | None = None,
+    ) -> Completion:
+        raise NotImplementedError
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.requests.append(list(messages))
+        call_number = len(self.requests)
+        if call_number == FIRST_CALL:
+            yield StreamFinished(message=blocking_call())
+        elif call_number == SECOND_CALL:
+            yield LlmTextDelta(text=PARTIAL)
+            await self.release.wait()
+            yield StreamFinished(message=reply(self._final_content))
+        else:
+            yield StreamFinished(message=reply(self._next_content))
+
+
+async def test_reply_while_the_asker_still_owns_the_exchange_spawns_no_second_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`ask_user` keeps the asking run's ownership: it delivers the question
+    and parks the exchange AWAITING_USER, but the run itself stays alive
+    (still generating its own next turn). A reply that arrives in that
+    window must not spawn a second process for the same exchange — only
+    once the asker actually ends (here: silently, having never seen the
+    reply) does the exchange reopen for a fresh run.
+    """
+    tool = AskingTool()
+    store = InMemoryTaskStore()
+    llm = AskThenStallLLM(final_content="", next_content="answered after all")
+    router = FakeRouter()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("what is the weather?")
+    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    await collect_until(queue, is_delivered(tool.question))
+    live = await exchanges.list_live(runner.dialog_id)
+    assert [item.status for item in live] == [ExchangeStatus.AWAITING_USER]
+    exchange_id = live[0].id
+    assert len(runner._processes) == ONE_PROCESS  # the asker, still alive
+
+    # the asker is mid-generation of its own next turn (still streaming)
+    await collect_until(
+        queue, lambda e: isinstance(e.payload, TextDelta) and e.payload.text == PARTIAL
+    )
+
+    router.decide_continue()
+    await runner.submit("Moscow")
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_STRAY_REPLY)
+    # the reply landed while the asker still owns the exchange: no new run
+    assert len(runner._processes) == ONE_PROCESS
+    assert next(iter(runner._processes.values())).exchange_id == exchange_id
+
+    llm.release.set()  # the asker finishes silently, never having synced "Moscow" in
+    await wait_for_condition(lambda: not runner._processes)
+
+    # only now does the exchange reopen, and a fresh run answers the reply
+    await wait_for_async_condition(lambda: _is_answered(exchanges, exchange_id))
+    events = await collect_until(queue, is_delivered("answered after all"))
+    assert any(isinstance(e.payload, Finished) for e in events)
+    assert [m.content for m in runner.history()] == [
+        "what is the weather?",
+        tool.question,
+        "Moscow",
+        "answered after all",
+    ]
+
+
+async def test_cancel_with_an_unseen_reply_settles_cancelled_not_reopened(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A stop must not resurrect the exchange it just cancelled even when a
+    reply arrived after the run's last sync: the cancel came after the
+    message, so it covers it (`_settle_exchange`'s CANCELLED short-circuit
+    skips the unseen-messages reopen).
+    """
+    llm = StallingLLM()
+    router = FakeRouter()
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        llm, ToolRegistry(), session_factory, ManagerOptions(router=router, store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("work")
+    await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
+    exchange_id = runner.history()[0].exchange_id
+    assert exchange_id is not None
+
+    router.decide_continue()
+    await runner.submit("more context")  # arrives after the run's last sync
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+
+    await runner.cancel()
+    llm.release.set()
+    events = await collect_until(queue, is_completed)
+
+    assert any(isinstance(e.payload, Cancelled) for e in events)
+    await wait_for_async_condition(lambda: _is_cancelled(exchanges, exchange_id))
+    assert runner._processes == {}
+    await asyncio.sleep(POLL_SECONDS * 5)  # give a would-be resurrection a chance to appear
+    assert runner._processes == {}
+    still = await exchanges.get(exchange_id)
+    assert still.status is ExchangeStatus.CANCELLED
+
+
+async def test_cancel_closes_a_parked_awaiting_exchange_with_no_live_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The stop button also closes an obligation that already finished
+    asking and has nobody left running it (the run ended right after the
+    ask) — otherwise the nudge would keep re-asking a question the user just
+    said to drop.
+    """
+    tool = AskingTool()
+    llm = ScriptedLLM([blocking_call(), reply("")])
+    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("what is the weather?")
+    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    await collect_until(queue, is_delivered(tool.question))
+    await wait_for_condition(lambda: not runner._processes)  # the run ended, the ask is parked
+
+    live = await exchanges.list_live(runner.dialog_id)
+    assert [item.status for item in live] == [ExchangeStatus.AWAITING_USER]
+    exchange_id = live[0].id
+
+    await runner.cancel()
+
+    await wait_for_async_condition(lambda: _is_cancelled(exchanges, exchange_id))
+
+
+async def test_unowned_open_exchange_is_revived_when_a_process_slot_frees(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`_sweep_unowned_open` runs whenever a slot frees up: an OPEN exchange
+    with no owner (a crash between exchange creation and owner assignment,
+    or a limit window that never got a retry) waits quietly while every slot
+    is busy, and gets a fresh run the moment one opens up.
+    """
+    tool = BlockingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call(), reply("first done"), reply("stranded answered")])
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(store=store, max_processes=ONE_PROCESS),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+
+    # seed an OPEN, ownerless exchange with its message already in the
+    # narrative (a crash between exchange creation and owner assignment)
+    stranded = await exchanges.create(runner.dialog_id, "stranded question")
+    stranded_message_id = await messages.append(
+        runner.dialog_id, ChatMessage(role=MessageRole.USER, content="stranded question")
+    )
+    await messages.set_exchange(stranded_message_id, stranded.id)
+    runner._narrative.append(
+        ChatMessage(
+            id=stranded_message_id,
+            role=MessageRole.USER,
+            content="stranded question",
+            exchange_id=stranded.id,
+        )
+    )
+
+    # the single slot is taken: nothing may spawn for the stranded exchange
+    await runner.submit("first")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    assert len(runner._processes) == ONE_PROCESS
+    still_open = await exchanges.get(stranded.id)
+    assert still_open.status is ExchangeStatus.OPEN
+    assert still_open.owner_task_id is None  # nothing spawned for it yet
+
+    tool.release.set()
+    events = await collect_until(queue, is_delivered("stranded answered"))
+
+    assert any(isinstance(e.payload, Finished) for e in events)
+    await wait_for_async_condition(lambda: _is_answered(exchanges, stranded.id))
+
+
+async def test_recover_interrupted_revives_an_unowned_open_exchange(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The startup counterpart of the freed-slot sweep: an OPEN, ownerless
+    exchange whose message is already stored (a crash before any run ever
+    claimed it) gets a fresh run from `recover_interrupted`, the same way an
+    orphaned task gets restarted.
+    """
+    llm = ScriptedLLM([reply("stranded answered")])
+    manager = make_manager(llm, ToolRegistry(), session_factory)
+    dialog = await get_dialog(session_factory)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    exchange = await exchanges.create(dialog.id, "stranded question")  # OPEN, no owner
+    message_id = await messages.append(
+        dialog.id, ChatMessage(role=MessageRole.USER, content="stranded question")
+    )
+    await messages.set_exchange(message_id, exchange.id)
+
+    await manager.recover_interrupted()
+
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    events = await collect_until(queue, is_delivered("stranded answered"))
+
+    assert any(isinstance(e.payload, Finished) for e in events)
+    await wait_for_async_condition(lambda: _is_answered(exchanges, exchange.id))

@@ -88,3 +88,8 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# test-time budget is enforced, not aspirational: every run prints what is
+# slow (>=0.5s), and a test stuck past 90s dumps stacks instead of hanging
+# the gate silently (faulthandler is stdlib, no plugin dependency)
+addopts = "--durations=15 --durations-min=0.5"
+faulthandler_timeout = 90

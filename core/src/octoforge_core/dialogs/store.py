@@ -315,6 +315,22 @@ class SqlAlchemyExchangeRepository:
             )
             return [_to_exchange(row) for row in result.all()]
 
+    async def list_unowned_open(self, dialog_id: str | None = None) -> ExchangeList:
+        """OPEN exchanges without an owner, oldest first (None: all dialogs)."""
+        query = (
+            select(ExchangeRow)
+            .where(
+                ExchangeRow.status == ExchangeStatus.OPEN.value,
+                ExchangeRow.owner_task_id.is_(None),
+            )
+            .order_by(ExchangeRow.created_at)
+        )
+        if dialog_id is not None:
+            query = query.where(ExchangeRow.dialog_id == dialog_id)
+        async with self._session_factory() as session:
+            result = await session.scalars(query)
+            return [_to_exchange(row) for row in result.all()]
+
     async def reopen_in_progress(self) -> int:
         """Reset every IN_PROGRESS exchange to OPEN; return how many (startup)."""
         async with self._session_factory() as session:

@@ -237,23 +237,30 @@ class _ProcessTerminated:
     """A process (or a recovery sweep) asking the actor to deliver a task outcome.
 
     `terminal` is the live run's Finished/Failed event (None for cancellations
-    and recovery redeliveries — the stored task status decides then). An
-    exchange-owning run streamed its outcome live (the user already watched
-    it), so `exchange_id is not None` doubles as the delivered-already signal.
+    and recovery redeliveries — the stored task status decides then).
+    `delivered_live` is whether that terminal actually reached a subscriber
+    queue: only then is the streamed outcome stamped delivered — with nobody
+    watching, it goes through the outbox like any background result.
     """
 
     task_id: str
     terminal: Finished | Failed | None = None
     exchange_id: str | None = None
+    delivered_live: bool = False
     exchange_status: ExchangeStatus | None = None
     # a message of the same exchange arrived after the run's last sync: the
     # answer could not have accounted for it, so the exchange reopens
     unseen_messages: bool = False
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class _Delivery:
-    """Events of one finished task awaiting transport delivery."""
+    """Events of one finished task awaiting transport delivery.
+
+    Identity semantics (`eq=False`): the outbox removes a flushed delivery
+    by the exact instance, never by equal payload — two look-alike
+    deliveries must not collapse into one removal.
+    """
 
     events: tuple[LoopEvent, ...]
     task_id: str | None
@@ -290,6 +297,9 @@ class _Process:
     # (reply threading); both ride task.input so a restart restores them
     source_message_id: str | None = None
     source_client_message_id: str | None = None
+    # the run's Finished/Failed reached at least one subscriber queue: only
+    # then may the outcome be stamped delivered without outbox redelivery
+    terminal_accepted: bool = False
     overflow_retried: bool = False
 
 
@@ -341,6 +351,10 @@ class ConversationRunner:
         # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
         # which run in pump/scheduler tasks outside the actor's inbox
         self._spawn_lock = asyncio.Lock()
+        # serializes branch assembles: the post-assemble trim shifts narrative
+        # indices, so two interleaved assembles with stale snapshot coordinates
+        # would evict live messages (lock order: spawn_lock -> assemble_lock)
+        self._assemble_lock = asyncio.Lock()
         # serializes outbox flushes between the actor and wake()/restart_task()
         self._flush_lock = asyncio.Lock()
         self._spawner: TaskSpawner = _DialogTaskSpawner(self)
@@ -414,11 +428,14 @@ class ConversationRunner:
 
         Applied directly, not through the inbox: the actor may be busy inside
         a routing LLM call (up to OF_ROUTER_TIMEOUT_SECONDS), and a queued
-        cancel would wait behind it — a stop must act now. Only the runs'
-        LoopControl flags are touched, all owned by this event loop, so
-        bypassing the inbox is race-free.
+        cancel would wait behind it — a stop must act now. Live runs are
+        stopped via their LoopControl flags (owned by this event loop);
+        parked AWAITING_USER exchanges with no live run are closed too —
+        otherwise the nudge would keep re-asking a question the user just
+        stopped caring about.
         """
         self._handle_cancel()
+        await self._cancel_parked_exchanges()
 
     async def spawn_task(self, title: str, prompt: str) -> str:
         """Create a RUN task with its background process; refuse when the limit is hit."""
@@ -498,14 +515,14 @@ class ConversationRunner:
             # Close the row silently; the user's reply resumes the exchange.
             await self._tasks.mark_done(task, "")
             return
-        narrative = await self._assemble_narrative(own_exchange_id=exchange_id)
+        narrative, watermark = await self._assemble_narrative(own_exchange_id=exchange_id)
         process = self._create_process(
             task=task,
             branch=[self._system_message(), *narrative],
             narrative_built=True,
         )
         process.synced_len = len(process.branch)
-        process.watermark = len(self._narrative)
+        process.watermark = watermark
         if exchange_id is not None:
             # the restarted run re-owns its obligation
             with suppress(ExchangeNotFoundError):
@@ -654,6 +671,13 @@ class ConversationRunner:
                     # downstream (e.g. a store error replaces CancelledError):
                     # honor the cancel instead of looping forever
                     raise asyncio.CancelledError from None
+                if isinstance(command, _Submit):
+                    # the message may be persisted yet unrouted/unanswered: a
+                    # silent black hole left users waiting forever — tell
+                    # them. A resend can duplicate the row (duplicate beats
+                    # silence); the unowned-open sweep revives an exchange
+                    # stranded mid-apply.
+                    self._broadcast(Failed(error=SUBMIT_FAILED_ERROR))
 
     @staticmethod
     def _cancellation_pending() -> bool:
@@ -743,9 +767,14 @@ class ConversationRunner:
             return False
         await self._deliver_notice(question, exchange_id=process.exchange_id)
         with suppress(ExchangeNotFoundError):
+            # keep ownership: the asking run is still alive (it unwinds on
+            # its own schedule after the ack) — clearing the owner here let
+            # a prompt reply spawn a second run on the same exchange, both
+            # streaming into one transport draft
             await self._exchanges.set_status(
                 process.exchange_id,
                 ExchangeStatus.AWAITING_USER,
+                owner_task_id=process.task_id,
                 pending_question=question,
             )
         return True
@@ -755,6 +784,21 @@ class ConversationRunner:
         if client_message_id is None:
             return False
         return await self._messages.find_by_client_id(self._dialog.id, client_message_id)
+
+    async def _cancel_parked_exchanges(self) -> None:
+        """Close AWAITING_USER exchanges whose run already ended (stop button).
+
+        Exchanges with a live run are settled CANCELLED by their own
+        termination; OPEN ones are left alone — they are transient (a run
+        is being started, or the sweep will pick them up) and cancelling
+        them here would race the actor's start path.
+        """
+        for exchange in await self._exchanges.list_live(self._dialog.id):
+            if (
+                exchange.status is ExchangeStatus.AWAITING_USER
+                and exchange.owner_task_id not in self._processes
+            ):
+                await self._exchanges.set_status(exchange.id, ExchangeStatus.CANCELLED)
 
     def _handle_cancel(self) -> None:
         """Stop every live answer run (the user's stop button / /cancel).
@@ -786,20 +830,26 @@ class ConversationRunner:
             await self._mark_streamed_delivered(task)
         elif command.terminal is None:
             self._enqueue_redelivery(task)
-        elif command.exchange_id is not None:
+        elif command.exchange_id is not None and command.delivered_live:
             await self._mark_streamed_delivered(task)
         else:
+            # either a RUN task (never streamed) or a streamed answer whose
+            # terminal reached zero subscribers (tab reload at the wrong
+            # moment, bridge down): the outbox redelivers it whole
             self._enqueue_terminal(command.terminal, task)
         await self._flush_deliveries()
+        # a slot just freed: revive anything stranded OPEN without an owner
+        await self._sweep_unowned_open()
 
     async def _settle_exchange(self, command: _ProcessTerminated) -> None:
         """Move the finished run's exchange to its next state.
 
-        A run that asked the user something leaves the exchange awaiting them
-        (the ask itself set that state and must not be overwritten). Messages
-        that arrived after the run's last sync reopen the exchange instead of
-        closing it — a fresh run picks it up, which is what the requeue
-        heuristic used to approximate.
+        Order matters: the owner guard first (a settled exchange that
+        changed hands belongs to its new owner), then the unseen-messages
+        reopen (a reply that arrived during the run's tail must get a fresh
+        run — even when the run had asked and parked the exchange), then the
+        AWAITING_USER handling (kept open for the user's move, closed on a
+        user cancel or when the run answered anyway).
         """
         if command.exchange_id is None or command.exchange_status is None:
             return
@@ -815,8 +865,6 @@ class ConversationRunner:
             command.exchange_status.value,
             command.unseen_messages,
         )
-        if exchange.status is ExchangeStatus.AWAITING_USER:
-            return  # the run asked the user something; the obligation stays open
         if exchange.owner_task_id != command.task_id:
             # the exchange changed hands while this termination sat in the
             # inbox (a follow-up already spawned a fresh owner, or a cancel
@@ -830,13 +878,40 @@ class ConversationRunner:
                 exchange.owner_task_id,
             )
             return
-        if command.unseen_messages:
+        if command.unseen_messages and command.exchange_status is not ExchangeStatus.CANCELLED:
+            # a message of this exchange arrived after the run's last sync —
+            # even one the run asked for (AWAITING_USER): reopen, fresh run.
+            # A user-cancelled run must NOT resurrect itself this way: the
+            # stop came after the message, so the stop covers it.
             await self._exchanges.set_status(exchange.id, ExchangeStatus.OPEN)
             await self._resume_open_exchange(exchange.id)
             return
+        if exchange.status is ExchangeStatus.AWAITING_USER:
+            await self._settle_awaiting(exchange, command)
+            return
         await self._exchanges.set_status(exchange.id, command.exchange_status)
 
-    async def _resume_open_exchange(self, exchange_id: str) -> None:
+    async def _settle_awaiting(self, exchange: Exchange, command: _ProcessTerminated) -> None:
+        """Settle a run that asked the user something and then terminated.
+
+        The obligation normally stays open (the reply resumes it). Two
+        exceptions: a user cancel closes it — otherwise the nudge would
+        re-ask a question the user explicitly stopped — and a run that
+        asked but then answered anyway closes it as answered, or its stale
+        pending question would be nudged forever.
+        """
+        if command.exchange_status is ExchangeStatus.CANCELLED:
+            await self._exchanges.set_status(exchange.id, ExchangeStatus.CANCELLED)
+            return
+        answered_anyway = (
+            command.exchange_status is ExchangeStatus.ANSWERED
+            and isinstance(command.terminal, Finished)
+            and bool(command.terminal.message.content.strip())
+        )
+        if answered_anyway:
+            await self._exchanges.set_status(exchange.id, ExchangeStatus.ANSWERED)
+
+    async def _resume_open_exchange(self, exchange_id: str, *, notify_limit: bool = True) -> None:
         """Give an OPEN exchange a fresh run (its last one missed something)."""
         message = next(
             (
@@ -847,16 +922,46 @@ class ConversationRunner:
             None,
         )
         if message is None:
+            # compacted out of the hot tail: nothing to hand a fresh run
+            logger.warning(
+                "cannot resume exchange, its message left the hot tail: dialog=%s exchange=%s",
+                self._dialog.id,
+                exchange_id,
+            )
             return
         with suppress(ExchangeNotFoundError):
-            exchange = await self._exchanges.get(exchange_id)
             async with self._spawn_lock:
+                # re-read INSIDE the lock: a sweep and a settle may both try
+                # to revive the same exchange — the second must see the first
+                exchange = await self._exchanges.get(exchange_id)
+                if exchange.status is not ExchangeStatus.OPEN or exchange.owner_task_id is not None:
+                    return
                 if self._exceeds_limit(set()):
-                    # never refuse silently: the exchange would strand OPEN
-                    # with nothing scheduled to revive it — tell the user
-                    await self._reject_for_limit(message)
+                    if notify_limit:
+                        # the user-facing path tells them; the background
+                        # sweep stays silent and retries on the next slot
+                        await self._reject_for_limit(message)
                     return
                 await self._start_answer(exchange, message)
+
+    async def _sweep_unowned_open(self) -> None:
+        """Revive OPEN exchanges nobody owns (crash and limit leftovers).
+
+        The documented predicate "OPEN without an owner = work for the
+        system", run when a slot frees up (and via `resume_stranded` at
+        startup). Silent on the process limit: the next freed slot retries.
+        """
+        try:
+            stranded = await self._exchanges.list_unowned_open(self._dialog.id)
+        except Exception:  # the sweep is a safety net; never break the actor
+            logger.exception("unowned-open sweep failed: dialog=%s", self._dialog.id)
+            return
+        for exchange in stranded:
+            await self._resume_open_exchange(exchange.id, notify_limit=False)
+
+    async def resume_stranded(self) -> None:
+        """Startup entry of the unowned-open sweep (called by the manager)."""
+        await self._sweep_unowned_open()
 
     def _enqueue_redelivery(self, task: Task) -> None:
         """Queue the stored outcome of a finished task for delivery (recovery path)."""
@@ -956,7 +1061,14 @@ class ConversationRunner:
                     # a racing task_delete must not wedge the outbox behind it
                     with suppress(TaskNotFoundError):
                         await self._tasks.mark_delivered(delivery.task_id)
-                self._pending_deliveries.popleft()
+                # remove by identity, not position: an ask_user question may
+                # have jumped the queue (appendleft) during the await above —
+                # a blind popleft would silently drop that question instead
+                if self._pending_deliveries and self._pending_deliveries[0] is delivery:
+                    self._pending_deliveries.popleft()
+                else:
+                    with suppress(ValueError):
+                        self._pending_deliveries.remove(delivery)
 
     async def _apply_route(
         self, message: ChatMessage, decision: RouteDecision, command: _Submit
@@ -988,9 +1100,12 @@ class ConversationRunner:
         if refused:
             await self._reject_for_limit(message)
             return
-        await self._nudge_stale_exchanges(exchange_id)
+        # owner first, nudge after: a cosmetic reminder must never sit
+        # between exchange creation and owner assignment — a failure inside
+        # it would strand the fresh exchange unowned
         if exchange_id is not None:
             await self._ensure_owner(exchange_id, message, command.client_message_id, cancelled)
+        await self._nudge_stale_exchanges(exchange_id)
 
     async def _cancel_exchanges(self, exchange_ids: tuple[str, ...]) -> set[str]:
         """Cancel the named exchanges and their live runs; return what was cancelled."""
@@ -1021,10 +1136,12 @@ class ConversationRunner:
         "stop X, continue Y" message hits the limit on X's still-live slot.
         """
         with suppress(ExchangeNotFoundError):
-            exchange = await self._exchanges.get(exchange_id)
-            if exchange.owner_task_id is not None and exchange.owner_task_id in self._processes:
-                return
             async with self._spawn_lock:
+                # read the exchange INSIDE the lock: a check-then-act across
+                # the lock await is how a second owner slips in
+                exchange = await self._exchanges.get(exchange_id)
+                if exchange.owner_task_id is not None and exchange.owner_task_id in self._processes:
+                    return
                 if self._exceeds_limit(self._cancelled_tasks(cancelled or set())):
                     await self._reject_for_limit(message)
                     return
@@ -1100,14 +1217,14 @@ class ConversationRunner:
         await self._exchanges.set_status(
             exchange.id, ExchangeStatus.IN_PROGRESS, owner_task_id=task.id
         )
-        narrative = await self._assemble_narrative(own_exchange_id=exchange.id)
+        narrative, watermark = await self._assemble_narrative(own_exchange_id=exchange.id)
         process = self._create_process(
             task=task,
             branch=[self._system_message(), *narrative],
             narrative_built=True,
         )
         process.synced_len = len(process.branch)
-        process.watermark = len(self._narrative)
+        process.watermark = watermark
         # the reply target must reach the transport BEFORE the first token:
         # a reply can only be set when the message is created. Every answer
         # run streams into its own per-exchange draft — there is no
@@ -1124,8 +1241,22 @@ class ConversationRunner:
     def _system_message(self) -> ChatMessage:
         return ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME))
 
-    async def _assemble_narrative(self, own_exchange_id: str | None = None) -> list[ChatMessage]:
+    async def _assemble_narrative(
+        self, own_exchange_id: str | None = None
+    ) -> tuple[list[ChatMessage], int]:
         """Assemble the narrative part of a branch: compactor tail, marks, date.
+
+        Returns the rendered narrative AND the watermark the caller must
+        record for the branch: the post-trim index up to which the branch
+        has seen the narrative. Both come from the compactor's snapshot —
+        a message appended while the assemble awaited is NOT in the branch,
+        so it must stay above the watermark or the pull model silently
+        loses it (the run never syncs it in, `_has_unseen_messages` never
+        reopens for it, and the exchange closes as answered).
+
+        `_assemble_lock` serializes assembles across pumps: the trim below
+        shifts narrative indices, and a concurrent assemble holding stale
+        snapshot coordinates would evict live messages.
 
         The assembled tail size also drives the memory diet: once compaction
         has advanced, everything before the hot tail is dropped from the
@@ -1135,14 +1266,15 @@ class ConversationRunner:
         Marking is delegated to `render_branch`: one rule over durable
         exchange state instead of the envelope patchwork it replaced.
         """
-        assembled = await self._compactor.assemble(self._dialog, self._narrative)
-        self._trim_narrative(assembled.tail_count)
+        async with self._assemble_lock:
+            assembled = await self._compactor.assemble(self._dialog, self._narrative)
+            self._trim_narrative(assembled.snapshot_len - assembled.tail_count)
         narrative = render_branch(
             assembled.messages, own_exchange_id, await self._live_exchange_ids(own_exchange_id)
         )
         if narrative:
             narrative[-1] = _with_date_envelope(narrative[-1])
-        return narrative
+        return narrative, assembled.tail_count
 
     async def _live_exchange_ids(self, own_exchange_id: str | None = None) -> frozenset[str]:
         """Other unanswered obligations, from the durable state.
@@ -1158,14 +1290,14 @@ class ConversationRunner:
             if item.id != own_exchange_id
         )
 
-    def _trim_narrative(self, tail_count: int) -> None:
+    def _trim_narrative(self, drop: int) -> None:
         """Drop compacted messages from memory, keeping watermarks consistent.
 
-        Watermarks are positions in the narrative list, so they shift by the
-        dropped count. Nothing else needs pruning: message-to-exchange
-        ownership lives in the database, not in in-memory id sets.
+        `drop` comes from the compactor's snapshot (snapshot_len - tail_count),
+        NOT from the live list length: messages appended during the assemble
+        are past the snapshot and must survive the trim. Watermarks are
+        positions in the narrative list, so they shift by the dropped count.
         """
-        drop = len(self._narrative) - tail_count
         if drop <= 0:
             return
         del self._narrative[:drop]
@@ -1266,17 +1398,21 @@ class ConversationRunner:
             return
         if not force and len(self._narrative) == process.watermark:
             return
-        narrative = await self._assemble_narrative(own_exchange_id=process.exchange_id)
+        narrative, watermark = await self._assemble_narrative(own_exchange_id=process.exchange_id)
         private = process.branch[process.synced_len :]
         process.branch[:] = [self._system_message(), *narrative, *private]
         process.synced_len = 1 + len(narrative)
-        process.watermark = len(self._narrative)
+        # the snapshot watermark, NOT len(self._narrative): a message appended
+        # during the assemble is not in this branch and must stay unseen
+        process.watermark = watermark
 
     def _fail_run(self, process: _Process, error: str) -> LoopEvent:
         """Broadcast and return a Failed terminal for the process."""
         terminal = Failed(error=error)
         if process.exchange_id is not None:
-            self._broadcast(terminal, exchange_id=process.exchange_id)
+            process.terminal_accepted = (
+                self._broadcast(terminal, exchange_id=process.exchange_id) > 0
+            )
         return terminal
 
     async def _stream_once(self, process: _Process) -> LoopEvent:
@@ -1302,7 +1438,12 @@ class ConversationRunner:
                     # reply threading: the loop knows nothing about tasks
                     out = replace(event, source_client_message_id=process.source_client_message_id)
                 if process.exchange_id is not None:
-                    self._broadcast(out, exchange_id=process.exchange_id)
+                    accepted = self._broadcast(out, exchange_id=process.exchange_id)
+                    if isinstance(out, (Finished, Failed)):
+                        # delivery is only real if the terminal reached a
+                        # subscriber queue; "streamed live" alone proves
+                        # nothing when nobody was watching
+                        process.terminal_accepted = accepted > 0
                 if isinstance(out, (Finished, Cancelled, Failed)):
                     terminal = out
         except ContextOverflowError:
@@ -1313,7 +1454,8 @@ class ConversationRunner:
             )
             terminal = Failed(error=format_error(exc))
             if process.exchange_id is not None:
-                self._broadcast(terminal, exchange_id=process.exchange_id)
+                accepted = self._broadcast(terminal, exchange_id=process.exchange_id)
+                process.terminal_accepted = accepted > 0
         return terminal
 
     def _terminate_process(
@@ -1337,6 +1479,7 @@ class ConversationRunner:
                 task_id=process.task_id,
                 terminal=terminal if isinstance(terminal, (Finished, Failed)) else None,
                 exchange_id=process.exchange_id,
+                delivered_live=process.terminal_accepted,
                 exchange_status=_exchange_outcome(status),
                 unseen_messages=self._has_unseen_messages(process),
             )
@@ -1384,6 +1527,11 @@ class ConversationRunner:
                 )
                 await self._persist(message, usage=terminal.usage)
                 self._narrative.append(message)
+                if not process.narrative_built:
+                    # RUN/cron results grow the narrative too, but only
+                    # answer runs assemble branches — a dialog fed purely by
+                    # cron would never trigger compaction and grow unbounded
+                    await self._compact_after_run_final()
             await self._tasks.mark_done(task, terminal.message.content)
             status = TaskStatus.DONE
         elif isinstance(terminal, Failed):
@@ -1395,6 +1543,18 @@ class ConversationRunner:
             status = TaskStatus.CANCELLED
         await self._report_outcome(task, status)
         return status
+
+    async def _compact_after_run_final(self) -> None:
+        """Run the compactor's overflow check for a narrative grown by RUN work.
+
+        Reuses the assemble path (which carries the trigger and the memory
+        trim) and discards the rendered result. Failures are swallowed: this
+        is bookkeeping, not the run's outcome.
+        """
+        try:
+            await self._assemble_narrative()
+        except Exception:
+            logger.exception("post-run compaction check failed: dialog=%s", self._dialog.id)
 
     async def _report_outcome(self, task: Task, status: TaskStatus) -> None:
         """Tell the outcome listener about a finished cron-tagged task, if any."""
@@ -1619,15 +1779,40 @@ class ConversationManager:
         orphaned = await self._list_orphaned()
         for task in orphaned:
             await self._restart_orphaned(task)
+        revived = await self._revive_unowned_open()
         undelivered = await self._list_undelivered()
         for task in undelivered:
             await self._redeliver_undelivered(task)
         logger.info(
-            "startup recovery: reopened=%s restarted=%s redelivered=%s",
+            "startup recovery: reopened=%s restarted=%s revived=%s redelivered=%s",
             stranded,
             len(orphaned),
+            revived,
             len(undelivered),
         )
+
+    async def _revive_unowned_open(self) -> int:
+        """Give every unowned OPEN exchange back to its dialog's sweep.
+
+        Runs after the orphan restarts (which re-own their exchanges), so
+        whatever is still unowned here is a genuine crash leftover: an
+        exchange created whose run never came to exist.
+        """
+        try:
+            stranded = await self._exchanges.list_unowned_open()
+        except Exception:
+            logger.exception("unowned-open startup sweep failed")
+            return 0
+        revived = 0
+        for exchange in stranded:
+            try:
+                dialog = await self._dialogs.get(exchange.dialog_id)
+                runner = await self.get_or_create_runner(dialog.user_id, dialog.channel)
+                await runner.resume_stranded()
+                revived += 1
+            except Exception:
+                logger.exception("stranded exchange revive failed: exchange=%s", exchange.id)
+        return revived
 
     async def _reopen_stranded_exchanges(self) -> int:
         """Reset obligations whose owner died; return how many.

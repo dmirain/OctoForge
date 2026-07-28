@@ -52,11 +52,16 @@ class AssembledContext:
     `tail_count` is how many trailing narrative messages went in verbatim —
     the actor uses it to trim its in-memory narrative down to the hot tail
     once compaction has advanced (everything older is reachable through
-    summaries and history_search only).
+    summaries and history_search only). `snapshot_len` is the narrative
+    length at the moment the tail was sliced: messages appended during the
+    assemble's awaits are NOT in `messages`, and the caller must neither
+    trim them nor count them as seen — both are computed from the snapshot,
+    never from the live list length.
     """
 
     messages: list[ChatMessage]
     tail_count: int
+    snapshot_len: int
 
 
 @dataclass(frozen=True, slots=True)

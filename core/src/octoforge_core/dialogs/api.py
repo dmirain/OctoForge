@@ -88,6 +88,15 @@ class ExchangeRepository(Protocol):
         """Return the dialog's non-terminal exchanges, oldest first."""
         ...
 
+    async def list_unowned_open(self, dialog_id: str | None = None) -> ExchangeList:
+        """OPEN exchanges without an owner, oldest first (None: all dialogs).
+
+        The "work left for the system" predicate: every crash or limit
+        window that leaves a question unowned lands here, and the sweeps
+        (startup, freed slot) revive them.
+        """
+        ...
+
     async def reopen_in_progress(self) -> int:
         """Reset every IN_PROGRESS exchange to OPEN; return how many.
 
