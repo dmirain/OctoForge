@@ -190,11 +190,15 @@
       scrollToBottom();
     }
 
-    function addMarker(content) {
+    function addMarker(content, anchor) {
       const div = document.createElement("div");
       div.className = "marker";
       div.textContent = content;
-      messagesEl.appendChild(div);
+      if (anchor && anchor.parentNode === messagesEl) {
+        anchor.after(div);
+      } else {
+        messagesEl.appendChild(div);
+      }
       scrollToBottom();
     }
 
@@ -226,20 +230,40 @@
       liveBubbles.delete(exchangeId || "");
     }
 
-    function setRunning(running) {
-      stopEl.classList.toggle("visible", running);
+    // the stop button cancels ALL live answers, so it stays visible while
+    // any exchange is running ("" tracks a submit not yet tied to a process)
+    const liveExchanges = new Set();
+
+    function updateStopButton() {
+      stopEl.classList.toggle("visible", liveExchanges.size > 0);
+      stopEl.textContent = liveExchanges.size > 1 ? "Остановить всё" : "Стоп";
+    }
+
+    function markLive(exchangeId) {
+      liveExchanges.add(exchangeId || "");
+      if (exchangeId) liveExchanges.delete("");
+      updateStopButton();
+    }
+
+    function markDone(exchangeId) {
+      liveExchanges.delete(exchangeId || "");
+      updateStopButton();
     }
 
     function handleEvent(event) {
       switch (event.type) {
+        case "process_started":
+          markLive(event.exchange_id);
+          break;
         case "text_delta":
+          markLive(event.exchange_id);
           appendDelta(event.text, event.exchange_id);
           break;
         case "assistant_message":
           finalizeBubble(event.content, event.interrupted, event.exchange_id);
           break;
         case "tool_call_requested":
-          setRunning(true);
+          markLive(event.exchange_id);
           addStep(`→ ${event.name} ${JSON.stringify(event.arguments)}`);
           break;
         case "tool_call_completed":
@@ -250,21 +274,25 @@
           break;
         case "finished":
           liveBubbles.delete(event.exchange_id || "");
-          setRunning(false);
+          markDone(event.exchange_id);
           break;
         case "cancelled":
           liveBubbles.delete(event.exchange_id || "");
-          setRunning(false);
+          markDone(event.exchange_id);
           break;
         case "failed":
           addMessage("error", event.error);
-          setRunning(false);
+          markDone(event.exchange_id);
           break;
         case "retry_scheduled":
           addStep(`🔁 повтор ${event.attempt} через ${Math.round(event.delay_seconds)}с (${event.reason})`);
           break;
         case "process_completed":
-          addMarker(`процесс завершён (${event.status}): ${event.title}`);
+          addMarker(
+            `процесс завершён (${event.status}): ${event.title}`,
+            liveBubbles.get(event.exchange_id || ""),
+          );
+          markDone(event.exchange_id);
           break;
       }
     }
@@ -295,6 +323,8 @@
 
     async function connect() {
       disconnect();
+      liveExchanges.clear();
+      updateStopButton();
       const id = userId();
       if (!id) return;
       const controller = new AbortController();
@@ -344,7 +374,7 @@
       }
       addMessage("user", content);
       textEl.value = "";
-      setRunning(true);
+      markLive("");
       try {
         await fetch("/api/dialog/messages", {
           method: "POST",
@@ -353,7 +383,7 @@
         });
       } catch (error) {
         addMessage("error", "Не удалось отправить сообщение.");
-        setRunning(false);
+        markDone("");
       }
       textEl.focus();
     });

@@ -18,6 +18,7 @@ from typing import Generic, Protocol, TypeVar
 from octoforge_core.context.api import DialogueSummary
 from octoforge_core.cron.api import CronJob
 from octoforge_core.datasets.api import Dataset, DatasetRecord
+from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.instructions.api import Instruction
 from octoforge_core.memory.api import Memory
 from octoforge_core.tasks.api import Task
@@ -77,6 +78,28 @@ class MessageRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ExchangeOverview:
+    """An exchange with the dialog identity an operator needs to place it.
+
+    `Exchange` (the `dialogs` module's own DTO) doesn't carry user_id/channel
+    — only tasks denormalize those onto their own row. This DTO joins in what
+    `DialogRow` knows, the same way `DialogOverview` does for the dialogs
+    listing.
+    """
+
+    id: str
+    dialog_id: str
+    user_id: str
+    channel: str
+    status: ExchangeStatus
+    title: str
+    owner_task_id: str | None
+    pending_question: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class Totals:
     """Row counts per entity: the console's landing page."""
 
@@ -89,6 +112,7 @@ class Totals:
     dataset_records: int
     memories: int
     dialog_summaries: int
+    exchanges: int
 
 
 class AdminReadModel(Protocol):
@@ -148,6 +172,19 @@ class AdminReadModel(Protocol):
 
     async def list_summaries(self, limit: int, offset: int) -> Page[DialogueSummary]:
         """Dialog summaries (compaction output) of every dialog."""
+        ...
+
+    async def list_exchanges(
+        self,
+        limit: int,
+        offset: int,
+        user_id: str | None = None,
+        status: str | None = None,
+    ) -> Page[ExchangeOverview]:
+        """Exchanges of every dialog, most recently updated first.
+
+        `user_id` and `status` narrow the listing; both are optional.
+        """
         ...
 
 

@@ -118,6 +118,8 @@ HTTP-границу); таблицы модуля — его собственн�
 
 ## Этап E. Процессная модель + LLM-роутер ✅
 
+> 28.07.2026 заменена моделью обменов — см. [exchanges.md](exchanges.md); ниже — исторический план.
+
 (process-model.md; крупный рефактор runner'а)
 
 1. `agent/router.py`: `RouteAction` (INJECT|START_NEW|CANCEL|PROMOTE), `RouteOp`,

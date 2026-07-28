@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.admin.api import (
     DialogOverview,
+    ExchangeOverview,
     MessageRecord,
     Page,
     Totals,
@@ -26,7 +27,8 @@ from octoforge_core.cron.models import CronJobRow
 from octoforge_core.datasets.api import Dataset, DatasetRecord
 from octoforge_core.datasets.models import DatasetRecordRow, DatasetRow
 from octoforge_core.datasets.validation import parse_schema
-from octoforge_core.dialogs.models import DialogRow, MessageRow
+from octoforge_core.dialogs.api import ExchangeStatus
+from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
 from octoforge_core.instructions.api import Instruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.memory.api import Memory
@@ -52,6 +54,7 @@ class SqlAlchemyAdminStore:
                     ("datasets", DatasetRow),
                     ("dataset_records", DatasetRecordRow),
                     ("dialog_summaries", SummaryRow),
+                    ("exchanges", ExchangeRow),
                 )
             }
             # memories share the instructions table (type=memory): the two
@@ -259,6 +262,45 @@ class SqlAlchemyAdminStore:
             items=tuple(_to_summary(row) for row in rows), total=total, limit=limit, offset=offset
         )
 
+    async def list_exchanges(
+        self,
+        limit: int,
+        offset: int,
+        user_id: str | None = None,
+        status: str | None = None,
+    ) -> Page[ExchangeOverview]:
+        """Exchanges of every dialog, most recently updated first.
+
+        `ExchangeRow` doesn't carry user_id/channel (unlike tasks, which
+        denormalize those onto their own row), so this joins `DialogRow` the
+        same way `list_dialogs` correlates its counters — here as a plain
+        join since every exchange has exactly one owning dialog.
+        """
+        filters = []
+        if user_id is not None:
+            filters.append(DialogRow.user_id == user_id)
+        if status is not None:
+            filters.append(ExchangeRow.status == status)
+        statement = (
+            select(ExchangeRow, DialogRow.user_id, DialogRow.channel)
+            .join(DialogRow, DialogRow.id == ExchangeRow.dialog_id)
+            .where(*filters)
+            .order_by(ExchangeRow.updated_at.desc(), ExchangeRow.id)
+            .limit(limit)
+            .offset(offset)
+        )
+        counter = (
+            select(func.count())
+            .select_from(ExchangeRow)
+            .join(DialogRow, DialogRow.id == ExchangeRow.dialog_id)
+            .where(*filters)
+        )
+        async with self._session_factory() as session:
+            rows = (await session.execute(statement)).all()
+            total = await _count(session, counter)
+        items = tuple(_to_exchange_overview(row[0], row[1], row[2]) for row in rows)
+        return Page(items=items, total=total, limit=limit, offset=offset)
+
     async def _page(
         self,
         statement: Select[Any],
@@ -380,6 +422,21 @@ def _to_memory(row: InstructionRow) -> Memory:
         key=row.title,
         content=row.content,
         tags=tuple(row.tags),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _to_exchange_overview(row: ExchangeRow, user_id: str, channel: str) -> ExchangeOverview:
+    return ExchangeOverview(
+        id=row.id,
+        dialog_id=row.dialog_id,
+        user_id=user_id,
+        channel=channel,
+        status=ExchangeStatus(row.status),
+        title=row.title,
+        owner_task_id=row.owner_task_id,
+        pending_question=row.pending_question,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

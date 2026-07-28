@@ -37,6 +37,7 @@ from octoforge_web.telegram.models import (
     TelegramChat,
     TelegramChatType,
     TelegramMessage,
+    TelegramReplyToMessage,
     TelegramUpdate,
     TelegramUser,
 )
@@ -119,6 +120,24 @@ class FakeTelegramClient:
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         pass
+
+
+class RecordingBridge:
+    """TelegramBridge stub recording `handle_text` calls (poller-forwarding tests only)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None, int | None]] = []
+
+    async def handle_text(
+        self,
+        content: str,
+        client_message_id: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        self.calls.append((content, client_message_id, reply_to_message_id))
+
+    async def cancel(self) -> None:
+        raise AssertionError("cancel should not be called in these tests")
 
 
 class ScriptedLLM:
@@ -374,6 +393,40 @@ def test_chat_id_from_user_id() -> None:
     assert chat_id_from_user_id(USER_ID) == TELEGRAM_USER_ID
     assert chat_id_from_user_id("alice") is None
     assert chat_id_from_user_id(f"{USER_ID_PREFIX}abc") is None
+
+
+async def test_dispatch_forwards_the_reply_target_to_the_bridge() -> None:
+    """`reply_to_message.message_id` on the update reaches `bridge.handle_text`."""
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+    fake_bridge = RecordingBridge()
+    poller._registry._bridges[USER_ID] = fake_bridge  # type: ignore[assignment]
+    update = TelegramUpdate(
+        update_id=FIRST_UPDATE_ID,
+        message=TelegramMessage(
+            message_id=2001,
+            from_user=TelegramUser(id=TELEGRAM_USER_ID),
+            chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
+            text="reply text",
+            reply_to_message=TelegramReplyToMessage(message_id=999),
+        ),
+    )
+
+    await poller.dispatch(update)
+
+    assert fake_bridge.calls == [("reply text", "2001", 999)]
+
+
+async def test_dispatch_forwards_no_reply_target_when_absent() -> None:
+    """A plain (non-reply) message forwards `reply_to_message_id=None`."""
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+    fake_bridge = RecordingBridge()
+    poller._registry._bridges[USER_ID] = fake_bridge  # type: ignore[assignment]
+
+    await poller.dispatch(make_update(FIRST_UPDATE_ID, text="plain"))
+
+    assert fake_bridge.calls == [("plain", str(FIRST_UPDATE_ID), None)]
 
 
 async def test_warm_starts_bridges_for_known_telegram_dialogs(

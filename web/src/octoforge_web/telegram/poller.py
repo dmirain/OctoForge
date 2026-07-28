@@ -210,9 +210,21 @@ class TelegramPoller:
         user_id = f"{USER_ID_PREFIX}{message.from_user.id}"
         if not await self._check_membership(user_id, chat_id, message.text):
             return
-        await self._dispatch_text(message.message_id, user_id, chat_id, message.text)
+        reply_to_message_id = (
+            message.reply_to_message.message_id if message.reply_to_message is not None else None
+        )
+        await self._dispatch_text(
+            message.message_id, user_id, chat_id, message.text, reply_to_message_id
+        )
 
-    async def _dispatch_text(self, message_id: int, user_id: str, chat_id: int, text: str) -> None:
+    async def _dispatch_text(
+        self,
+        message_id: int,
+        user_id: str,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: int | None = None,
+    ) -> None:
         """Route an allowed text: surface commands first, then the dialog bridge."""
         if text == COMMAND_START or _start_code(text) is not None:
             if text == COMMAND_START:
@@ -231,7 +243,9 @@ class TelegramPoller:
         # the chat-level message id, not update_id: it doubles as the reply
         # target when the answer threads back to this question, and it is
         # unique per chat — enough for the (dialog, client_message_id) dedup
-        await bridge.handle_text(text, client_message_id=str(message_id))
+        await bridge.handle_text(
+            text, client_message_id=str(message_id), reply_to_message_id=reply_to_message_id
+        )
 
     async def _send_secrets_link(self, user_id: str, chat_id: int) -> None:
         if self._secrets_link is None:

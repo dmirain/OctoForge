@@ -3,12 +3,14 @@
 import base64
 import logging
 from collections.abc import Iterator
+from functools import partial
 from http import HTTPStatus
 from pathlib import Path
 from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
+from octoforge_core.dialogs.api import DialogRepository, ExchangeRepository, ExchangeStatus
 from octoforge_core.instructions.api import (
     InstructionDraft,
     InstructionService,
@@ -36,6 +38,7 @@ LISTING_PATHS = (
     "/api/admin/datasets",
     "/api/admin/memories",
     "/api/admin/summaries",
+    "/api/admin/exchanges",
 )
 EMPTY_TOTALS = 0
 
@@ -157,6 +160,42 @@ def test_dialog_and_its_messages_are_visible(client: TestClient) -> None:
     assert dialogs["total"] == 1
     assert dialogs["items"][0]["user_id"] == "alice"
     assert [item["content"] for item in messages["items"]] == ["hi"]
+
+
+def app_exchanges(client: TestClient) -> ExchangeRepository:
+    return cast(ExchangeRepository, client.app.state.exchanges)  # type: ignore[attr-defined]
+
+
+def test_exchanges_carry_dialog_identity_and_filter_by_status(client: TestClient) -> None:
+    # seed through the repositories, not the dialog API: a posted message
+    # would race this test by creating its own exchange via routing
+    dialogs = cast(DialogRepository, client.app.state.dialogs)  # type: ignore[attr-defined]
+    exchanges = app_exchanges(client)
+    assert client.portal is not None
+    dialog = client.portal.call(dialogs.get_or_create, "alice", "web")
+    opened = client.portal.call(exchanges.create, dialog.id, "a question")
+    client.portal.call(
+        partial(
+            exchanges.set_status,
+            opened.id,
+            ExchangeStatus.AWAITING_USER,
+            pending_question="which one?",
+        )
+    )
+
+    everything = client.get("/api/admin/exchanges").json()
+    for_alice = client.get("/api/admin/exchanges?user_id=alice").json()
+    for_someone_else = client.get("/api/admin/exchanges?user_id=bob").json()
+    awaiting = client.get("/api/admin/exchanges?status=awaiting_user").json()
+
+    assert everything["total"] == 1
+    assert everything["items"][0]["user_id"] == "alice"
+    assert everything["items"][0]["channel"] == "web"
+    assert for_alice["total"] == 1
+    assert for_someone_else["total"] == 0
+    assert awaiting["total"] == 1
+    assert awaiting["items"][0]["pending_question"] == "which one?"
+    assert awaiting["items"][0]["status"] == "awaiting_user"
 
 
 def test_dialog_deletion_cascades_and_survives_recreation(client: TestClient) -> None:

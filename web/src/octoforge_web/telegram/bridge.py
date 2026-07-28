@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -42,6 +43,10 @@ CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
 RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
 PARSE_MODE_HTML = "HTML"
+# how many sent-message-id -> exchange-id mappings the bridge remembers for
+# reply routing; a restart loses the map entirely (routing falls back to the
+# LLM router), so this only bounds in-process memory, not correctness
+REPLY_TARGET_MAP_SIZE = 512
 
 
 @dataclass(slots=True)
@@ -70,6 +75,10 @@ class _Draft:
     # a reply at message creation, never on a later edit
     reply_to: int | None = None
     last_flush_monotonic: float = 0.0
+    # the exchange this draft belongs to, carried alongside so a fresh
+    # message id can be recorded into the reply-target map at send time
+    # without threading exchange_id through every render/flush call
+    exchange_id: str | None = None
 
 
 class TelegramBridge:
@@ -92,6 +101,11 @@ class TelegramBridge:
         self._runner: ConversationRunner | None = None
         self._forwarder: asyncio.Task[None] | None = None
         self._drafts: dict[str | None, _Draft] = {}
+        # sent message id -> exchange id, for resolving a Telegram reply back
+        # to its exchange without an LLM routing call; bounded (oldest
+        # evicted first) and lost on restart, which just falls back to the
+        # router — never a correctness issue, only a routing-cost one
+        self._reply_targets: OrderedDict[int, str] = OrderedDict()
 
     async def start(self) -> None:
         """Resolve the runner and start forwarding its events to the chat."""
@@ -101,17 +115,36 @@ class TelegramBridge:
         queue = runner.subscribe()  # subscribe before the run starts, events are not replayed
         self._forwarder = asyncio.create_task(self._forward(runner, queue))
 
-    async def handle_text(self, content: str, client_message_id: str | None = None) -> None:
+    async def handle_text(
+        self,
+        content: str,
+        client_message_id: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> None:
         """Submit user text into the dialog, starting the forwarder on first contact.
 
         `client_message_id` (the chat-level Telegram message id) deduplicates
         delivery retries — Telegram re-sends an update until it gets a 200 —
         and doubles as the reply target the answer threads back to.
+        `reply_to_message_id` is the message the user replied to, if any: when
+        it names a message this bridge sent for a live exchange, routing
+        skips the LLM router entirely (`ConversationRunner.submit`'s
+        deterministic reply shortcut). An unknown or absent reply id falls
+        back to the router, same as before.
         """
         runner = await self._ensure_runner()
         await self.start()
         await self._client.send_chat_action(self._chat_id, CHAT_ACTION_TYPING)
-        await runner.submit(content, client_message_id=client_message_id)
+        reply_to_exchange_id = (
+            self._reply_targets.get(reply_to_message_id)
+            if reply_to_message_id is not None
+            else None
+        )
+        await runner.submit(
+            content,
+            client_message_id=client_message_id,
+            reply_to_exchange_id=reply_to_exchange_id,
+        )
 
     async def cancel(self) -> None:
         """Cancel the current run of the dialog."""
@@ -149,7 +182,7 @@ class TelegramBridge:
     def _draft_of(self, exchange_id: str | None) -> _Draft:
         draft = self._drafts.get(exchange_id)
         if draft is None:
-            draft = _Draft()
+            draft = _Draft(exchange_id=exchange_id)
             self._drafts[exchange_id] = draft
         return draft
 
@@ -236,11 +269,19 @@ class TelegramBridge:
             draft.message_id = await self._client.send_message(
                 self._chat_id, html, parse_mode=PARSE_MODE_HTML, reply_to_message_id=reply_to
             )
+            if draft.exchange_id is not None:
+                self._record_reply_target(draft.message_id, draft.exchange_id)
         else:
             await self._client.edit_message_text(
                 self._chat_id, draft.message_id, html, parse_mode=PARSE_MODE_HTML
             )
         draft.delivered_text = html
+
+    def _record_reply_target(self, message_id: int, exchange_id: str) -> None:
+        """Remember a sent message as a reply target for its exchange (bounded)."""
+        self._reply_targets[message_id] = exchange_id
+        if len(self._reply_targets) > REPLY_TARGET_MAP_SIZE:
+            self._reply_targets.popitem(last=False)  # evict the oldest mapping
 
 
 def _reply_target(source_client_message_id: str | None) -> int | None:
@@ -266,5 +307,6 @@ def _status_line(event: LoopEvent) -> str | None:
             reason=event.reason, attempt=event.attempt, delay=event.delay_seconds
         )
     # ProcessCompleted is not rendered: completions arrive as directly delivered
-    # assistant messages (foreground stream or broker outbox delivery).
+    # assistant messages, either streamed live per-exchange or delivered whole
+    # through the outbox — there is no separate foreground path anymore.
     return None

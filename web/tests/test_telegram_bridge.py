@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from octoforge_core import (
@@ -13,10 +13,10 @@ from octoforge_core import (
     ToolRegistry,
     ToolSpec,
 )
-from octoforge_core.agent.events import ProcessStarted, TextDelta
+from octoforge_core.agent.events import Finished, ProcessStarted, TextDelta
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
-from octoforge_core.agent.runner import RunnerConfig
+from octoforge_core.agent.runner import ConversationRunner, RunnerConfig
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.store import (
@@ -38,7 +38,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_web.telegram.bridge import (
     CANCELLED_LINE,
     PARSE_MODE_HTML,
+    REPLY_TARGET_MAP_SIZE,
     TOOL_LINE_TEMPLATE,
+    RunnerProvider,
     TelegramBridge,
     TelegramBridgeOptions,
 )
@@ -231,6 +233,39 @@ class PassthroughRouter:
         max_exchanges: int,
     ) -> RouteDecision:
         return RouteDecision()
+
+
+class FakeRunner:
+    """ConversationRunner stub recording `submit()` calls (reply-routing tests only)."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple[str, str | None, str | None]] = []
+
+    def subscribe(self) -> asyncio.Queue[Any]:
+        return asyncio.Queue()
+
+    def unsubscribe(self, queue: asyncio.Queue[Any]) -> None:
+        pass
+
+    async def submit(
+        self,
+        content: str,
+        client_message_id: str | None = None,
+        reply_to_exchange_id: str | None = None,
+    ) -> None:
+        self.submitted.append((content, client_message_id, reply_to_exchange_id))
+
+    async def cancel(self) -> None:
+        raise AssertionError("cancel should not be called in these tests")
+
+
+def make_fake_provider(runner: FakeRunner) -> RunnerProvider:
+    """A RunnerProvider always returning the given fake runner."""
+
+    async def provider(user_id: str, channel: str) -> ConversationRunner:
+        return cast(ConversationRunner, runner)
+
+    return provider
 
 
 def reply(content: str = REPLY) -> ChatMessage:
@@ -627,3 +662,99 @@ async def test_a_failing_rich_upgrade_keeps_the_html_version(
     assert client.current_text() == content  # the HTML draft survived
     await bridge.aclose()
     await manager.stop_all()
+
+
+# --- reply-target routing (deterministic reply shortcut) --------------------
+
+
+def make_fake_bridge(client: FakeTelegramClient, runner: FakeRunner) -> TelegramBridge:
+    return TelegramBridge(
+        user_id=TELEGRAM_USER_ID,
+        chat_id=CHAT_ID,
+        runner_provider=make_fake_provider(runner),
+        client=client,
+        options=TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE),
+    )
+
+
+async def test_reply_target_is_recorded_and_used_for_a_matching_reply() -> None:
+    """A message the bridge sends for an exchange becomes that exchange's reply target."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge._render(TextDelta(text=REPLY), "x1")
+    await bridge._render(Finished(message=reply()), "x1")
+    assert client.sent == [(CHAT_ID, REPLY, PARSE_MODE_HTML)]
+    assert bridge._reply_targets == {1: "x1"}  # the sent message id maps to its exchange
+
+    await bridge.handle_text("thanks", reply_to_message_id=1)
+
+    assert runner.submitted == [("thanks", None, "x1")]
+    await bridge.aclose()
+
+
+async def test_unmatched_reply_target_submits_without_an_exchange() -> None:
+    """A reply to an id the bridge never sent falls back to the router (no exchange)."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge._render(TextDelta(text=REPLY), "x1")
+    await bridge._render(Finished(message=reply()), "x1")
+
+    await bridge.handle_text("thanks", reply_to_message_id=999)
+
+    assert runner.submitted == [("thanks", None, None)]
+    await bridge.aclose()
+
+
+async def test_absent_reply_target_submits_without_an_exchange() -> None:
+    """A plain (non-reply) submit passes no `reply_to_exchange_id` at all."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge.handle_text("hi")
+
+    assert runner.submitted == [("hi", None, None)]
+    await bridge.aclose()
+
+
+async def test_reply_target_map_is_bounded() -> None:
+    """The reply-target map evicts the oldest mapping once past its cap."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+    overflow = REPLY_TARGET_MAP_SIZE + 5
+
+    for message_id in range(overflow):
+        bridge._record_reply_target(message_id, f"exchange-{message_id}")
+
+    assert len(bridge._reply_targets) == REPLY_TARGET_MAP_SIZE
+    assert 0 not in bridge._reply_targets  # the oldest mappings were evicted
+    assert overflow - 1 in bridge._reply_targets  # the newest survives
+
+
+async def test_concurrent_exchanges_render_into_separate_messages() -> None:
+    """Two exchanges streaming at once produce two distinct Telegram messages.
+
+    Each carries its own content, and both drafts are cleaned up once their
+    exchange's terminal event arrives.
+    """
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge._render(TextDelta(text="alpha"), "x1")
+    await bridge._render(TextDelta(text="beta"), "x2")
+    await bridge._render(Finished(message=reply("alpha")), "x1")
+    await bridge._render(Finished(message=reply("beta")), "x2")
+
+    assert len(client.sent) == EXPECTED_MESSAGE_COUNT
+    (chat_id_1, text_1, mode_1), (chat_id_2, text_2, mode_2) = client.sent
+    assert (chat_id_1, text_1, mode_1) == (CHAT_ID, "alpha", PARSE_MODE_HTML)
+    assert (chat_id_2, text_2, mode_2) == (CHAT_ID, "beta", PARSE_MODE_HTML)
+    # distinct message ids, each correctly mapped back to the exchange it answered
+    assert bridge._reply_targets == {1: "x1", 2: "x2"}
+    assert bridge._drafts == {}  # both terminal events popped their draft

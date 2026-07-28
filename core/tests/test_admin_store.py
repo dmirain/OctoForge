@@ -15,7 +15,12 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.api import DatasetSchema
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.api import ExchangeStatus
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import InstructionDraft, InstructionType
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
@@ -114,11 +119,12 @@ async def test_totals_counts_every_entity(
     await SqlAlchemyTaskStore(session_factory).add(task(dialog.id, USER_A, TaskStatus.DONE))
     await SqlAlchemyCronStore(session_factory).create(cron_job("j1", USER_A, NOW))
     await SqlAlchemyInstructionStore(session_factory).upsert(memory_draft("diet", USER_A))
+    await SqlAlchemyExchangeRepository(session_factory).create(dialog.id, "a question")
 
     totals = await store.totals()
 
     assert (totals.dialogs, totals.messages, totals.tasks) == (1, 1, 1)
-    assert (totals.cron_jobs, totals.memories) == (1, 1)
+    assert (totals.cron_jobs, totals.memories, totals.exchanges) == (1, 1, 1)
     assert (totals.instructions, totals.datasets, totals.dialog_summaries) == (0, 0, 0)
 
 
@@ -303,3 +309,37 @@ async def test_summaries_are_listed_across_dialogs(
 
     assert page.total == 1
     assert page.items[0].topics == ("food",)
+
+
+async def test_exchanges_join_dialog_identity_and_filter(
+    session_factory: async_sessionmaker[AsyncSession],
+    store: SqlAlchemyAdminStore,
+) -> None:
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    alice = await dialogs.get_or_create(USER_A, CHANNEL)
+    bob = await dialogs.get_or_create(USER_B, TELEGRAM)
+    await exchanges.create(alice.id, "alice question")
+    waiting = await exchanges.create(bob.id, "bob question", owner_task_id="t1")
+    await exchanges.set_status(
+        waiting.id,
+        ExchangeStatus.AWAITING_USER,
+        pending_question="which one?",
+    )
+
+    everything = await store.list_exchanges(DEFAULT_LIMIT, 0)
+    for_bob = await store.list_exchanges(DEFAULT_LIMIT, 0, user_id=USER_B)
+    awaiting_only = await store.list_exchanges(
+        DEFAULT_LIMIT, 0, status=ExchangeStatus.AWAITING_USER.value
+    )
+
+    assert everything.total == TWO_ITEMS
+    assert {item.user_id for item in everything.items} == {USER_A, USER_B}
+    # bob's exchange was set_status'd last, so it sorts first (updated_at desc)
+    assert everything.items[0].dialog_id == bob.id
+    assert for_bob.total == 1
+    assert for_bob.items[0].channel == TELEGRAM
+    assert awaiting_only.total == 1
+    assert awaiting_only.items[0].pending_question == "which one?"
+    assert awaiting_only.items[0].status == ExchangeStatus.AWAITING_USER
+    assert awaiting_only.items[0].owner_task_id is None

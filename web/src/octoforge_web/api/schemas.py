@@ -8,10 +8,16 @@ MIN_QUERY_PARAM_LENGTH = 1
 
 
 class PostMessageRequest(BaseModel):
-    """Incoming user message."""
+    """Incoming user message.
+
+    `reply_to_exchange_id` lets a transport that already resolved an explicit
+    reply (e.g. a Telegram reply-to) name the exchange outright, skipping the
+    LLM router (`ConversationRunner.submit`'s deterministic reply shortcut).
+    """
 
     content: str
     client_message_id: str | None = None
+    reply_to_exchange_id: str | None = None
 
 
 class AckResponse(BaseModel):

@@ -210,6 +210,17 @@ def test_post_message_accepted(client: TestClient) -> None:
     assert response.json() == {"status": STATUS_ACCEPTED}
 
 
+def test_post_message_accepts_reply_to_exchange_id(client: TestClient) -> None:
+    response = client.post(
+        "/api/dialog/messages",
+        json={"content": "hi", "reply_to_exchange_id": "ex-1"},
+        headers={USER_ID_HEADER: USER_A},
+    )
+
+    assert response.status_code == HTTPStatus.ACCEPTED
+    assert response.json() == {"status": STATUS_ACCEPTED}
+
+
 async def test_dialog_is_get_or_created_per_user(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -294,6 +305,40 @@ async def test_users_are_isolated(session_factory: async_sessionmaker[AsyncSessi
 
     assert queue_b.empty()
     assert all(SECRET_A not in message.content for message in runner_b.history())
+    await manager.stop_all()
+
+
+async def test_post_message_forwards_reply_to_exchange_id(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`reply_to_exchange_id` on the request reaches `ConversationRunner.submit`.
+
+    A Telegram (or other) transport that already resolved an explicit reply
+    passes the exchange id straight through the API, skipping the LLM
+    router (`ConversationRunner.submit`'s deterministic reply shortcut).
+    """
+    manager = await make_manager([], session_factory)
+    runner = await manager.get_or_create_runner(USER_A, CHANNEL)
+    submitted: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_submit(
+        content: str,
+        client_message_id: str | None = None,
+        reply_to_exchange_id: str | None = None,
+    ) -> None:
+        submitted.append((content, client_message_id, reply_to_exchange_id))
+
+    monkeypatch.setattr(runner, "submit", fake_submit)
+
+    await post_message_endpoint(
+        PostMessageRequest(content="hi", reply_to_exchange_id="ex-1"),
+        USER_A,
+        CHANNEL,
+        manager,
+    )
+
+    assert submitted == [("hi", None, "ex-1")]
     await manager.stop_all()
 
 

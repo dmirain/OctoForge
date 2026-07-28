@@ -19,6 +19,7 @@ from octoforge_core import ConversationManager
 from octoforge_core.admin.api import (
     AdminReadModel,
     DialogOverview,
+    ExchangeOverview,
     MessageRecord,
     Page,
     clamp_page,
@@ -327,6 +328,21 @@ async def summaries(
     return _page_payload(page, _summary_to_dict)
 
 
+@router.get("/exchanges")
+async def exchanges(
+    read_model: ReadModelDep,
+    limit: LimitDep = None,
+    offset: OffsetDep = None,
+    user_id: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    resolved_limit, resolved_offset = clamp_page(limit, offset)
+    page = await read_model.list_exchanges(
+        resolved_limit, resolved_offset, user_id=user_id, status=status
+    )
+    return _page_payload(page, _exchange_to_dict)
+
+
 def _dialog_to_dict(item: DialogOverview) -> dict[str, Any]:
     return {
         "id": item.id,
@@ -451,6 +467,21 @@ def _summary_to_dict(item: DialogueSummary) -> dict[str, Any]:
         "topics": list(item.topics),
         "content": item.content,
         "created_at": _iso(item.created_at),
+    }
+
+
+def _exchange_to_dict(item: ExchangeOverview) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "dialog_id": item.dialog_id,
+        "user_id": item.user_id,
+        "channel": item.channel,
+        "status": item.status.value,
+        "title": item.title,
+        "owner_task_id": item.owner_task_id,
+        "pending_question": item.pending_question,
+        "created_at": _iso(item.created_at),
+        "updated_at": _iso(item.updated_at),
     }
 
 

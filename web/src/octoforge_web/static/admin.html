@@ -185,11 +185,21 @@ const VIEWS = {
       `<td><button class="link" data-view="${esc(s.content)}">открыть</button></td>` +
       `<td class="mono">${time(s.created_at)}</td>`,
   },
+  exchanges: {
+    title: "Обмены", path: () => "/api/admin/exchanges",
+    filters: ["status"],
+    statusOptions: ["", "open", "in_progress", "awaiting_user", "answered", "cancelled", "failed"],
+    columns: ["user_id", "title", "статус", "вопрос", "task_id", "обновлён"],
+    row: (e) => `${clip(e.user_id, "mono")}${clip(e.title)}<td>${esc(e.status)}</td>` +
+      `${clip(e.pending_question)}${clip(e.owner_task_id, "mono")}` +
+      `<td class="mono">${time(e.updated_at)}</td>`,
+  },
 };
 
 const NAV = [
-  ["dialogs", "Диалоги"], ["tasks", "Задачи"], ["cron", "Cron"], ["instructions", "Инструкции"],
-  ["datasets", "Датасеты"], ["memories", "Память"], ["summaries", "Сводки"],
+  ["dialogs", "Диалоги"], ["exchanges", "Обмены"], ["tasks", "Задачи"], ["cron", "Cron"],
+  ["instructions", "Инструкции"], ["datasets", "Датасеты"], ["memories", "Память"],
+  ["summaries", "Сводки"],
 ];
 
 function renderNav() {
@@ -206,7 +216,8 @@ function renderToolbar(view) {
     parts.push(`<input id="f-query" placeholder="поиск по title" value="${esc(state.query)}">`);
   }
   if (view.filters?.includes("status")) {
-    const options = ["", "pending", "running", "done", "failed", "cancelled"]
+    const values = view.statusOptions || ["", "pending", "running", "done", "failed", "cancelled"];
+    const options = values
       .map((s) => `<option value="${s}" ${s === state.status ? "selected" : ""}>${s || "любой статус"}</option>`);
     parts.push(`<select id="f-status">${options.join("")}</select>`);
   }

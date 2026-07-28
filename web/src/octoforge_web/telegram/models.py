@@ -32,6 +32,20 @@ class TelegramChat(BaseModel):
     type: TelegramChatType
 
 
+class TelegramReplyToMessage(BaseModel):
+    """The replied-to message, slimmed to just its id.
+
+    The Bot API's `reply_to_message` field carries the full message object,
+    which is itself a `TelegramMessage` (and could in principle nest further
+    replies); the bridge only ever needs the id to resolve a reply target, so
+    this stays a minimal model rather than a recursive `TelegramMessage`.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    message_id: int
+
+
 class TelegramMessage(BaseModel):
     """A message payload of an update (`from` is a keyword, hence the alias)."""
 
@@ -41,6 +55,7 @@ class TelegramMessage(BaseModel):
     from_user: TelegramUser | None = Field(default=None, alias="from")
     chat: TelegramChat
     text: str | None = None
+    reply_to_message: TelegramReplyToMessage | None = None
 
 
 class TelegramUpdate(BaseModel):

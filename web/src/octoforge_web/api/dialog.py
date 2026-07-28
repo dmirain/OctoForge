@@ -35,9 +35,15 @@ async def post_message(
 
     `client_message_id` is an idempotency key: a retry with an
     already-recorded key is accepted but skipped (no double run).
+    `reply_to_exchange_id`, if the client already knows it, skips the LLM
+    router and joins the message to that exchange outright.
     """
     runner = await manager.get_or_create_runner(user_id, channel)
-    await runner.submit(request.content, client_message_id=request.client_message_id)
+    await runner.submit(
+        request.content,
+        client_message_id=request.client_message_id,
+        reply_to_exchange_id=request.reply_to_exchange_id,
+    )
     return AckResponse(status=STATUS_ACCEPTED)
 
 
