@@ -20,12 +20,16 @@ from octoforge_core import (
 )
 from octoforge_core.agent.events import Cancelled, Failed, Finished
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
-from octoforge_core.agent.router import ProcessInfo, RouteDecision
+from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import RunnerConfig
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import DialogRow
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
@@ -99,9 +103,9 @@ class PassthroughRouter:
 
     async def route(
         self,
-        processes: tuple[ProcessInfo, ...],
+        exchanges: tuple[ExchangeInfo, ...],
         message: str,
-        max_processes: int,
+        max_exchanges: int,
     ) -> RouteDecision:
         return RouteDecision()
 
@@ -130,6 +134,7 @@ async def make_manager(
         dialogs=SqlAlchemyDialogRepository(session_factory),
         messages=SqlAlchemyMessageRepository(session_factory),
         tasks=InMemoryTaskStore(),
+        exchanges=SqlAlchemyExchangeRepository(session_factory),
     )
 
 

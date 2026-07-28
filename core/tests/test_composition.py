@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.events import Cancelled, Failed, Finished
 from octoforge_core.agent.prompts import StaticPromptProvider
-from octoforge_core.agent.router import ProcessInfo, RouteDecision
+from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import ConversationEvent
 from octoforge_core.composition import (
     RunnerOptions,
@@ -35,7 +35,11 @@ from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
@@ -260,9 +264,9 @@ class PassThroughRouter:
 
     async def route(
         self,
-        processes: tuple[ProcessInfo, ...],
+        exchanges: tuple[ExchangeInfo, ...],
         message: str,
-        max_processes: int,
+        max_exchanges: int,
     ) -> RouteDecision:
         return RouteDecision()
 
@@ -366,6 +370,7 @@ async def test_build_conversation_manager_runs_a_dialog(
         dialogs=SqlAlchemyDialogRepository(session_factory),
         messages=SqlAlchemyMessageRepository(session_factory),
         tasks=InMemoryTaskStore(),
+        exchanges=SqlAlchemyExchangeRepository(session_factory),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()

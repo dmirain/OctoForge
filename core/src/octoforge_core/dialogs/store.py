@@ -13,8 +13,17 @@ from sqlalchemy import delete, func, insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.dialogs.api import DialogNotFoundError, MessageStats, MessageStatsList
-from octoforge_core.dialogs.models import DialogRow, MessageRow
+from octoforge_core.dialogs.api import (
+    LIVE_EXCHANGE_STATUSES,
+    DialogNotFoundError,
+    Exchange,
+    ExchangeList,
+    ExchangeNotFoundError,
+    ExchangeStatus,
+    MessageStats,
+    MessageStatsList,
+)
+from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.llm.usage import Usage
 from octoforge_core.time import utc_now
@@ -24,6 +33,8 @@ from octoforge_core.time import utc_now
 # freshly recomputed seq rather than propagated. Bounded so a genuine
 # duplicate client_message_id still raises instead of looping forever.
 MESSAGE_SEQ_RETRY_ATTEMPTS = 5
+# exchange titles quote the question; the full text lives in the message
+TITLE_MAX_LENGTH = 60
 
 
 class SqlAlchemyDialogRepository:
@@ -128,6 +139,7 @@ class SqlAlchemyMessageRepository:
                         prompt_tokens=usage.prompt_tokens if usage is not None else None,
                         completion_tokens=usage.completion_tokens if usage is not None else None,
                         task_id=message.task_id,
+                        exchange_id=message.exchange_id,
                     )
                 )
                 dialog = await session.get(DialogRow, dialog_id)
@@ -178,6 +190,7 @@ class SqlAlchemyMessageRepository:
                             tool_calls=_tool_calls_to_json(message.tool_calls),
                             tool_call_id=message.tool_call_id,
                             task_id=message.task_id,
+                            exchange_id=message.exchange_id,
                         )
                     )
                 dialog = await session.get(DialogRow, dialog_id)
@@ -230,6 +243,14 @@ class SqlAlchemyMessageRepository:
             )
             return [_to_chat_message(row) for row in result.all()]
 
+    async def set_exchange(self, message_id: str, exchange_id: str) -> None:
+        """Attach a stored message to the exchange it belongs to."""
+        async with self._session_factory() as session:
+            row = await session.get(MessageRow, message_id)
+            if row is not None:
+                row.exchange_id = exchange_id
+                await session.commit()
+
     async def stats_by_channel(self, channel: str) -> MessageStatsList:
         """Return per-user message counters of the channel, one entry per dialog owner."""
         async with self._session_factory() as session:
@@ -250,6 +271,97 @@ class SqlAlchemyMessageRepository:
             ]
 
 
+class SqlAlchemyExchangeRepository:
+    """Exchanges of a dialog: the durable obligation state."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def create(
+        self, dialog_id: str, title: str, owner_task_id: str | None = None
+    ) -> Exchange:
+        """Open a new exchange; IN_PROGRESS when an owner is given, OPEN otherwise."""
+        status = ExchangeStatus.IN_PROGRESS if owner_task_id else ExchangeStatus.OPEN
+        async with self._session_factory() as session:
+            row = ExchangeRow(
+                id=uuid.uuid4().hex,
+                dialog_id=dialog_id,
+                status=status.value,
+                title=title[:TITLE_MAX_LENGTH],
+                owner_task_id=owner_task_id,
+            )
+            session.add(row)
+            await session.commit()
+            return _to_exchange(row)
+
+    async def get(self, exchange_id: str) -> Exchange:
+        async with self._session_factory() as session:
+            row = await session.get(ExchangeRow, exchange_id)
+            if row is None:
+                raise ExchangeNotFoundError(exchange_id)
+            return _to_exchange(row)
+
+    async def list_live(self, dialog_id: str) -> ExchangeList:
+        """Return the dialog's non-terminal exchanges, oldest first."""
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(ExchangeRow)
+                .where(
+                    ExchangeRow.dialog_id == dialog_id,
+                    ExchangeRow.status.in_([status.value for status in LIVE_EXCHANGE_STATUSES]),
+                )
+                .order_by(ExchangeRow.created_at)
+            )
+            return [_to_exchange(row) for row in result.all()]
+
+    async def list_unowned_open(self) -> ExchangeList:
+        """Return every OPEN exchange without an owner (restart recovery)."""
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(ExchangeRow)
+                .where(
+                    ExchangeRow.status == ExchangeStatus.OPEN.value,
+                    ExchangeRow.owner_task_id.is_(None),
+                )
+                .order_by(ExchangeRow.created_at)
+            )
+            return [_to_exchange(row) for row in result.all()]
+
+    async def set_status(
+        self,
+        exchange_id: str,
+        status: ExchangeStatus,
+        owner_task_id: str | None = None,
+        pending_question: str | None = None,
+    ) -> None:
+        async with self._session_factory() as session:
+            row = await session.get(ExchangeRow, exchange_id)
+            if row is None:
+                raise ExchangeNotFoundError(exchange_id)
+            row.status = status.value
+            row.owner_task_id = owner_task_id
+            row.pending_question = pending_question
+            await session.commit()
+
+    async def delete_for_dialog(self, dialog_id: str) -> None:
+        async with self._session_factory() as session:
+            await session.execute(delete(ExchangeRow).where(ExchangeRow.dialog_id == dialog_id))
+            await session.commit()
+
+
+def _to_exchange(row: ExchangeRow) -> Exchange:
+    return Exchange(
+        id=row.id,
+        dialog_id=row.dialog_id,
+        status=ExchangeStatus(row.status),
+        title=row.title,
+        owner_task_id=row.owner_task_id,
+        pending_question=row.pending_question,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
 def _to_dialog(row: DialogRow) -> Dialog:
     return Dialog(
         id=row.id,
@@ -268,6 +380,7 @@ def _to_chat_message(row: MessageRow) -> ChatMessage:
         tool_call_id=row.tool_call_id,
         task_id=row.task_id,
         id=row.id,
+        exchange_id=row.exchange_id,
     )
 
 

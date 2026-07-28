@@ -10,6 +10,11 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from octoforge_core.agent.branch import (
+    CLARIFICATION_NOTE_TEMPLATE,
+    OTHER_TASK_NOTE_TEMPLATE,
+    TASK_NOTE_TEMPLATE,
+)
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
     Cancelled,
@@ -23,17 +28,13 @@ from octoforge_core.agent.events import (
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import (
+    ExchangeInfo,
     MessageRouter,
-    ProcessInfo,
     RouteAction,
     RouteDecision,
-    RouteOp,
 )
 from octoforge_core.agent.runner import (
-    ANSWER_THIS_NOTE_TEMPLATE,
     BACKGROUND_TASK_PROMPT,
-    HANDLED_ELSEWHERE_NOTE_TEMPLATE,
-    MID_RUN_NOTE_TEMPLATE,
     RESTART_LIMIT_ERROR,
     SUBMIT_FAILED_ERROR,
     SUBSCRIBER_QUEUE_SIZE,
@@ -41,7 +42,6 @@ from octoforge_core.agent.runner import (
     ConversationManager,
     RunnerConfig,
     TaskOutcomeListener,
-    _Submit,
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, AssembledContext, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
@@ -49,7 +49,11 @@ from octoforge_core.cron.api import CronWaker
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import MessageRow
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
@@ -105,25 +109,42 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 
 
 class FakeRouter:
-    """MessageRouter stub with a programmable decision handler."""
+    """MessageRouter stub: NEW by default, CONTINUE into the first live exchange."""
 
     def __init__(self) -> None:
-        self.handler: Callable[[tuple[ProcessInfo, ...], str], RouteDecision] = (
-            lambda processes, message: RouteDecision()
-        )
-        self.calls: list[tuple[tuple[ProcessInfo, ...], str]] = []
+        self.action = RouteAction.NEW
+        self.cancel_all = False
+        self.cancel_one: str | None = None
+        self.calls: list[tuple[tuple[ExchangeInfo, ...], str]] = []
 
     async def route(
         self,
-        processes: tuple[ProcessInfo, ...],
+        exchanges: tuple[ExchangeInfo, ...],
         message: str,
-        max_processes: int,
+        max_exchanges: int,
     ) -> RouteDecision:
-        self.calls.append((processes, message))
-        return self.handler(processes, message)
+        self.calls.append((exchanges, message))
+        cancel_ids: tuple[str, ...] = ()
+        if self.cancel_all:
+            cancel_ids = tuple(item.id for item in exchanges)
+        elif self.cancel_one is not None:
+            cancel_ids = (self.cancel_one,)
+        if self.action is RouteAction.CONTINUE and exchanges:
+            return RouteDecision(
+                action=RouteAction.CONTINUE, exchange_id=exchanges[0].id, cancel_ids=cancel_ids
+            )
+        return RouteDecision(action=self.action, cancel_ids=cancel_ids)
 
-    def decide(self, *ops: RouteOp) -> None:
-        self.handler = lambda processes, message: RouteDecision(ops=ops)
+    def decide_continue(self) -> None:
+        """Route the next message into the oldest live exchange (the old INJECT)."""
+        self.action = RouteAction.CONTINUE
+
+    def decide_cancel_all(self) -> None:
+        self.cancel_all = True
+
+    def decide_cancel(self, exchange_id: str) -> None:
+        """Cancel one named exchange while the message opens its own."""
+        self.cancel_one = exchange_id
 
 
 class GatedRouter:
@@ -140,9 +161,9 @@ class GatedRouter:
 
     async def route(
         self,
-        processes: tuple[ProcessInfo, ...],
+        exchanges: tuple[ExchangeInfo, ...],
         message: str,
-        max_processes: int,
+        max_exchanges: int,
     ) -> RouteDecision:
         if self.gate_armed:
             self.entered.set()
@@ -513,6 +534,7 @@ def make_manager(
         dialogs=SqlAlchemyDialogRepository(session_factory),
         messages=SqlAlchemyMessageRepository(session_factory),
         tasks=resolved.store if resolved.store is not None else InMemoryTaskStore(),
+        exchanges=SqlAlchemyExchangeRepository(session_factory),
     )
 
 
@@ -626,7 +648,9 @@ async def test_submit_streams_events_and_updates_narrative(
     assert task.kind is TaskKind.ANSWER
     source_message = runner.history()[0]
     assert source_message.id is not None  # captured from the persist
-    assert task.input == {"prompt": "hi", "source_message_id": source_message.id}
+    assert task.input["prompt"] == "hi"
+    assert task.input["source_message_id"] == source_message.id
+    assert task.input["exchange_id"] == source_message.exchange_id
     assert task.status is TaskStatus.DONE
     # the foreground stream was the delivery: the actor stamps it asynchronously
     await wait_for_condition(lambda: task.delivered_at is not None)
@@ -727,7 +751,10 @@ async def test_duplicate_client_message_id_is_skipped(
     await runner.submit("again", client_message_id=SECOND_CLIENT_KEY)
     await collect_until(queue, is_completed)
 
-    assert len(router.calls) == RETRIED_CALLS  # the duplicate never reached the router
+    # neither message needs the router (the first has nothing to belong to, the
+    # second arrives once the first exchange is answered); the duplicate never
+    # got that far either
+    assert router.calls == []
     assert [m.content for m in runner.history()] == ["hi", REPLY, "again", SECOND_REPLY]
 
 
@@ -865,16 +892,14 @@ async def test_start_new_queues_behind_the_busy_foreground(
     # the queued process's branch marks the foreground's question as taken:
     # each question is answered by exactly one process
     queued_branch = llm.requests[1]
-    assert any(
-        HANDLED_ELSEWHERE_NOTE_TEMPLATE.format(content="first") in m.content for m in queued_branch
-    )
+    assert any(OTHER_TASK_NOTE_TEMPLATE.format(content="first") in m.content for m in queued_branch)
     done = completions(events)
     assert {item.title for item in done} == {"first", "second"}
     assert all(item.status == TaskStatus.DONE.value for item in done)
     tasks = await store.list(runner.dialog_id)
     assert {task.title for task in tasks} == {"first", "second"}
     assert all(task.status is TaskStatus.DONE for task in tasks)
-    assert all(task.delivered_at is not None for task in tasks)
+    await wait_for_condition(lambda: all(task.delivered_at is not None for task in tasks))
     assert not runner._pending_deliveries
     history = runner.history()
     assert [m.content for m in history] == ["first", "second", "second final", "first final"]
@@ -897,7 +922,7 @@ async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     await runner.submit("start")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    router.decide(RouteOp(action=RouteAction.INJECT))
+    router.decide_continue()
     await runner.submit("extra context")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     assert len(llm.requests) == 1  # INJECT is a no-op: no new run, no push channel
@@ -913,86 +938,12 @@ async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     )
     # the mid-run arrival carries the note (the model is told to fold it into
     # the answer); the run's own question carries its own marker
-    wrapped = MID_RUN_NOTE_TEMPLATE.format(content="extra context")
+    wrapped = CLARIFICATION_NOTE_TEMPLATE.format(content="extra context")
     assert any(wrapped in m.content for m in second_request)
-    assert any(
-        ANSWER_THIS_NOTE_TEMPLATE.format(content="start") in m.content for m in second_request
-    )
+    assert any(TASK_NOTE_TEMPLATE.format(content="start") in m.content for m in second_request)
     # a message the process did sync is not re-routed at finalize: one process only
     assert len(llm.requests) == RETRIED_CALLS
     assert [m.content for m in runner.history()] == ["start", "extra context", "after"]
-
-
-async def test_wrap_epoch_lifts_a_stale_mid_run_note(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """White-box: a routing decision can cover a message WITHOUT growing the
-    narrative (START_NEW appends nothing); the wrap epoch makes the next sync
-    re-derive the envelopes instead of freezing a stale "account for this"
-    note past the decision (2026-07-27 audit, finding 1)."""
-    tool = BlockingTool()
-    llm = ScriptedLLM([blocking_call()])
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    runner.subscribe()
-    await runner.submit("first")
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    process = next(iter(runner._processes.values()))
-
-    # simulate the routing window: the message is in the narrative and marked
-    # injected, the router has not decided yet
-    extra = ChatMessage(role=MessageRole.USER, content="extra", id="row-extra")
-    runner._narrative.append(extra)
-    runner._injected_ids.add("row-extra")
-    await runner._sync_branch(process)
-    assert any(MID_RUN_NOTE_TEMPLATE.format(content="extra") in m.content for m in process.branch)
-
-    # the decision lands: the message is covered elsewhere, narrative unchanged
-    runner._covered_ids.add("row-extra")
-    runner._wrap_epoch += 1  # what _apply_decision does after any package
-    await runner._sync_branch(process)
-
-    assert not any(
-        MID_RUN_NOTE_TEMPLATE.format(content="extra") in m.content for m in process.branch
-    )
-    # plain history now (as the branch tail it still carries the date envelope)
-    assert any(m.content.endswith("\nextra") for m in process.branch)
-    tool.release.set()
-    await manager.stop_all()
-
-
-async def test_mid_run_note_is_foreground_only(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """A clarification belongs to the run the user watches: the queued
-    background answer sees it as plain history, not as an "account for this"
-    instruction (2026-07-27 audit, finding 2)."""
-    tool = BlockingTool()
-    llm = ScriptedLLM([blocking_call(), blocking_call(), reply("first final"), reply("second")])
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    runner.subscribe()
-    await runner.submit("first")
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")  # queues behind the foreground
-    await wait_for_condition(lambda: len(runner._processes) == TWO_PROCESSES)
-    processes = {
-        ("fg" if runner._foreground_id == p.id else "queued"): p for p in runner._processes.values()
-    }
-
-    extra = ChatMessage(role=MessageRole.USER, content="extra", id="row-extra")
-    runner._narrative.append(extra)
-    runner._injected_ids.add("row-extra")
-    await runner._sync_branch(processes["fg"])
-    await runner._sync_branch(processes["queued"])
-
-    wrapped = MID_RUN_NOTE_TEMPLATE.format(content="extra")
-    assert any(wrapped in m.content for m in processes["fg"].branch)
-    assert not any(wrapped in m.content for m in processes["queued"].branch)
-    # plain history in the queued branch (date-enveloped as the tail)
-    assert any(m.content.endswith("\nextra") for m in processes["queued"].branch)
-    tool.release.set()
-    await manager.stop_all()
 
 
 async def test_answer_events_carry_the_source_client_key(
@@ -1045,69 +996,7 @@ async def test_empty_final_is_silence_not_an_empty_bubble(
     assert [m.content for m in runner.history()] == ["hi"]
 
 
-async def test_prior_era_injection_is_not_wrapped_in_a_new_process(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """The mid-run note is scoped to the run it joined: history stays clean after."""
-    tool = BlockingTool()
-    llm = ScriptedLLM([blocking_call(), reply("after"), reply(SECOND_REPLY)])
-    router = FakeRouter()
-    manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("start")
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    router.decide(RouteOp(action=RouteAction.INJECT))
-    await runner.submit("extra context")
-    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
-    tool.release.set()
-    await collect_until(queue, is_completed)
-    router.decide(RouteOp(action=RouteAction.START_NEW))
-    await runner.submit("next question")
-    await collect_until(queue, is_completed)
-
-    # the new process's branch carries the old injection as plain history
-    third_request = llm.requests[-1]
-    assert any(m.content == "extra context" for m in third_request)
-    assert not any(
-        MID_RUN_NOTE_TEMPLATE.format(content="extra context") in m.content for m in third_request
-    )
-
-
-async def test_orphan_restart_sets_the_mid_run_boundary(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """White-box: an orphan-recovered ANSWER process treats pre-restart history
-    as plain context, not as mid-run arrivals (start_watermark is set on the
-    second narrative-built creation path too)."""
-    tool = BlockingTool()
-    llm = ScriptedLLM([reply("old answer"), blocking_call(), reply("after")])
-    store = InMemoryTaskStore()
-    manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
-    )
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-    await runner.submit("old question")
-    await collect_until(queue, is_completed)
-
-    dialog = await get_dialog(session_factory)
-    orphan = orphaned_task(dialog, kind=TaskKind.ANSWER)
-    await store.add(orphan)
-    await runner.restart_task(orphan)
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-
-    process = next(iter(runner._processes.values()))
-    assert process.start_watermark == len(runner.history())
-    assert process.start_watermark > 0
-    tool.release.set()
-    await collect_until(queue, is_completed)
-
-
-async def test_unseen_message_is_requeued_at_finalize(
+async def test_late_message_reopens_the_exchange(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = GatedLLM()
@@ -1123,19 +1012,20 @@ async def test_unseen_message_is_requeued_at_finalize(
     await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
 
     # the message lands after the process's last sync: the run finishes without it
-    router.decide(RouteOp(action=RouteAction.INJECT))
+    router.decide_continue()
     await runner.submit("extra context")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     llm.release.set()
     await collect_completions(queue, 2)
 
-    # the watermark re-routes it: a new answer task picks it up
+    # the exchange reopens (its answer could not have accounted for the late
+    # message) and a fresh run picks it up — durable state instead of the
+    # requeue heuristic it replaced
     assert len(llm.requests) == EXPECTED_LLM_CALLS
     third_request = llm.requests[2]
-    # the re-routed message is the new run's own question: marked as its task
     assert any(
         m.role is MessageRole.USER
-        and ANSWER_THIS_NOTE_TEMPLATE.format(content="extra context") in m.content
+        and CLARIFICATION_NOTE_TEMPLATE.format(content="extra context") in m.content
         for m in third_request
     )
     assert [m.content for m in runner.history()] == [
@@ -1144,13 +1034,6 @@ async def test_unseen_message_is_requeued_at_finalize(
         "first final",
         "after",
     ]
-    # the re-routed answer task links to its source message (the id rides the
-    # narrative copy captured at submit)
-    tasks = {task.title: task for task in await store.list(runner.dialog_id)}
-    rerouted = tasks["extra context"]
-    source_message = runner.history()[1]
-    assert source_message.id is not None
-    assert rerouted.input["source_message_id"] == source_message.id
 
 
 async def test_bring_back_starts_a_new_answer_process(
@@ -1183,7 +1066,7 @@ async def test_bring_back_starts_a_new_answer_process(
     # "first" is still being answered by the live foreground -> marked taken;
     # "second" already finished, so its question is plain history
     assert [m.content for m in bring_back_request[1:-1]] == [
-        HANDLED_ELSEWHERE_NOTE_TEMPLATE.format(content="first"),
+        OTHER_TASK_NOTE_TEMPLATE.format(content="first"),
         "second",
         "second final",
     ]
@@ -1225,14 +1108,8 @@ async def test_router_cancel_stops_the_process(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
-    def cancel_all(processes: tuple[ProcessInfo, ...], message: str) -> RouteDecision:
-        return RouteDecision(
-            ops=tuple(
-                RouteOp(action=RouteAction.CANCEL, target_id=process.id) for process in processes
-            )
-        )
-
-    router.handler = cancel_all
+    router.action = RouteAction.COMMAND  # a pure stop, nothing to answer
+    router.decide_cancel_all()
     await runner.submit("stop it")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     tool.release.set()
@@ -1764,7 +1641,7 @@ async def test_two_cron_results_are_delivered_separately(
     tasks = await store.list(runner.dialog_id)
     assert {task.title for task in tasks} == {"first job", "second job"}
     assert all(task.status is TaskStatus.DONE for task in tasks)
-    assert all(task.delivered_at is not None for task in tasks)
+    await wait_for_condition(lambda: all(task.delivered_at is not None for task in tasks))
     # one task = one message, each linked to its producer
     by_task = {task.id: task for task in tasks}
     history = runner.history()
@@ -1893,31 +1770,42 @@ async def test_listener_failure_does_not_break_finalize(
 async def test_actor_survives_a_failing_command(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    router = FakeRouter()
     seen = {"calls": 0}
 
-    def handler(processes: tuple[ProcessInfo, ...], message: str) -> RouteDecision:
-        seen["calls"] += 1
-        if seen["calls"] == FIRST_CALL:
-            raise RuntimeError("router boom")
-        return RouteDecision()
+    class BoomingRouter:
+        """Raises on its first call, then behaves."""
 
-    router.handler = handler
+        async def route(
+            self,
+            exchanges: tuple[ExchangeInfo, ...],
+            message: str,
+            max_exchanges: int,
+        ) -> RouteDecision:
+            seen["calls"] += 1
+            if seen["calls"] == FIRST_CALL:
+                raise RuntimeError("router boom")
+            return RouteDecision()
+
+    tool = BlockingTool()
     manager = make_manager(
-        ScriptedLLM([reply()]),
-        ToolRegistry(),
+        ScriptedLLM([blocking_call(), reply(), reply()]),
+        blocking_registry(tool),
         session_factory,
-        ManagerOptions(router=router),
+        ManagerOptions(router=BoomingRouter()),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")  # router raises: the actor must log and stay alive
-    await runner.submit("second")  # processed normally, proving the actor survived
+    # the first message needs no router; the next two reach it while the first
+    # exchange is still live — one raises, and the actor must survive it
+    await runner.submit("first")
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit("second")  # router raises: the actor logs and stays alive
+    await runner.submit("third")  # processed normally, proving the actor survived
+    tool.release.set()
 
-    events = await collect_until(queue, is_completed)
-    done = completions(events)
-    assert [item.status for item in done] == [TaskStatus.DONE.value]
+    events = await collect_completions(queue, 2)
+    assert TaskStatus.DONE.value in [item.status for item in completions(events)]
     assert seen["calls"] == SECOND_CALL
 
 
@@ -1935,9 +1823,9 @@ class ConvertingRouter:
 
     async def route(
         self,
-        processes: tuple[ProcessInfo, ...],
+        exchanges: tuple[ExchangeInfo, ...],
         message: str,
-        max_processes: int,
+        max_exchanges: int,
     ) -> RouteDecision:
         self.entered.set()
         try:
@@ -1951,16 +1839,20 @@ async def test_actor_dies_when_a_failing_command_races_its_cancellation(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     router = ConvertingRouter()
+    tool = BlockingTool()
     manager = make_manager(
-        ScriptedLLM([reply()]),
-        ToolRegistry(),
+        ScriptedLLM([blocking_call(), reply()]),
+        blocking_registry(tool),
         session_factory,
         ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
-    await runner.submit("hi")
+    await runner.submit("hi")  # no live exchange yet: the router is skipped
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit("again")  # now the router is reached — and blocks
     await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
+    tool.release.set()
     await runner.stop()  # cancels the actor mid-dispatch
 
     actor = runner._actor_task
@@ -2282,10 +2174,11 @@ async def test_queued_answer_knows_its_question_after_being_overtaken(
     """Prod incident 2026-07-28: two quick questions, only the first answered.
 
     The router (an LLM call) still held the second message when the foreground
-    finished, so the queued run's branch ended with the foreground's ANSWER,
-    sitting after its own question. With the task implied by position the run
-    read the exchange as closed and produced an empty final, which the
-    silent-done path swallowed. The own-question marker states the task.
+    finished. Under the old model the branch ended with the foreground's
+    ANSWER sitting after its own question, the task was implied by position,
+    and the run produced an empty final that the silent-done path swallowed.
+    Now the message joins the narrative only once its exchange is known, and
+    the branch states the task outright.
     """
     tool = BlockingTool()
     store = InMemoryTaskStore()
@@ -2309,14 +2202,13 @@ async def test_queued_answer_knows_its_question_after_being_overtaken(
     router.release.set()
     events = await collect_until(queue, is_delivered("weather answer"))
 
-    # the queued run's branch ends with the foreground's final, so its question
-    # is only identifiable by the marker
+    # the message became visible only after routing, so it sits AFTER the
+    # foreground's final — and it is marked as this run's task either way
     queued_branch = llm.requests[-1]
-    assert queued_branch[-1].content.endswith("seagull answer")
     assert any(
-        ANSWER_THIS_NOTE_TEMPLATE.format(content="Какая погода?") in m.content
-        for m in queued_branch
+        TASK_NOTE_TEMPLATE.format(content="Какая погода?") in m.content for m in queued_branch
     )
+    assert any(m.content.endswith("seagull answer") for m in queued_branch)
     # and the user actually gets the second answer
     assert any(isinstance(e.payload, Finished) for e in events)
     tasks = {task.title: task for task in await store.list(runner.dialog_id)}
@@ -2344,13 +2236,14 @@ async def test_cancel_takes_absorbed_clarifications_with_it(
 
     await runner.submit("first")
     await asyncio.wait_for(tool.started[0].wait(), timeout=TIMEOUT_SECONDS)
-    router.decide(RouteOp(action=RouteAction.INJECT))
+    router.decide_continue()
     await runner.submit("уточнение")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     tool.release[0].set()  # iteration 2: the sync absorbs the clarification
     await asyncio.wait_for(tool.started[1].wait(), timeout=TIMEOUT_SECONDS)
     assert any(
-        MID_RUN_NOTE_TEMPLATE.format(content="уточнение") in m.content for m in llm.requests[1]
+        CLARIFICATION_NOTE_TEMPLATE.format(content="уточнение") in m.content
+        for m in llm.requests[1]
     )
 
     await runner.cancel()
@@ -2362,7 +2255,7 @@ async def test_cancel_takes_absorbed_clarifications_with_it(
     # the absorbed clarification is NOT re-routed: no second answer process
     completed = completions(events)
     assert [item.status for item in completed] == [TaskStatus.CANCELLED.value]
-    assert len(router.calls) == RETRIED_CALLS  # first + clarification, no requeue
+    assert len(router.calls) == 1  # only the clarification needed routing
     assert not any(isinstance(e.payload, Finished) for e in events)
 
 
@@ -2414,9 +2307,11 @@ async def test_router_cancel_targets_a_queued_background_answer(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await runner.submit("second")
     await wait_for_condition(lambda: len(runner._processes) == TWO_PROCESSES)
-    queued_id = next(pid for pid in runner._processes if pid != runner._foreground_id)
+    queued = next(p for p in runner._processes.values() if p.id != runner._foreground_id)
+    assert queued.exchange_id is not None
 
-    router.decide(RouteOp(action=RouteAction.CANCEL, target_id=queued_id))
+    router.action = RouteAction.COMMAND
+    router.decide_cancel(queued.exchange_id)
     await runner.submit("cancel the queued one")
     await wait_for_condition(lambda: len(runner._processes) == 1)
     tool.release.set()
@@ -2758,11 +2653,11 @@ class StuckRouter:
 
     async def route(
         self,
-        processes: tuple[ProcessInfo, ...],
+        exchanges: tuple[ExchangeInfo, ...],
         message: str,
-        max_processes: int,
+        max_exchanges: int,
     ) -> RouteDecision:
-        if processes:  # first message routes instantly (empty snapshot skips the LLM anyway)
+        if exchanges:  # the first message needs no router (nothing to belong to)
             self.entered.set()
             await self.release.wait()
         return RouteDecision()
@@ -2934,10 +2829,10 @@ async def test_initial_narrative_load_starts_after_the_compaction_boundary(
     await manager.stop_all()
 
 
-async def test_trim_narrative_remaps_watermarks_and_prunes_coverage(
+async def test_trim_narrative_remaps_watermarks(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """White-box: trimming shifts process watermarks and drops stale covered ids."""
+    """White-box: trimming shifts process watermarks (ownership lives in the DB)."""
     tool = BlockingTool()
     llm = ScriptedLLM([blocking_call()])
     manager = make_manager(llm, blocking_registry(tool), session_factory)
@@ -2948,19 +2843,13 @@ async def test_trim_narrative_remaps_watermarks_and_prunes_coverage(
 
     process = next(iter(runner._processes.values()))
     watermark_before = process.watermark
-    start_watermark_before = process.start_watermark
     (first_message,) = runner.history()
     assert first_message.id is not None
-    assert first_message.id in runner._covered_ids
-    assert first_message.id in runner._injected_ids
 
     runner._trim_narrative(0)  # everything compacted away
 
     assert runner.history() == []
     assert process.watermark == 0 and watermark_before > 0
-    assert process.start_watermark == 0 and start_watermark_before > 0
-    assert first_message.id not in runner._covered_ids
-    assert first_message.id not in runner._injected_ids
 
     tool.release.set()
     await manager.stop_all()
@@ -2999,36 +2888,6 @@ async def test_failed_submit_persist_reports_to_the_transport(
     failed = next(e.payload for e in events if isinstance(e.payload, Failed))
     assert failed.error == SUBMIT_FAILED_ERROR
     assert runner.history() == []  # nothing was recorded, nothing routed
-    await manager.stop_all()
-
-
-async def test_covered_requeue_is_not_routed_twice(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """A requeue racing the original routing must not produce a second answer.
-
-    _requeue_unanswered runs in a terminating pump while the actor may still
-    be inside the router call for the same message (coverage is marked only
-    after routing), so the message can reach the inbox twice — the covered
-    duplicate is dropped instead of routed.
-    """
-    router = FakeRouter()
-    llm = ScriptedLLM([reply()])
-    manager = make_manager(llm, quick_registry(), session_factory, ManagerOptions(router=router))
-    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
-
-    await runner.submit("question")
-    await collect_completions(queue, 1)
-    routed_before = len(router.calls)
-    (recorded,) = [m for m in runner.history() if m.role is MessageRole.USER]
-    assert recorded.id is not None and recorded.id in runner._covered_ids
-
-    runner._inbox.put_nowait(_Submit(recorded, recorded=True))
-    await asyncio.sleep(POLL_SECONDS * 5)  # let the actor drain the inbox
-
-    assert len(router.calls) == routed_before  # the duplicate was dropped, not routed
-    assert [m.content for m in runner.history() if m.role is MessageRole.USER] == ["question"]
     await manager.stop_all()
 
 

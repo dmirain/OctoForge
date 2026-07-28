@@ -33,7 +33,7 @@ class ChatMessage:
     of the LLM-facing payload. `id` is the persisted row id, filled in by the
     store on load and by the actor right after persisting — pure database
     metadata, excluded from equality so constructed and loaded messages
-    compare equal.
+    compare equal; `exchange_id` is the same kind of metadata.
     """
 
     role: MessageRole
@@ -42,6 +42,9 @@ class ChatMessage:
     tool_call_id: str | None = None
     task_id: str | None = None
     id: str | None = field(default=None, compare=False)
+    # the exchange (obligation to the user) this message belongs to; database
+    # metadata like `id`, excluded from equality
+    exchange_id: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

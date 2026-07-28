@@ -21,6 +21,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
+from octoforge_core.agent.branch import render_branch
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
     Cancelled,
@@ -35,15 +36,20 @@ from octoforge_core.agent.events import (
 from octoforge_core.agent.loop import AgentLoop, format_error
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, PromptProvider
 from octoforge_core.agent.router import (
+    ExchangeInfo,
     MessageRouter,
-    ProcessInfo,
-    ProcessPlace,
     RouteAction,
     RouteDecision,
-    RouteOp,
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
-from octoforge_core.dialogs.api import DialogRepository, MessageRepository
+from octoforge_core.dialogs.api import (
+    DialogRepository,
+    Exchange,
+    ExchangeNotFoundError,
+    ExchangeRepository,
+    ExchangeStatus,
+    MessageRepository,
+)
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
@@ -81,14 +87,12 @@ BACKGROUND_TASK_PROMPT = (
 )
 DATE_ENVELOPE_TEMPLATE = "[Current date and time: {now} (UTC)]\n{content}"
 CURRENT_DATE_FORMAT = "%Y-%m-%d %H:%M"
-MID_RUN_NOTE_TEMPLATE = (
-    "[Received while you were working: account for this user clarification/addition "
-    "in your current answer]\n{content}"
+NUDGE_TEMPLATE = (
+    "Кстати, я всё ещё жду ответа по «{title}» — я спрашивал: «{question}». "
+    "Ответь, когда будет удобно, или скажи, что это уже неактуально."
 )
-HANDLED_ELSEWHERE_NOTE_TEMPLATE = (
-    "[A separate process is already answering this message — do not answer it here]\n{content}"
-)
-ANSWER_THIS_NOTE_TEMPLATE = "[This is the message you must answer in this run]\n{content}"
+# how stale an awaiting exchange must be before a new message triggers a nudge
+NUDGE_AFTER_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,18 +137,6 @@ def _with_date_envelope(message: ChatMessage) -> ChatMessage:
     )
 
 
-def _with_mid_run_note(message: ChatMessage) -> ChatMessage:
-    """Mark a branch copy of a user message that joined a run already in flight.
-
-    Pulled-in messages sit BEFORE the run's private tool suffix, where the
-    model tends to ignore them mid-task; the note tells it to fold them into
-    the answer it is composing. Branch-only, like the date envelope: the
-    narrative and the store keep the clean copy. `replace` keeps the id — the
-    wrap must happen before `_with_date_envelope`, which drops it.
-    """
-    return replace(message, content=MID_RUN_NOTE_TEMPLATE.format(content=message.content))
-
-
 def _silent_done(task: Task) -> bool:
     """Whether the task finished with a deliberately empty result (nothing to show)."""
     return task.status is TaskStatus.DONE and not (task.result or "").strip()
@@ -153,6 +145,21 @@ def _silent_done(task: Task) -> bool:
 def _task_source_message(task: Task) -> str | None:
     """The narrative row id of the user message an ANSWER task answers."""
     raw = task.input.get("source_message_id")
+    return raw if isinstance(raw, str) else None
+
+
+def _exchange_outcome(status: TaskStatus) -> ExchangeStatus:
+    """How a run's terminal status settles the obligation it owed."""
+    if status is TaskStatus.DONE:
+        return ExchangeStatus.ANSWERED
+    if status is TaskStatus.CANCELLED:
+        return ExchangeStatus.CANCELLED
+    return ExchangeStatus.FAILED
+
+
+def _task_exchange(task: Task) -> str | None:
+    """The exchange an ANSWER task owes, if recorded."""
+    raw: object = task.input.get("exchange_id")
     return raw if isinstance(raw, str) else None
 
 
@@ -171,47 +178,36 @@ def _delivery_started(task: Task) -> ProcessStarted:
     )
 
 
-def _with_answer_this_note(message: ChatMessage) -> ChatMessage:
-    """Mark the branch copy of the very message this run has to answer.
-
-    An answer branch is the shared narrative, so the run's task used to be
-    implicit: "your question is the last message". That breaks as soon as the
-    answer is queued — the foreground's final lands AFTER the question, the
-    branch ends with an assistant message, and the model reads the exchange as
-    already closed and says nothing (prod incident 2026-07-28: a queued
-    "Какая погода?" finished with an empty final and was silently swallowed).
-    The marker states the task instead of implying it from position.
-    """
-    return replace(message, content=ANSWER_THIS_NOTE_TEMPLATE.format(content=message.content))
-
-
-def _with_handled_elsewhere_note(message: ChatMessage) -> ChatMessage:
-    """Mark a branch copy of a user message another live process is answering.
-
-    Every answer process sees the shared narrative, so without the note two
-    concurrent processes each see the other's still-unanswered question and
-    both answer both (measured on the queue rollout: the queued «17*23»
-    process answered the capabilities question too, and vice versa). Same
-    branch-only mechanics as the other envelopes.
-    """
-    return replace(message, content=HANDLED_ELSEWHERE_NOTE_TEMPLATE.format(content=message.content))
-
-
 @dataclass(frozen=True, slots=True)
 class _AnswerSource:
-    """The user message an ANSWER task answers: narrative row id + transport id."""
+    """What an ANSWER task answers: the message, its transport id, its exchange."""
 
     message_id: str | None
     client_message_id: str | None
+    exchange_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RunnerStores:
+    """Persistence collaborators of one dialog actor."""
+
+    messages: MessageRepository
+    tasks: TaskStore
+    exchanges: ExchangeRepository
 
 
 @dataclass(frozen=True, slots=True)
 class _Submit:
-    """A message to route; recorded ones already live in the narrative."""
+    """A user message to route into an exchange.
+
+    `reply_to_exchange_id` is the transport's own resolution of an explicit
+    reply (it owns its message ids; the core only sees the domain id) — the
+    deterministic routing signal that needs no LLM call.
+    """
 
     message: ChatMessage
-    recorded: bool = False
     client_message_id: str | None = None
+    reply_to_exchange_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +228,11 @@ class _ProcessTerminated:
     task_id: str
     terminal: Finished | Failed | None = None
     streamed: bool = False
+    exchange_id: str | None = None
+    exchange_status: ExchangeStatus | None = None
+    # a message of the same exchange arrived after the run's last sync: the
+    # answer could not have accounted for it, so the exchange reopens
+    unseen_messages: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,17 +267,12 @@ class _Process:
     narrative_built: bool = False
     synced_len: int = 0
     watermark: int = 0
-    # narrative length at process birth: user messages past it are mid-run
-    # arrivals — sync wraps them with MID_RUN_NOTE_TEMPLATE in the branch copy
-    start_watermark: int = 0
-    # the user message an ANSWER process answers; other processes wrap it
-    # with the handled-elsewhere note so exactly one process answers it
+    # the obligation this run owes the user; None for self-contained RUN tasks
+    exchange_id: str | None = None
+    # the user message an ANSWER process answers, and its transport-level id
+    # (reply threading); both ride task.input so a restart restores them
     source_message_id: str | None = None
-    # its transport-level id (reply threading); rides task.input like the above
     source_client_message_id: str | None = None
-    # the runner's wrap epoch this branch was last assembled under: envelope
-    # inputs can change without the narrative growing (see _sync_branch)
-    synced_epoch: int = -1
     overflow_retried: bool = False
 
 
@@ -307,10 +303,10 @@ class ConversationRunner:
         self,
         dialog: Dialog,
         config: RunnerConfig,
-        messages: MessageRepository,
-        tasks: TaskStore,
+        stores: _RunnerStores,
         history: list[ChatMessage],
     ) -> None:
+        messages, tasks, exchanges = stores.messages, stores.tasks, stores.exchanges
         self._dialog = dialog
         self._loop = config.loop
         self._prompts = config.prompts
@@ -320,26 +316,11 @@ class ConversationRunner:
         self._compactor = config.compactor
         self._messages = messages
         self._tasks = tasks
+        self._exchanges = exchanges
         self._narrative = history
         self._processes: dict[str, _Process] = {}
         self._foreground_id: str | None = None
         self._pending_deliveries: deque[_Delivery] = deque()
-        # row ids of user messages that need no (further) answer: an answer
-        # task was created from them, or they were pure commands. Ids, not
-        # narrative indices — the narrative is trimmed to the hot tail as
-        # compaction advances, and indices would shift under a queued command
-        self._covered_ids: set[str] = set()
-        # row ids of user messages that entered the narrative while a process
-        # could be running. Marked eagerly at append time (not after routing:
-        # the router is an LLM call, and a sync can pull the message before
-        # the decision lands); messages later covered by START_NEW/CANCEL
-        # packages are excluded at wrap time via _covered_ids
-        self._injected_ids: set[str] = set()
-        # bumped whenever envelope inputs change without a narrative append:
-        # coverage marked after routing, a process created (its source becomes
-        # foreign to siblings — including requeue-born processes, which append
-        # nothing) or removed. _sync_branch re-assembles when it moved.
-        self._wrap_epoch = 0
         # serializes the limit-check → process-create sequence between the
         # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
         # which run in pump/scheduler tasks outside the actor's inbox
@@ -391,16 +372,24 @@ class ConversationRunner:
                 await task
         await self._compactor.aclose(self._dialog.id)
 
-    async def submit(self, content: str, client_message_id: str | None = None) -> None:
-        """Submit a user message; the router decides how it maps to processes.
+    async def submit(
+        self,
+        content: str,
+        client_message_id: str | None = None,
+        reply_to_exchange_id: str | None = None,
+    ) -> None:
+        """Submit a user message; the router decides which exchange it joins.
 
         `client_message_id` is an idempotency key: a repeat with an
         already-recorded key is skipped (delivery retries are normal).
+        `reply_to_exchange_id` lets a transport that knows the user replied to
+        a specific message name the exchange outright, skipping the router.
         """
         await self._inbox.put(
             _Submit(
                 ChatMessage(role=MessageRole.USER, content=content),
                 client_message_id=client_message_id,
+                reply_to_exchange_id=reply_to_exchange_id,
             )
         )
 
@@ -483,10 +472,8 @@ class ConversationRunner:
     async def _start_orphaned(self, task: Task) -> None:
         """Start the replacement background process of an orphaned task."""
         if task.kind is TaskKind.ANSWER:
-            narrative = await self._assemble_narrative(
-                foreign_ids=self._foreign_source_ids(),
-                own_source_id=_task_source_message(task),
-            )
+            exchange_id = _task_exchange(task)
+            narrative = await self._assemble_narrative(own_exchange_id=exchange_id)
             process = self._create_process(
                 task=task,
                 branch=[self._system_message(), *narrative],
@@ -494,7 +481,12 @@ class ConversationRunner:
             )
             process.synced_len = len(process.branch)
             process.watermark = len(self._narrative)
-            process.start_watermark = len(self._narrative)
+            if exchange_id is not None:
+                # the restarted run re-owns its obligation
+                with suppress(ExchangeNotFoundError):
+                    await self._exchanges.set_status(
+                        exchange_id, ExchangeStatus.IN_PROGRESS, owner_task_id=task.id
+                    )
         else:
             self._start_process(task)
 
@@ -544,6 +536,9 @@ class ConversationRunner:
             if source is not None and source.client_message_id is not None:
                 # the transport-level id of that message (reply threading)
                 task_input["source_client_message_id"] = source.client_message_id
+            if source is not None and source.exchange_id is not None:
+                # the obligation this run owes: restored verbatim after a restart
+                task_input["exchange_id"] = source.exchange_id
         task = Task(
             dialog_id=self._dialog.id,
             user_id=self._dialog.user_id,
@@ -637,45 +632,60 @@ class ConversationRunner:
 
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
-        if command.recorded and message.id is not None and message.id in self._covered_ids:
-            # a requeue raced the original routing: _requeue_unanswered runs in
-            # a terminating pump while the actor may still be inside the router
-            # call for this very message (coverage is only marked after it), so
-            # the message can arrive here twice — routing the duplicate could
-            # start a SECOND answer process for one user message
-            return
-        if not command.recorded:
-            try:
-                if await self._is_duplicate(command.client_message_id):
-                    logger.info(
-                        "duplicate submit skipped: dialog=%s key=%s",
-                        self._dialog.id,
-                        command.client_message_id,
-                    )
-                    return
-                message_id = await self._persist(
-                    message, client_message_id=command.client_message_id
+        try:
+            if await self._is_duplicate(command.client_message_id):
+                logger.info(
+                    "duplicate submit skipped: dialog=%s key=%s",
+                    self._dialog.id,
+                    command.client_message_id,
                 )
-            except Exception:
-                # a store failure here silently swallowed the user's message
-                # (the actor's catch only logged it): tell the transport, so
-                # the user knows to resend instead of waiting for an answer
-                logger.exception("submit persist failed: dialog=%s", self._dialog.id)
-                self._broadcast(Failed(error=SUBMIT_FAILED_ERROR))
                 return
-            # the routed/narrative copy carries its row id: an answer task
-            # created from this message links back via source_message_id, and
-            # coverage tracking keys on it
-            message = replace(message, id=message_id)
-            self._narrative.append(message)
-            if message.id is not None:
-                # mark BEFORE routing: the router call below suspends, and a
-                # running process can sync the message in meanwhile — it must
-                # already count as a mid-run arrival (covered ids are excluded
-                # at wrap time once the routing decision lands)
-                self._injected_ids.add(message.id)
-        decision = await self._router.route(self._snapshot(), message.content, self._max_processes)
-        await self._apply_decision(message, decision, command.client_message_id)
+            message_id = await self._persist(message, client_message_id=command.client_message_id)
+        except Exception:
+            # a store failure here silently swallowed the user's message
+            # (the actor's catch only logged it): tell the transport, so
+            # the user knows to resend instead of waiting for an answer
+            logger.exception("submit persist failed: dialog=%s", self._dialog.id)
+            self._broadcast(Failed(error=SUBMIT_FAILED_ERROR))
+            return
+        # the routed/narrative copy carries its row id: the answer task links
+        # back to it via source_message_id
+        message = replace(message, id=message_id)
+        decision = await self._route(message, command)
+        await self._apply_route(message, decision, command)
+
+    async def _route(self, message: ChatMessage, command: _Submit) -> RouteDecision:
+        """Decide which exchange the message belongs to (deterministic first).
+
+        Two shortcuts skip the LLM entirely: an explicit transport-level reply
+        names its exchange outright, and with no live exchange there is
+        nothing to belong to. Everything else goes to the router, which sees
+        exchanges (user-visible obligations), not process ids.
+        """
+        live = await self._exchanges.list_live(self._dialog.id)
+        live_ids = {item.id for item in live}
+        if command.reply_to_exchange_id in live_ids:
+            logger.info(
+                "routed by reply: dialog=%s exchange=%s",
+                self._dialog.id,
+                command.reply_to_exchange_id,
+            )
+            return RouteDecision(
+                action=RouteAction.CONTINUE, exchange_id=command.reply_to_exchange_id
+            )
+        if not live:
+            return RouteDecision()
+        infos = tuple(
+            ExchangeInfo(
+                id=item.id,
+                title=item.title,
+                status=item.status,
+                pending_question=item.pending_question,
+                age_seconds=(utc_now() - item.created_at).total_seconds(),
+            )
+            for item in live
+        )
+        return await self._router.route(infos, message.content, self._max_processes)
 
     async def _is_duplicate(self, client_message_id: str | None) -> bool:
         """Whether a submit with this idempotency key was already recorded."""
@@ -696,6 +706,7 @@ class ConversationRunner:
         no terminal and rebuilds the delivery from the stored task.
         Cancellations and user-deleted rows deliver nothing.
         """
+        await self._settle_exchange(command)
         try:
             task = await self._tasks.get(command.task_id)
         except TaskNotFoundError:
@@ -711,6 +722,53 @@ class ConversationRunner:
         else:
             self._enqueue_terminal(command.terminal, task)
         await self._flush_if_free()
+
+    async def _settle_exchange(self, command: _ProcessTerminated) -> None:
+        """Move the finished run's exchange to its next state.
+
+        A run that asked the user something leaves the exchange awaiting them
+        (the ask itself set that state and must not be overwritten). Messages
+        that arrived after the run's last sync reopen the exchange instead of
+        closing it — a fresh run picks it up, which is what the requeue
+        heuristic used to approximate.
+        """
+        if command.exchange_id is None or command.exchange_status is None:
+            return
+        try:
+            exchange = await self._exchanges.get(command.exchange_id)
+        except ExchangeNotFoundError:
+            return
+        if exchange.status is ExchangeStatus.AWAITING_USER:
+            await self._exchanges.set_status(
+                exchange.id,
+                ExchangeStatus.AWAITING_USER,
+                pending_question=exchange.pending_question,
+            )
+            return
+        if command.unseen_messages:
+            await self._exchanges.set_status(exchange.id, ExchangeStatus.OPEN)
+            await self._resume_open_exchange(exchange.id)
+            return
+        await self._exchanges.set_status(exchange.id, command.exchange_status)
+
+    async def _resume_open_exchange(self, exchange_id: str) -> None:
+        """Give an OPEN exchange a fresh run (its last one missed something)."""
+        message = next(
+            (
+                item
+                for item in reversed(self._narrative)
+                if item.role is MessageRole.USER and item.exchange_id == exchange_id
+            ),
+            None,
+        )
+        if message is None:
+            return
+        with suppress(ExchangeNotFoundError):
+            exchange = await self._exchanges.get(exchange_id)
+            async with self._spawn_lock:
+                if self._exceeds_limit(set()):
+                    return
+                await self._start_answer(exchange, message)
 
     def _enqueue_redelivery(self, task: Task) -> None:
         """Queue the stored outcome of a finished task for delivery (recovery path)."""
@@ -812,63 +870,90 @@ class ConversationRunner:
                         await self._tasks.mark_delivered(delivery.task_id)
                 self._pending_deliveries.popleft()
 
-    def _snapshot(self) -> tuple[ProcessInfo, ...]:
-        return tuple(
-            ProcessInfo(
-                id=process.id,
-                title=process.title,
-                place=(
-                    ProcessPlace.FOREGROUND
-                    if process.id == self._foreground_id
-                    else ProcessPlace.BACKGROUND
-                ),
-            )
-            for process in self._processes.values()
-        )
-
-    async def _apply_decision(
-        self, message: ChatMessage, decision: RouteDecision, client_key: str | None = None
+    async def _apply_route(
+        self, message: ChatMessage, decision: RouteDecision, command: _Submit
     ) -> None:
-        ops = decision.ops or (RouteOp(action=RouteAction.START_NEW),)
-        cancelled: set[str] = set()
-        inject = False
-        for op in ops:
-            if op.action is RouteAction.CANCEL:
-                if op.target_id is not None and self._cancel_process(op.target_id):
-                    cancelled.add(op.target_id)
-            elif op.action is RouteAction.INJECT:
-                inject = True
-                await self._apply_inject(message, cancelled, client_key)
-            elif op.action is RouteAction.START_NEW:
-                await self._apply_start_new(message, cancelled, client_key)
-        if not inject and message.id is not None:
-            # a package without inject is fully handled here: start_new covers
-            # the message itself, bare cancel packages are pure commands
-            self._covered_ids.add(message.id)
-        # coverage and the process set may have changed without a narrative
-        # append: nudge every branch to re-derive its envelopes
-        self._wrap_epoch += 1
+        """Attach the message to its exchange and make sure someone owes an answer.
 
-    async def _apply_inject(
-        self, message: ChatMessage, cancelled: set[str], client_key: str | None
-    ) -> None:
-        """No-op for process control: the message already lives in the narrative.
-
-        A running process picks it up at its next iteration sync; without a
-        foreground the message needs its own process (fallback start).
+        The message becomes visible to running branches only here, once its
+        fate is settled: a branch that saw it mid-routing could neither know
+        whether it was a clarification nor whether another run was about to
+        own it (that window cost a lost answer and a duplicated one in
+        production, 28.07).
         """
-        if self._foreground() is not None:
+        cancelled = await self._cancel_exchanges(decision.cancel_ids)
+        exchange_id: str | None = None
+        refused = False
+        if decision.action is RouteAction.CONTINUE and decision.exchange_id is not None:
+            exchange_id = decision.exchange_id
+        elif decision.action is not RouteAction.COMMAND:
+            if self._exceeds_limit(cancelled):
+                refused = True
+            else:
+                exchange = await self._exchanges.create(self._dialog.id, message.content)
+                exchange_id = exchange.id
+        # the user's message enters the narrative before anything reacts to it
+        message = replace(message, exchange_id=exchange_id)
+        self._narrative.append(message)
+        if message.id is not None and exchange_id is not None:
+            await self._messages.set_exchange(message.id, exchange_id)
+        if refused:
+            await self._reject_for_limit(message)
             return
-        await self._apply_start_new(message, cancelled, client_key)
+        await self._nudge_stale_exchanges(exchange_id)
+        if exchange_id is not None:
+            await self._ensure_owner(exchange_id, message, command.client_message_id)
 
-    async def _apply_start_new(
-        self, message: ChatMessage, cancelled: set[str], client_key: str | None
+    async def _cancel_exchanges(self, exchange_ids: tuple[str, ...]) -> set[str]:
+        """Cancel the named exchanges and their live runs; return what was cancelled."""
+        cancelled: set[str] = set()
+        for exchange_id in exchange_ids:
+            with suppress(ExchangeNotFoundError):
+                exchange = await self._exchanges.get(exchange_id)
+                if exchange.owner_task_id is not None:
+                    self._cancel_process(exchange.owner_task_id)
+                await self._exchanges.set_status(exchange_id, ExchangeStatus.CANCELLED)
+                cancelled.add(exchange_id)
+        return cancelled
+
+    async def _ensure_owner(
+        self, exchange_id: str, message: ChatMessage, client_key: str | None
     ) -> None:
-        async with self._spawn_lock:
-            if not self._exceeds_limit(cancelled):
-                await self._start_new(message, client_key)
+        """Make sure a live run owes this exchange an answer.
+
+        An exchange already being answered needs nothing: its run pulls the
+        new message in at the next iteration sync (the pull model). One that
+        is queued or was waiting for the user gets a run now.
+        """
+        with suppress(ExchangeNotFoundError):
+            exchange = await self._exchanges.get(exchange_id)
+            if exchange.owner_task_id is not None and exchange.owner_task_id in self._processes:
                 return
-        await self._reject_for_limit(message)
+            async with self._spawn_lock:
+                if self._exceeds_limit(set()):
+                    await self._reject_for_limit(message)
+                    return
+                await self._start_answer(exchange, message, client_key)
+
+    async def _nudge_stale_exchanges(self, current_exchange_id: str | None) -> None:
+        """Remind the user about a question they left hanging (event-driven).
+
+        Fires when a new message arrives while some other exchange has been
+        waiting for a reply longer than `NUDGE_AFTER_SECONDS` — as its own
+        message, quoting the agent's own pending question.
+        """
+        now = utc_now()
+        for exchange in await self._exchanges.list_live(self._dialog.id):
+            if (
+                exchange.id == current_exchange_id
+                or exchange.status is not ExchangeStatus.AWAITING_USER
+                or exchange.pending_question is None
+                or (now - exchange.updated_at).total_seconds() < NUDGE_AFTER_SECONDS
+            ):
+                continue
+            await self._deliver_notice(
+                NUDGE_TEMPLATE.format(title=exchange.title, question=exchange.pending_question)
+            )
 
     def _exceeds_limit(self, cancelled: set[str]) -> bool:
         """Whether a NEW process would exceed the limit, counting pending cancellations."""
@@ -883,27 +968,30 @@ class ConversationRunner:
         )
         await self._deliver_notice(notice)
 
-    async def _start_new(self, message: ChatMessage, client_key: str | None = None) -> None:
-        """Start the answer process of a narrative user message.
+    async def _start_answer(
+        self, exchange: Exchange, message: ChatMessage, client_key: str | None = None
+    ) -> None:
+        """Start the run that owes `exchange` an answer.
 
         A busy foreground is never taken over: the current answer keeps
-        streaming into its own message, and the new process queues as a
-        background answer — its final arrives whole through the outbox once
-        the foreground frees. Both transports render the event stream into
-        ONE current draft, so a takeover used to splice the new answer into
-        the previous answer's message (and starve the cancelled foreground's
-        terminal line, which only broadcasts while it holds the slot).
+        streaming into its own message and the new run works in the
+        background, delivering its final whole through the outbox.
         """
         task = await self._prepare_process_task(
-            message.content[:TITLE_MAX_LENGTH],
+            exchange.title,
             message.content,
             kind=TaskKind.ANSWER,
             cron_job_id=None,
-            source=_AnswerSource(message_id=message.id, client_message_id=client_key),
+            source=_AnswerSource(
+                message_id=message.id,
+                client_message_id=client_key,
+                exchange_id=exchange.id,
+            ),
         )
-        narrative = await self._assemble_narrative(
-            foreign_ids=self._foreign_source_ids(), own_source_id=message.id
+        await self._exchanges.set_status(
+            exchange.id, ExchangeStatus.IN_PROGRESS, owner_task_id=task.id
         )
+        narrative = await self._assemble_narrative(own_exchange_id=exchange.id)
         process = self._create_process(
             task=task,
             branch=[self._system_message(), *narrative],
@@ -911,7 +999,6 @@ class ConversationRunner:
         )
         process.synced_len = len(process.branch)
         process.watermark = len(self._narrative)
-        process.start_watermark = len(self._narrative)
         if self._foreground() is None:
             self._foreground_id = process.id
             # the reply target must reach the transport BEFORE the first
@@ -923,76 +1010,51 @@ class ConversationRunner:
                     source_client_message_id=process.source_client_message_id,
                 )
             )
-        if message.id is not None:
-            self._covered_ids.add(message.id)
 
     def _system_message(self) -> ChatMessage:
         return ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME))
 
-    async def _assemble_narrative(
-        self,
-        mid_run_ids: frozenset[str] = frozenset(),
-        foreign_ids: frozenset[str] = frozenset(),
-        own_source_id: str | None = None,
-    ) -> list[ChatMessage]:
-        """Assemble the narrative part of a branch, date-enveloping its tail copy.
+    async def _assemble_narrative(self, own_exchange_id: str | None = None) -> list[ChatMessage]:
+        """Assemble the narrative part of a branch: compactor tail, marks, date.
 
         The assembled tail size also drives the memory diet: once compaction
         has advanced, everything before the hot tail is dropped from the
         in-memory narrative (S3, 2026-07-26 audit) — it stays reachable
         through the topics block and history_search, exactly like the prompt.
 
-        `mid_run_ids` (sync path only) marks user messages that joined the
-        run in flight: they get the mid-run note. `foreign_ids` marks user
-        messages that are the source of ANOTHER live answer process: they get
-        the handled-elsewhere note, so concurrent processes don't answer each
-        other's questions. `own_source_id` marks THIS run's own question, so
-        the task stays explicit even when another process's final lands after
-        it. All wraps happen before the date envelope (which drops ids); a
-        wrapped message that is also last simply carries both envelopes nested.
+        Marking is delegated to `render_branch`: one rule over durable
+        exchange state instead of the envelope patchwork it replaced.
         """
         assembled = await self._compactor.assemble(self._dialog, self._narrative)
         self._trim_narrative(assembled.tail_count)
-        narrative = assembled.messages
-        if mid_run_ids or foreign_ids or own_source_id is not None:
-            for index, message in enumerate(narrative):
-                if message.role is not MessageRole.USER:
-                    continue
-                if message.id in foreign_ids:
-                    narrative[index] = _with_handled_elsewhere_note(message)
-                elif message.id == own_source_id:
-                    narrative[index] = _with_answer_this_note(message)
-                elif message.id in mid_run_ids:
-                    narrative[index] = _with_mid_run_note(message)
+        narrative = render_branch(
+            assembled.messages, own_exchange_id, self._live_exchange_ids(own_exchange_id)
+        )
         if narrative:
             narrative[-1] = _with_date_envelope(narrative[-1])
         return narrative
 
-    def _foreign_source_ids(self, own_id: str | None = None) -> frozenset[str]:
-        """Source-message ids of live answer processes other than `own_id`."""
+    def _live_exchange_ids(self, own_exchange_id: str | None = None) -> frozenset[str]:
+        """Exchanges other live runs are answering (from the in-memory processes)."""
         return frozenset(
-            process.source_message_id
+            process.exchange_id
             for process in self._processes.values()
-            if process.id != own_id and process.source_message_id is not None
+            if process.exchange_id is not None and process.exchange_id != own_exchange_id
         )
 
     def _trim_narrative(self, tail_count: int) -> None:
-        """Drop compacted messages from memory, keeping bookkeeping consistent.
+        """Drop compacted messages from memory, keeping watermarks consistent.
 
         Watermarks are positions in the narrative list, so they shift by the
-        dropped count; coverage tracking keys on message ids and only needs
-        the dropped ids pruned.
+        dropped count. Nothing else needs pruning: message-to-exchange
+        ownership lives in the database, not in in-memory id sets.
         """
         drop = len(self._narrative) - tail_count
         if drop <= 0:
             return
-        dropped_ids = {message.id for message in self._narrative[:drop] if message.id is not None}
         del self._narrative[:drop]
-        self._covered_ids -= dropped_ids
-        self._injected_ids -= dropped_ids
         for process in self._processes.values():
             process.watermark = max(0, process.watermark - drop)
-            process.start_watermark = max(0, process.start_watermark - drop)
 
     def _cancel_process(self, target_id: str) -> bool:
         process = self._processes.get(target_id)
@@ -1017,12 +1079,10 @@ class ConversationRunner:
             narrative_built=narrative_built,
             source_message_id=_task_source_message(task),
             source_client_message_id=_task_client_source(task),
+            exchange_id=_task_exchange(task),
         )
         process.pump = asyncio.create_task(self._pump_process(process))
         self._processes[process.id] = process
-        # a new source message becomes foreign to sibling branches; requeue-born
-        # processes append nothing to the narrative, so the epoch is the only signal
-        self._wrap_epoch += 1
         return process
 
     async def _pump_process(self, process: _Process) -> None:
@@ -1081,52 +1141,20 @@ class ConversationRunner:
 
         Runs at every iteration boundary for narrative-built processes (the
         pull model): messages appended to the narrative since the last sync —
-        user messages, finals of other tasks, broker notes — become visible
-        to the run. Mid-run user arrivals are wrapped with the mid-run note
-        in the FOREGROUND branch only (branch copy only): pulled-in text sits
-        before the run's private tool suffix, and without the note the model
-        tends to ignore it mid-task — and the requeue net at termination only
-        catches what arrived after the LAST sync. Queued background answers
-        see such arrivals as plain history: the clarification belongs to the
-        run the user is watching. An unchanged state leaves the branch
-        byte-identical (prefix cache). Staleness gate: the narrative length
-        AND the wrap epoch — coverage/process changes (START_NEW covering a
-        message, a process appearing or dying) alter the envelopes without
-        growing the narrative, and a length-only gate froze a stale
-        "account for this" note past the routing decision (2026-07-27 audit).
+        clarifications of this run's exchange, finals of other runs, broker
+        notes — become visible, each carrying its role (see `render_branch`).
+        An unchanged narrative leaves the branch byte-identical (prefix
+        cache), unless the sync is `force`d (reactive compaction).
         """
         if not process.narrative_built:
             return
-        if (
-            not force
-            and len(self._narrative) == process.watermark
-            and process.synced_epoch == self._wrap_epoch
-        ):
+        if not force and len(self._narrative) == process.watermark:
             return
-        # ids are stable across the trim inside assemble, so the set can be
-        # computed up front; covered ids (START_NEW/CANCEL packages) are
-        # excluded — their answer lives elsewhere, a note would double it
-        if self._foreground_id == process.id:
-            mid_run_ids = frozenset(
-                message.id
-                for message in self._narrative[process.start_watermark :]
-                if message.id is not None
-                and message.id in self._injected_ids
-                and message.id not in self._covered_ids
-                and message.role is MessageRole.USER
-            )
-        else:
-            mid_run_ids = frozenset()
-        narrative = await self._assemble_narrative(
-            mid_run_ids,
-            foreign_ids=self._foreign_source_ids(own_id=process.id),
-            own_source_id=process.source_message_id,
-        )
+        narrative = await self._assemble_narrative(own_exchange_id=process.exchange_id)
         private = process.branch[process.synced_len :]
         process.branch[:] = [self._system_message(), *narrative, *private]
         process.synced_len = 1 + len(narrative)
         process.watermark = len(self._narrative)
-        process.synced_epoch = self._wrap_epoch
 
     def _fail_run(self, process: _Process, error: str) -> LoopEvent:
         """Broadcast and return a Failed terminal for the process."""
@@ -1185,24 +1213,25 @@ class ConversationRunner:
                 task_id=process.task_id,
                 terminal=terminal if isinstance(terminal, (Finished, Failed)) else None,
                 streamed=streamed,
+                exchange_id=process.exchange_id,
+                exchange_status=_exchange_outcome(status),
+                unseen_messages=self._has_unseen_messages(process),
             )
         )
-        self._requeue_unanswered(process)
 
-    def _requeue_unanswered(self, process: _Process) -> None:
-        """Re-submit user messages the process finished without seeing.
+    def _has_unseen_messages(self, process: _Process) -> bool:
+        """Whether messages of this run's exchange arrived after its last sync.
 
-        The watermark tracks the narrative length at the process's last sync;
-        newer user messages without an answer task of their own go back
-        through routing, so no user message is left unanswered (this replaces
-        the inject channel's drain-requeue).
+        Replaces the requeue heuristic: instead of re-submitting messages, the
+        exchange simply goes back to OPEN and gets a fresh run — the durable
+        state decides, not an in-memory scan.
         """
-        if not process.narrative_built:
-            return
-        for message in self._narrative[process.watermark :]:
-            covered = message.id is not None and message.id in self._covered_ids
-            if message.role is MessageRole.USER and not covered:
-                self._inbox.put_nowait(_Submit(message, recorded=True))
+        if not process.narrative_built or process.exchange_id is None:
+            return False
+        return any(
+            message.role is MessageRole.USER and message.exchange_id == process.exchange_id
+            for message in self._narrative[process.watermark :]
+        )
 
     async def _finalize(self, process: _Process, terminal: LoopEvent) -> TaskStatus:
         """Fold the run outcome into the narrative and the task store.
@@ -1272,8 +1301,6 @@ class ConversationRunner:
         self._processes.pop(process.id, None)
         if self._foreground_id == process.id:
             self._foreground_id = None
-        # its source message stops being foreign to sibling branches
-        self._wrap_epoch += 1
 
     def _foreground(self) -> _Process | None:
         if self._foreground_id is None:
@@ -1381,11 +1408,13 @@ class ConversationManager:
         dialogs: DialogRepository,
         messages: MessageRepository,
         tasks: TaskStore,
+        exchanges: ExchangeRepository,
     ) -> None:
         self._config = config
         self._dialogs = dialogs
         self._messages = messages
         self._tasks = tasks
+        self._exchanges = exchanges
         self._runners: dict[str, ConversationRunner] = {}
         # (user_id, channel) -> the build task, memoized: concurrent callers
         # await one build, later callers get the finished runner from it
@@ -1432,8 +1461,9 @@ class ConversationManager:
         runner = ConversationRunner(
             dialog=dialog,
             config=self._config,
-            messages=self._messages,
-            tasks=self._tasks,
+            stores=_RunnerStores(
+                messages=self._messages, tasks=self._tasks, exchanges=self._exchanges
+            ),
             history=history,
         )
         runner.start()

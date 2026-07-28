@@ -47,7 +47,11 @@ from octoforge_core.cron.api import CronStore
 from octoforge_core.cron.scheduler import CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.registry import (
@@ -143,6 +147,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     session_factory = create_session_factory(engine)
     dialogs = SqlAlchemyDialogRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
     task_store = SqlAlchemyTaskStore(session_factory)
     cron_store = SqlAlchemyCronStore(session_factory)
     secret_store = _build_secret_store(settings, session_factory)
@@ -248,6 +253,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 dialogs=dialogs,
                 messages=messages,
                 tasks=task_store,
+                exchanges=exchanges,
             )
             # Sweep before the scheduler and surfaces start: orphaned tasks
             # are restarted as background processes and persisted results

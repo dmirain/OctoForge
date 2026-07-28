@@ -51,4 +51,30 @@ class MessageRow(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     task_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # the exchange this message belongs to: a user question opens one, its
+    # clarifications and the answer join it. NULL on legacy rows and on
+    # messages of RUN tasks (cron/spawned work owes the user nothing).
+    exchange_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
+
+
+class ExchangeRow(Base):
+    """One obligation to the user: a question, its clarifications and its answer.
+
+    Task status and exchange status are deliberately separate: a run may end
+    (DONE) without closing the exchange — asking the user something back is
+    exactly that case.
+    """
+
+    __tablename__ = "exchanges"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), index=True)
+    status: Mapped[str] = mapped_column(String, index=True)
+    title: Mapped[str] = mapped_column(String)
+    # the run currently owning the exchange (NULL when nobody works on it)
+    owner_task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # the question the agent asked back, kept for the reminder text
+    pending_question: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now, onupdate=utc_now)

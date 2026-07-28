@@ -9,41 +9,62 @@ import pytest
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import (
     ROUTE_TOOL_NAME,
+    ExchangeInfo,
     LLMRouter,
-    ProcessInfo,
-    ProcessPlace,
     RouteAction,
-    RouteOp,
 )
+from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent
 from octoforge_core.llm.usage import Completion
 from octoforge_core.tools.base import ToolSpec
 
-FG_ID = "p-fg"
-BG_ID = "p-bg"
-UNKNOWN_ID = "p-unknown"
+OPEN_ID = "x-open"
+WAITING_ID = "x-waiting"
+UNKNOWN_ID = "x-unknown"
 MESSAGE = "what about the budget?"
-MAX_PROCESSES = 5
+MAX_EXCHANGES = 5
 TIMEOUT_SECONDS = 0.05
 SLOW_LLM_DELAY_SECONDS = 60.0
-CUSTOM_ROUTER_PROMPT = "CUSTOM ROUTER: limit {limit}; processes:\n{processes}"
+CUSTOM_ROUTER_PROMPT = "CUSTOM ROUTER: limit {limit}; exchanges:\n{exchanges}"
 ROUTER_LOGGER = "octoforge_core.agent.router"
 
 
-def foreground() -> ProcessInfo:
-    return ProcessInfo(id=FG_ID, title="foreground work", place=ProcessPlace.FOREGROUND)
+PENDING_QUESTION = "In which city?"
 
 
-def background() -> ProcessInfo:
-    return ProcessInfo(id=BG_ID, title="background work", place=ProcessPlace.BACKGROUND)
+def in_progress() -> ExchangeInfo:
+    return ExchangeInfo(id=OPEN_ID, title="the budget report", status=ExchangeStatus.IN_PROGRESS)
 
 
-def route_reply(ops: list[dict[str, object]]) -> ChatMessage:
+def awaiting_user() -> ExchangeInfo:
+    return ExchangeInfo(
+        id=WAITING_ID,
+        title="What is the weather?",
+        status=ExchangeStatus.AWAITING_USER,
+        pending_question=PENDING_QUESTION,
+    )
+
+
+def route_reply(
+    action: str = "new",
+    exchange_id: str | None = None,
+    cancel: list[str] | None = None,
+) -> ChatMessage:
     return ChatMessage(
         role=MessageRole.ASSISTANT,
         content="",
-        tool_calls=(ToolCall(id="call-1", name=ROUTE_TOOL_NAME, arguments={"ops": ops}),),
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name=ROUTE_TOOL_NAME,
+                arguments={
+                    "action": action,
+                    "exchange_id": exchange_id,
+                    "cancel_exchange_ids": cancel or [],
+                },
+            ),
+        ),
     )
 
 
@@ -111,329 +132,119 @@ def make_router(llm: ScriptedLLM | SlowLLM) -> LLMRouter:
     )
 
 
-async def test_empty_snapshot_skips_the_llm() -> None:
-    llm = ScriptedLLM(reply=plain_reply())
+async def test_no_live_exchanges_skips_the_llm() -> None:
+    """Nothing to belong to: a new exchange is the only possible answer."""
+    llm = ScriptedLLM(reply=route_reply())
     router = make_router(llm)
 
-    decision = await router.route((), MESSAGE, MAX_PROCESSES)
+    decision = await router.route((), MESSAGE, MAX_EXCHANGES)
 
-    assert decision.ops == ()
-    assert llm.complete_calls == 0  # no active processes: trivially START_NEW
+    assert decision.action is RouteAction.NEW
+    assert llm.complete_calls == 0
 
 
-async def test_fallback_decision_has_no_ops() -> None:
-    llm = ScriptedLLM(error=RuntimeError("llm down"))
+async def test_continue_into_a_known_exchange() -> None:
+    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=WAITING_ID))
     router = make_router(llm)
 
-    decision = await router.route((background(),), MESSAGE, MAX_PROCESSES)
+    decision = await router.route((in_progress(), awaiting_user()), "Moscow", MAX_EXCHANGES)
 
-    assert decision.ops == ()
-
-
-async def test_ops_are_parsed_from_the_route_tool_call() -> None:
-    llm = ScriptedLLM(
-        reply=route_reply(
-            [
-                {"action": "cancel", "target_id": BG_ID},
-                {"action": "start_new", "target_id": None},
-            ]
-        )
-    )
-    router = make_router(llm)
-
-    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (
-        RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),
-        RouteOp(action=RouteAction.START_NEW),
-    )
+    assert decision.action is RouteAction.CONTINUE
+    assert decision.exchange_id == WAITING_ID
 
 
-async def test_inject_drops_start_new_regardless_of_order() -> None:
-    llm = ScriptedLLM(
-        reply=route_reply(
-            [
-                {"action": "inject", "target_id": None},
-                {"action": "start_new", "target_id": None},
-            ]
-        )
-    )
-    router = make_router(llm)
-
-    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
-
-
-async def test_start_new_before_inject_is_also_dropped() -> None:
-    llm = ScriptedLLM(
-        reply=route_reply(
-            [
-                {"action": "start_new", "target_id": None},
-                {"action": "inject", "target_id": None},
-            ]
-        )
-    )
-    router = make_router(llm)
-
-    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
-
-
-async def test_start_new_without_inject_is_kept() -> None:
-    llm = ScriptedLLM(reply=route_reply([{"action": "start_new", "target_id": None}]))
-    router = make_router(llm)
-
-    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
-
-
-async def test_duplicate_start_new_ops_are_deduped() -> None:
-    llm = ScriptedLLM(
-        reply=route_reply(
-            [
-                {"action": "start_new", "target_id": None},
-                {"action": "start_new", "target_id": None},
-            ]
-        )
-    )
-    router = make_router(llm)
-
-    decision = await router.route((background(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
-
-
-async def test_duplicate_inject_ops_are_deduped() -> None:
-    llm = ScriptedLLM(
-        reply=route_reply(
-            [
-                {"action": "inject", "target_id": None},
-                {"action": "inject", "target_id": None},
-            ]
-        )
-    )
-    router = make_router(llm)
-
-    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
-
-
-async def test_inject_drops_start_new_but_keeps_cancel() -> None:
-    llm = ScriptedLLM(
-        reply=route_reply(
-            [
-                {"action": "cancel", "target_id": BG_ID},
-                {"action": "inject", "target_id": None},
-                {"action": "start_new", "target_id": None},
-            ]
-        )
-    )
-    router = make_router(llm)
-
-    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (
-        RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),
-        RouteOp(action=RouteAction.INJECT),
-    )
-
-
-async def test_request_carries_processes_limit_and_user_message() -> None:
-    llm = ScriptedLLM(reply=route_reply([]))
-    router = make_router(llm)
-
-    await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
-
-    system, user = llm.last_messages
-    assert system.role is MessageRole.SYSTEM
-    assert FG_ID in system.content and BG_ID in system.content
-    assert str(MAX_PROCESSES) in system.content
-    assert user == ChatMessage(role=MessageRole.USER, content=MESSAGE)
-    assert llm.last_tools is not None
-    assert [spec.name for spec in llm.last_tools] == [ROUTE_TOOL_NAME]
-
-
-async def test_invalid_ops_are_dropped() -> None:
-    llm = ScriptedLLM(
-        reply=route_reply(
-            [
-                {"action": "explode", "target_id": None},
-                {"action": "cancel", "target_id": None},
-                # a stale "promote" op (removed route) is dropped like any unknown action
-                {"action": "promote", "target_id": BG_ID},
-                {"action": "cancel", "target_id": BG_ID},
-                "not-an-object",
-            ]
-        )
-    )
-    router = make_router(llm)
-
-    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),)
-
-
-async def test_inject_keeps_its_op_when_the_model_fills_target_id() -> None:
-    """A superfluous target_id must not turn an inject into an empty package.
-
-    Measured against deepseek-v4-pro: on a clarification aimed at a running
-    foreground it answers `inject(target_id=<that process>)` in most runs.
-    Dropping the op left ops=(), which the runner maps to START_NEW — the
-    clarification span a new process instead of reaching the running one.
-    `_apply_inject` never reads a target (the pull model), so the field is
-    simply ignored.
-    """
-    llm = ScriptedLLM(reply=route_reply([{"action": "inject", "target_id": FG_ID}]))
-    router = make_router(llm)
-
-    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
-
-
-async def test_inject_keeps_its_op_when_target_id_is_unknown() -> None:
-    """An id nobody knows is still just a superfluous field on an inject."""
-    llm = ScriptedLLM(reply=route_reply([{"action": "inject", "target_id": UNKNOWN_ID}]))
-    router = make_router(llm)
-
-    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
-
-
-async def test_start_new_keeps_its_op_when_the_model_fills_target_id() -> None:
-    llm = ScriptedLLM(reply=route_reply([{"action": "start_new", "target_id": BG_ID}]))
-    router = make_router(llm)
-
-    decision = await router.route((background(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.START_NEW),)
-
-
-async def test_inject_with_a_target_still_wins_over_start_new() -> None:
-    """The inject-drops-start_new guardrail holds once the target is ignored."""
-    llm = ScriptedLLM(
-        reply=route_reply(
-            [
-                {"action": "inject", "target_id": FG_ID},
-                {"action": "start_new", "target_id": BG_ID},
-                {"action": "cancel", "target_id": BG_ID},
-            ]
-        )
-    )
-    router = make_router(llm)
-
-    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (
-        RouteOp(action=RouteAction.INJECT),
-        RouteOp(action=RouteAction.CANCEL, target_id=BG_ID),
-    )
-
-
-async def test_dropped_ops_are_logged(caplog: pytest.LogCaptureFixture) -> None:
-    """A dropped op must leave a trace: silent drops hid a routing bug for weeks."""
-    llm = ScriptedLLM(reply=route_reply([{"action": "cancel", "target_id": UNKNOWN_ID}]))
+async def test_continue_into_an_unknown_exchange_degrades_to_new(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Safe default: a redundant answer is visible, a swallowed message is not."""
+    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=UNKNOWN_ID))
     router = make_router(llm)
 
     with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
-        decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+        decision = await router.route((in_progress(),), MESSAGE, MAX_EXCHANGES)
 
-    assert decision.ops == ()
-    assert "cancel needs a known target" in caplog.text
+    assert decision.action is RouteAction.NEW
+    assert decision.exchange_id is None
+    assert caplog.records
 
 
-async def test_missing_tool_call_logs_the_fallback(caplog: pytest.LogCaptureFixture) -> None:
-    llm = ScriptedLLM(reply=plain_reply())
+async def test_unknown_action_degrades_to_new_keeping_cancels(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = ScriptedLLM(reply=route_reply(action="nonsense", cancel=[OPEN_ID, UNKNOWN_ID]))
     router = make_router(llm)
 
     with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
-        await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+        decision = await router.route((in_progress(),), MESSAGE, MAX_EXCHANGES)
 
-    assert ROUTE_TOOL_NAME in caplog.text
-    assert "falling back" in caplog.text
+    assert decision.action is RouteAction.NEW
+    assert decision.cancel_ids == (OPEN_ID,)  # the unknown id is dropped
+    assert caplog.records
 
 
-async def test_llm_failure_logs_the_fallback(caplog: pytest.LogCaptureFixture) -> None:
+async def test_command_action_answers_nothing() -> None:
+    llm = ScriptedLLM(reply=route_reply(action="command", cancel=[OPEN_ID]))
+    router = make_router(llm)
+
+    decision = await router.route((in_progress(),), "stop", MAX_EXCHANGES)
+
+    assert decision.action is RouteAction.COMMAND
+    assert decision.cancel_ids == (OPEN_ID,)
+
+
+async def test_llm_failure_falls_back_to_new(caplog: pytest.LogCaptureFixture) -> None:
     llm = ScriptedLLM(error=RuntimeError("provider down"))
     router = make_router(llm)
 
     with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
-        await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+        decision = await router.route((in_progress(),), MESSAGE, MAX_EXCHANGES)
 
-    assert "router LLM call failed" in caplog.text
-    assert "provider down" in caplog.text
-
-
-async def test_all_invalid_ops_yield_an_empty_decision() -> None:
-    llm = ScriptedLLM(reply=route_reply([{"action": "cancel", "target_id": UNKNOWN_ID}]))
-    router = make_router(llm)
-
-    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == ()
+    assert decision.action is RouteAction.NEW
+    assert caplog.records
 
 
-async def test_missing_tool_call_falls_back_to_inject_with_foreground() -> None:
+async def test_timeout_falls_back_to_new() -> None:
+    router = make_router(SlowLLM())
+
+    decision = await router.route((in_progress(),), MESSAGE, MAX_EXCHANGES)
+
+    assert decision.action is RouteAction.NEW
+
+
+async def test_missing_tool_call_falls_back_to_new(caplog: pytest.LogCaptureFixture) -> None:
     llm = ScriptedLLM(reply=plain_reply())
     router = make_router(llm)
 
-    decision = await router.route((foreground(), background()), MESSAGE, MAX_PROCESSES)
+    with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
+        decision = await router.route((in_progress(),), MESSAGE, MAX_EXCHANGES)
 
-    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
+    assert decision.action is RouteAction.NEW
+    assert caplog.records
 
 
-async def test_missing_tool_call_falls_back_to_empty_without_foreground() -> None:
-    llm = ScriptedLLM(reply=plain_reply())
+async def test_prompt_describes_the_exchanges_in_human_terms() -> None:
+    """The router reasons about obligations, not process ids."""
+    llm = ScriptedLLM(reply=route_reply())
     router = make_router(llm)
 
-    decision = await router.route((background(),), MESSAGE, MAX_PROCESSES)
+    await router.route((in_progress(), awaiting_user()), MESSAGE, MAX_EXCHANGES)
 
-    assert decision.ops == ()
-
-
-async def test_llm_error_falls_back() -> None:
-    llm = ScriptedLLM(error=RuntimeError("llm down"))
-    router = make_router(llm)
-
-    decision = await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == (RouteOp(action=RouteAction.INJECT),)
-
-
-async def test_prompt_prefers_inject_and_forbids_combining() -> None:
-    llm = ScriptedLLM(reply=route_reply([]))
-    router = make_router(llm)
-
-    await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
-
-    system = llm.last_messages[0]
-    assert "When unsure, prefer inject" in system.content
-    assert "Never combine inject and start_new" in system.content
+    system = llm.last_messages[0].content
+    assert "being answered right now" in system
+    assert "waiting for the user to reply" in system
+    assert PENDING_QUESTION in system  # the reply target is obvious to the model
+    assert "When you are unsure, choose new" in system
+    assert llm.last_messages[1] == ChatMessage(role=MessageRole.USER, content=MESSAGE)
 
 
 async def test_router_prompt_comes_from_the_prompt_provider() -> None:
-    llm = ScriptedLLM(reply=route_reply([]))
+    llm = ScriptedLLM(reply=route_reply())
     router = LLMRouter(
         llm=llm,
         timeout_seconds=TIMEOUT_SECONDS,
         prompts=StaticPromptProvider({ROUTER_PROMPT_NAME: CUSTOM_ROUTER_PROMPT}),
     )
 
-    await router.route((foreground(),), MESSAGE, MAX_PROCESSES)
+    await router.route((in_progress(),), MESSAGE, MAX_EXCHANGES)
 
-    system = llm.last_messages[0]
-    assert system.content.startswith("CUSTOM ROUTER: limit 5")
-    assert FG_ID in system.content
-
-
-async def test_llm_timeout_falls_back() -> None:
-    router = make_router(SlowLLM())
-
-    decision = await router.route((background(),), MESSAGE, MAX_PROCESSES)
-
-    assert decision.ops == ()
+    assert llm.last_messages[0].content.startswith("CUSTOM ROUTER: limit 5")

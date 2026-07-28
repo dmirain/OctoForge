@@ -43,7 +43,11 @@ from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
@@ -76,7 +80,7 @@ SEARCH_QUERY = "fake query"
 FAKE_ANSWER = "fake direct answer"
 FAKE_RESULT_TITLE = "Fake result"
 CUSTOM_SYSTEM_PROMPT = "CUSTOM SYSTEM PROMPT FROM FILE"
-CUSTOM_ROUTER_PROMPT = "CUSTOM ROUTER PROMPT FROM FILE (limit {limit}):\n{processes}"
+CUSTOM_ROUTER_PROMPT = "CUSTOM ROUTER PROMPT FROM FILE (limit {limit}):\n{exchanges}"
 MAX_ITERATIONS = 5
 MAX_PROCESSES = 5
 DEFAULT_K = 5
@@ -331,6 +335,7 @@ def build_third_party_root(
         dialogs=SqlAlchemyDialogRepository(session_factory),
         messages=SqlAlchemyMessageRepository(session_factory),
         tasks=InMemoryTaskStore(),
+        exchanges=SqlAlchemyExchangeRepository(session_factory),
     )
     return ThirdPartyRoot(manager=manager, llm=llm, instructions=instructions)
 

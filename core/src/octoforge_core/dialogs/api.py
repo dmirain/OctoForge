@@ -8,6 +8,8 @@ repositories were the last concrete-only dependencies in the actor).
 """
 
 from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
 from typing import Protocol
 
 from octoforge_core.domain import ChatMessage, Dialog
@@ -16,6 +18,93 @@ from octoforge_core.llm.usage import Usage
 
 class DialogNotFoundError(Exception):
     """Raised when a dialog id does not resolve to a stored dialog."""
+
+
+class ExchangeNotFoundError(Exception):
+    """Raised when an exchange id does not resolve to a stored exchange."""
+
+
+class ExchangeStatus(StrEnum):
+    """Lifecycle of one obligation to the user.
+
+    OPEN is the only state that means work for the SYSTEM: the "what is left
+    to do" predicate is `OPEN and no owner`, and it also drives restart
+    recovery. AWAITING_USER means work for the USER — the exchange is not
+    closed, but nobody must restart it.
+    """
+
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    AWAITING_USER = "awaiting_user"
+    ANSWERED = "answered"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+#: statuses an incoming message may still be routed into
+LIVE_EXCHANGE_STATUSES = (
+    ExchangeStatus.OPEN,
+    ExchangeStatus.IN_PROGRESS,
+    ExchangeStatus.AWAITING_USER,
+)
+
+
+@dataclass(slots=True)
+class Exchange:
+    """One obligation to the user: their question, clarifications, the answer.
+
+    Deliberately separate from the task row: a run can finish (task DONE)
+    without closing the exchange — asking the user something back is exactly
+    that case.
+    """
+
+    id: str
+    dialog_id: str
+    status: ExchangeStatus
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    owner_task_id: str | None = None
+    pending_question: str | None = None
+
+
+ExchangeList = list[Exchange]
+
+
+class ExchangeRepository(Protocol):
+    """Port over the exchanges of a dialog."""
+
+    async def create(
+        self, dialog_id: str, title: str, owner_task_id: str | None = None
+    ) -> Exchange:
+        """Open a new exchange; IN_PROGRESS when an owner is given, OPEN otherwise."""
+        ...
+
+    async def get(self, exchange_id: str) -> Exchange:
+        """Return the exchange or raise ExchangeNotFoundError."""
+        ...
+
+    async def list_live(self, dialog_id: str) -> ExchangeList:
+        """Return the dialog's non-terminal exchanges, oldest first."""
+        ...
+
+    async def list_unowned_open(self) -> ExchangeList:
+        """Return every OPEN exchange without an owner (restart recovery)."""
+        ...
+
+    async def set_status(
+        self,
+        exchange_id: str,
+        status: ExchangeStatus,
+        owner_task_id: str | None = None,
+        pending_question: str | None = None,
+    ) -> None:
+        """Move the exchange to `status`, replacing owner and pending question."""
+        ...
+
+    async def delete_for_dialog(self, dialog_id: str) -> None:
+        """Drop every exchange of the dialog (admin dialog deletion)."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +184,10 @@ class MessageRepository(Protocol):
 
     async def list(self, dialog_id: str) -> ChatMessageList:
         """Return the dialog messages ordered by seq."""
+        ...
+
+    async def set_exchange(self, message_id: str, exchange_id: str) -> None:
+        """Attach a stored message to the exchange it belongs to."""
         ...
 
     async def stats_by_channel(self, channel: str) -> MessageStatsList:

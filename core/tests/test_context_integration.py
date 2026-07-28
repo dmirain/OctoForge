@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_core.agent.events import ProcessCompleted
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
-from octoforge_core.agent.router import ProcessInfo, RouteDecision
+from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
@@ -21,7 +21,11 @@ from octoforge_core.context.api import DialogueSummary
 from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
@@ -63,9 +67,9 @@ class PassthroughRouter:
 
     async def route(
         self,
-        processes: tuple[ProcessInfo, ...],
+        exchanges: tuple[ExchangeInfo, ...],
         message: str,
-        max_processes: int,
+        max_exchanges: int,
     ) -> RouteDecision:
         return RouteDecision()
 
@@ -118,6 +122,7 @@ def make_manager(
         dialogs=SqlAlchemyDialogRepository(session_factory),
         messages=SqlAlchemyMessageRepository(session_factory),
         tasks=InMemoryTaskStore(),
+        exchanges=SqlAlchemyExchangeRepository(session_factory),
     )
 
 
