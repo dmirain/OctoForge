@@ -75,6 +75,7 @@ WAIT_TIMEOUT_SECONDS = 2.0
 
 ALL_BASIC_TOOLS = {
     "http_request",
+    "ask_user",
     "task_create",
     "task_list",
     "task_delete",

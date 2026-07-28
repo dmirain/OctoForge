@@ -20,6 +20,14 @@ class TaskSpawner(Protocol):
         ...
 
 
+class UserPrompter(Protocol):
+    """Asks the user a question on behalf of the run that needs an answer."""
+
+    async def ask(self, question: str) -> None:
+        """Deliver the question and leave the run's exchange awaiting the user."""
+        ...
+
+
 class TaskDeleteOutcome(StrEnum):
     """Result of a dialog-bound task stop request."""
 
@@ -67,6 +75,7 @@ class ToolContext:
     dialog_id: str
     task_spawner: TaskSpawner | None = None
     task_deleter: TaskDeleter | None = None
+    user_prompter: UserPrompter | None = None
     owner_task_id: str | None = None
 
 

@@ -35,6 +35,7 @@ from octoforge_core.dialogs.api import (
     ExchangeRepository,
     MessageRepository,
 )
+from octoforge_core.dialogs.tools import AskUserTool
 from octoforge_core.instructions.api import InstructionService, InstructionStore
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES, LocalInstructionService
 from octoforge_core.instructions.tools import (
@@ -266,6 +267,7 @@ def _register_core_tools(
 ) -> None:
     """Register the HTTP and deferred-work (task/cron) tools."""
     registry.register(HttpRequestTool(http_client=outbound_http, guard=guard))
+    registry.register(AskUserTool())
     registry.register(TaskCreateTool(cron_store=cron_store))
     registry.register(TaskListTool(store=task_store, cron_store=cron_store))
     registry.register(TaskDeleteTool(store=task_store, cron_store=cron_store))

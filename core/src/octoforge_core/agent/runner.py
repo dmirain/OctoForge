@@ -187,6 +187,17 @@ class _AnswerSource:
     exchange_id: str | None = None
 
 
+class _DialogUserPrompter:
+    """UserPrompter bound to one run: delivers the question, parks the exchange."""
+
+    def __init__(self, runner: "ConversationRunner", process_id: str) -> None:
+        self._runner = runner
+        self._process_id = process_id
+
+    async def ask(self, question: str) -> None:
+        await self._runner.ask_user(self._process_id, question)
+
+
 @dataclass(frozen=True, slots=True)
 class _RunnerStores:
     """Persistence collaborators of one dialog actor."""
@@ -273,6 +284,8 @@ class _Process:
     # (reply threading); both ride task.input so a restart restores them
     source_message_id: str | None = None
     source_client_message_id: str | None = None
+    # the run asked the user something: its final must not close the exchange
+    asked_user: bool = False
     overflow_retried: bool = False
 
 
@@ -501,17 +514,24 @@ class ConversationRunner:
         )
         await self._deliver_notice(notice)
 
-    async def _deliver_notice(self, content: str) -> None:
-        """Persist a canned broker notice as an assistant message and queue it."""
-        notice = ChatMessage(role=MessageRole.ASSISTANT, content=content)
-        await self._persist(notice)
+    async def _deliver_notice(self, content: str, exchange_id: str | None = None) -> None:
+        """Persist a broker message (limit notice, nudge, question) and queue it.
+
+        A question of an exchange jumps the queue: it is the only thing that
+        unblocks that obligation, so it must not wait behind other results.
+        """
+        notice = ChatMessage(role=MessageRole.ASSISTANT, content=content, exchange_id=exchange_id)
+        message_id = await self._persist(notice)
+        notice = replace(notice, id=message_id)
         self._narrative.append(notice)
-        self._pending_deliveries.append(
-            _Delivery(
-                events=(TextDelta(text=content), Finished(message=notice)),
-                task_id=None,
-            )
+        delivery = _Delivery(
+            events=(TextDelta(text=content), Finished(message=notice)),
+            task_id=None,
         )
+        if exchange_id is not None:
+            self._pending_deliveries.appendleft(delivery)
+        else:
+            self._pending_deliveries.append(delivery)
         await self._flush_if_free()
 
     async def _prepare_process_task(
@@ -687,6 +707,26 @@ class ConversationRunner:
         )
         return await self._router.route(infos, message.content, self._max_processes)
 
+    async def ask_user(self, process_id: str, question: str) -> None:
+        """Deliver a run's clarifying question and park its exchange.
+
+        Called from the `ask_user` tool inside a pump task. The obligation is
+        NOT closed: it moves to AWAITING_USER, so the "what is left to do"
+        predicate skips it (that is the user's move) while it stays visible
+        to the agent, the reminder and the operator console.
+        """
+        process = self._processes.get(process_id)
+        if process is None or process.exchange_id is None:
+            return
+        process.asked_user = True
+        await self._deliver_notice(question, exchange_id=process.exchange_id)
+        with suppress(ExchangeNotFoundError):
+            await self._exchanges.set_status(
+                process.exchange_id,
+                ExchangeStatus.AWAITING_USER,
+                pending_question=question,
+            )
+
     async def _is_duplicate(self, client_message_id: str | None) -> bool:
         """Whether a submit with this idempotency key was already recorded."""
         if client_message_id is None:
@@ -739,12 +779,7 @@ class ConversationRunner:
         except ExchangeNotFoundError:
             return
         if exchange.status is ExchangeStatus.AWAITING_USER:
-            await self._exchanges.set_status(
-                exchange.id,
-                ExchangeStatus.AWAITING_USER,
-                pending_question=exchange.pending_question,
-            )
-            return
+            return  # the run asked the user something; the obligation stays open
         if command.unseen_messages:
             await self._exchanges.set_status(exchange.id, ExchangeStatus.OPEN)
             await self._resume_open_exchange(exchange.id)
@@ -1171,6 +1206,7 @@ class ConversationRunner:
             dialog_id=self._dialog.id,
             task_spawner=self._spawner,
             task_deleter=self._deleter,
+            user_prompter=_DialogUserPrompter(self, process.id),
             owner_task_id=process.task_id,
         )
         terminal: LoopEvent = Failed(error="loop ended without a terminal event")

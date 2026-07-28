@@ -2,7 +2,7 @@
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -48,6 +48,7 @@ from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.cron.api import CronWaker
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.dialogs.models import MessageRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
@@ -994,6 +995,83 @@ async def test_empty_final_is_silence_not_an_empty_bubble(
     await wait_for_condition(lambda: task.delivered_at is not None)
     assert not runner._pending_deliveries
     assert [m.content for m in runner.history()] == ["hi"]
+
+
+async def _is_answered(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
+    return (await exchanges.get(exchange_id)).status is ExchangeStatus.ANSWERED
+
+
+async def wait_for_async_condition(
+    condition: Callable[[], Awaitable[bool]],
+    timeout: float = TIMEOUT_SECONDS,
+) -> None:
+    """Poll an awaitable condition (store state settles after the event)."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if await condition():
+            return
+        await asyncio.sleep(POLL_SECONDS)
+    raise TimeoutError("condition was not met in time")
+
+
+class AskingTool:
+    """Tool stub asking the user a question through the runner port."""
+
+    def __init__(self, question: str = "which city?") -> None:
+        self.question = question
+        self.called = asyncio.Event()
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=BLOCKING_TOOL, description="asks", parameters_schema={})
+
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        assert context.user_prompter is not None
+        await context.user_prompter.ask(self.question)
+        self.called.set()
+        return "asked"
+
+
+async def test_asking_the_user_keeps_the_exchange_open_and_resumes_it(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The scenario that shaped the model: a run needs input, so it asks —
+    the obligation stays open, the reply resumes it, and the answer closes it."""
+    tool = AskingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call(), reply(""), reply("+21 in Moscow")])
+    router = FakeRouter()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("what is the weather?")
+    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    await collect_until(queue, is_delivered(tool.question))
+
+    # the question reached the user and the obligation is NOT closed
+    live = await exchanges.list_live(runner.dialog_id)
+    assert [item.status for item in live] == [ExchangeStatus.AWAITING_USER]
+    assert live[0].pending_question == tool.question
+    await wait_for_condition(lambda: not runner._processes)  # the slot was freed
+
+    # the reply continues that exchange and a fresh run answers it
+    router.decide_continue()
+    await runner.submit("Moscow")
+    await collect_until(queue, is_delivered("+21 in Moscow"))
+
+    await wait_for_async_condition(
+        lambda: _is_answered(exchanges, live[0].id)
+    )  # the same obligation, now closed by a real answer
+    assert [m.content for m in runner.history()] == [
+        "what is the weather?",
+        tool.question,
+        "Moscow",
+        "+21 in Moscow",
+    ]
 
 
 async def test_late_message_reopens_the_exchange(
@@ -2190,10 +2268,10 @@ async def test_queued_answer_knows_its_question_after_being_overtaken(
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("Почему чаек много на море?")
+    await runner.submit("why so many seagulls?")
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     router.gate_armed = True
-    await runner.submit("Какая погода?")
+    await runner.submit("what is the weather?")
     await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
 
     # the foreground finishes while the router still holds the second message
@@ -2206,13 +2284,14 @@ async def test_queued_answer_knows_its_question_after_being_overtaken(
     # foreground's final — and it is marked as this run's task either way
     queued_branch = llm.requests[-1]
     assert any(
-        TASK_NOTE_TEMPLATE.format(content="Какая погода?") in m.content for m in queued_branch
+        TASK_NOTE_TEMPLATE.format(content="what is the weather?") in m.content
+        for m in queued_branch
     )
     assert any(m.content.endswith("seagull answer") for m in queued_branch)
     # and the user actually gets the second answer
     assert any(isinstance(e.payload, Finished) for e in events)
     tasks = {task.title: task for task in await store.list(runner.dialog_id)}
-    weather = tasks["Какая погода?"]
+    weather = tasks["what is the weather?"]
     await wait_for_condition(lambda: weather.result == "weather answer")
     await wait_for_condition(lambda: [m.content for m in runner.history()][-1] == "weather answer")
 
