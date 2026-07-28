@@ -16,6 +16,7 @@ from octoforge_core.tasks.store import TaskStore
 from octoforge_web.auth import check_basic_auth
 from octoforge_web.config import Settings
 from octoforge_web.secret_links import SecretLinkService
+from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 
 MISSING_USER_ID_MESSAGE = "X-User-Id header is required"
 
@@ -58,6 +59,16 @@ def get_dialog_repository(request: Request) -> DialogRepository:
 def get_exchange_repository(request: Request) -> ExchangeRepository:
     """Return the exchange repository built at application startup."""
     return cast(ExchangeRepository, request.app.state.exchanges)
+
+
+def get_telegram_members(request: Request) -> "MemberDirectory | None":
+    """Return the Telegram member directory (None: bot not configured)."""
+    return cast("MemberDirectory | None", request.app.state.telegram_members)
+
+
+def get_telegram_invites(request: Request) -> "InviteStore | None":
+    """Return the Telegram invite store (None: bot not configured)."""
+    return cast("InviteStore | None", request.app.state.telegram_invites)
 
 
 def get_summary_store(request: Request) -> SummaryStore:

@@ -25,6 +25,8 @@ from octoforge_web.telegram.invites.api import (
     Invite,
     InviteStatus,
     InviteStore,
+    MemberDirectory,
+    MemberProfile,
 )
 from octoforge_web.telegram.poller import chat_id_from_user_id
 
@@ -104,6 +106,8 @@ class AdminStores:
     messages: MessageRepository
     dialogs: DialogRepository
     instructions: InstructionService
+    # who-is-who profiles recorded by the poller (None: not configured)
+    directory: MemberDirectory | None = None
 
 
 ActionHandler = Callable[[dict[str, Any]], Awaitable[str]]
@@ -118,6 +122,7 @@ class AdminManageTool:
         self._messages = stores.messages
         self._dialogs = stores.dialogs
         self._instructions = stores.instructions
+        self._directory = stores.directory
         self._access = access
         self._handlers: dict[str, ActionHandler] = {
             ACTION_LIST_USERS: self._list_users,
@@ -133,7 +138,8 @@ class AdminManageTool:
         return ToolSpec(
             name=NAME,
             description=(
-                "Administer the Telegram bot: list users with usage stats, generate "
+                "Administer the Telegram bot: list users (name, @username, which "
+                "invite they entered through, usage stats), generate "
                 "an invite code, revoke a user's access (disables their cron jobs, "
                 "reversible) or restore it back; search instructions across all users "
                 "and publish one by id (makes it visible to everyone). Admins only."
@@ -166,18 +172,29 @@ class AdminManageTool:
             for entry in await self._messages.stats_by_channel(TELEGRAM_CHANNEL)
         }
         dialogs = await self._dialogs.list_by_channel(TELEGRAM_CHANNEL)
+        profiles = await self._member_profiles()
         user_ids = sorted(
             {invite.claimed_by for invite in invites if invite.claimed_by}
             | {dialog.user_id for dialog in dialogs}
+            | set(profiles)
         )
         lines = [f"telegram users: {len(user_ids)}, invites: {len(invites)}"]
         for user_id in user_ids:
-            lines.append(await self._user_line(user_id, stats.get(user_id), dialogs, invites))
+            lines.append(
+                await self._user_line(
+                    user_id, stats.get(user_id), dialogs, invites, profiles.get(user_id)
+                )
+            )
         pending = [invite for invite in invites if invite.status is InviteStatus.PENDING]
         if pending:
             lines.append("pending invite codes:")
             lines.extend(f"- {invite.code} ({invite.note or 'no note'})" for invite in pending)
         return "\n".join(lines)
+
+    async def _member_profiles(self) -> dict[str, MemberProfile]:
+        if self._directory is None:
+            return {}
+        return {profile.user_id: profile for profile in await self._directory.list_all()}
 
     async def _user_line(
         self,
@@ -185,9 +202,15 @@ class AdminManageTool:
         stats: MessageStats | None,
         dialogs: list[Dialog],
         invites: list[Invite],
+        profile: MemberProfile | None,
     ) -> str:
         invite = next((item for item in invites if item.claimed_by == user_id), None)
-        access = invite.status.value if invite is not None else "no-invite"
+        if invite is not None:
+            note = f", note: {invite.note}" if invite.note else ""
+            access = f"{invite.status.value} via invite {invite.code}{note}"
+        else:
+            access = "no-invite (admin or pre-gate)"
+        who = f" ({profile.display_name})" if profile is not None else ""
         activity = max(
             (dialog.updated_at for dialog in dialogs if dialog.user_id == user_id),
             default=None,
@@ -198,7 +221,8 @@ class AdminManageTool:
         total_chars = stats.total_chars if stats is not None else 0
         last_active = activity.isoformat() if activity is not None else "never"
         return (
-            f"- {user_id}: access={access}, messages={message_count} ({total_chars} chars), "
+            f"- {user_id}{who}: access={access}, "
+            f"messages={message_count} ({total_chars} chars), "
             f"last_active={last_active}, cron={enabled_jobs}/{len(jobs)} enabled"
         )
 

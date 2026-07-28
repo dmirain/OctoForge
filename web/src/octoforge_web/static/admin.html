@@ -185,6 +185,16 @@ const VIEWS = {
       `<td><button class="link" data-view="${esc(s.content)}">открыть</button></td>` +
       `<td class="mono">${time(s.created_at)}</td>`,
   },
+  tgusers: {
+    title: "Пользователи", path: () => "/api/admin/telegram/users",
+    columns: ["имя", "username", "user_id", "инвайт", "впервые", "последний раз"],
+    row: (u) => `${clip([u.first_name, u.last_name].filter(Boolean).join(" ") || "—")}` +
+      `<td class="mono">${u.username ? "@" + esc(u.username) : "—"}</td>` +
+      `${clip(u.user_id, "mono")}` +
+      `<td class="mono">${u.invite_code ? esc(u.invite_code) + (u.invite_note ? " · " + esc(u.invite_note) : "") + " (" + esc(u.invite_status) + ")" : "—"}</td>` +
+      `<td class="mono">${time(u.first_seen_at)}</td>` +
+      `<td class="mono">${time(u.last_seen_at)}</td>`,
+  },
   exchanges: {
     title: "Обмены", path: () => "/api/admin/exchanges",
     filters: ["status"],
@@ -197,7 +207,8 @@ const VIEWS = {
 };
 
 const NAV = [
-  ["dialogs", "Диалоги"], ["exchanges", "Обмены"], ["tasks", "Задачи"], ["cron", "Cron"],
+  ["dialogs", "Диалоги"], ["tgusers", "Пользователи"], ["exchanges", "Обмены"],
+  ["tasks", "Задачи"], ["cron", "Cron"],
   ["instructions", "Инструкции"], ["datasets", "Датасеты"], ["memories", "Память"],
   ["summaries", "Сводки"],
 ];

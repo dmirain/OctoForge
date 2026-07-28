@@ -34,6 +34,45 @@ class Invite:
     disabled_cron_job_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class MemberProfile:
+    """What Telegram last told us about a gated user."""
+
+    user_id: str
+    first_name: str
+    last_name: str
+    username: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+    @property
+    def display_name(self) -> str:
+        """Human-readable name: "First Last (@username)" with graceful gaps."""
+        name = " ".join(part for part in (self.first_name, self.last_name) if part)
+        handle = f"@{self.username}" if self.username else ""
+        if name and handle:
+            return f"{name} ({handle})"
+        return name or handle or self.user_id
+
+
+class MemberDirectory(Protocol):
+    """Storage port for member profiles (the who-is-who of the bot)."""
+
+    async def record(
+        self, user_id: str, first_name: str, last_name: str, username: str | None
+    ) -> None:
+        """Upsert the profile as seen on this contact; stamps last_seen_at."""
+        ...
+
+    async def get(self, user_id: str) -> MemberProfile | None:
+        """Return the profile, None when the user was never recorded."""
+        ...
+
+    async def list_all(self) -> list[MemberProfile]:
+        """Return every recorded profile, most recently seen first."""
+        ...
+
+
 class InviteNotFoundError(Exception):
     """No invite for the given code or id."""
 

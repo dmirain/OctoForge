@@ -52,8 +52,11 @@ from octoforge_web.deps import (
     get_instruction_service,
     get_summary_store,
     get_task_store,
+    get_telegram_invites,
+    get_telegram_members,
     require_admin,
 )
+from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_admin)])
 
@@ -65,6 +68,8 @@ ManagerDep = Annotated[ConversationManager, Depends(get_conversation_manager)]
 DialogsDep = Annotated[DialogRepository, Depends(get_dialog_repository)]
 ExchangesDep = Annotated[ExchangeRepository, Depends(get_exchange_repository)]
 SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
+MembersDep = Annotated["MemberDirectory | None", Depends(get_telegram_members)]
+InvitesDep = Annotated["InviteStore | None", Depends(get_telegram_invites)]
 LimitDep = Annotated[int | None, Query(ge=1)]
 OffsetDep = Annotated[int | None, Query(ge=0)]
 
@@ -156,6 +161,43 @@ async def delete_dialog(
     except DialogNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
     return DELETED_STATUS
+
+
+@router.get("/telegram/users")
+async def telegram_users(members: MembersDep, invites: InvitesDep) -> dict[str, Any]:
+    """Telegram who-is-who: profiles recorded at the gate, with invite attribution.
+
+    Served straight from the Telegram surface's own store (not the core read
+    model — the entity is transport-specific). Empty when the bot is not
+    configured.
+    """
+    if members is None:
+        return {"items": [], "total": 0}
+    invite_by_user: dict[str, Any] = {}
+    if invites is not None:
+        invite_by_user = {
+            invite.claimed_by: invite
+            for invite in await invites.list_all()
+            if invite.claimed_by is not None
+        }
+    items = []
+    for profile in await members.list_all():
+        invite = invite_by_user.get(profile.user_id)
+        items.append(
+            {
+                "user_id": profile.user_id,
+                "first_name": profile.first_name,
+                "last_name": profile.last_name,
+                "username": profile.username,
+                "display_name": profile.display_name,
+                "invite_code": invite.code if invite is not None else None,
+                "invite_note": invite.note if invite is not None else None,
+                "invite_status": invite.status.value if invite is not None else None,
+                "first_seen_at": profile.first_seen_at.isoformat(),
+                "last_seen_at": profile.last_seen_at.isoformat(),
+            }
+        )
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/tasks")

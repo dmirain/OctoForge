@@ -16,8 +16,10 @@ from octoforge_web.telegram.invites.api import (
     InviteNotFoundError,
     InviteStatus,
     InviteStore,
+    MemberDirectory,
+    MemberProfile,
 )
-from octoforge_web.telegram.invites.models import InviteRow
+from octoforge_web.telegram.invites.models import InviteRow, MemberRow
 
 _CODE_BYTES = 8
 
@@ -140,4 +142,58 @@ def _to_invite(row: InviteRow) -> Invite:
         revoked_at=row.revoked_at,
         claimed_by=row.claimed_by,
         disabled_cron_job_ids=tuple(row.disabled_cron_job_ids or ()),
+    )
+
+
+class SqlAlchemyMemberDirectory(MemberDirectory):
+    """Member profiles in the same dedicated Telegram database."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def record(
+        self, user_id: str, first_name: str, last_name: str, username: str | None
+    ) -> None:
+        now = utc_now()
+        async with self._session_factory() as session:
+            row = await session.get(MemberRow, user_id)
+            if row is None:
+                session.add(
+                    MemberRow(
+                        user_id=user_id,
+                        first_name=first_name,
+                        last_name=last_name,
+                        username=username,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                    )
+                )
+            else:
+                row.first_name = first_name
+                row.last_name = last_name
+                row.username = username
+                row.last_seen_at = now
+            await session.commit()
+
+    async def get(self, user_id: str) -> MemberProfile | None:
+        async with self._session_factory() as session:
+            row = await session.get(MemberRow, user_id)
+            return _to_profile(row) if row is not None else None
+
+    async def list_all(self) -> list[MemberProfile]:
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(MemberRow).order_by(MemberRow.last_seen_at.desc())
+            )
+            return [_to_profile(row) for row in result.all()]
+
+
+def _to_profile(row: MemberRow) -> MemberProfile:
+    return MemberProfile(
+        user_id=row.user_id,
+        first_name=row.first_name,
+        last_name=row.last_name,
+        username=row.username,
+        first_seen_at=row.first_seen_at,
+        last_seen_at=row.last_seen_at,
     )

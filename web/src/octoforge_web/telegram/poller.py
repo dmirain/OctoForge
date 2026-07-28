@@ -20,8 +20,9 @@ from octoforge_web.telegram.invites.api import (
     InviteNotFoundError,
     InviteStatus,
     InviteStore,
+    MemberDirectory,
 )
-from octoforge_web.telegram.models import TelegramChatType, TelegramUpdate
+from octoforge_web.telegram.models import TelegramChatType, TelegramUpdate, TelegramUser
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,8 @@ class TelegramPollerOptions:
     error_backoff_seconds: float = DEFAULT_ERROR_BACKOFF_SECONDS
     membership: TelegramMembership | None = None
     secrets_link: Callable[[str], str] | None = None
+    # who-is-who mirror: profiles of gated users, refreshed on every contact
+    directory: MemberDirectory | None = None
 
 
 class TelegramPoller:
@@ -179,6 +182,7 @@ class TelegramPoller:
         self._error_backoff_seconds = options.error_backoff_seconds
         self._membership = options.membership
         self._secrets_link = options.secrets_link
+        self._directory = options.directory
         self._offset: int | None = None
 
     async def run_forever(self) -> None:
@@ -226,6 +230,8 @@ class TelegramPoller:
         user_id = f"{USER_ID_PREFIX}{message.from_user.id}"
         if not await self._check_membership(user_id, chat_id, message.text):
             return
+        # only past the gate: strangers knocking with bad codes stay unrecorded
+        await self._record_member(user_id, message.from_user)
         reply_to_message_id = (
             message.reply_to_message.message_id if message.reply_to_message is not None else None
         )
@@ -270,6 +276,15 @@ class TelegramPoller:
         await self._client.send_message(
             chat_id, SECRETS_LINK_TEXT.format(url=self._secrets_link(user_id))
         )
+
+    async def _record_member(self, user_id: str, user: TelegramUser) -> None:
+        """Mirror the sender's profile; recording must never break dispatch."""
+        if self._directory is None:
+            return
+        try:
+            await self._directory.record(user_id, user.first_name, user.last_name, user.username)
+        except Exception:
+            logger.exception("member profile record failed: user=%s", user_id)
 
     async def _check_membership(self, user_id: str, chat_id: int, text: str) -> bool:
         """Apply the invite gate (no gate configured = everyone passes)."""

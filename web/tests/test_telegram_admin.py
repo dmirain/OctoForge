@@ -14,6 +14,7 @@ from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import InstructionService, InstructionType
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
+from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -31,7 +32,7 @@ from octoforge_web.telegram.admin import (
     AdminStores,
 )
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL
-from octoforge_web.telegram.invites.api import InviteStatus
+from octoforge_web.telegram.invites.api import InviteStatus, MemberProfile
 from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
 
@@ -319,3 +320,51 @@ async def test_publish_instruction_requires_an_id(
     result = await tool.execute({"action": ACTION_PUBLISH_INSTRUCTION}, ADMIN_CONTEXT)
 
     assert result.startswith("error:")
+
+
+class OneProfileDirectory:
+    """MemberDirectory fake with a single known profile."""
+
+    def __init__(self, profile: MemberProfile) -> None:
+        self._profile = profile
+
+    async def record(
+        self, user_id: str, first_name: str, last_name: str, username: str | None
+    ) -> None:
+        raise AssertionError("the admin tool must not write profiles")
+
+    async def get(self, user_id: str) -> MemberProfile | None:
+        return self._profile if user_id == self._profile.user_id else None
+
+    async def list_all(self) -> list[MemberProfile]:
+        return [self._profile]
+
+
+async def test_list_users_shows_name_and_invite_attribution(stores: StoresTuple) -> None:
+    invites, cron_store, messages, dialogs, instructions = stores
+    invite_id = await claim_invite(stores)
+    invite = await invites.get_by_id(invite_id)
+    assert invite is not None
+    profile = MemberProfile(
+        user_id=USER_ID,
+        first_name="Alice",
+        last_name="Smith",
+        username="alice",
+        first_seen_at=utc_now(),
+        last_seen_at=utc_now(),
+    )
+    tool = AdminManageTool(
+        AdminStores(
+            invites=invites,
+            cron_store=cron_store,
+            messages=messages,
+            dialogs=dialogs,
+            instructions=instructions,
+            directory=OneProfileDirectory(profile),
+        ),
+        AdminAccess(admin_ids=frozenset({ADMIN_TELEGRAM_ID})),
+    )
+    output = await tool.execute({"action": "list_users"}, ADMIN_CONTEXT)
+    assert "Alice Smith (@alice)" in output
+    assert f"claimed via invite {invite.code}" in output
+    assert NOTE in output

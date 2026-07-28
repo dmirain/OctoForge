@@ -90,8 +90,9 @@ from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
 from octoforge_web.telegram.admin import AdminAccess, AdminManageTool, AdminStores
 from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
+from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 from octoforge_web.telegram.invites.models import InviteBase
-from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
+from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
 from octoforge_web.telegram.poller import (
     TelegramBridgeRegistry,
     TelegramMembership,
@@ -133,6 +134,10 @@ class Runtime:
     dialogs: DialogRepository
     summary_store: SummaryStore
     exchanges: ExchangeRepository
+    # Telegram who-is-who (None: bot not configured) — read by the operator
+    # console to decorate user ids with names and invite attribution
+    telegram_members: MemberDirectory | None = None
+    telegram_invites: InviteStore | None = None
 
 
 @asynccontextmanager
@@ -154,7 +159,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     cron_store = SqlAlchemyCronStore(session_factory)
     secret_store = _build_secret_store(settings, session_factory)
     secret_links = SecretLinkService()
-    invites = await _build_invite_store(settings)
+    telegram_stores = await _build_telegram_stores(settings)
     try:
         async with (
             httpx.AsyncClient(base_url=settings.llm_base_url) as llm_http,
@@ -200,15 +205,16 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 ),
                 limits=_tool_limits(settings),
             )
-            if invites is not None and settings.telegram_admin_ids:
+            if telegram_stores is not None and settings.telegram_admin_ids:
                 registry.register(
                     AdminManageTool(
                         AdminStores(
-                            invites=invites[0],
+                            invites=telegram_stores.invites,
                             cron_store=cron_store,
                             messages=messages,
                             dialogs=dialogs,
                             instructions=instructions,
+                            directory=telegram_stores.directory,
                         ),
                         AdminAccess(
                             admin_ids=frozenset(settings.telegram_admin_ids),
@@ -268,7 +274,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 dialogs,
                 outbound_http,
                 _TelegramExtras(
-                    invites=invites,
+                    stores=telegram_stores,
                     secrets_link=(
                         _secrets_link_builder(settings, secret_links)
                         if secret_store is not None
@@ -291,14 +297,20 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     dialogs=dialogs,
                     summary_store=summary_store,
                     exchanges=exchanges,
+                    telegram_members=(
+                        telegram_stores.directory if telegram_stores is not None else None
+                    ),
+                    telegram_invites=(
+                        telegram_stores.invites if telegram_stores is not None else None
+                    ),
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, telegram)
                 await manager.stop_all()
     finally:
         await engine.dispose()
-        if invites is not None:
-            await invites[1].dispose()
+        if telegram_stores is not None:
+            await telegram_stores.engine.dispose()
 
 
 def _configure_logging() -> None:
@@ -335,6 +347,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.dialogs = rt.dialogs
             app.state.summary_store = rt.summary_store
             app.state.exchanges = rt.exchanges
+            app.state.telegram_members = rt.telegram_members
+            app.state.telegram_invites = rt.telegram_invites
             yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)
@@ -542,30 +556,41 @@ def _start_cron_scheduler(
     return asyncio.create_task(scheduler.run_forever())
 
 
-async def _build_invite_store(
-    settings: Settings,
-) -> tuple[SqlAlchemyInviteStore, AsyncEngine] | None:
-    """Build the invite store on its own database when Telegram is enabled.
+@dataclass(frozen=True, slots=True)
+class _TelegramStores:
+    """The Telegram surface's own database: invites plus member profiles."""
 
-    The invites schema is bootstrapped with a plain create_all: one small
-    isolated table on its own Base/engine, no Alembic chain of its own.
+    invites: SqlAlchemyInviteStore
+    directory: SqlAlchemyMemberDirectory
+    engine: AsyncEngine
+
+
+async def _build_telegram_stores(settings: Settings) -> _TelegramStores | None:
+    """Build the invite store and member directory when Telegram is enabled.
+
+    The schema is bootstrapped with a plain create_all: a couple of small
+    isolated tables on their own Base/engine, no Alembic chain of their own.
     """
     if not settings.telegram_bot_token:
         return None
     engine = create_engine(settings.telegram_database_url)
     async with engine.begin() as connection:
         await connection.run_sync(InviteBase.metadata.create_all)
-    store = SqlAlchemyInviteStore(
-        create_session_factory(engine), ttl_seconds=settings.telegram_invite_ttl_seconds
+    session_factory = create_session_factory(engine)
+    return _TelegramStores(
+        invites=SqlAlchemyInviteStore(
+            session_factory, ttl_seconds=settings.telegram_invite_ttl_seconds
+        ),
+        directory=SqlAlchemyMemberDirectory(session_factory),
+        engine=engine,
     )
-    return store, engine
 
 
 @dataclass(frozen=True, slots=True)
 class _TelegramExtras:
     """Optional collaborators of the Telegram surface."""
 
-    invites: tuple[SqlAlchemyInviteStore, AsyncEngine] | None = None
+    stores: _TelegramStores | None = None
     secrets_link: Callable[[str], str] | None = None
 
 
@@ -605,8 +630,8 @@ def _start_telegram(
         rich_messages_enabled=settings.telegram_rich_messages,
     )
     membership = None
-    if resolved.invites is not None and settings.telegram_admin_ids:
-        membership = TelegramMembership(resolved.invites[0], settings.telegram_admin_ids)
+    if resolved.stores is not None and settings.telegram_admin_ids:
+        membership = TelegramMembership(resolved.stores.invites, settings.telegram_admin_ids)
     poller = TelegramPoller(
         client=client,
         registry=registry,
@@ -614,6 +639,7 @@ def _start_telegram(
             poll_timeout_seconds=settings.telegram_poll_timeout_seconds,
             membership=membership,
             secrets_link=resolved.secrets_link,
+            directory=resolved.stores.directory if resolved.stores is not None else None,
         ),
     )
     task = asyncio.create_task(_run_telegram(poller, registry, dialogs))

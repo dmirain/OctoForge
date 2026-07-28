@@ -17,10 +17,12 @@ from octoforge_core.instructions.api import (
     InstructionType,
 )
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
+from octoforge_core.time import utc_now
 
 from octoforge_web.auth import hash_password, verify_password
 from octoforge_web.config import Settings
 from octoforge_web.main import create_app
+from octoforge_web.telegram.invites.api import Invite, InviteStatus, MemberProfile
 
 TEST_BASE_URL = "http://test-llm/v1"
 ADMIN_USER = "operator"
@@ -295,3 +297,62 @@ def test_httpx_logging_never_carries_the_bot_token(tmp_path: Path) -> None:
     create_app(make_settings(tmp_path))
 
     assert logging.getLogger("httpx").level == logging.WARNING
+
+
+def test_telegram_users_empty_without_the_bot(client: TestClient) -> None:
+    listing = client.get("/api/admin/telegram/users").json()
+    assert listing == {"items": [], "total": 0}
+
+
+class _StaticDirectory:
+    """MemberDirectory fake serving one fixed profile."""
+
+    def __init__(self, profile: MemberProfile) -> None:
+        self._profile = profile
+
+    async def record(
+        self, user_id: str, first_name: str, last_name: str, username: str | None
+    ) -> None:
+        raise AssertionError("read-only endpoint must not write")
+
+    async def get(self, user_id: str) -> MemberProfile | None:
+        return self._profile
+
+    async def list_all(self) -> list[MemberProfile]:
+        return [self._profile]
+
+
+def test_telegram_users_join_profile_with_invite(client: TestClient) -> None:
+    profile = MemberProfile(
+        user_id="tg:42",
+        first_name="Alice",
+        last_name="Smith",
+        username="alice",
+        first_seen_at=utc_now(),
+        last_seen_at=utc_now(),
+    )
+    invite = Invite(
+        id="inv-1",
+        code="SECRETCODE",
+        status=InviteStatus.CLAIMED,
+        note="for Alice",
+        created_at=utc_now(),
+        claimed_at=utc_now(),
+        revoked_at=None,
+        claimed_by="tg:42",
+        disabled_cron_job_ids=(),
+    )
+
+    class _StaticInvites:
+        async def list_all(self) -> list[Invite]:
+            return [invite]
+
+    client.app.state.telegram_members = _StaticDirectory(profile)  # type: ignore[attr-defined]
+    client.app.state.telegram_invites = _StaticInvites()  # type: ignore[attr-defined]
+    listing = client.get("/api/admin/telegram/users").json()
+    assert listing["total"] == 1
+    (item,) = listing["items"]
+    assert item["display_name"] == "Alice Smith (@alice)"
+    assert item["invite_code"] == "SECRETCODE"
+    assert item["invite_note"] == "for Alice"
+    assert item["invite_status"] == "claimed"

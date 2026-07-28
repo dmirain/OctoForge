@@ -15,6 +15,23 @@ class InviteBase(DeclarativeBase):
     """Base class of the Telegram invite schema (isolated from core's Base)."""
 
 
+class MemberRow(InviteBase):
+    """Profile of a Telegram user who passed the gate, refreshed on contact.
+
+    Names and usernames change, so this is a living mirror of what Telegram
+    sent last, not an immutable record; `first_seen_at` is the entry moment.
+    """
+
+    __tablename__ = "members"
+
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    first_name: Mapped[str] = mapped_column(String, default="")
+    last_name: Mapped[str] = mapped_column(String, default="")
+    username: Mapped[str | None] = mapped_column(String, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
 class InviteRow(InviteBase):
     """One invite code: pending -> claimed -> (revoked -> claimed)."""
 

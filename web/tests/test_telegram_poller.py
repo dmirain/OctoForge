@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.telegram.bridge import PARSE_MODE_HTML, RunnerProvider
 from octoforge_web.telegram.client import USER_ID_PREFIX
+from octoforge_web.telegram.invites.api import MemberProfile
 from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
 from octoforge_web.telegram.models import (
@@ -683,3 +684,83 @@ async def test_secrets_command_without_the_feature_reports_it() -> None:
 
     ((_, text, _),) = client.sent
     assert text == SECRETS_DISABLED_TEXT
+
+
+class RecordingDirectory:
+    """MemberDirectory fake capturing every record call."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, str, str | None]] = []
+
+    async def record(
+        self, user_id: str, first_name: str, last_name: str, username: str | None
+    ) -> None:
+        self.records.append((user_id, first_name, last_name, username))
+
+    async def get(self, user_id: str) -> None:
+        return None
+
+    async def list_all(self) -> list[MemberProfile]:
+        return []
+
+
+async def test_gated_member_profile_is_recorded_on_contact(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = await make_manager(
+        [ChatMessage(role=MessageRole.ASSISTANT, content=REPLY)], session_factory
+    )
+    client = FakeTelegramClient()
+    directory = RecordingDirectory()
+    registry = TelegramBridgeRegistry(
+        runner_provider=manager.get_or_create_runner,
+        client=client,
+        edit_throttle_seconds=NO_THROTTLE,
+    )
+    poller = TelegramPoller(
+        client=client,
+        registry=registry,
+        options=TelegramPollerOptions(
+            poll_timeout_seconds=POLL_TIMEOUT,
+            error_backoff_seconds=NO_BACKOFF,
+            directory=directory,
+        ),
+    )
+    update = TelegramUpdate(
+        update_id=1,
+        message=TelegramMessage(
+            message_id=1,
+            from_user=TelegramUser(
+                id=TELEGRAM_USER_ID, first_name="Alice", last_name="Smith", username="alice"
+            ),
+            chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
+            text="hello",
+        ),
+    )
+    await poller.dispatch(update)
+    assert directory.records == [(USER_ID, "Alice", "Smith", "alice")]
+    await manager.stop_all()
+
+
+async def test_stranger_denied_by_the_gate_is_not_recorded(
+    invite_store: SqlAlchemyInviteStore,
+) -> None:
+    client = FakeTelegramClient()
+    directory = RecordingDirectory()
+    registry = TelegramBridgeRegistry(
+        runner_provider=forbidden_provider,
+        client=client,
+        edit_throttle_seconds=NO_THROTTLE,
+    )
+    poller = TelegramPoller(
+        client=client,
+        registry=registry,
+        options=TelegramPollerOptions(
+            poll_timeout_seconds=POLL_TIMEOUT,
+            error_backoff_seconds=NO_BACKOFF,
+            membership=make_membership(invite_store),
+            directory=directory,
+        ),
+    )
+    await poller.dispatch(make_update(1, text="hello"))
+    assert directory.records == []
