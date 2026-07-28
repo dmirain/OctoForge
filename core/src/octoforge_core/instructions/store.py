@@ -63,6 +63,7 @@ class SqlAlchemyInstructionStore:
             version=FIRST_VERSION,
             system=draft.system,
             owner_id=draft.owner_id,
+            author_id=draft.author_id,
         )
         session.add(row)
         await session.commit()
@@ -79,6 +80,10 @@ class SqlAlchemyInstructionStore:
         row.tags = list(draft.tags)
         row.version += 1
         row.system = draft.system
+        if draft.author_id is not None:
+            # authorship is set, never cleared: a registry/system upsert
+            # (author None) must not strip a record of its author
+            row.author_id = draft.author_id
         row.updated_at = utc_now()
         await session.commit()
         return _to_instruction(row)
@@ -173,6 +178,10 @@ class SqlAlchemyInstructionStore:
             row = await session.get(InstructionRow, instruction_id)
             if row is None or row.type == InstructionType.MEMORY.value:
                 return None
+            if row.author_id is None:
+                # publication must not lose who wrote it: the departing
+                # owner is the author (also backfills pre-authorship rows)
+                row.author_id = row.owner_id
             row.owner_id = None
             row.updated_at = utc_now()
             await session.commit()
@@ -254,4 +263,5 @@ def _to_instruction(row: InstructionRow) -> Instruction:
         updated_at=row.updated_at,
         system=row.system,
         owner_id=row.owner_id,
+        author_id=row.author_id,
     )

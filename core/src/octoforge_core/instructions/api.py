@@ -56,10 +56,11 @@ class Instruction:
     The embedding is intentionally not part of the DTO: it is a local
     implementation detail of the search engine. `system` marks records owned
     by the declarative system registry: they are upserted/deleted by the
-    startup sync only, never by agent-facing save/delete. `owner_id` is the
-    record's author (set from the caller's session); None marks a public
-    record visible to everyone — new records are private and only the
-    admin-facing `publish` makes them public.
+    startup sync only, never by agent-facing save/delete. `owner_id` scopes
+    visibility (None marks a public record visible to everyone — new records
+    are private and only the admin-facing `publish` makes them public);
+    `author_id` is who wrote it, and it survives publication: the author
+    keeps editing their published record through the ordinary save flow.
     """
 
     id: str
@@ -74,6 +75,7 @@ class Instruction:
     updated_at: datetime
     system: bool = False
     owner_id: str | None = None
+    author_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +110,9 @@ class InstructionDraft:
     embedding: tuple[float, ...]
     system: bool = False
     owner_id: str | None = None
+    # authorship is orthogonal to visibility: it is set once at save time
+    # and never cleared by an update (see the store's update rule)
+    author_id: str | None = None
 
 
 class InstructionStore(Protocol):

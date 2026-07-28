@@ -148,8 +148,9 @@ const VIEWS = {
   instructions: {
     title: "Инструкции", path: () => "/api/admin/instructions",
     filters: ["query"],
-    columns: ["тип", "title", "владелец", "system", "версия", "теги", "текст", ""],
+    columns: ["тип", "title", "владелец", "автор", "system", "версия", "теги", "текст", ""],
     row: (i) => `<td>${esc(i.type)}</td>${clip(i.title)}${clip(i.owner_id || "public", "mono")}` +
+      `${clip(i.author_id || "—", "mono")}` +
       `<td>${flag(i.system)}</td><td>${i.version}</td><td>${tags(i.tags)}</td>` +
       `<td><button class="link" data-view="${esc(i.content)}">открыть</button></td>` +
       `<td>${i.owner_id ? `<button class="act" data-post="/api/admin/instructions/${esc(i.id)}/publish">опубликовать</button> ` : ""}` +

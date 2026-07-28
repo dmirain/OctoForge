@@ -68,6 +68,8 @@ SAVE_DESCRIPTION = (
     "endpoint — an API request contract executed by external_call (like an MCP tool). "
     "The record belongs to you: only you can see and delete it. "
     "Existing (type, title) records of yours are replaced with a bumped version. "
+    "If one of your records was published, you stay its author: saving the same "
+    "(type, title) updates the published record for everyone. "
     "Personal facts about the user are not instructions: save them with memory_store."
 )
 SAVED_TEMPLATE = "instruction saved: [{kind}] {title} (version {version})"

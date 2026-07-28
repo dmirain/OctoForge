@@ -141,13 +141,20 @@ class LocalInstructionService:
         content: str,
         tags: tuple[str, ...] = (),
     ) -> Instruction:
-        """Upsert the caller's private record (version bump on replace).
+        """Upsert the caller's record (version bump on replace).
 
-        Agent-facing: refuses to overwrite a system (registry-owned) record,
-        and a public record with the same title is left alone — the save
-        creates the owner's private copy.
+        Agent-facing: refuses to overwrite a system (registry-owned) record.
+        A public record with the same title stays untouched for everyone —
+        the save creates the caller's private copy — with one exception:
+        the record's AUTHOR. Publication moves visibility, not authorship,
+        so the author's save updates their published record in place (it
+        stays public, they stay its author).
         """
         await self._ensure_not_system(kind, title)
+        published = await self._store.get_by_title(title, kind)
+        author_edit = (
+            published is not None and not published.system and published.author_id == user_id
+        )
         draft = InstructionDraft(
             kind=kind,
             title=title,
@@ -155,7 +162,8 @@ class LocalInstructionService:
             tags=tags,
             embedding=await self._embed_lenient(title, content),
             system=False,
-            owner_id=user_id,
+            owner_id=None if author_edit else user_id,
+            author_id=user_id,
         )
         return await self._store.upsert(draft)
 

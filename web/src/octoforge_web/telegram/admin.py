@@ -314,13 +314,14 @@ class AdminManageTool:
 
 
 def _instruction_line(index: int, hit: SearchHit) -> str:
-    """One search result line for the admin console: id, owner, type, title, snippet."""
+    """One search result line for the admin console: id, owner, author, type, title, snippet."""
     instruction = hit.instruction
     owner = instruction.owner_id or "public"
+    author = f", author: {instruction.author_id}" if instruction.author_id else ""
     snippet = instruction.content.replace("\n", " ")[:INSTRUCTION_SNIPPET_CHARS]
     return (
         f"{index}. [{instruction.type.value}] {instruction.title}\n"
-        f"   id: {instruction.id} — owner: {owner}\n"
+        f"   id: {instruction.id} — owner: {owner}{author}\n"
         f"   {snippet}"
     )
 

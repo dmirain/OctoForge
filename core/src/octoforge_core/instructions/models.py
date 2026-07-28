@@ -49,5 +49,8 @@ class InstructionRow(Base):
     success_count: Mapped[int] = mapped_column(Integer, default=0)
     system: Mapped[bool] = mapped_column(Boolean, default=False)
     owner_id: Mapped[str | None] = mapped_column(String, index=True, default=None)
+    # who wrote the record (migration d4b8f1c6e250); unlike owner_id it
+    # survives publication, so the author keeps edit rights over their skill
+    author_id: Mapped[str | None] = mapped_column(String, index=True, default=None)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now, onupdate=utc_now)

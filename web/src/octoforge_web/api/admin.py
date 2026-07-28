@@ -457,6 +457,7 @@ def _instruction_to_dict(item: Instruction) -> dict[str, Any]:
         "content": item.content,
         "tags": list(item.tags),
         "owner_id": item.owner_id,
+        "author_id": item.author_id,
         "system": item.system,
         "version": item.version,
         "usage_count": item.usage_count,

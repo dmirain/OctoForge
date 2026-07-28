@@ -710,3 +710,54 @@ async def test_mixed_search_caps_each_types_share(
     # cap = ceil(3/2) = 2 skills; the knowledge record backfills the last slot
     assert types.count(InstructionType.SKILL) == TWO_HITS
     assert InstructionType.KNOWLEDGE in types
+
+
+async def test_publish_preserves_authorship(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
+    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    assert saved.author_id == USER_ID
+
+    published = await service.publish(saved.id)
+
+    assert published.owner_id is None
+    assert published.author_id == USER_ID
+
+
+async def test_author_save_updates_their_published_record_in_place(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
+    register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
+    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    await service.publish(saved.id)
+
+    updated = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
+
+    assert updated.id == saved.id  # the same record, not a private copy
+    assert updated.owner_id is None  # still public for everyone
+    assert updated.author_id == USER_ID
+    assert updated.content == CONTENT_B
+    assert updated.version == saved.version + 1
+
+
+async def test_non_author_save_still_creates_a_private_copy(
+    service: InstructionService,
+    embedder: StubEmbedder,
+) -> None:
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
+    register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
+    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    await service.publish(saved.id)
+
+    copy = await service.save(OTHER_USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
+
+    assert copy.id != saved.id
+    assert copy.owner_id == OTHER_USER_ID
+    assert copy.author_id == OTHER_USER_ID
+    original = await service.get_by_name(TITLE_ALPHA)
+    assert original.content == CONTENT_A  # the published record is untouched
+    assert original.author_id == USER_ID
