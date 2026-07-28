@@ -1,7 +1,8 @@
 """Minimal Telegram Bot API client over plain httpx."""
 
+import asyncio
 import logging
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 import httpx
 from pydantic import ValidationError
@@ -19,12 +20,26 @@ LONG_POLL_TIMEOUT_MARGIN_SECONDS = 10.0
 NOT_MODIFIED_MARKER = "message is not modified"
 CANT_PARSE_ENTITIES_MARKER = "can't parse entities"
 ALLOWED_UPDATES = ("message",)
+TOO_MANY_REQUESTS_STATUS = 429
+RETRYABLE_HTTP_STATUS_CODES = frozenset({500, 502, 503, 504})
+# 1 initial attempt + up to 2 retries; a bounded, honest retry, not a rate limiter.
+MAX_CALL_ATTEMPTS = 3
+MAX_TOTAL_RETRY_WAIT_SECONDS = 10.0
+TRANSIENT_RETRY_DELAY_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
 
 
 class TelegramApiError(Exception):
     """The Bot API answered `ok=false` for a method call."""
+
+
+class _RetryableCallError(Exception):
+    """Internal signal: the call failed but is worth retrying after `wait_seconds`."""
+
+    def __init__(self, wait_seconds: float, message: str) -> None:
+        super().__init__(message)
+        self.wait_seconds = wait_seconds
 
 
 class TelegramClient(Protocol):
@@ -113,7 +128,9 @@ class TelegramBotClient:
                 raise
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
-        await self._call("sendChatAction", {"chat_id": chat_id, "action": action})
+        # fire-and-forget UX hint (a typing indicator): worth failing fast on
+        # rather than queuing behind a rate-limit retry.
+        await self._call("sendChatAction", {"chat_id": chat_id, "action": action}, retry=False)
 
     async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
         payload: dict[str, Any] = {
@@ -145,24 +162,96 @@ class TelegramBotClient:
         method: str,
         payload: dict[str, Any],
         timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        *,
+        retry: bool = True,
     ) -> dict[str, Any] | list[Any]:
-        response = await self._http.post(
-            f"{self._base_url}/{method}", json=payload, timeout=timeout
-        )
+        """POST `method`, retrying a bounded number of times on 429/transient failures.
+
+        A 429 honors the Bot API's `parameters.retry_after`; transient
+        network errors and 5xx responses use a fixed short backoff instead
+        (Telegram gives no `retry_after` for those). Total sleep across all
+        retries is capped at `MAX_TOTAL_RETRY_WAIT_SECONDS` — a `retry_after`
+        above that cap is not worth waiting for and fails immediately, same
+        as exhausting the attempt budget. `retry=False` skips all of this
+        for fire-and-forget calls that should fail fast instead of queuing
+        behind a rate limit.
+        """
+        total_wait = 0.0
+        attempts = MAX_CALL_ATTEMPTS if retry else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._call_once(method, payload, timeout)
+            except _RetryableCallError as exc:
+                exhausted = attempt == attempts
+                over_cap = total_wait + exc.wait_seconds > MAX_TOTAL_RETRY_WAIT_SECONDS
+                if exhausted or over_cap:
+                    raise TelegramApiError(str(exc)) from None
+                logger.warning(
+                    "%s: %s; retrying in %.1fs (attempt %d/%d)",
+                    method,
+                    exc,
+                    exc.wait_seconds,
+                    attempt,
+                    attempts,
+                )
+                await asyncio.sleep(exc.wait_seconds)
+                total_wait += exc.wait_seconds
+        raise AssertionError("unreachable: the loop above always returns or raises")
+
+    async def _call_once(
+        self, method: str, payload: dict[str, Any], timeout: float
+    ) -> dict[str, Any] | list[Any]:
+        """Make one HTTP attempt; raises `_RetryableCallError` for a worth-retrying failure."""
+        try:
+            response = await self._http.post(
+                f"{self._base_url}/{method}", json=payload, timeout=timeout
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise _RetryableCallError(TRANSIENT_RETRY_DELAY_SECONDS, f"{method}: {exc}") from exc
         body = _parse_body(response)
         if body is None:
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                # The request URL carries the bot token; keep it out of logs.
-                raise TelegramApiError(f"{method}: HTTP {exc.response.status_code}") from None
-            raise TelegramApiError(f"{method}: unexpected response shape")
-        # Error statuses still carry a JSON body with the failure description.
-        if not body.get("ok"):
-            description = body.get("description", "unknown error")
-            raise TelegramApiError(f"{method}: {description}")
-        result = body.get("result")
-        return result if isinstance(result, (dict, list)) else {}
+            _raise_for_non_json_response(method, response)
+        return _result_or_raise(method, response, body)
+
+
+def _raise_for_non_json_response(method: str, response: httpx.Response) -> NoReturn:
+    if response.status_code in RETRYABLE_HTTP_STATUS_CODES:
+        raise _RetryableCallError(
+            TRANSIENT_RETRY_DELAY_SECONDS, f"{method}: HTTP {response.status_code}"
+        )
+    try:
+        # The request URL carries the bot token; keep it out of logs.
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise TelegramApiError(f"{method}: HTTP {exc.response.status_code}") from None
+    raise TelegramApiError(f"{method}: unexpected response shape")
+
+
+def _result_or_raise(
+    method: str, response: httpx.Response, body: dict[str, Any]
+) -> dict[str, Any] | list[Any]:
+    # Error statuses still carry a JSON body with the failure description.
+    if not body.get("ok"):
+        description = body.get("description", "unknown error")
+        retry_after = _retry_after_seconds(body)
+        is_too_many_requests = (
+            response.status_code == TOO_MANY_REQUESTS_STATUS
+            or body.get("error_code") == TOO_MANY_REQUESTS_STATUS
+        )
+        if is_too_many_requests and retry_after is not None:
+            raise _RetryableCallError(retry_after, f"{method}: {description}")
+        raise TelegramApiError(f"{method}: {description}")
+    result = body.get("result")
+    return result if isinstance(result, (dict, list)) else {}
+
+
+def _retry_after_seconds(body: dict[str, Any]) -> float | None:
+    """Extract `parameters.retry_after` from an error body, if present."""
+    parameters = body.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    retry_after = parameters.get("retry_after")
+    return float(retry_after) if isinstance(retry_after, int | float) else None
 
 
 def _parse_body(response: httpx.Response) -> dict[str, Any] | None:

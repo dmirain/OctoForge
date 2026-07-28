@@ -56,3 +56,6 @@ packages = ["octoforge_web"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# see core/pyproject.toml: slow tests are visible on every run, hangs dump
+addopts = "--durations=15 --durations-min=0.5"
+faulthandler_timeout = 90

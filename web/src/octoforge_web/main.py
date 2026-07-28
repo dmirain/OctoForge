@@ -616,7 +616,9 @@ def _start_telegram(
             secrets_link=resolved.secrets_link,
         ),
     )
-    return registry, asyncio.create_task(_run_telegram(poller, registry, dialogs))
+    task = asyncio.create_task(_run_telegram(poller, registry, dialogs))
+    task.add_done_callback(_report_telegram_task_failure)
+    return registry, task
 
 
 async def _run_telegram(
@@ -628,6 +630,24 @@ async def _run_telegram(
     user_ids = await dialogs.list_user_ids_by_channel(TELEGRAM_CHANNEL)
     await registry.warm(user_ids)
     await poller.run_forever()
+
+
+def _report_telegram_task_failure(task: asyncio.Task[None]) -> None:
+    """Supervisor-lite: loudly report the Telegram surface task dying.
+
+    `TelegramPoller.run_forever` already retries after any exception it can
+    see, so reaching here at all means something failed before that loop's
+    own catch-all could take over (warming bridges, listing dialogs) or an
+    exception type it cannot catch escaped. Either way the Telegram surface
+    is now dark for every user until a process restart, which is worth an
+    error-level log, not a silently dropped task result. Cancellation
+    (normal shutdown via `_stop_background_tasks`) is not a failure.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Telegram surface task terminated unexpectedly", exc_info=exc)
 
 
 async def _stop_background_tasks(

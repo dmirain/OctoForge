@@ -182,18 +182,34 @@ class TelegramPoller:
         self._offset: int | None = None
 
     async def run_forever(self) -> None:
-        """Poll updates until cancelled; transient failures only log and back off."""
+        """Poll updates until cancelled.
+
+        Three layers of defense, from innermost out: a `get_updates` failure
+        only backs off and retries; a single update failing to dispatch is
+        caught in `_dispatch_safely` and never stops the loop; this
+        top-level catch-all is the last resort for whatever escapes both
+        (an invites-store DB blip, a bug in code we didn't anticipate) — if
+        it also killed the loop, the whole Telegram surface would go dark
+        for every user until a process restart.
+        """
         await self._drain_backlog()
         while True:
             try:
-                updates = await self._client.get_updates(self._offset, self._poll_timeout_seconds)
-            except (httpx.HTTPError, TelegramApiError):
-                logger.warning("Telegram polling failed; retrying", exc_info=True)
+                await self._poll_once()
+            except Exception:
+                logger.exception("Telegram poll loop hit an unexpected error; retrying")
                 await asyncio.sleep(self._error_backoff_seconds)
-                continue
-            for update in updates:
-                self._offset = update.update_id + 1
-                await self._dispatch_safely(update)
+
+    async def _poll_once(self) -> None:
+        try:
+            updates = await self._client.get_updates(self._offset, self._poll_timeout_seconds)
+        except (httpx.HTTPError, TelegramApiError):
+            logger.warning("Telegram polling failed; retrying", exc_info=True)
+            await asyncio.sleep(self._error_backoff_seconds)
+            return
+        for update in updates:
+            self._offset = update.update_id + 1
+            await self._dispatch_safely(update)
 
     async def dispatch(self, update: TelegramUpdate) -> None:
         """Route one update: commands, non-text/group notices, or text into the bridge."""
@@ -272,9 +288,17 @@ class TelegramPoller:
         return False
 
     async def _dispatch_safely(self, update: TelegramUpdate) -> None:
+        """Dispatch one update; any failure is logged and swallowed.
+
+        A broad `Exception` catch is deliberate: one bad update (a poison
+        payload, an invites-store DB blip, an unexpected bug) must never take
+        the whole polling loop down with it — that would go dark for every
+        Telegram user until a process restart. `asyncio.CancelledError` is a
+        `BaseException`, not an `Exception`, so shutdown still cancels cleanly.
+        """
         try:
             await self.dispatch(update)
-        except (httpx.HTTPError, TelegramApiError):
+        except Exception:
             logger.warning("Failed to dispatch Telegram update %s", update.update_id, exc_info=True)
 
     async def _drain_backlog(self) -> None:

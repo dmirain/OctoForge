@@ -47,6 +47,11 @@ PARSE_MODE_HTML = "HTML"
 # reply routing; a restart loses the map entirely (routing falls back to the
 # LLM router), so this only bounds in-process memory, not correctness
 REPLY_TARGET_MAP_SIZE = 512
+# a FINAL flush is the one delivery that must not be silently dropped: the
+# client already retries 429s/transient failures internally, so a second
+# bridge-level attempt after a short pause is for whatever still gets
+# through (e.g. two independent transient failures back to back).
+TERMINAL_FLUSH_RETRY_DELAY_SECONDS = 1.0
 
 
 @dataclass(slots=True)
@@ -211,10 +216,38 @@ class TelegramBridge:
             self._append_line(draft, CANCELLED_LINE)
         elif isinstance(event, Failed):
             self._append_line(draft, FAILED_LINE_TEMPLATE.format(error=event.error))
-        await self._flush_draft(draft)
+        try:
+            await self._flush_terminal_with_retry(draft)
+        finally:
+            # the draft must never outlive its terminal event: a stale entry
+            # left behind by a failed flush would corrupt (or silently eat)
+            # the next answer delivered under the same exchange id
+            self._drafts.pop(exchange_id, None)
         if isinstance(event, Finished):
             await self._upgrade_to_rich(draft)
-        self._drafts.pop(exchange_id, None)
+
+    async def _flush_terminal_with_retry(self, draft: _Draft) -> None:
+        """Flush the final draft, retrying once more on a transport/API hiccup.
+
+        A FINAL flush that still fails after the retry is a message the user
+        never sees; that is logged loudly (error, not warning) so it stands
+        out from routine render hiccups.
+        """
+        try:
+            await self._flush_draft(draft)
+        except (TelegramApiError, httpx.HTTPError):
+            logger.warning(
+                "Telegram final flush failed for %s, retrying once", self._user_id, exc_info=True
+            )
+            await asyncio.sleep(TERMINAL_FLUSH_RETRY_DELAY_SECONDS)
+            try:
+                await self._flush_draft(draft)
+            except (TelegramApiError, httpx.HTTPError):
+                logger.error(
+                    "Telegram final flush failed twice for %s; the answer was lost",
+                    self._user_id,
+                    exc_info=True,
+                )
 
     async def _upgrade_to_rich(self, draft: _Draft) -> None:
         """Re-render the final answer as a native Rich Message when it earns one.

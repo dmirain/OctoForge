@@ -1,7 +1,9 @@
 """Tests for the Telegram long-poll loop and the bridge registry."""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
+from contextlib import suppress
 
 import httpx
 import pytest
@@ -78,6 +80,7 @@ EXPECTED_TWO_REPLIES = 2
 EXPECTED_GREETING_COUNT = 2
 EXPECTED_CALLS_AFTER_DRAIN = 2
 MIN_CALLS_AFTER_RECOVERY = 3
+MIN_POLL_ONCE_CALLS_AFTER_FAILURE = 2
 
 
 class FakeTelegramClient:
@@ -135,6 +138,21 @@ class RecordingBridge:
         reply_to_message_id: int | None = None,
     ) -> None:
         self.calls.append((content, client_message_id, reply_to_message_id))
+
+    async def cancel(self) -> None:
+        raise AssertionError("cancel should not be called in these tests")
+
+
+class ExplodingBridge:
+    """TelegramBridge stub whose `handle_text` always raises (resilience tests only)."""
+
+    async def handle_text(
+        self,
+        content: str,
+        client_message_id: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        raise RuntimeError("boom")
 
     async def cancel(self) -> None:
         raise AssertionError("cancel should not be called in these tests")
@@ -387,6 +405,55 @@ async def test_poller_recovers_from_poll_errors() -> None:
         task.cancel()
 
     assert len(client.poll_calls) >= MIN_CALLS_AFTER_RECOVERY
+
+
+async def test_dispatch_safely_survives_a_generic_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bug or DB blip inside dispatch (not just httpx/TelegramApiError) must not propagate.
+
+    Regression: the old narrow `except (httpx.HTTPError, TelegramApiError)`
+    let anything else (an invites-store error, an unanticipated bug) escape
+    and kill the poll loop for every Telegram user.
+    """
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+    poller._registry._bridges[USER_ID] = ExplodingBridge()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING):
+        await poller._dispatch_safely(make_update(FIRST_UPDATE_ID, text="hi"))
+
+    assert any("Failed to dispatch" in record.message for record in caplog.records)
+
+
+async def test_run_forever_survives_an_unexpected_poll_exception() -> None:
+    """`run_forever`'s own top-level catch-all outlives whatever escapes `_poll_once`.
+
+    This is the last line of defense: even a failure `_dispatch_safely`
+    cannot see (e.g. one raised before it, inside `_poll_once` itself) must
+    only back off and retry, never stop the loop.
+    """
+    client = FakeTelegramClient(batches=[[]])  # drains cleanly
+    poller = make_poller(client)
+    calls = 0
+    original_poll_once = poller._poll_once
+
+    async def flaky_poll_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("unexpected blip")
+        await original_poll_once()
+
+    poller._poll_once = flaky_poll_once  # type: ignore[method-assign]
+    task = asyncio.create_task(poller.run_forever())
+    try:
+        await wait_until(lambda: calls >= MIN_POLL_ONCE_CALLS_AFTER_FAILURE)
+        assert not task.done()  # the loop kept polling despite the exception
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def test_chat_id_from_user_id() -> None:

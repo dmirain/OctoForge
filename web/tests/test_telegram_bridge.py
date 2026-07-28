@@ -1,6 +1,7 @@
 """Tests for the Telegram bridge rendering dialog events into a chat."""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any, cast
 
@@ -13,7 +14,7 @@ from octoforge_core import (
     ToolRegistry,
     ToolSpec,
 )
-from octoforge_core.agent.events import Finished, ProcessStarted, TextDelta
+from octoforge_core.agent.events import Cancelled, Finished, ProcessStarted, TextDelta
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import ConversationRunner, RunnerConfig
@@ -35,6 +36,7 @@ from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from octoforge_web.telegram import bridge as bridge_module
 from octoforge_web.telegram.bridge import (
     CANCELLED_LINE,
     PARSE_MODE_HTML,
@@ -83,6 +85,8 @@ class FakeTelegramClient:
         self.rich_edited: list[tuple[int, int, str]] = []
         self.actions: list[tuple[int, str]] = []
         self.rich_edit_error: TelegramApiError | None = None
+        # errors popped (in order) and raised by the next edit_message_text calls
+        self.edit_failures: list[Exception] = []
         self._next_message_id = 0
 
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[Any]:
@@ -103,6 +107,8 @@ class FakeTelegramClient:
     async def edit_message_text(
         self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
     ) -> None:
+        if self.edit_failures:
+            raise self.edit_failures.pop(0)
         self.edited.append((chat_id, message_id, text, parse_mode))
 
     async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
@@ -758,3 +764,56 @@ async def test_concurrent_exchanges_render_into_separate_messages() -> None:
     # distinct message ids, each correctly mapped back to the exchange it answered
     assert bridge._reply_targets == {1: "x1", 2: "x2"}
     assert bridge._drafts == {}  # both terminal events popped their draft
+
+
+# --- terminal-flush retry -----------------------------------------------------
+
+
+async def test_terminal_flush_retries_once_before_giving_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first failed terminal flush is retried once; the retry delivers the text."""
+    monkeypatch.setattr(bridge_module, "TERMINAL_FLUSH_RETRY_DELAY_SECONDS", 0.0)
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge._render(TextDelta(text=PARTIAL), "x1")  # sends the head, message_id=1
+    client.edit_failures = [TelegramApiError("temporary hiccup")]
+
+    await bridge._render(Cancelled(), "x1")
+
+    expected = f"{PARTIAL}\n{CANCELLED_LINE}"
+    assert client.edited[-1] == (CHAT_ID, 1, expected, PARSE_MODE_HTML)
+    assert bridge._drafts == {}  # popped exactly once, on the successful retry
+    await bridge.aclose()
+
+
+async def test_terminal_flush_pops_the_draft_even_when_both_attempts_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A terminal flush failing twice still frees the draft and logs loudly.
+
+    A permanently stale draft would corrupt or swallow the next answer
+    delivered under the same exchange id, so the pop must happen regardless
+    of the flush outcome; the lost message is reported as an error, not a
+    warning, so it stands out from routine render hiccups.
+    """
+    monkeypatch.setattr(bridge_module, "TERMINAL_FLUSH_RETRY_DELAY_SECONDS", 0.0)
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge._render(TextDelta(text=PARTIAL), "x1")  # sends the head, message_id=1
+    client.edit_failures = [
+        TelegramApiError("temporary hiccup"),
+        TelegramApiError("still down"),
+    ]
+
+    with caplog.at_level(logging.ERROR, logger=bridge_module.__name__):
+        await bridge._render(Cancelled(), "x1")
+
+    assert bridge._drafts == {}  # never left stale despite the lost message
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+    await bridge.aclose()

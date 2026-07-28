@@ -1,12 +1,15 @@
 """Tests for the standalone Telegram surface (no HTTP listener involved)."""
 
+import asyncio
+import logging
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
 from octoforge_core.config import EmbeddingBackend
 
 from octoforge_web.config import Settings
-from octoforge_web.main import WEB_CHANNEL, runtime
+from octoforge_web.main import WEB_CHANNEL, _report_telegram_task_failure, runtime
 from octoforge_web.telegram.__main__ import NO_TOKEN_MESSAGE, run_standalone
 
 
@@ -31,3 +34,38 @@ async def test_runtime_builds_without_fastapi(tmp_path: Path) -> None:
         assert rt.conversation_manager is not None
         assert rt.channel == WEB_CHANNEL
         assert rt.cron_store is not None
+
+
+# --- the telegram task's done-callback (supervisor-lite) --------------------
+
+
+async def test_report_telegram_task_failure_logs_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exception escaping the Telegram surface task is logged loudly, not dropped."""
+
+    async def explode() -> None:
+        raise RuntimeError("boom")
+
+    task = asyncio.create_task(explode())
+    with suppress(RuntimeError):
+        await task  # let it finish (and record its exception) before inspecting it
+
+    with caplog.at_level(logging.ERROR):
+        _report_telegram_task_failure(task)
+
+    assert any("Telegram surface task terminated" in record.message for record in caplog.records)
+
+
+async def test_report_telegram_task_failure_ignores_cancellation() -> None:
+    """Normal shutdown (task.cancel() from `_stop_background_tasks`) is not a failure."""
+
+    async def spin_forever() -> None:
+        await asyncio.sleep(10)
+
+    task = asyncio.create_task(spin_forever())
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+    _report_telegram_task_failure(task)  # must not raise (task.exception() would, on cancel)
