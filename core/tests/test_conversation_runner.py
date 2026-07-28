@@ -850,11 +850,11 @@ async def test_compaction_crash_fails_the_run_and_releases_the_slot(
     assert finished[0].message.content == REPLY
 
 
-async def test_start_new_queues_behind_the_busy_foreground(
+async def test_answers_stream_concurrently_each_into_its_own_exchange(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A new question never takes over the stream: the first answer finishes
-    in its own message, the queued answer arrives whole as the next one."""
+    """Phase 4: no foreground — every answer streams live, tagged with its
+    exchange, and each question is answered by exactly one run."""
     tool = BlockingTool()
     store = InMemoryTaskStore()
     llm = ScriptedLLM([blocking_call(), reply("second final"), reply("first final")])
@@ -868,40 +868,35 @@ async def test_start_new_queues_behind_the_busy_foreground(
     events = await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("second", client_message_id="102")
-    events += await collect_completions(queue, 1)  # "second" finishes in the background
-
-    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert finished == []  # the queued answer is not streamed and not delivered yet
+    # the second answer streams to completion while the first is still blocked
+    events += await collect_until(queue, is_delivered("second final"))
+    second_finished = next(e for e in events if isinstance(e.payload, Finished))
+    assert second_finished.payload.message.content == "second final"
+    assert second_finished.exchange_id is not None  # tagged for its own draft
 
     tool.release.set()
-    events += await collect_until(queue, is_delivered("second final"))
+    events += await collect_until(queue, is_delivered("first final"))
 
-    # the queued delivery opens with its own reply target, not the foreground's
+    # the two streams are tagged with different exchanges
+    tagged = {
+        e.exchange_id
+        for e in events
+        if isinstance(e.payload, Finished) and e.payload.message.content.endswith("final")
+    }
+    assert len(tagged) == TWO_PROCESSES
     started_keys = [
         e.payload.source_client_message_id for e in events if isinstance(e.payload, ProcessStarted)
     ]
-    assert started_keys == ["101", "102"]
-
-    # the foreground streamed to completion first; the queued final arrived
-    # whole (TextDelta + Finished) strictly after it
-    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
-    assert deltas == ["first final", "second final"]
-    # the queued process's branch marks the foreground's question as taken:
-    # each question is answered by exactly one process
+    assert sorted(started_keys) == ["101", "102"]
+    # the second run never saw the first question (someone else owes it)
     queued_branch = llm.requests[1]
     assert not any(m.role is MessageRole.USER and m.content == "first" for m in queued_branch)
-    done = completions(events)
-    assert {item.title for item in done} == {"first", "second"}
-    assert all(item.status == TaskStatus.DONE.value for item in done)
     tasks = await store.list(runner.dialog_id)
     assert {task.title for task in tasks} == {"first", "second"}
-    assert all(task.status is TaskStatus.DONE for task in tasks)
+    await wait_for_condition(lambda: all(task.status is TaskStatus.DONE for task in tasks))
     await wait_for_condition(lambda: all(task.delivered_at is not None for task in tasks))
-    assert not runner._pending_deliveries
     history = runner.history()
     assert [m.content for m in history] == ["first", "second", "second final", "first final"]
-    task_ids = {task.id for task in tasks}
-    assert all(m.task_id in task_ids for m in history if m.role is MessageRole.ASSISTANT)
 
 
 async def test_inject_routed_message_is_pulled_into_the_next_iteration(
@@ -991,6 +986,11 @@ async def test_empty_final_is_silence_not_an_empty_bubble(
     await wait_for_condition(lambda: task.delivered_at is not None)
     assert not runner._pending_deliveries
     assert [m.content for m in runner.history()] == ["hi"]
+
+
+async def _only_first_is_live(exchanges: SqlAlchemyExchangeRepository, dialog_id: str) -> bool:
+    live = await exchanges.list_live(dialog_id)
+    return [item.title for item in live] == ["first"]
 
 
 async def _is_answered(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
@@ -1128,26 +1128,30 @@ async def test_bring_back_starts_a_new_answer_process(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("second")
-    events = await collect_completions(queue, 1)
+    events = await collect_until(queue, is_delivered("second final"))
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    # wait for "second" to settle: its question then renders as plain history
+    await wait_for_async_condition(lambda: _only_first_is_live(exchanges, runner.dialog_id))
     await runner.submit("bring back the first one")
-    events += await collect_completions(queue, 1)
+    events += await collect_until(queue, is_delivered("bring-back answer"))
 
-    # there is no promote route: a "bring back" request is a plain START_NEW —
-    # it queues behind the busy foreground like any other question (nobody
-    # takes the slot away from "first"), and its branch sees the whole
-    # narrative, including the other queued answer
+    # there is no promote route: a "bring back" request is a plain new
+    # exchange; its branch sees the whole narrative — "second" is answered
+    # history, while "first" is still owed by a live run (dropped)
     bring_back_request = llm.requests[2]
-    # "first" is still owed by the live foreground -> not this run's business;
-    # "second" is already answered, so its question is plain history
     assert [m.content for m in bring_back_request[1:-1]] == ["second", "second final"]
     assert "bring back the first one" in bring_back_request[-1].content
 
     tool.release.set()
-    events += await collect_until(queue, is_delivered("bring-back answer"))
+    events += await collect_until(queue, is_delivered("first final"))
+    events += await collect_until(
+        queue, lambda e: isinstance(e.payload, ProcessCompleted) and e.payload.title == "first"
+    )
 
     done = completions(events)
     assert {item.title for item in done} == {"first", "second", "bring back the first one"}
-    assert all(item.status == TaskStatus.DONE.value for item in done)
+    tasks = await store.list(runner.dialog_id)
+    await wait_for_condition(lambda: all(t.status is TaskStatus.DONE for t in tasks))
     assert [m.content for m in runner.history()] == [
         "first",
         "second",
@@ -1197,12 +1201,13 @@ async def test_router_cancel_stops_the_process(
     assert task.status is TaskStatus.CANCELLED
 
 
-async def test_cancel_api_cancels_only_the_foreground(
+async def test_cancel_api_cancels_answer_runs_but_not_run_tasks(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """The stop button stops every live ANSWER run; spawned RUN work survives."""
     tool = BlockingTool()
     store = InMemoryTaskStore()
-    llm = ScriptedLLM([blocking_call(), blocking_call(), reply("second final")])
+    llm = BranchLLM(main=[blocking_call()], background=[reply(TASK_RESULT)])
     manager = make_manager(
         llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
     )
@@ -1211,25 +1216,17 @@ async def test_cancel_api_cancels_only_the_foreground(
 
     await runner.submit("first")
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await runner.submit("second")
-    # the queued process streams nothing: wait for its existence, not its events
-    await wait_for_condition(lambda: len(runner._processes) == TWO_PROCESSES)
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
 
-    await runner.cancel()  # hits the foreground "first"; the queued "second" survives
-    tool.release.set()
-    events = await collect_completions(queue, 2)
-    events += await collect_until(queue, is_delivered("second final"))
+    await runner.cancel()
+    events = await collect_until(queue, lambda e: isinstance(e.payload, ProcessCompleted))
 
-    by_title = {item.title: item.status for item in completions(events)}
-    assert by_title == {"first": TaskStatus.CANCELLED.value, "second": TaskStatus.DONE.value}
     assert any(isinstance(e.payload, Cancelled) for e in events)
-    # the cancelled process delivers nothing; the queued one comes via the outbox
-    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert [item.message.content for item in finished] == ["second final"]
     tasks = {task.title: task for task in await store.list(runner.dialog_id)}
-    assert tasks["first"].status is TaskStatus.CANCELLED  # the row is kept
-    assert tasks["second"].status is TaskStatus.DONE
-    assert [m.content for m in runner.history()] == ["first", "second", "second final"]
+    await wait_for_condition(lambda: tasks["first"].status is TaskStatus.CANCELLED)
+    # the spawned RUN task was not touched by the user's stop
+    await wait_for_condition(lambda: tasks[TASK_TITLE].status is TaskStatus.DONE)
 
 
 async def test_process_limit_delivers_a_canned_notice_without_an_llm_run(
@@ -1249,19 +1246,16 @@ async def test_process_limit_delivers_a_canned_notice_without_an_llm_run(
     await runner.submit("new question")
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_REFUSAL)
     assert len(llm.requests) == 1  # the notice needs no LLM run
-    tool.release.set()
-    events = await collect_completions(queue, 1)
-    events += await collect_until(queue, is_delivered(runner.history()[2].content))
-
-    assert len(completions(events)) == 1  # no new process was started for the question
     notice = runner.history()[2]
     assert notice.role is MessageRole.ASSISTANT
     assert "process limit (1)" in notice.content
     assert "start" in notice.content
-    # the queued notice is delivered once the foreground is free
-    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
-    assert deltas == ["after", notice.content]
-    assert len(llm.requests) == RETRIED_CALLS  # still no extra run
+    # phase 4: the notice is delivered immediately, its own message
+    events = await collect_until(queue, is_delivered(notice.content))
+    assert any(isinstance(e.payload, Finished) for e in events)
+    tool.release.set()
+    events += await collect_until(queue, lambda e: isinstance(e.payload, ProcessCompleted))
+    assert len(completions(events)) == 1  # only "start" ever became a process
 
 
 async def test_process_limit_notice_flushes_immediately_when_foreground_is_free(
@@ -1466,9 +1460,12 @@ async def test_task_create_tool_runs_background_process_and_delivers(
     assert background_request[1].content.endswith(TASK_PROMPT)  # date envelope + prompt
 
 
-async def test_background_delivery_waits_for_a_busy_foreground(
+async def test_run_task_result_delivers_immediately_even_mid_stream(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """Phase 4: the delivery gate is gone — a RUN-task result is broadcast the
+    moment it finishes, into its own (untagged) message, even while an answer
+    is still streaming."""
     tool = BlockingTool()
     llm = BranchLLM(main=[blocking_call(), reply("after")], background=[reply(TASK_RESULT)])
     store = InMemoryTaskStore()
@@ -1483,21 +1480,17 @@ async def test_background_delivery_waits_for_a_busy_foreground(
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
     await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
+    # delivered while the answer stream is still blocked in its tool
+    events = await collect_until(queue, is_delivered(TASK_RESULT))
+    delivered = next(e for e in events if isinstance(e.payload, Finished))
+    assert delivered.exchange_id is None  # a RUN result owns no exchange
     (task,) = [t for t in await store.list(runner.dialog_id) if t.kind is TaskKind.RUN]
-    await wait_for_condition(lambda: task.status is TaskStatus.DONE)
-    # the foreground is busy: the finished result waits in the outbox, unstamped
-    assert task.delivered_at is None
-    assert len(runner._pending_deliveries) == 1
+    await wait_for_condition(lambda: task.delivered_at is not None)
+    assert not runner._pending_deliveries
 
     tool.release.set()
-    events = await collect_until(queue, is_delivered(TASK_RESULT))
-
-    # delivered whole, after the foreground's own stream events
-    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
-    assert deltas == ["after", TASK_RESULT]
-    assert task.delivered_at is not None
-    assert not runner._pending_deliveries
-    # the foreground pulled the background final into its next iteration
+    events += await collect_until(queue, is_delivered("after"))
+    # the answer run pulled the background final into its next iteration
     second_request = llm.main_requests[1]
     assert any(TASK_RESULT in m.content for m in second_request)
 
@@ -1750,10 +1743,12 @@ async def test_wake_over_the_process_limit_publishes_a_canned_notice(
     # the foreground question is the only row)
     assert [task for task in await store.list(runner.dialog_id) if task.kind is TaskKind.RUN] == []
 
-    tool.release.set()
+    # phase 4: the notice delivers immediately, no gate to wait behind
     events = await collect_until(queue, is_delivered(note.content))
+    tool.release.set()
+    events += await collect_until(queue, is_delivered("after"))
     deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
-    assert deltas == ["after", note.content]  # flushed once the foreground is free
+    assert deltas == [note.content, "after"]
     assert len(llm.requests) == RETRIED_CALLS  # the notice needed no LLM run
 
 
@@ -2163,12 +2158,9 @@ async def test_recover_interrupted_restarts_orphaned_run_tasks(
 
     assert task.status is TaskStatus.DONE  # the restarted process finished it
     assert task.delivered_at is not None
-    # queue-mode: the process never became the foreground — the completion
-    # marker precedes the delivered events (a foreground would stream first)
     done = completions(events)
     assert [(item.title, item.status) for item in done] == [(TASK_TITLE, TaskStatus.DONE.value)]
     assert isinstance(events[-1].payload, Finished)
-    assert runner._foreground_id is None
     # the RUN restart branch is self-contained: background prompt + task prompt
     request = llm.requests[0]
     assert request[0].content == BACKGROUND_TASK_PROMPT
@@ -2330,10 +2322,10 @@ async def test_cancel_takes_absorbed_clarifications_with_it(
     assert not any(isinstance(e.payload, Finished) for e in events)
 
 
-async def test_failed_foreground_still_drains_the_queue(
+async def test_a_failed_answer_does_not_affect_the_sibling_stream(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A provider failure in the foreground must not wedge queued answers."""
+    """One run failing on the provider leaves the other exchange untouched."""
     tool = BlockingTool()
     store = InMemoryTaskStore()
     llm = ExhaustedFailsLLM([blocking_call(), reply("second final")])
@@ -2347,23 +2339,19 @@ async def test_failed_foreground_still_drains_the_queue(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.submit("second")
-    # wait for the queued answer to consume its scripted reply and finish:
-    # releasing earlier would race it for the script with the foreground
-    await collect_completions(queue, 1)
-    tool.release.set()  # foreground iteration 2 hits the dry script -> Failed
-
     events = await collect_until(queue, is_delivered("second final"))
+    tool.release.set()  # the first run's iteration 2 hits the dry script -> Failed
+    events += await collect_until(queue, lambda e: isinstance(e.payload, Failed))
 
     tasks = {task.title: task for task in await store.list(runner.dialog_id)}
-    assert tasks["first"].status is TaskStatus.FAILED
-    assert tasks["second"].status is TaskStatus.DONE
-    assert any(isinstance(e.payload, Failed) for e in events)
+    await wait_for_condition(lambda: tasks["first"].status is TaskStatus.FAILED)
+    await wait_for_condition(lambda: tasks["second"].status is TaskStatus.DONE)
 
 
-async def test_router_cancel_targets_a_queued_background_answer(
+async def test_router_cancel_targets_one_exchange_while_the_other_streams(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """CANCEL(target_id) can stop a queued answer while the foreground streams on."""
+    """CANCEL(exchange) stops one obligation; the other keeps streaming."""
     tool = BlockingTool()
     store = InMemoryTaskStore()
     llm = ScriptedLLM([blocking_call(), blocking_call(), reply("first final")])
@@ -2378,23 +2366,23 @@ async def test_router_cancel_targets_a_queued_background_answer(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await runner.submit("second")
     await wait_for_condition(lambda: len(runner._processes) == TWO_PROCESSES)
-    queued = next(p for p in runner._processes.values() if p.id != runner._foreground_id)
-    assert queued.exchange_id is not None
+    second = next(p for p in runner._processes.values() if p.title == "second")
+    assert second.exchange_id is not None
 
     router.action = RouteAction.COMMAND
-    router.decide_cancel(queued.exchange_id)
-    await runner.submit("cancel the queued one")
+    router.decide_cancel(second.exchange_id)
+    await runner.submit("cancel the second one")
     await wait_for_condition(lambda: len(runner._processes) == 1)
     tool.release.set()
     events = await collect_until(queue, is_delivered("first final"))
 
     tasks = {task.title: task for task in await store.list(runner.dialog_id)}
     assert tasks["second"].status is TaskStatus.CANCELLED
-    # the store write lands after the terminal broadcast: wait, not assert
     await wait_for_condition(lambda: tasks["first"].status is TaskStatus.DONE)
-    # the foreground never lost its slot and streamed its own answer
-    deltas = [e.payload.text for e in events if isinstance(e.payload, TextDelta)]
-    assert deltas == ["first final"]
+    assert any(
+        isinstance(e.payload, Finished) and e.payload.message.content == "first final"
+        for e in events
+    )
 
 
 async def test_redelivery_threads_the_reply_and_skips_silent_results(

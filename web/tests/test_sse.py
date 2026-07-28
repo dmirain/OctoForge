@@ -87,8 +87,11 @@ PAYLOAD_CASES: list[tuple[LoopEvent, dict[str, object]]] = [
 ]
 
 
+EXCHANGE_ID = "x-1"
+
+
 def make_envelope(payload: LoopEvent) -> ConversationEvent:
-    return ConversationEvent(dialog_id=DIALOG_ID, seq=SEQ, payload=payload)
+    return ConversationEvent(dialog_id=DIALOG_ID, seq=SEQ, payload=payload, exchange_id=EXCHANGE_ID)
 
 
 @pytest.mark.parametrize(("event", "expected"), PAYLOAD_CASES)
@@ -98,6 +101,7 @@ def test_event_to_payload(event: LoopEvent, expected: dict[str, object]) -> None
     assert payload == {
         "seq": SEQ,
         "dialog_id": DIALOG_ID,
+        "exchange_id": EXCHANGE_ID,
         **expected,
     }
 

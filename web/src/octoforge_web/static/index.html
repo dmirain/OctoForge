@@ -158,7 +158,6 @@
     const nameEl = document.getElementById("name-input");
     const greetingEl = document.getElementById("greeting");
 
-    let currentBubble = null;
     let eventsAbort = null;
 
     function userId() {
@@ -199,23 +198,32 @@
       scrollToBottom();
     }
 
-    function appendDelta(text) {
-      if (!currentBubble) {
-        currentBubble = addMessage("assistant", "");
+    // one live bubble per exchange: answers of different questions stream
+    // concurrently, each into its own message ("" groups untagged events)
+    const liveBubbles = new Map();
+
+    function bubbleOf(exchangeId) {
+      const key = exchangeId || "";
+      let bubble = liveBubbles.get(key);
+      if (!bubble) {
+        bubble = addMessage("assistant", "");
+        liveBubbles.set(key, bubble);
       }
-      currentBubble.textContent += text;
+      return bubble;
+    }
+
+    function appendDelta(text, exchangeId) {
+      bubbleOf(exchangeId).textContent += text;
       scrollToBottom();
     }
 
-    function finalizeBubble(content, interrupted) {
-      if (!currentBubble) {
-        currentBubble = addMessage("assistant", "");
-      }
-      currentBubble.textContent = content;
+    function finalizeBubble(content, interrupted, exchangeId) {
+      const bubble = bubbleOf(exchangeId);
+      bubble.textContent = content;
       if (interrupted) {
-        currentBubble.classList.add("interrupted");
+        bubble.classList.add("interrupted");
       }
-      currentBubble = null;
+      liveBubbles.delete(exchangeId || "");
     }
 
     function setRunning(running) {
@@ -225,10 +233,10 @@
     function handleEvent(event) {
       switch (event.type) {
         case "text_delta":
-          appendDelta(event.text);
+          appendDelta(event.text, event.exchange_id);
           break;
         case "assistant_message":
-          finalizeBubble(event.content, event.interrupted);
+          finalizeBubble(event.content, event.interrupted, event.exchange_id);
           break;
         case "tool_call_requested":
           setRunning(true);
@@ -241,9 +249,11 @@
           addStep(`✕ ${event.name}: ${event.error}`);
           break;
         case "finished":
+          liveBubbles.delete(event.exchange_id || "");
           setRunning(false);
           break;
         case "cancelled":
+          liveBubbles.delete(event.exchange_id || "");
           setRunning(false);
           break;
         case "failed":

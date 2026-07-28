@@ -37,8 +37,16 @@ def encode_heartbeat() -> str:
 
 
 def event_to_payload(event: ConversationEvent) -> dict[str, Any]:
-    """Convert a conversation event into a JSON-serializable payload."""
-    base: dict[str, Any] = {"seq": event.seq, "dialog_id": event.dialog_id}
+    """Convert a conversation event into a JSON-serializable payload.
+
+    `exchange_id` routes the event to its per-exchange bubble: answers of
+    different questions stream concurrently, each into its own message.
+    """
+    base: dict[str, Any] = {
+        "seq": event.seq,
+        "dialog_id": event.dialog_id,
+        "exchange_id": event.exchange_id,
+    }
     return base | _event_details(event.payload)
 
 

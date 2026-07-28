@@ -97,11 +97,17 @@ NUDGE_AFTER_SECONDS = 300.0
 
 @dataclass(frozen=True, slots=True)
 class ConversationEvent:
-    """A loop event wrapped with dialog metadata."""
+    """A loop event wrapped with dialog metadata.
+
+    `exchange_id` names the obligation the event belongs to (None for
+    RUN-task deliveries and broker notices): transports keep one draft per
+    exchange, so every answer streams into its own message.
+    """
 
     dialog_id: str
     seq: int
     payload: LoopEvent
+    exchange_id: str | None = None
 
 
 def _latest_assistant_with_content(branch: list[ChatMessage]) -> ChatMessage | None:
@@ -252,6 +258,7 @@ class _Delivery:
 
     events: tuple[LoopEvent, ...]
     task_id: str | None
+    exchange_id: str | None = None
 
 
 _Command = _Submit | _ProcessTerminated | _Flush
@@ -332,7 +339,6 @@ class ConversationRunner:
         self._exchanges = exchanges
         self._narrative = history
         self._processes: dict[str, _Process] = {}
-        self._foreground_id: str | None = None
         self._pending_deliveries: deque[_Delivery] = deque()
         # serializes the limit-check → process-create sequence between the
         # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
@@ -480,7 +486,7 @@ class ConversationRunner:
         self._pending_deliveries.append(
             _Delivery(events=(Failed(error=RESTART_LIMIT_ERROR),), task_id=task.id)
         )
-        await self._flush_if_free()
+        await self._flush_deliveries()
 
     async def _start_orphaned(self, task: Task) -> None:
         """Start the replacement background process of an orphaned task."""
@@ -527,12 +533,13 @@ class ConversationRunner:
         delivery = _Delivery(
             events=(TextDelta(text=content), Finished(message=notice)),
             task_id=None,
+            exchange_id=exchange_id,
         )
         if exchange_id is not None:
             self._pending_deliveries.appendleft(delivery)
         else:
             self._pending_deliveries.append(delivery)
-        await self._flush_if_free()
+        await self._flush_deliveries()
 
     async def _prepare_process_task(
         self,
@@ -648,7 +655,7 @@ class ConversationRunner:
         elif isinstance(command, _ProcessTerminated):
             await self._handle_terminated(command)
         elif isinstance(command, _Flush):
-            await self._flush_if_free()
+            await self._flush_deliveries()
 
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
@@ -734,9 +741,14 @@ class ConversationRunner:
         return await self._messages.find_by_client_id(self._dialog.id, client_message_id)
 
     def _handle_cancel(self) -> None:
-        foreground = self._foreground()
-        if foreground is not None:
-            foreground.control.cancel()
+        """Stop every live answer run (the user's stop button / /cancel).
+
+        RUN tasks (spawned/cron work) keep going: they are background jobs
+        with their own lifecycle, cancellable via task_delete or the router.
+        """
+        for process in self._processes.values():
+            if process.exchange_id is not None:
+                process.control.cancel()
 
     async def _handle_terminated(self, command: _ProcessTerminated) -> None:
         """Queue the delivery of a terminated task; flush when the foreground is free.
@@ -761,7 +773,7 @@ class ConversationRunner:
             await self._mark_streamed_delivered(task)
         else:
             self._enqueue_terminal(command.terminal, task)
-        await self._flush_if_free()
+        await self._flush_deliveries()
 
     async def _settle_exchange(self, command: _ProcessTerminated) -> None:
         """Move the finished run's exchange to its next state.
@@ -832,6 +844,7 @@ class ConversationRunner:
                         ),
                     ),
                     task_id=task.id,
+                    exchange_id=_task_exchange(task),
                 )
             )
         elif task.status is TaskStatus.FAILED:
@@ -842,6 +855,7 @@ class ConversationRunner:
                         Failed(error=task.error or DEFAULT_TASK_ERROR),
                     ),
                     task_id=task.id,
+                    exchange_id=_task_exchange(task),
                 )
             )
 
@@ -861,6 +875,7 @@ class ConversationRunner:
                         ),
                     ),
                     task_id=task.id,
+                    exchange_id=_task_exchange(task),
                 )
             )
         else:
@@ -868,6 +883,7 @@ class ConversationRunner:
                 _Delivery(
                     events=(_delivery_started(task), Failed(error=terminal.error)),
                     task_id=task.id,
+                    exchange_id=_task_exchange(task),
                 )
             )
 
@@ -876,10 +892,6 @@ class ConversationRunner:
         if task.status in (TaskStatus.DONE, TaskStatus.FAILED):
             with suppress(TaskNotFoundError):  # a racing task_delete may drop the row
                 await self._tasks.mark_delivered(task.id)
-
-    async def _flush_if_free(self) -> None:
-        if self._foreground() is None:
-            await self._flush_deliveries()
 
     async def _flush_deliveries(self) -> None:
         """Broadcast queued deliveries, stamping each task delivered only after sending.
@@ -901,7 +913,7 @@ class ConversationRunner:
                 delivery = self._pending_deliveries[0]
                 accepted = 0
                 for event in delivery.events:
-                    accepted = self._broadcast(event)
+                    accepted = self._broadcast(event, exchange_id=delivery.exchange_id)
                 if accepted == 0:
                     # the terminal (last) event reached no queue: do not stamp
                     # it delivered — the delivery stays queued for a flush with
@@ -1042,17 +1054,18 @@ class ConversationRunner:
         )
         process.synced_len = len(process.branch)
         process.watermark = len(self._narrative)
-        if self._foreground() is None:
-            self._foreground_id = process.id
-            # the reply target must reach the transport BEFORE the first
-            # token: a reply can only be set when the message is created
-            self._broadcast(
-                ProcessStarted(
-                    process_id=process.id,
-                    title=process.title,
-                    source_client_message_id=process.source_client_message_id,
-                )
-            )
+        # the reply target must reach the transport BEFORE the first token:
+        # a reply can only be set when the message is created. Every answer
+        # run streams into its own per-exchange draft — there is no
+        # foreground slot to wait for.
+        self._broadcast(
+            ProcessStarted(
+                process_id=process.id,
+                title=process.title,
+                source_client_message_id=process.source_client_message_id,
+            ),
+            exchange_id=exchange.id,
+        )
 
     def _system_message(self) -> ChatMessage:
         return ChatMessage(role=MessageRole.SYSTEM, content=self._prompts.get(SYSTEM_PROMPT_NAME))
@@ -1208,8 +1221,8 @@ class ConversationRunner:
     def _fail_run(self, process: _Process, error: str) -> LoopEvent:
         """Broadcast and return a Failed terminal for the process."""
         terminal = Failed(error=error)
-        if self._foreground_id == process.id:
-            self._broadcast(terminal)
+        if process.exchange_id is not None:
+            self._broadcast(terminal, exchange_id=process.exchange_id)
         return terminal
 
     async def _stream_once(self, process: _Process) -> LoopEvent:
@@ -1234,8 +1247,8 @@ class ConversationRunner:
                 if isinstance(event, Finished):
                     # reply threading: the loop knows nothing about tasks
                     out = replace(event, source_client_message_id=process.source_client_message_id)
-                if self._foreground_id == process.id:
-                    self._broadcast(out)
+                if process.exchange_id is not None:
+                    self._broadcast(out, exchange_id=process.exchange_id)
                 if isinstance(out, (Finished, Cancelled, Failed)):
                     terminal = out
         except ContextOverflowError:
@@ -1245,15 +1258,15 @@ class ConversationRunner:
                 "process loop crashed: dialog=%s process=%s", self._dialog.id, process.id
             )
             terminal = Failed(error=format_error(exc))
-            if self._foreground_id == process.id:
-                self._broadcast(terminal)
+            if process.exchange_id is not None:
+                self._broadcast(terminal, exchange_id=process.exchange_id)
         return terminal
 
     def _terminate_process(
         self, process: _Process, status: TaskStatus, terminal: LoopEvent
     ) -> None:
         """Remove the process, announce completion and hand the outcome to the actor."""
-        streamed = self._foreground_id == process.id
+        streamed = process.exchange_id is not None
         logger.info(
             "process terminated: dialog=%s task=%s exchange=%s status=%s streamed=%s",
             self._dialog.id,
@@ -1264,7 +1277,8 @@ class ConversationRunner:
         )
         self._remove_process(process)
         self._broadcast(
-            ProcessCompleted(process_id=process.id, title=process.title, status=status.value)
+            ProcessCompleted(process_id=process.id, title=process.title, status=status.value),
+            exchange_id=process.exchange_id,
         )
         self._inbox.put_nowait(
             _ProcessTerminated(
@@ -1361,13 +1375,6 @@ class ConversationRunner:
 
     def _remove_process(self, process: _Process) -> None:
         self._processes.pop(process.id, None)
-        if self._foreground_id == process.id:
-            self._foreground_id = None
-
-    def _foreground(self) -> _Process | None:
-        if self._foreground_id is None:
-            return None
-        return self._processes.get(self._foreground_id)
 
     def _active_titles(self) -> str:
         return ", ".join(process.title for process in self._processes.values())
@@ -1393,7 +1400,7 @@ class ConversationRunner:
             self._dialog.id, message, usage=usage, client_message_id=client_message_id
         )
 
-    def _broadcast(self, event: LoopEvent) -> int:
+    def _broadcast(self, event: LoopEvent, exchange_id: str | None = None) -> int:
         """Fan the event out; return how many subscriber queues accepted it.
 
         A slow subscriber's full queue drops stream chatter (deltas, tool
@@ -1408,6 +1415,7 @@ class ConversationRunner:
             dialog_id=self._dialog.id,
             seq=self._seq,
             payload=event,
+            exchange_id=exchange_id,
         )
         critical = isinstance(event, _CRITICAL_EVENTS)
         accepted = 0

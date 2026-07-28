@@ -406,15 +406,15 @@ async def test_process_started_does_not_retarget_a_live_draft(
     bridge = make_bridge(client, manager)
 
     await bridge._render(
-        ProcessStarted(process_id="p1", title="one", source_client_message_id="777")
+        ProcessStarted(process_id="p1", title="one", source_client_message_id="777"), "x1"
     )
-    await bridge._render(TextDelta(text="draft text"))
+    await bridge._render(TextDelta(text="draft text"), "x1")
     assert client.replies == [QUESTION_MESSAGE_ID]
     await bridge._render(
-        ProcessStarted(process_id="p2", title="two", source_client_message_id="888")
+        ProcessStarted(process_id="p2", title="two", source_client_message_id="888"), "x1"
     )
 
-    assert bridge._draft.reply_to == QUESTION_MESSAGE_ID  # unchanged
+    assert bridge._drafts["x1"].reply_to == QUESTION_MESSAGE_ID  # unchanged
     await manager.stop_all()
 
 
