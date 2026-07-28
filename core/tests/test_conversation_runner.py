@@ -10,11 +10,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.agent.branch import (
-    CLARIFICATION_NOTE_TEMPLATE,
-    OTHER_TASK_NOTE_TEMPLATE,
-    TASK_NOTE_TEMPLATE,
-)
+from octoforge_core.agent.branch import CLARIFICATION_NOTE_TEMPLATE, TASK_NOTE_TEMPLATE
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
     Cancelled,
@@ -893,7 +889,7 @@ async def test_start_new_queues_behind_the_busy_foreground(
     # the queued process's branch marks the foreground's question as taken:
     # each question is answered by exactly one process
     queued_branch = llm.requests[1]
-    assert any(OTHER_TASK_NOTE_TEMPLATE.format(content="first") in m.content for m in queued_branch)
+    assert not any(m.role is MessageRole.USER and m.content == "first" for m in queued_branch)
     done = completions(events)
     assert {item.title for item in done} == {"first", "second"}
     assert all(item.status == TaskStatus.DONE.value for item in done)
@@ -1141,13 +1137,9 @@ async def test_bring_back_starts_a_new_answer_process(
     # takes the slot away from "first"), and its branch sees the whole
     # narrative, including the other queued answer
     bring_back_request = llm.requests[2]
-    # "first" is still being answered by the live foreground -> marked taken;
-    # "second" already finished, so its question is plain history
-    assert [m.content for m in bring_back_request[1:-1]] == [
-        OTHER_TASK_NOTE_TEMPLATE.format(content="first"),
-        "second",
-        "second final",
-    ]
+    # "first" is still owed by the live foreground -> not this run's business;
+    # "second" is already answered, so its question is plain history
+    assert [m.content for m in bring_back_request[1:-1]] == ["second", "second final"]
     assert "bring back the first one" in bring_back_request[-1].content
 
     tool.release.set()

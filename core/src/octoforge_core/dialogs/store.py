@@ -7,9 +7,10 @@ objects (`Dialog`, `ChatMessage` from the shared kernel) at the boundary.
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import delete, func, insert, select
+from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -326,6 +327,20 @@ class SqlAlchemyExchangeRepository:
                 .order_by(ExchangeRow.created_at)
             )
             return [_to_exchange(row) for row in result.all()]
+
+    async def reopen_in_progress(self) -> int:
+        """Reset every IN_PROGRESS exchange to OPEN; return how many (startup)."""
+        async with self._session_factory() as session:
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(ExchangeRow)
+                    .where(ExchangeRow.status == ExchangeStatus.IN_PROGRESS.value)
+                    .values(status=ExchangeStatus.OPEN.value, owner_task_id=None)
+                ),
+            )
+            await session.commit()
+            return result.rowcount or 0
 
     async def set_status(
         self,

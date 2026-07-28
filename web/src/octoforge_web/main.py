@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from octoforge_core import (
     ConversationManager,
     DialogRepository,
+    ExchangeRepository,
     SqlAlchemyTaskStore,
     bootstrap_schema,
     build_agent_loop,
@@ -131,6 +132,7 @@ class Runtime:
     secret_links: SecretLinkService
     dialogs: DialogRepository
     summary_store: SummaryStore
+    exchanges: ExchangeRepository
 
 
 @asynccontextmanager
@@ -288,6 +290,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     secret_links=secret_links,
                     dialogs=dialogs,
                     summary_store=summary_store,
+                    exchanges=exchanges,
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, telegram)
@@ -331,6 +334,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.secret_links = rt.secret_links
             app.state.dialogs = rt.dialogs
             app.state.summary_store = rt.summary_store
+            app.state.exchanges = rt.exchanges
             yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)

@@ -231,6 +231,9 @@ async def test_dialog_is_get_or_created_per_user(
     async with session_factory() as session:
         dialogs = (await session.scalars(select(DialogRow))).all()
     assert len(dialogs) == EXPECTED_TWO_DIALOGS
+    # settle-exchange writes happen after the terminal event: stop the actors
+    # before the fixture disposes the engine, or a pump races a closed pool
+    await manager.stop_all()
     assert {row.user_id for row in dialogs} == {USER_A, USER_B}
     assert all(row.channel == CHANNEL for row in dialogs)
 
@@ -276,6 +279,7 @@ async def test_post_message_deduplicates_client_message_id(
         "two",
         REPLY_CONTENT,
     ]
+    await manager.stop_all()
 
 
 async def test_users_are_isolated(session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -290,6 +294,7 @@ async def test_users_are_isolated(session_factory: async_sessionmaker[AsyncSessi
 
     assert queue_b.empty()
     assert all(SECRET_A not in message.content for message in runner_b.history())
+    await manager.stop_all()
 
 
 async def test_cancel_accepted(session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -298,6 +303,7 @@ async def test_cancel_accepted(session_factory: async_sessionmaker[AsyncSession]
     result = await cancel_endpoint(USER_A, CHANNEL, manager)
 
     assert result.status == STATUS_ACCEPTED
+    await manager.stop_all()
 
 
 async def test_events_endpoint_streams_frames(
@@ -333,6 +339,7 @@ async def test_events_endpoint_streams_frames(
     assert all(payload["dialog_id"] for payload in payloads)
     seqs = [payload["seq"] for payload in payloads]
     assert seqs == sorted(seqs)
+    await manager.stop_all()
 
 
 def test_health(client: TestClient) -> None:

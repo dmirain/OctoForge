@@ -343,6 +343,7 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     assert client.sent == [(CHAT_ID, CRON_RESULT, PARSE_MODE_HTML)]
     await wait_until(lambda: task.delivered_at is not None)
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_single_delta_sends_one_message(
@@ -358,6 +359,7 @@ async def test_single_delta_sends_one_message(
     assert client.sent == [(CHAT_ID, REPLY, PARSE_MODE_HTML)]
     assert client.edited == []
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_answer_replies_to_its_question(
@@ -373,6 +375,7 @@ async def test_answer_replies_to_its_question(
 
     assert client.replies == [777]
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_empty_final_renders_nothing(
@@ -390,6 +393,7 @@ async def test_empty_final_renders_nothing(
     assert client.sent == []
     assert client.edited == []
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_process_started_does_not_retarget_a_live_draft(
@@ -411,6 +415,7 @@ async def test_process_started_does_not_retarget_a_live_draft(
     )
 
     assert bridge._draft.reply_to == QUESTION_MESSAGE_ID  # unchanged
+    await manager.stop_all()
 
 
 async def test_keyless_submit_sends_a_plain_message(
@@ -425,6 +430,7 @@ async def test_keyless_submit_sends_a_plain_message(
 
     assert client.replies == [None]
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_deltas_stream_into_one_edited_message(
@@ -440,6 +446,7 @@ async def test_deltas_stream_into_one_edited_message(
     assert client.sent == [(CHAT_ID, "hel", PARSE_MODE_HTML)]
     assert client.edited == [(CHAT_ID, 1, "hello", PARSE_MODE_HTML)]
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_long_reply_is_split_into_telegram_sized_messages(
@@ -460,6 +467,7 @@ async def test_long_reply_is_split_into_telegram_sized_messages(
     # only the head of a split answer replies; continuations are plain
     assert client.replies == [555, None]
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_tool_call_renders_status_line_before_the_answer(
@@ -481,6 +489,7 @@ async def test_tool_call_renders_status_line_before_the_answer(
     assert client.sent == [(CHAT_ID, tool_line, PARSE_MODE_HTML)]
     assert client.edited == [(CHAT_ID, 1, expected, PARSE_MODE_HTML)]
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_cancel_appends_the_cancelled_line(
@@ -500,6 +509,7 @@ async def test_cancel_appends_the_cancelled_line(
 
     assert client.current_text() == expected
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_llm_failure_appends_the_error_line(
@@ -515,6 +525,7 @@ async def test_llm_failure_appends_the_error_line(
     assert client.current_text().startswith(PARTIAL)
     assert "RuntimeError: boom" in client.current_text()
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_markdown_reply_is_delivered_as_html(
@@ -531,6 +542,7 @@ async def test_markdown_reply_is_delivered_as_html(
 
     assert client.sent == [(CHAT_ID, expected_html, PARSE_MODE_HTML)]
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_table_reply_is_upgraded_to_a_rich_message(
@@ -549,6 +561,7 @@ async def test_table_reply_is_upgraded_to_a_rich_message(
     # the in-place rich upgrade edits the same message: threading survives
     assert client.replies[0] == QUESTION_MESSAGE_ID
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_plain_reply_stays_on_the_legacy_path(
@@ -563,6 +576,7 @@ async def test_plain_reply_stays_on_the_legacy_path(
 
     assert client.rich_edited == []
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_split_reply_is_not_upgraded(
@@ -578,6 +592,7 @@ async def test_split_reply_is_not_upgraded(
 
     assert client.rich_edited == []
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_rich_upgrade_can_be_disabled(
@@ -593,6 +608,7 @@ async def test_rich_upgrade_can_be_disabled(
 
     assert client.rich_edited == []
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_a_failing_rich_upgrade_keeps_the_html_version(
@@ -610,3 +626,4 @@ async def test_a_failing_rich_upgrade_keeps_the_html_version(
     assert client.rich_edited == []
     assert client.current_text() == content  # the HTML draft survived
     await bridge.aclose()
+    await manager.stop_all()

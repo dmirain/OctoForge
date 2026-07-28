@@ -1,16 +1,19 @@
 """Async engine and session factories plus schema bootstrap."""
 
+import uuid
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Connection, inspect
+from sqlalchemy import Connection, event, inspect
+from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import AsyncAdaptedQueuePool, ConnectionPoolEntry
 
 # Imported for their side effect: every model module has to register its tables
 # on `Base.metadata` before `create_all` runs (same list as `migrations/env.py`).
@@ -34,8 +37,80 @@ SQLITE_DIALECT = "sqlite"
 
 
 def create_engine(database_url: str) -> AsyncEngine:
-    """Create an async SQLAlchemy engine for the given database URL."""
+    """Create an async SQLAlchemy engine for the given database URL.
+
+    An in-memory SQLite database exists per CONNECTION: with the default
+    pool, a second pooled connection silently gets its own empty database and
+    concurrent writers (the dialog actor and its process pumps) lose updates
+    to a ghost. `:memory:` is therefore mapped to a unique named shared-cache
+    database — every session gets its own connection, all connections see the
+    same data, and SQLite does its own locking.
+
+    Two follow-on gotchas, both found by a live 1-in-3 flake of
+    `test_dialog_is_get_or_created_per_user` (2026-07-28) and reproduced in
+    isolation before being fixed here:
+
+    - SQLAlchemy's aiosqlite dialect auto-selects `StaticPool` (one physical
+      connection reused by every session) whenever the URL's `mode=memory`
+      query param is present — `cache=shared` does not change that heuristic.
+      Pinning one shared connection is worse than the ghost-DB problem it
+      replaces: an unrelated session's implicit rollback-on-close (e.g. a
+      plain SELECT whose `async with session_factory()` block never calls
+      `commit()`) runs on the *same* physical connection and silently wipes
+      another session's just-inserted, not-yet-committed row — reproduced
+      directly (a concurrent read-only session closing mid-write made a
+      committed INSERT vanish) and confirmed live: an exchange settling to
+      ANSWERED logged as done, and a whole user message, both never landed in
+      the database. `poolclass=AsyncAdaptedQueuePool` is forced explicitly so
+      every session gets its own connection instead (same class a real file
+      URL would get).
+    - Real per-session connections then hit the other side of the trade-off:
+      SQLite's shared-cache mode raises `OperationalError: database table is
+      locked` (SQLITE_LOCKED) the moment two connections touch the same
+      table while one has an uncommitted write — and, unlike SQLITE_BUSY,
+      confirmed NOT to honor `busy_timeout` (a concurrent writer to an
+      unrelated table failed immediately instead of waiting for it to
+      commit). SQLite fundamentally allows one writer at a time anyway, so
+      `pool_size=1, max_overflow=0` makes that explicit: every session in
+      this process gets the one connection in turn (`AsyncAdaptedQueuePool`
+      blocks a second checkout instead of opening another), which serializes
+      the rare true overlap without ever deadlocking — every store method
+      here opens and fully closes its own session before returning, so no
+      code path holds one checkout while awaiting a second. The pool still
+      keeps that one connection open between checkouts, so the shared-cache
+      database outlives individual sessions until `engine.dispose()`.
+      `PRAGMA read_uncommitted=1` is kept as a second line of defense (it
+      alone was enough for the read/write case, just not writer/writer).
+
+    Tests only; file/Postgres URLs pass through untouched.
+    """
+    if ":memory:" in database_url:
+        name = f"mem_{uuid.uuid4().hex}"
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///file:{name}?mode=memory&cache=shared&uri=true",
+            poolclass=AsyncAdaptedQueuePool,
+            pool_size=1,
+            max_overflow=0,
+        )
+        event.listen(engine.sync_engine, "connect", _enable_read_uncommitted)
+        return engine
     return create_async_engine(database_url)
+
+
+def _enable_read_uncommitted(
+    dbapi_connection: DBAPIConnection, _record: ConnectionPoolEntry
+) -> None:
+    """Relax shared-cache table locking so concurrent sessions don't SQLITE_LOCKED.
+
+    Fires on every new pooled connection (`connect`, not `checkout`): the
+    pragma is per-connection state, so it must be reapplied whenever
+    `AsyncAdaptedQueuePool` opens a fresh one.
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA read_uncommitted=1")
+    finally:
+        cursor.close()
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

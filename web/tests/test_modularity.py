@@ -10,6 +10,7 @@ composition root.
 """
 
 import asyncio
+import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -209,7 +210,8 @@ class FakeSearchProvider:
 class RootLLM:
     """LLMClient stub scripting the dialog and recording every request.
 
-    complete() serves the router (always inject); stream() drives the dialog:
+    complete() serves the router (always continue into the live exchange);
+    stream() drives the dialog:
     the first call waits on a gate (so the second user message meets an active
     process and exercises the router), then asks for web_search, then for
     recall, then finishes with the final reply.
@@ -226,6 +228,9 @@ class RootLLM:
         tools: list[ToolSpec] | None = None,
     ) -> Completion:
         self.complete_requests.append(list(messages))
+        # the live exchange id is read from the prompt itself: the router's
+        # whole input is the human-readable exchange listing
+        match = re.search(r"id=([0-9a-f]{32})", messages[0].content)
         return Completion(
             message=ChatMessage(
                 role=MessageRole.ASSISTANT,
@@ -234,7 +239,11 @@ class RootLLM:
                     ToolCall(
                         id="route-1",
                         name=ROUTE_TOOL_NAME,
-                        arguments={"ops": [{"action": "inject", "target_id": None}]},
+                        arguments={
+                            "action": "continue",
+                            "exchange_id": match.group(1) if match else None,
+                            "cancel_exchange_ids": [],
+                        },
                     ),
                 ),
             )

@@ -9,7 +9,7 @@ instruction store (type=memory) and are deleted through the same facade.
 """
 
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
 from typing import Annotated, Any, TypeVar
@@ -26,7 +26,11 @@ from octoforge_core.admin.api import (
 from octoforge_core.context.api import DialogueSummary, SummaryStore
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError, CronStore
 from octoforge_core.datasets.api import Dataset, DatasetRecord
-from octoforge_core.dialogs.api import DialogNotFoundError, DialogRepository
+from octoforge_core.dialogs.api import (
+    DialogNotFoundError,
+    DialogRepository,
+    ExchangeRepository,
+)
 from octoforge_core.instructions.api import (
     Instruction,
     InstructionNotFoundError,
@@ -43,6 +47,7 @@ from octoforge_web.deps import (
     get_conversation_manager,
     get_cron_store,
     get_dialog_repository,
+    get_exchange_repository,
     get_instruction_service,
     get_summary_store,
     get_task_store,
@@ -57,11 +62,30 @@ TaskStoreDep = Annotated[TaskStore, Depends(get_task_store)]
 InstructionsDep = Annotated[InstructionService, Depends(get_instruction_service)]
 ManagerDep = Annotated[ConversationManager, Depends(get_conversation_manager)]
 DialogsDep = Annotated[DialogRepository, Depends(get_dialog_repository)]
+ExchangesDep = Annotated[ExchangeRepository, Depends(get_exchange_repository)]
 SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
 LimitDep = Annotated[int | None, Query(ge=1)]
 OffsetDep = Annotated[int | None, Query(ge=0)]
 
 DELETED_STATUS = {"status": "deleted"}
+
+
+@dataclass(frozen=True, slots=True)
+class _DialogCascade:
+    """Per-module deleters composed by the dialog-deletion endpoint."""
+
+    tasks: TaskStore
+    summaries: SummaryStore
+    exchanges: ExchangeRepository
+
+
+def _dialog_cascade(
+    tasks: TaskStoreDep,
+    summaries: SummariesDep,
+    exchanges: ExchangesDep,
+) -> _DialogCascade:
+    return _DialogCascade(tasks=tasks, summaries=summaries, exchanges=exchanges)
+
 
 T = TypeVar("T")
 
@@ -111,10 +135,10 @@ async def delete_dialog(
     dialog_id: str,
     dialogs: DialogsDep,
     manager: ManagerDep,
-    tasks_store: TaskStoreDep,
-    summaries_store: SummariesDep,
+    stores: Annotated[_DialogCascade, Depends(_dialog_cascade)],
 ) -> dict[str, str]:
-    """Delete a dialog with everything it owns: messages, tasks, summaries.
+    """Delete a dialog with everything it owns: messages, tasks, summaries,
+    exchanges.
 
     The live runner (if any) is stopped first, so no actor keeps writing
     into rows that are about to disappear; the next contact of the same
@@ -124,8 +148,9 @@ async def delete_dialog(
     try:
         dialog = await dialogs.get(dialog_id)
         await manager.evict(dialog.user_id, dialog.channel)
-        await summaries_store.delete_for_dialog(dialog_id)
-        await tasks_store.delete_for_dialog(dialog_id)
+        await stores.summaries.delete_for_dialog(dialog_id)
+        await stores.tasks.delete_for_dialog(dialog_id)
+        await stores.exchanges.delete_for_dialog(dialog_id)
         await dialogs.delete(dialog_id)
     except DialogNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc

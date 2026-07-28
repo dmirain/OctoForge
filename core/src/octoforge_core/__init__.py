@@ -54,7 +54,12 @@ from octoforge_core.db.engine import (
     create_session_factory,
     init_db,
 )
-from octoforge_core.dialogs.api import DialogNotFoundError, DialogRepository, MessageRepository
+from octoforge_core.dialogs.api import (
+    DialogNotFoundError,
+    DialogRepository,
+    ExchangeRepository,
+    MessageRepository,
+)
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import (
@@ -123,6 +128,7 @@ __all__ = [
     "EmbeddingClient",
     "EmbeddingConfig",
     "ErrorKind",
+    "ExchangeRepository",
     "Failed",
     "Finished",
     "InstructionService",

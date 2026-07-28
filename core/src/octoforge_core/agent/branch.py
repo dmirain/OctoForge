@@ -7,9 +7,12 @@ sets. Here the marks are derived from durable exchange state instead:
 
 - the run's own question -> "your task";
 - later messages of the same exchange -> clarifications of that task;
-- questions of OTHER live exchanges -> being handled elsewhere;
-- everything else (closed exchanges, legacy rows, assistant messages) ->
-  plain history.
+- questions of OTHER live exchanges -> DROPPED: someone else owes them, and
+  a marked "do not answer this" sitting at the end of the branch still pulls
+  the model into answering it (measured on the live 28.07 probe — both runs
+  answered the newest question). A run sees its own obligation and the
+  resolved history, not other people's open ones;
+- everything else (answers, notices, legacy rows) -> plain history.
 
 Marks live in the branch copy only: the narrative and the store keep the
 clean text, exactly like the date envelope.
@@ -23,7 +26,6 @@ TASK_NOTE_TEMPLATE = "[YOUR TASK — this is the message you must answer in this
 CLARIFICATION_NOTE_TEMPLATE = (
     "[Clarification for your task — account for it in your answer]\n{content}"
 )
-OTHER_TASK_NOTE_TEMPLATE = "[Another run is answering this — do not answer it here]\n{content}"
 
 
 def render_branch(
@@ -40,15 +42,15 @@ def render_branch(
     rendered: list[ChatMessage] = []
     own_seen = False
     for message in messages:
-        mark = None
-        if message.role is MessageRole.USER and message.exchange_id is not None:
-            if message.exchange_id == own_exchange_id:
-                mark = CLARIFICATION_NOTE_TEMPLATE if own_seen else TASK_NOTE_TEMPLATE
-                own_seen = True
-            elif message.exchange_id in live_exchange_ids:
-                mark = OTHER_TASK_NOTE_TEMPLATE
-        if mark is None:
+        if message.role is not MessageRole.USER or message.exchange_id is None:
             rendered.append(message)
-        else:
+            continue
+        if message.exchange_id == own_exchange_id:
+            mark = CLARIFICATION_NOTE_TEMPLATE if own_seen else TASK_NOTE_TEMPLATE
+            own_seen = True
             rendered.append(replace(message, content=mark.format(content=message.content)))
+            continue
+        if message.exchange_id in live_exchange_ids:
+            continue  # another run owes this one; it is not this run's business
+        rendered.append(message)
     return rendered

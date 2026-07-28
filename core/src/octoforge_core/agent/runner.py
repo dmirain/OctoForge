@@ -778,6 +778,14 @@ class ConversationRunner:
             exchange = await self._exchanges.get(command.exchange_id)
         except ExchangeNotFoundError:
             return
+        logger.info(
+            "settling exchange: dialog=%s exchange=%s from=%s to=%s unseen=%s",
+            self._dialog.id,
+            command.exchange_id,
+            exchange.status.value,
+            command.exchange_status.value,
+            command.unseen_messages,
+        )
         if exchange.status is ExchangeStatus.AWAITING_USER:
             return  # the run asked the user something; the obligation stays open
         if command.unseen_messages:
@@ -1063,18 +1071,24 @@ class ConversationRunner:
         assembled = await self._compactor.assemble(self._dialog, self._narrative)
         self._trim_narrative(assembled.tail_count)
         narrative = render_branch(
-            assembled.messages, own_exchange_id, self._live_exchange_ids(own_exchange_id)
+            assembled.messages, own_exchange_id, await self._live_exchange_ids(own_exchange_id)
         )
         if narrative:
             narrative[-1] = _with_date_envelope(narrative[-1])
         return narrative
 
-    def _live_exchange_ids(self, own_exchange_id: str | None = None) -> frozenset[str]:
-        """Exchanges other live runs are answering (from the in-memory processes)."""
+    async def _live_exchange_ids(self, own_exchange_id: str | None = None) -> frozenset[str]:
+        """Other unanswered obligations, from the durable state.
+
+        Read from the store, not from the in-memory processes: an exchange
+        exists before its message becomes visible and before its run starts,
+        so the process map would leave a window in which another run sees a
+        question that looks unclaimed.
+        """
         return frozenset(
-            process.exchange_id
-            for process in self._processes.values()
-            if process.exchange_id is not None and process.exchange_id != own_exchange_id
+            item.id
+            for item in await self._exchanges.list_live(self._dialog.id)
+            if item.id != own_exchange_id
         )
 
     def _trim_narrative(self, tail_count: int) -> None:
@@ -1240,6 +1254,14 @@ class ConversationRunner:
     ) -> None:
         """Remove the process, announce completion and hand the outcome to the actor."""
         streamed = self._foreground_id == process.id
+        logger.info(
+            "process terminated: dialog=%s task=%s exchange=%s status=%s streamed=%s",
+            self._dialog.id,
+            process.task_id,
+            process.exchange_id,
+            status.value,
+            streamed,
+        )
         self._remove_process(process)
         self._broadcast(
             ProcessCompleted(process_id=process.id, title=process.title, status=status.value)
@@ -1290,7 +1312,11 @@ class ConversationRunner:
                     process.title,
                 )
             if terminal.message.content.strip():
-                message = replace(terminal.message, task_id=process.task_id)
+                message = replace(
+                    terminal.message,
+                    task_id=process.task_id,
+                    exchange_id=process.exchange_id,
+                )
                 await self._persist(message, usage=terminal.usage)
                 self._narrative.append(message)
             await self._tasks.mark_done(task, terminal.message.content)
@@ -1530,6 +1556,7 @@ class ConversationManager:
         never raises: a recovery failure must not take the app down — every
         operation is idempotent and simply retried on the next restart.
         """
+        stranded = await self._reopen_stranded_exchanges()
         orphaned = await self._list_orphaned()
         for task in orphaned:
             await self._restart_orphaned(task)
@@ -1537,8 +1564,25 @@ class ConversationManager:
         for task in undelivered:
             await self._redeliver_undelivered(task)
         logger.info(
-            "startup recovery: restarted=%s redelivered=%s", len(orphaned), len(undelivered)
+            "startup recovery: reopened=%s restarted=%s redelivered=%s",
+            stranded,
+            len(orphaned),
+            len(undelivered),
         )
+
+    async def _reopen_stranded_exchanges(self) -> int:
+        """Reset obligations whose owner died; return how many.
+
+        Processes never survive a restart, so an IN_PROGRESS exchange at
+        startup is stale by definition — and a settle that failed mid-write
+        would otherwise strand it forever, invisible to the OPEN-based
+        predicate. AWAITING_USER is left alone: that one waits for a human.
+        """
+        try:
+            return await self._exchanges.reopen_in_progress()
+        except Exception:  # recovery must never take the app down
+            logger.exception("stranded exchange sweep failed")
+            return 0
 
     async def _list_orphaned(self) -> list[Task]:
         try:

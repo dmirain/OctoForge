@@ -282,6 +282,7 @@ async def test_text_message_reaches_the_dialog_and_renders_the_reply(
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+    await manager.stop_all()
 
 
 async def test_redelivered_update_is_not_answered_twice(
@@ -308,6 +309,7 @@ async def test_redelivered_update_is_not_answered_twice(
     assert len(client.sent) == EXPECTED_TWO_REPLIES
     # end-to-end: each answer replies to the message that asked it
     assert client.replies == [1001, 1002]
+    await manager.stop_all()
 
 
 async def test_cancel_command_is_accepted(
@@ -320,6 +322,7 @@ async def test_cancel_command_is_accepted(
     await poller.dispatch(make_update(FIRST_UPDATE_ID, text=COMMAND_CANCEL))
 
     assert client.sent == []
+    await manager.stop_all()
 
 
 async def test_run_advances_the_offset_per_update() -> None:
@@ -391,6 +394,7 @@ async def test_warm_starts_bridges_for_known_telegram_dialogs(
     await registry.warm([USER_ID, "alice", f"{USER_ID_PREFIX}not-a-number"])
 
     assert requested == [(USER_ID, CHANNEL)]
+    await manager.stop_all()
     await registry.aclose()
 
 
@@ -432,6 +436,7 @@ async def test_admin_passes_the_gate_without_invite(
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+    await manager.stop_all()
 
 
 async def test_stranger_is_denied_and_gets_no_runner(
@@ -462,6 +467,7 @@ async def test_claimed_invite_passes_the_gate(
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+    await manager.stop_all()
 
 
 async def test_revoked_invite_is_denied(
@@ -500,6 +506,7 @@ async def test_start_with_code_claims_and_welcomes(
     await wait_until(lambda: len(client.sent) == EXPECTED_TWO_REPLIES)
 
     assert client.sent[1] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+    await manager.stop_all()
 
 
 async def test_start_with_invalid_code_is_denied(

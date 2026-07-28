@@ -92,6 +92,14 @@ class ExchangeRepository(Protocol):
         """Return every OPEN exchange without an owner (restart recovery)."""
         ...
 
+    async def reopen_in_progress(self) -> int:
+        """Reset every IN_PROGRESS exchange to OPEN; return how many.
+
+        Startup only: processes never survive a restart, so an owner recorded
+        in the database is stale by definition.
+        """
+        ...
+
     async def set_status(
         self,
         exchange_id: str,
