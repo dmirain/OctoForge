@@ -88,6 +88,7 @@ MID_RUN_NOTE_TEMPLATE = (
 HANDLED_ELSEWHERE_NOTE_TEMPLATE = (
     "[A separate process is already answering this message — do not answer it here]\n{content}"
 )
+ANSWER_THIS_NOTE_TEMPLATE = "[This is the message you must answer in this run]\n{content}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +150,12 @@ def _silent_done(task: Task) -> bool:
     return task.status is TaskStatus.DONE and not (task.result or "").strip()
 
 
+def _task_source_message(task: Task) -> str | None:
+    """The narrative row id of the user message an ANSWER task answers."""
+    raw = task.input.get("source_message_id")
+    return raw if isinstance(raw, str) else None
+
+
 def _task_client_source(task: Task) -> str | None:
     """The transport-level id of the task's source message, if recorded."""
     raw = task.input.get("source_client_message_id")
@@ -162,6 +169,20 @@ def _delivery_started(task: Task) -> ProcessStarted:
         title=task.title,
         source_client_message_id=_task_client_source(task),
     )
+
+
+def _with_answer_this_note(message: ChatMessage) -> ChatMessage:
+    """Mark the branch copy of the very message this run has to answer.
+
+    An answer branch is the shared narrative, so the run's task used to be
+    implicit: "your question is the last message". That breaks as soon as the
+    answer is queued — the foreground's final lands AFTER the question, the
+    branch ends with an assistant message, and the model reads the exchange as
+    already closed and says nothing (prod incident 2026-07-28: a queued
+    "Какая погода?" finished with an empty final and was silently swallowed).
+    The marker states the task instead of implying it from position.
+    """
+    return replace(message, content=ANSWER_THIS_NOTE_TEMPLATE.format(content=message.content))
 
 
 def _with_handled_elsewhere_note(message: ChatMessage) -> ChatMessage:
@@ -462,7 +483,10 @@ class ConversationRunner:
     async def _start_orphaned(self, task: Task) -> None:
         """Start the replacement background process of an orphaned task."""
         if task.kind is TaskKind.ANSWER:
-            narrative = await self._assemble_narrative(foreign_ids=self._foreign_source_ids())
+            narrative = await self._assemble_narrative(
+                foreign_ids=self._foreign_source_ids(),
+                own_source_id=_task_source_message(task),
+            )
             process = self._create_process(
                 task=task,
                 branch=[self._system_message(), *narrative],
@@ -877,7 +901,9 @@ class ConversationRunner:
             cron_job_id=None,
             source=_AnswerSource(message_id=message.id, client_message_id=client_key),
         )
-        narrative = await self._assemble_narrative(foreign_ids=self._foreign_source_ids())
+        narrative = await self._assemble_narrative(
+            foreign_ids=self._foreign_source_ids(), own_source_id=message.id
+        )
         process = self._create_process(
             task=task,
             branch=[self._system_message(), *narrative],
@@ -907,6 +933,7 @@ class ConversationRunner:
         self,
         mid_run_ids: frozenset[str] = frozenset(),
         foreign_ids: frozenset[str] = frozenset(),
+        own_source_id: str | None = None,
     ) -> list[ChatMessage]:
         """Assemble the narrative part of a branch, date-enveloping its tail copy.
 
@@ -919,19 +946,22 @@ class ConversationRunner:
         run in flight: they get the mid-run note. `foreign_ids` marks user
         messages that are the source of ANOTHER live answer process: they get
         the handled-elsewhere note, so concurrent processes don't answer each
-        other's questions. Both wraps happen before the date envelope (which
-        drops ids); a wrapped message that is also last simply carries both
-        envelopes nested.
+        other's questions. `own_source_id` marks THIS run's own question, so
+        the task stays explicit even when another process's final lands after
+        it. All wraps happen before the date envelope (which drops ids); a
+        wrapped message that is also last simply carries both envelopes nested.
         """
         assembled = await self._compactor.assemble(self._dialog, self._narrative)
         self._trim_narrative(assembled.tail_count)
         narrative = assembled.messages
-        if mid_run_ids or foreign_ids:
+        if mid_run_ids or foreign_ids or own_source_id is not None:
             for index, message in enumerate(narrative):
                 if message.role is not MessageRole.USER:
                     continue
                 if message.id in foreign_ids:
                     narrative[index] = _with_handled_elsewhere_note(message)
+                elif message.id == own_source_id:
+                    narrative[index] = _with_answer_this_note(message)
                 elif message.id in mid_run_ids:
                     narrative[index] = _with_mid_run_note(message)
         if narrative:
@@ -978,8 +1008,6 @@ class ConversationRunner:
         branch: list[ChatMessage],
         narrative_built: bool,
     ) -> _Process:
-        raw_source = task.input.get("source_message_id")
-        raw_client = task.input.get("source_client_message_id")
         process = _Process(
             id=task.id,
             title=task.title,
@@ -987,8 +1015,8 @@ class ConversationRunner:
             control=LoopControl(),
             branch=branch,
             narrative_built=narrative_built,
-            source_message_id=raw_source if isinstance(raw_source, str) else None,
-            source_client_message_id=raw_client if isinstance(raw_client, str) else None,
+            source_message_id=_task_source_message(task),
+            source_client_message_id=_task_client_source(task),
         )
         process.pump = asyncio.create_task(self._pump_process(process))
         self._processes[process.id] = process
@@ -1090,7 +1118,9 @@ class ConversationRunner:
         else:
             mid_run_ids = frozenset()
         narrative = await self._assemble_narrative(
-            mid_run_ids, foreign_ids=self._foreign_source_ids(own_id=process.id)
+            mid_run_ids,
+            foreign_ids=self._foreign_source_ids(own_id=process.id),
+            own_source_id=process.source_message_id,
         )
         private = process.branch[process.synced_len :]
         process.branch[:] = [self._system_message(), *narrative, *private]
@@ -1185,6 +1215,15 @@ class ConversationRunner:
         """
         task = await self._tasks.get(process.task_id)
         if isinstance(terminal, Finished):
+            if not terminal.message.content.strip():
+                # silence is legitimate but must never be invisible: it once
+                # masked a queued answer that could not tell what to answer
+                logger.info(
+                    "process finished with an empty final: dialog=%s task=%s title=%r",
+                    self._dialog.id,
+                    process.task_id,
+                    process.title,
+                )
             if terminal.message.content.strip():
                 message = replace(terminal.message, task_id=process.task_id)
                 await self._persist(message, usage=terminal.usage)

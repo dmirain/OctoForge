@@ -30,6 +30,7 @@ from octoforge_core.agent.router import (
     RouteOp,
 )
 from octoforge_core.agent.runner import (
+    ANSWER_THIS_NOTE_TEMPLATE,
     BACKGROUND_TASK_PROMPT,
     HANDLED_ELSEWHERE_NOTE_TEMPLATE,
     MID_RUN_NOTE_TEMPLATE,
@@ -123,6 +124,30 @@ class FakeRouter:
 
     def decide(self, *ops: RouteOp) -> None:
         self.handler = lambda processes, message: RouteDecision(ops=ops)
+
+
+class GatedRouter:
+    """MessageRouter stub stalling inside route() until the test releases it.
+
+    Models the real window: the router is an LLM call, so the actor sits in it
+    while the foreground finishes and its final lands in the narrative.
+    """
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.gate_armed = False
+
+    async def route(
+        self,
+        processes: tuple[ProcessInfo, ...],
+        message: str,
+        max_processes: int,
+    ) -> RouteDecision:
+        if self.gate_armed:
+            self.entered.set()
+            await self.release.wait()
+        return RouteDecision()
 
 
 class ScriptedLLM:
@@ -883,14 +908,16 @@ async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     second_request = llm.requests[1]
     contents = [m.content for m in second_request]
     assert any(m.role is MessageRole.USER and "extra context" in m.content for m in second_request)
-    assert contents.index("start") < next(
+    assert next(i for i, c in enumerate(contents) if "start" in c) < next(
         i for i, content in enumerate(contents) if "extra context" in content
     )
     # the mid-run arrival carries the note (the model is told to fold it into
-    # the answer); the process's own source message stays clean
+    # the answer); the run's own question carries its own marker
     wrapped = MID_RUN_NOTE_TEMPLATE.format(content="extra context")
     assert any(wrapped in m.content for m in second_request)
-    assert "start" in contents  # exact: no note on the source message
+    assert any(
+        ANSWER_THIS_NOTE_TEMPLATE.format(content="start") in m.content for m in second_request
+    )
     # a message the process did sync is not re-routed at finalize: one process only
     assert len(llm.requests) == RETRIED_CALLS
     assert [m.content for m in runner.history()] == ["start", "extra context", "after"]
@@ -1105,7 +1132,12 @@ async def test_unseen_message_is_requeued_at_finalize(
     # the watermark re-routes it: a new answer task picks it up
     assert len(llm.requests) == EXPECTED_LLM_CALLS
     third_request = llm.requests[2]
-    assert any(m.role is MessageRole.USER and m.content == "extra context" for m in third_request)
+    # the re-routed message is the new run's own question: marked as its task
+    assert any(
+        m.role is MessageRole.USER
+        and ANSWER_THIS_NOTE_TEMPLATE.format(content="extra context") in m.content
+        for m in third_request
+    )
     assert [m.content for m in runner.history()] == [
         "start",
         "extra context",
@@ -2242,6 +2274,55 @@ async def test_recover_interrupted_reports_cron_outcome_after_the_restart(
     assert [(task.id, status) for task, status in listener.calls] == [
         (cron_task.id, TaskStatus.DONE)
     ]
+
+
+async def test_queued_answer_knows_its_question_after_being_overtaken(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Prod incident 2026-07-28: two quick questions, only the first answered.
+
+    The router (an LLM call) still held the second message when the foreground
+    finished, so the queued run's branch ended with the foreground's ANSWER,
+    sitting after its own question. With the task implied by position the run
+    read the exchange as closed and produced an empty final, which the
+    silent-done path swallowed. The own-question marker states the task.
+    """
+    tool = BlockingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call(), reply("seagull answer"), reply("weather answer")])
+    router = GatedRouter()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("Почему чаек много на море?")
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    router.gate_armed = True
+    await runner.submit("Какая погода?")
+    await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
+
+    # the foreground finishes while the router still holds the second message
+    tool.release.set()
+    await collect_until(queue, is_completed)
+    router.release.set()
+    events = await collect_until(queue, is_delivered("weather answer"))
+
+    # the queued run's branch ends with the foreground's final, so its question
+    # is only identifiable by the marker
+    queued_branch = llm.requests[-1]
+    assert queued_branch[-1].content.endswith("seagull answer")
+    assert any(
+        ANSWER_THIS_NOTE_TEMPLATE.format(content="Какая погода?") in m.content
+        for m in queued_branch
+    )
+    # and the user actually gets the second answer
+    assert any(isinstance(e.payload, Finished) for e in events)
+    tasks = {task.title: task for task in await store.list(runner.dialog_id)}
+    weather = tasks["Какая погода?"]
+    await wait_for_condition(lambda: weather.result == "weather answer")
+    await wait_for_condition(lambda: [m.content for m in runner.history()][-1] == "weather answer")
 
 
 async def test_cancel_takes_absorbed_clarifications_with_it(
