@@ -217,12 +217,15 @@ class AdminManageTool:
         )
         jobs = await self._cron.list_for_user(user_id)
         enabled_jobs = sum(1 for job in jobs if job.enabled)
-        message_count = stats.message_count if stats is not None else 0
-        total_chars = stats.total_chars if stats is not None else 0
+        user_messages = stats.user_messages if stats is not None else 0
+        user_chars = stats.user_chars if stats is not None else 0
+        agent_messages = stats.agent_messages if stats is not None else 0
+        agent_chars = stats.agent_chars if stats is not None else 0
         last_active = activity.isoformat() if activity is not None else "never"
         return (
             f"- {user_id}{who}: access={access}, "
-            f"messages={message_count} ({total_chars} chars), "
+            f"wrote {user_messages} messages ({user_chars} chars), "
+            f"agent replied {agent_messages} ({agent_chars} chars), "
             f"last_active={last_active}, cron={enabled_jobs}/{len(jobs)} enabled"
         )
 

@@ -122,11 +122,17 @@ class ExchangeRepository(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class MessageStats:
-    """Per-user message counters of one channel (admin/reporting read model)."""
+    """Per-user message counters of one channel, split by author.
+
+    "How much did this person actually write" is the number that matters;
+    a summed count buries it under the agent's (usually longer) output.
+    """
 
     user_id: str
-    message_count: int
-    total_chars: int
+    user_messages: int
+    user_chars: int
+    agent_messages: int
+    agent_chars: int
 
 
 # `list`-returning signatures below a method named `list` need this alias:

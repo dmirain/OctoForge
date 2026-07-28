@@ -108,8 +108,9 @@ function open(text) {
 const VIEWS = {
   dialogs: {
     title: "Диалоги", path: () => "/api/admin/dialogs",
-    columns: ["user_id", "канал", "сообщений", "задач", "последнее", "создан", ""],
-    row: (d) => `${clip(d.user_id, "mono")}<td>${esc(d.channel)}</td><td>${d.message_count}</td>` +
+    columns: ["user_id", "канал", "юзер / агент", "задач", "последнее", "создан", ""],
+    row: (d) => `${clip(d.user_id, "mono")}<td>${esc(d.channel)}</td>` +
+      `<td>${d.user_message_count} / ${d.agent_message_count}</td>` +
       `<td>${d.task_count}</td><td class="mono">${time(d.last_message_at)}</td>` +
       `<td class="mono">${time(d.created_at)}</td>` +
       `<td><button class="act" data-open-dialog="${esc(d.id)}">сообщения</button> ` +

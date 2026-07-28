@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, cast
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import ColumnElement, case, delete, func, insert, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -253,13 +253,29 @@ class SqlAlchemyMessageRepository:
                 await session.commit()
 
     async def stats_by_channel(self, channel: str) -> MessageStatsList:
-        """Return per-user message counters of the channel, one entry per dialog owner."""
+        """Return per-user message counters of the channel, split by author.
+
+        Conditional aggregation in one pass: the user's own messages and the
+        agent's answers are counted separately (other roles are neither).
+        """
+
+        def role_count(role: MessageRole) -> ColumnElement[int]:
+            return func.count(case((MessageRow.role == role.value, 1)))
+
+        def role_chars(role: MessageRole) -> ColumnElement[int]:
+            return func.coalesce(
+                func.sum(case((MessageRow.role == role.value, func.length(MessageRow.content)))),
+                0,
+            )
+
         async with self._session_factory() as session:
             statement = (
                 select(
                     DialogRow.user_id,
-                    func.count(MessageRow.id),
-                    func.coalesce(func.sum(func.length(MessageRow.content)), 0),
+                    role_count(MessageRole.USER),
+                    role_chars(MessageRole.USER),
+                    role_count(MessageRole.ASSISTANT),
+                    role_chars(MessageRole.ASSISTANT),
                 )
                 .join(DialogRow, MessageRow.dialog_id == DialogRow.id)
                 .where(DialogRow.channel == channel)
@@ -267,8 +283,14 @@ class SqlAlchemyMessageRepository:
             )
             rows = (await session.execute(statement)).all()
             return [
-                MessageStats(user_id=user_id, message_count=count, total_chars=total)
-                for user_id, count, total in rows
+                MessageStats(
+                    user_id=user_id,
+                    user_messages=user_count,
+                    user_chars=user_chars,
+                    agent_messages=agent_count,
+                    agent_chars=agent_chars,
+                )
+                for user_id, user_count, user_chars, agent_count, agent_chars in rows
             ]
 
 

@@ -79,10 +79,16 @@ class SqlAlchemyAdminStore:
         The counters are correlated scalar subqueries rather than joins: a join
         would multiply rows across messages and tasks and need grouping to undo.
         """
-        message_count = (
+        user_message_count = (
             select(func.count())
             .select_from(MessageRow)
-            .where(MessageRow.dialog_id == DialogRow.id)
+            .where(MessageRow.dialog_id == DialogRow.id, MessageRow.role == "user")
+            .scalar_subquery()
+        )
+        agent_message_count = (
+            select(func.count())
+            .select_from(MessageRow)
+            .where(MessageRow.dialog_id == DialogRow.id, MessageRow.role == "assistant")
             .scalar_subquery()
         )
         task_count = (
@@ -97,7 +103,7 @@ class SqlAlchemyAdminStore:
             .scalar_subquery()
         )
         statement = (
-            select(DialogRow, message_count, task_count, last_message_at)
+            select(DialogRow, user_message_count, agent_message_count, task_count, last_message_at)
             .order_by(DialogRow.updated_at.desc(), DialogRow.id)
             .limit(limit)
             .offset(offset)
@@ -112,9 +118,10 @@ class SqlAlchemyAdminStore:
                 channel=row[0].channel,
                 created_at=row[0].created_at,
                 updated_at=row[0].updated_at,
-                message_count=row[1],
-                task_count=row[2],
-                last_message_at=row[3],
+                user_message_count=row[1],
+                agent_message_count=row[2],
+                task_count=row[3],
+                last_message_at=row[4],
             )
             for row in rows
         )

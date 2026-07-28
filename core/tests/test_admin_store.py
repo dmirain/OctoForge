@@ -146,9 +146,10 @@ async def test_dialogs_carry_counters_and_newest_activity_first(
     assert page.total == TWO_ITEMS
     newest = page.items[0]
     assert newest.user_id == USER_B  # touched last
-    assert (newest.message_count, newest.task_count) == (TWO_ITEMS, 1)
+    assert (newest.user_message_count, newest.agent_message_count) == (1, 1)
+    assert newest.task_count == 1
     assert newest.last_message_at is not None
-    assert page.items[1].message_count == 1
+    assert (page.items[1].user_message_count, page.items[1].agent_message_count) == (1, 0)
 
 
 async def test_messages_are_paginated_by_seq(

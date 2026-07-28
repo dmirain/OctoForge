@@ -192,7 +192,8 @@ async def test_list_users_reports_access_stats_and_cron(
 
     assert USER_ID in result
     assert "access=claimed" in result
-    assert "messages=1 (5 chars)" in result
+    assert "wrote 1 messages (5 chars)" in result
+    assert "agent replied 0 (0 chars)" in result
     assert "cron=1/2 enabled" in result
 
 

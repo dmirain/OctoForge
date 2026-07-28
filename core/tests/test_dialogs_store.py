@@ -49,7 +49,6 @@ COMPLETION_TOKENS = 12
 CLIENT_MESSAGE_ID = "client-key-1"
 EXPECTED_UNKEYED_PLUS_ONE = 3
 EXPECTED_RETRY_COMMIT_ATTEMPTS = 2
-EXPECTED_STATS_MESSAGE_COUNT = 2
 CREATED_EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
 TOOL_CALL = ToolCall(id="call-1", name="http_request", arguments={"url": "https://example.com"})
 EXCHANGE_TITLE = "the budget report"
@@ -185,10 +184,13 @@ async def test_message_stats_by_channel(
 
     stats = {entry.user_id: entry for entry in await messages.stats_by_channel(CHANNEL)}
 
-    assert stats[USER_ID].message_count == EXPECTED_STATS_MESSAGE_COUNT
-    assert stats[USER_ID].total_chars == len("one") + len("three")
-    assert stats[OTHER_USER_ID].message_count == 1
-    assert stats[OTHER_USER_ID].total_chars == len("four")
+    assert stats[USER_ID].user_messages == 1
+    assert stats[USER_ID].user_chars == len("one")
+    assert stats[USER_ID].agent_messages == 1
+    assert stats[USER_ID].agent_chars == len("three")
+    assert stats[OTHER_USER_ID].user_messages == 1
+    assert stats[OTHER_USER_ID].user_chars == len("four")
+    assert stats[OTHER_USER_ID].agent_messages == 0
 
 
 async def test_messages_get_monotonic_seq_and_order(
