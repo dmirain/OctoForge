@@ -11,6 +11,7 @@ from octoforge_core.agent.branch import (
     CLARIFICATION_NOTE_TEMPLATE,
     MATERIAL_NOTE_TEMPLATE,
     MATERIAL_TASK_NOTE_TEMPLATE,
+    SHARED_MATERIAL_NOTE_TEMPLATE,
     TASK_NOTE_TEMPLATE,
     render_branch,
 )
@@ -85,7 +86,13 @@ def test_material_only_exchange_marks_only_the_last_piece_as_task() -> None:
     assert rendered[2].content == MATERIAL_TASK_NOTE_TEMPLATE.format(content="third forward")
 
 
-def test_foreign_live_exchange_messages_are_dropped_regardless_of_kind() -> None:
+def test_foreign_live_question_is_dropped_but_its_material_stays_as_background() -> None:
+    """Another run owes the question; the forward is context the user gave everyone.
+
+    Dropping foreign material left the agent blind to what the user had just
+    forwarded (measured live 29.07): it answered "I see no forwarded
+    messages" while the forwards sat in a sibling collection.
+    """
     messages = [
         own_message("mine"),
         own_message("someone else's question", exchange_id=FOREIGN_EXCHANGE),
@@ -94,7 +101,10 @@ def test_foreign_live_exchange_messages_are_dropped_regardless_of_kind() -> None
 
     rendered = render_branch(messages, OWN_EXCHANGE, frozenset({FOREIGN_EXCHANGE}))
 
-    assert [m.content for m in rendered] == [TASK_NOTE_TEMPLATE.format(content="mine")]
+    assert [m.content for m in rendered] == [
+        TASK_NOTE_TEMPLATE.format(content="mine"),
+        SHARED_MATERIAL_NOTE_TEMPLATE.format(content="someone else's forward"),
+    ]
 
 
 def test_foreign_non_live_exchange_messages_pass_through_unmarked() -> None:

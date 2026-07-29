@@ -785,7 +785,7 @@ class ConversationRunner:
         nothing and the sweep still reacts. The touch is the quiet clock —
         a burst that keeps arriving keeps postponing the reaction.
         """
-        exchange = await self._collecting_exchange(command.origin)
+        exchange = await self._material_home(command.origin)
         message = replace(message, exchange_id=exchange.id)
         self._narrative.append(message)
         if message.id is not None:
@@ -797,6 +797,27 @@ class ConversationRunner:
             exchange.id,
             command.origin,
         )
+
+    async def _material_home(self, origin: str | None) -> Exchange:
+        """Where this forward belongs: a question being answered, or a collection.
+
+        The overwhelmingly common shape is "comment, then forwards" — the
+        client sends the user's own line first, so a run is already going by
+        the time the material lands. That run is what the material is for, so
+        it joins its exchange and the pull model syncs it in; if the run
+        already finished, the unseen-material rule parks the exchange and the
+        sweep reacts once more with the full picture. Waiting for a router
+        decision here would answer the question before the material arrived
+        (measured live, 29.07).
+        """
+        answering = [
+            item
+            for item in await self._exchanges.list_live(self._dialog.id)
+            if item.owner_task_id in self._processes
+        ]
+        if answering:
+            return max(answering, key=lambda item: item.updated_at)
+        return await self._collecting_exchange(origin)
 
     async def _collecting_exchange(self, origin: str | None) -> Exchange:
         """The dialog's collecting exchange, created on the first forward.
