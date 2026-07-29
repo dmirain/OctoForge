@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "octoforge-web"
-version = "0.5.0"
+version = "0.6.0"
 description = "OctoForge web wrapper (FastAPI)"
 license = { text = "BUSL-1.1" }
 requires-python = ">=3.11"
