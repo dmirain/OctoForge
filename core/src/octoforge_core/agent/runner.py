@@ -108,6 +108,7 @@ NUDGE_AFTER_SECONDS = 300.0
 MATERIAL_QUIET_SECONDS = 30.0
 MATERIAL_TITLE_TEMPLATE = "Переслано от {origin}"
 MATERIAL_TITLE_ANONYMOUS = "Пересланные сообщения"
+MATERIAL_TITLE_IMAGES = "Присланные изображения"
 # the routing decision sees a preview, not the whole batch: the narrative
 # keeps everything, the prompt stays bounded
 MATERIAL_DIGEST_MESSAGES = 20
@@ -164,6 +165,17 @@ def _with_date_envelope(message: ChatMessage) -> ChatMessage:
         tool_calls=message.tool_calls,
         tool_call_id=message.tool_call_id,
     )
+
+
+def _untitled(message: ChatMessage) -> str:
+    """Name a collection nobody attributed: say what it actually holds.
+
+    A picture the user sent themselves is material like a forward, but
+    calling its exchange "forwarded messages" would be a lie to the operator.
+    """
+    if any(item.kind is AttachmentKind.IMAGE for item in message.attachments):
+        return MATERIAL_TITLE_IMAGES
+    return MATERIAL_TITLE_ANONYMOUS
 
 
 def _silent_done(task: Task) -> bool:
@@ -822,7 +834,7 @@ class ConversationRunner:
         nothing and the sweep still reacts. The touch is the quiet clock —
         a burst that keeps arriving keeps postponing the reaction.
         """
-        exchange = await self._material_home(command.origin)
+        exchange = await self._material_home(message, command.origin)
         message = replace(message, exchange_id=exchange.id)
         self._narrative.append(message)
         if message.id is not None:
@@ -835,7 +847,7 @@ class ConversationRunner:
             command.origin,
         )
 
-    async def _material_home(self, origin: str | None) -> Exchange:
+    async def _material_home(self, message: ChatMessage, origin: str | None) -> Exchange:
         """Where this forward belongs: a question being answered, or a collection.
 
         The overwhelmingly common shape is "comment, then forwards" — the
@@ -854,9 +866,9 @@ class ConversationRunner:
         ]
         if answering:
             return max(answering, key=lambda item: item.updated_at)
-        return await self._collecting_exchange(origin)
+        return await self._collecting_exchange(message, origin)
 
-    async def _collecting_exchange(self, origin: str | None) -> Exchange:
+    async def _collecting_exchange(self, message: ChatMessage, origin: str | None) -> Exchange:
         """The dialog's collecting exchange, created on the first forward.
 
         One per dialog: a burst is one reaction, not one per message. The
@@ -867,9 +879,7 @@ class ConversationRunner:
         existing = await self._exchanges.find_collecting(self._dialog.id)
         if existing is not None:
             return existing
-        title = (
-            MATERIAL_TITLE_TEMPLATE.format(origin=origin) if origin else MATERIAL_TITLE_ANONYMOUS
-        )
+        title = MATERIAL_TITLE_TEMPLATE.format(origin=origin) if origin else _untitled(message)
         return await self._exchanges.create(
             self._dialog.id, title, status=ExchangeStatus.COLLECTING
         )

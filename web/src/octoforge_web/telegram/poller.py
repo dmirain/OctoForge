@@ -328,9 +328,16 @@ class TelegramPoller:
         chat_id: int,
         image: TelegramImageRef,
     ) -> None:
-        """The user's own photo: described via vision, else today's text/notice path."""
+        """The user's own photo: described via vision, else today's text/notice path.
+
+        A bare picture is material, not a request: the user shared something
+        without saying what they want, so it collects like a forward and the
+        agent asks what to do with it. A caption changes that — then the
+        caption is the user speaking and the picture is its context.
+        """
+        kind = MessageKind.OWN if message.body else MessageKind.MATERIAL
         try:
-            await self._dispatch_image(message, user_id, chat_id, image, kind=MessageKind.OWN)
+            await self._dispatch_image(message, user_id, chat_id, image, kind=kind)
             return
         except Exception:
             logger.warning(
@@ -362,7 +369,7 @@ class TelegramPoller:
             (ImageData(content=content, media_type=image.media_type),), INGESTION_PROMPT
         )
         text, origin = _compose_image_message(
-            message, description, forwarded=kind is MessageKind.MATERIAL
+            message, description, forwarded=message.forward_origin is not None
         )
         bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
         image_ref = f"{REF_PREFIX}{image.file_id}"

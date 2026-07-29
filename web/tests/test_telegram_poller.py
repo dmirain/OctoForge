@@ -60,6 +60,7 @@ from octoforge_web.telegram.poller import (
     IMAGE_TAG,
     INGESTION_PROMPT,
     INVITE_INVALID_TEXT,
+    MATERIAL_ATTRIBUTION_ANONYMOUS,
     MATERIAL_PLACEHOLDER,
     SECRETS_DISABLED_TEXT,
     TEXT_ONLY_NOTICE,
@@ -919,7 +920,12 @@ def make_forward_origin() -> TelegramForwardOrigin:
     return TelegramForwardOrigin.model_validate(FORWARD_ORIGIN_PAYLOAD)
 
 
-async def test_own_photo_with_vision_submits_the_description_and_attachment() -> None:
+async def test_bare_photo_is_material_like_a_forward() -> None:
+    """No caption means the user shared something without asking anything.
+
+    The bot must not invent a request out of a picture: the image collects
+    like a forward, and the agent asks what to do with it.
+    """
     client = FakeTelegramClient()
     vision = FakeVisionClient(VISION_DESCRIPTION)
     bridge = RecordingBridge()
@@ -931,8 +937,9 @@ async def test_own_photo_with_vision_submits_the_description_and_attachment() ->
     (content, client_message_id, _), (kind, origin) = bridge.calls[0], bridge.kinds[0]
     assert content == f"{IMAGE_TAG} {VISION_DESCRIPTION}"
     assert client_message_id == "1"
-    assert kind is MessageKind.OWN
-    assert origin is None
+    assert kind is MessageKind.MATERIAL
+    assert origin is None  # nobody forwarded it, so no attribution
+    assert MATERIAL_ATTRIBUTION_ANONYMOUS not in content
     expected_ref = f"tg:{PHOTO_FILE_ID}"
     assert bridge.attachments[0] == (Attachment(kind=AttachmentKind.IMAGE, ref=expected_ref),)
     assert client.downloaded_file_ids == [PHOTO_FILE_ID]
@@ -940,7 +947,8 @@ async def test_own_photo_with_vision_submits_the_description_and_attachment() ->
     assert client.sent == []  # no text-only notice, vision handled it
 
 
-async def test_own_photo_with_caption_appends_it_after_the_description() -> None:
+async def test_captioned_photo_is_the_user_speaking() -> None:
+    """A caption IS the request; the picture is its context, so kind stays OWN."""
     client = FakeTelegramClient()
     vision = FakeVisionClient(VISION_DESCRIPTION)
     bridge = RecordingBridge()
@@ -951,6 +959,7 @@ async def test_own_photo_with_caption_appends_it_after_the_description() -> None
 
     content = bridge.calls[0][0]
     assert content == f"{IMAGE_TAG} {VISION_DESCRIPTION}\n\n{CAPTION_LABEL} что это?"
+    assert bridge.kinds[0][0] is MessageKind.OWN
 
 
 async def test_forwarded_photo_with_vision_is_material_with_attribution() -> None:
