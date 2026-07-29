@@ -1147,6 +1147,63 @@ async def test_asking_the_user_keeps_the_exchange_open_and_resumes_it(
     ]
 
 
+async def test_a_run_that_asked_says_nothing_more(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A run that called `ask_user` is muted for the rest of its life.
+
+    The tool's ack tells it to end without writing anything else, but a model
+    with nothing left to say narrates the ack instead ("question delivered,
+    waiting for your answer") — a second, pointless message right under the
+    question. Muting also keeps the obligation honest: the filler used to
+    count as an answer and close the exchange, so the user's reply opened a
+    new one instead of continuing this.
+    """
+    filler = "Question delivered - waiting for your answer."
+    tool = AskingTool()
+    store = InMemoryTaskStore()
+    llm = ScriptedLLM([blocking_call(), reply(filler), reply("+21 in Moscow")])
+    router = FakeRouter()
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("what is the weather?")
+    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    events = await collect_until(queue, is_delivered(tool.question))
+    await wait_for_condition(lambda: not runner._processes)
+
+    # the filler reached neither the user nor the narrative
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert not any(filler in _rendered(event) for event in events)
+    assert [m.content for m in runner.history()] == ["what is the weather?", tool.question]
+
+    # and the obligation still waits for the user, question intact
+    live = await exchanges.list_live(runner.dialog_id)
+    assert [item.status for item in live] == [ExchangeStatus.AWAITING_USER]
+    assert live[0].pending_question == tool.question
+
+    # so the reply continues that same exchange rather than opening a new one
+    router.decide_continue()
+    await runner.submit("Moscow")
+    await collect_until(queue, is_delivered("+21 in Moscow"))
+    await wait_for_async_condition(lambda: _is_answered(exchanges, live[0].id))
+    assert len(await exchanges.list_live(runner.dialog_id)) == 0
+
+
+def _rendered(event: ConversationEvent) -> str:
+    """The user-visible text of an event, for "was this ever shown?" assertions."""
+    if isinstance(event.payload, TextDelta):
+        return event.payload.text
+    if isinstance(event.payload, Finished):
+        return event.payload.message.content
+    return ""
+
+
 async def test_late_message_reopens_the_exchange(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -3475,6 +3532,9 @@ class AskThenStallLLM:
     def __init__(self, final_content: str = "", next_content: str = REPLY) -> None:
         self.requests: list[list[ChatMessage]] = []
         self.release = asyncio.Event()
+        # the asker reached its post-question turn: observed here rather than
+        # through the stream, whose text the runner mutes once a run has asked
+        self.stalled = asyncio.Event()
         self._final_content = final_content
         self._next_content = next_content
 
@@ -3496,6 +3556,7 @@ class AskThenStallLLM:
             yield StreamFinished(message=blocking_call())
         elif call_number == SECOND_CALL:
             yield LlmTextDelta(text=PARTIAL)
+            self.stalled.set()
             await self.release.wait()
             yield StreamFinished(message=reply(self._final_content))
         else:
@@ -3532,9 +3593,7 @@ async def test_reply_while_the_asker_still_owns_the_exchange_spawns_no_second_ru
     assert len(runner._processes) == ONE_PROCESS  # the asker, still alive
 
     # the asker is mid-generation of its own next turn (still streaming)
-    await collect_until(
-        queue, lambda e: isinstance(e.payload, TextDelta) and e.payload.text == PARTIAL
-    )
+    await asyncio.wait_for(llm.stalled.wait(), timeout=TIMEOUT_SECONDS)
 
     router.decide_continue()
     await runner.submit("Moscow")
@@ -4386,6 +4445,34 @@ async def test_look_at_image_asks_about_the_newest_picture_of_the_dialog(
     assert resolver.refs == [NEW_IMAGE.ref]  # the newest one, not the first
     assert vision.prompts == [IMAGE_QUESTION]
     assert vision.images == [b"jpeg-bytes"]
+    await manager.stop_all()
+
+
+async def test_look_at_image_sees_every_picture_of_the_newest_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An album is one message with N pictures (three pages of one menu):
+    looking again must show the strong tier all of them in one call, or it
+    answers "there is no chicken on this menu" from page one — the very
+    blindness the tool exists to cure."""
+    vision, resolver = RecordingVision(), RecordingResolver()
+    manager = make_manager(
+        ScriptedLLM([]),
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(vision=vision, image_resolver=resolver),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    await runner.submit("старое фото", source=MessageSource(attachments=(OLD_IMAGE,)))
+    pages = (NEW_IMAGE, Attachment(kind=AttachmentKind.IMAGE, ref="tg:page-2"))
+    await runner.submit("меню в картинках", source=MessageSource(attachments=pages))
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+
+    await runner.look_at_image(IMAGE_QUESTION)
+
+    assert resolver.refs == [page.ref for page in pages]  # both pages, the older one left out
+    assert vision.images == [b"jpeg-bytes", b"jpeg-bytes"]  # one call, both pictures in it
+    assert vision.prompts == [IMAGE_QUESTION]
     await manager.stop_all()
 
 

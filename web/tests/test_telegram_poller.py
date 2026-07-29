@@ -57,7 +57,9 @@ from octoforge_web.telegram.poller import (
     COMMAND_START,
     GREETING_TEXT,
     GROUP_NOTICE,
+    IMAGE_FAILED_PLACEHOLDER,
     IMAGE_TAG,
+    IMAGE_TAG_NUMBERED,
     INGESTION_PROMPT,
     INVITE_INVALID_TEXT,
     MATERIAL_ATTRIBUTION_ANONYMOUS,
@@ -75,6 +77,8 @@ from octoforge_web.telegram.poller import (
 TELEGRAM_USER_ID = 12345
 USER_ID = f"{USER_ID_PREFIX}{TELEGRAM_USER_ID}"
 CHANNEL = "telegram"
+# the album window a test waits out (the production one is 1.5s)
+ALBUM_TEST_QUIET_SECONDS = 0.02
 SYSTEM_PROMPT = "test prompt"
 MAX_ITERATIONS = 3
 MAX_PROCESSES = 5
@@ -267,8 +271,9 @@ def make_photo_update(
     file_id: str = "photo-1",
     caption: str | None = None,
     forward_origin: TelegramForwardOrigin | None = None,
+    media_group_id: str | None = None,
 ) -> TelegramUpdate:
-    """An update carrying a single-size photo (own or forwarded)."""
+    """An update carrying a single-size photo (own, forwarded or an album item)."""
     return TelegramUpdate(
         update_id=update_id,
         message=TelegramMessage(
@@ -278,6 +283,7 @@ def make_photo_update(
             caption=caption,
             photo=[TelegramPhotoSize(file_id=file_id, width=800, height=600)],
             forward_origin=forward_origin,
+            media_group_id=media_group_id,
         ),
     )
 
@@ -325,6 +331,7 @@ def make_poller(
     secrets_link: Callable[[str], str] | None = None,
     vision: VisionClient | None = None,
 ) -> TelegramPoller:
+    """A poller whose album window is short enough for a test to wait it out."""
     registry = TelegramBridgeRegistry(
         runner_provider=provider,
         client=client,
@@ -339,8 +346,15 @@ def make_poller(
             membership=membership,
             secrets_link=secrets_link,
             vision=vision,
+            album_quiet_seconds=ALBUM_TEST_QUIET_SECONDS,
         ),
     )
+
+
+async def settle_albums(poller: TelegramPoller) -> None:
+    """Wait out the album quiet window and the submit that follows it."""
+    await wait_until(lambda: not poller._albums)
+    await asyncio.gather(*poller._album_timers)
 
 
 async def wait_until(predicate: Callable[[], bool]) -> None:
@@ -888,6 +902,7 @@ async def test_forwarded_attachment_becomes_one_placeholder_per_album() -> None:
     )
     await poller.dispatch(make_forward_update(2, text=None, media_group_id="album"))
     await poller.dispatch(make_forward_update(3, text=None, media_group_id="album"))
+    await settle_albums(poller)
 
     assert [call[0] for call in bridge.calls] == ["[переслано от Иван] гляди"]
     assert client.sent == []  # the album never triggers the text-only notice
@@ -1054,3 +1069,208 @@ async def test_image_document_is_treated_as_a_photo() -> None:
 
     assert bridge.calls[0][0] == f"{IMAGE_TAG} {VISION_DESCRIPTION}"
     assert client.downloaded_file_ids == ["doc-1"]
+
+
+# --- albums (one entry per burst, every page described) -----------------------
+
+ALBUM_ID = "album-1"
+PAGES = ("page-1", "page-2", "page-3")
+
+
+class PerImageVisionClient:
+    """VisionClient stub answering per file id, optionally failing for some.
+
+    The poller downloads before it describes, so the stub is keyed by the
+    call order the fake client records — enough to tell "page 2 failed" from
+    "page 2 was never looked at".
+    """
+
+    def __init__(self, client: "FakeTelegramClient", failing: frozenset[str] = frozenset()) -> None:
+        self._client = client
+        self._failing = failing
+        self.described: list[str] = []
+
+    async def look(self, images: tuple[ImageData, ...], prompt: str) -> str:
+        file_id = self._client.downloaded_file_ids[-1]
+        if file_id in self._failing:
+            raise RuntimeError(f"vision boom for {file_id}")
+        self.described.append(file_id)
+        return f"описание {file_id}"
+
+
+def make_album(caption: str | None = "вот меню в картинках") -> list[TelegramUpdate]:
+    """Three photos of one album; only the first carries the caption, as Telegram does."""
+    return [
+        make_photo_update(
+            index + 1,
+            file_id=file_id,
+            caption=caption if index == 0 else None,
+            media_group_id=ALBUM_ID,
+        )
+        for index, file_id in enumerate(PAGES)
+    ]
+
+
+async def test_album_becomes_one_message_with_every_page_described() -> None:
+    """Three photos with one question is ONE act of the user's.
+
+    Dropping the tail (what the poller used to do) answered a question about
+    a three-page menu from page one; splitting it into three would make the
+    uncaptioned pages material of their own, collected and answered apart
+    from the question the captioned page carries.
+    """
+    client = FakeTelegramClient()
+    vision = PerImageVisionClient(client)
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=vision)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    for update in make_album():
+        await poller.dispatch(update)
+    await settle_albums(poller)
+
+    assert len(bridge.calls) == 1
+    content, client_message_id, _ = bridge.calls[0]
+    assert content == (
+        f"{IMAGE_TAG_NUMBERED.format(index=1, total=3)} описание page-1\n\n"
+        f"{IMAGE_TAG_NUMBERED.format(index=2, total=3)} описание page-2\n\n"
+        f"{IMAGE_TAG_NUMBERED.format(index=3, total=3)} описание page-3\n\n"
+        f"{CAPTION_LABEL} вот меню в картинках"
+    )
+    assert client_message_id == "1"  # the album's first item: dedup key and reply target
+    assert bridge.kinds[0][0] is MessageKind.OWN  # the caption is the user speaking
+    assert bridge.attachments[0] == tuple(
+        Attachment(kind=AttachmentKind.IMAGE, ref=f"tg:{file_id}") for file_id in PAGES
+    )
+    assert sorted(vision.described) == sorted(PAGES)  # every page looked at, none dropped
+
+
+async def test_album_without_a_caption_is_material() -> None:
+    """Same rule as a single bare photo: nothing was asked, so it collects."""
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=PerImageVisionClient(client))
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    for update in make_album(caption=None):
+        await poller.dispatch(update)
+    await settle_albums(poller)
+
+    assert len(bridge.calls) == 1
+    assert bridge.kinds[0][0] is MessageKind.MATERIAL
+    assert CAPTION_LABEL not in bridge.calls[0][0]
+
+
+async def test_album_page_that_could_not_be_described_keeps_its_slot() -> None:
+    """A page the model choked on must be visible as a gap, not vanish."""
+    client = FakeTelegramClient()
+    vision = PerImageVisionClient(client, failing=frozenset({"page-2"}))
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=vision)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    for update in make_album():
+        await poller.dispatch(update)
+    await settle_albums(poller)
+
+    content = bridge.calls[0][0]
+    assert f"{IMAGE_TAG_NUMBERED.format(index=2, total=3)} {IMAGE_FAILED_PLACEHOLDER}" in content
+    assert "описание page-3" in content
+    # the file is still attached: `image_look` can go back to it later
+    assert len(bridge.attachments[0]) == len(PAGES)
+
+
+async def test_a_following_message_submits_the_album_before_itself() -> None:
+    """Order is what the user typed: the album, then the question about it."""
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=PerImageVisionClient(client))
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    for update in make_album(caption=None):
+        await poller.dispatch(update)
+    await poller.dispatch(make_update(9, text="что тут по белку?"))
+    await settle_albums(poller)
+
+    assert [call[1] for call in bridge.calls] == ["1", "9"]
+    assert bridge.calls[1][0] == "что тут по белку?"
+
+
+class CancellableBridge(RecordingBridge):
+    """RecordingBridge that accepts `cancel` instead of refusing it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancels = 0
+
+    async def cancel(self) -> None:
+        self.cancels += 1
+
+
+async def test_cancel_does_not_wait_for_the_album() -> None:
+    """Stopping is latency-critical: it must not queue behind slow vision calls."""
+    client = FakeTelegramClient()
+    bridge = CancellableBridge()
+    poller = make_poller(client, vision=PerImageVisionClient(client))
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    for update in make_album(caption=None):
+        await poller.dispatch(update)
+    await poller.dispatch(make_update(9, text=COMMAND_CANCEL))
+
+    assert bridge.cancels == 1
+    assert bridge.calls == []  # the album is still collecting, /cancel went straight through
+    await settle_albums(poller)
+    assert len(bridge.calls) == 1
+
+
+async def test_album_without_vision_yields_one_notice() -> None:
+    """Vision off: the pre-vision behavior, one notice for the whole burst."""
+    client = FakeTelegramClient()
+    poller = make_poller(client)  # vision=None
+
+    for update in make_album(caption=None):
+        await poller.dispatch(update)
+    await settle_albums(poller)
+
+    assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE, None)]
+    assert client.downloaded_file_ids == []
+
+
+class SlowVisionClient:
+    """VisionClient stub that blocks until released (ordering-race tests only)."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def look(self, images: tuple[ImageData, ...], prompt: str) -> str:
+        self.entered.set()
+        await self.release.wait()
+        return VISION_DESCRIPTION
+
+
+async def test_a_message_typed_mid_description_still_lands_after_the_album() -> None:
+    """The timer can fire a second before the user types, and describing is slow.
+
+    Without the per-user submit lock the question would reach the dialog
+    ahead of the pictures it is about.
+    """
+    client = FakeTelegramClient()
+    vision = SlowVisionClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=vision)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    for update in make_album(caption=None):
+        await poller.dispatch(update)
+    await asyncio.wait_for(vision.entered.wait(), WAIT_TIMEOUT_SECONDS)  # submit in flight
+
+    typing = asyncio.create_task(poller.dispatch(make_update(9, text="что тут по белку?")))
+    await asyncio.sleep(POLL_SECONDS)
+    assert bridge.calls == []  # the question waits for the album, not the other way round
+
+    vision.release.set()
+    await typing
+    await settle_albums(poller)
+    assert [call[1] for call in bridge.calls] == ["1", "9"]

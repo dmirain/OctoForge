@@ -91,6 +91,10 @@ SPAWNED_TEMPLATE = "task {task_id} spawned"
 SUBMIT_FAILED_ERROR = "your message could not be saved — please send it again"
 RESTART_LIMIT_ERROR = "could not resume after the service restart: process limit reached"
 DEFAULT_TASK_ERROR = "unknown error"
+# how many pictures of one message the strong vision tier is shown at once
+# (an album is one message): enough for a multi-page document, bounded
+# because that tier is slow and paid per image
+MAX_LOOK_IMAGES = 6
 BACKGROUND_TASK_PROMPT = (
     "You are solving a background task. User message is the task. "
     "Produce the final answer as the result."
@@ -181,6 +185,28 @@ def _untitled(message: ChatMessage) -> str:
 def _silent_done(task: Task) -> bool:
     """Whether the task finished with a deliberately empty result (nothing to show)."""
     return task.status is TaskStatus.DONE and not (task.result or "").strip()
+
+
+def _muted_after_ask(event: LoopEvent) -> LoopEvent | None:
+    """Silence what a run writes after `ask_user`; None means "drop the event".
+
+    The question is already on its way to the user and the tool's ack says
+    so ("end this run now without writing anything else"), but a run must
+    still end with something — and a model that has nothing left to say
+    tends to narrate the ack instead ("question delivered, waiting for your
+    answer"), which reaches the user as a second, pointless message.
+
+    Muting is deterministic, so it does not depend on the model obeying:
+    text stops being broadcast and the final is emptied, which the existing
+    empty-final path already treats as legitimate silence (nothing persisted,
+    nothing delivered). Only the visible output is muted — the loop itself,
+    its tool calls and the terminal event keep flowing.
+    """
+    if isinstance(event, TextDelta):
+        return None
+    if isinstance(event, Finished):
+        return replace(event, message=replace(event.message, content=""))
+    return event
 
 
 def _task_source_message(task: Task) -> str | None:
@@ -378,6 +404,9 @@ class _Process:
     # then may the outcome be stamped delivered without outbox redelivery
     terminal_accepted: bool = False
     overflow_retried: bool = False
+    # the run called `ask_user` and its question already went out: everything
+    # it writes afterwards is muted (see `_muted_after_ask`)
+    asked: bool = False
 
 
 class TaskOutcomeListener(Protocol):
@@ -1034,10 +1063,15 @@ class ConversationRunner:
         the question was actually delivered: a RUN/cron process has no
         exchange to park, so asking is unavailable there — the tool must
         report that honestly instead of promising a reply.
+
+        Delivering also mutes the rest of the run (`_muted_after_ask`): the
+        user has been asked, so nothing this run writes afterwards is an
+        answer to anything.
         """
         process = self._processes.get(process_id)
         if process is None or process.exchange_id is None:
             return False
+        process.asked = True
         await self._deliver_notice(question, exchange_id=process.exchange_id)
         with suppress(ExchangeNotFoundError):
             # keep ownership: the asking run is still alive (it unwinds on
@@ -1058,31 +1092,42 @@ class ConversationRunner:
         return self._vision is not None and self._image_resolver is not None
 
     async def look_at_image(self, question: str) -> str:
-        """Ask the strong vision model about the dialog's most recent image.
+        """Ask the strong vision model about the dialog's most recent picture(s).
 
         The cheap description written at ingestion answers most questions;
         this is the escape hatch for the ones it cannot, so it is spent only
         when a tool call asked for it.
+
+        "Most recent" means one message, not one file: an album arrives as a
+        single message carrying every picture (the three pages of one menu),
+        and answering about page one alone would repeat the very blindness
+        the tool exists to cure. The batch is capped at `MAX_LOOK_IMAGES` —
+        the strong tier is slow and paid per image.
         """
         if self._vision is None or self._image_resolver is None:
             raise VisionUnavailableError("vision is not configured")
-        attachment = self._latest_image()
-        if attachment is None:
+        attachments = self._latest_images()
+        if not attachments:
             raise VisionUnavailableError("no image in this dialog")
         logger.info(
-            "looking at image again: dialog=%s ref=%s",
+            "looking at images again: dialog=%s refs=%s",
             self._dialog.id,
-            attachment.ref,
+            [item.ref for item in attachments],
         )
-        image = await self._image_resolver.fetch(attachment.ref)
-        return await self._vision.look((image,), question)
+        images = tuple(
+            [await self._image_resolver.fetch(attachment.ref) for attachment in attachments]
+        )
+        return await self._vision.look(images, question)
 
-    def _latest_image(self) -> Attachment | None:
-        """The newest image attachment still present in the hot narrative."""
+    def _latest_images(self) -> tuple[Attachment, ...]:
+        """Every image of the newest narrative message that carries one."""
         for message in reversed(self._narrative):
-            for attachment in message.attachments:
-                if attachment.kind is AttachmentKind.IMAGE:
-                    return attachment
+            images = tuple(
+                item for item in message.attachments if item.kind is AttachmentKind.IMAGE
+            )
+            if images:
+                return images[:MAX_LOOK_IMAGES]
+        return ()
         return None
 
     async def _is_duplicate(self, client_message_id: str | None) -> bool:
@@ -1214,22 +1259,17 @@ class ConversationRunner:
     async def _settle_awaiting(self, exchange: Exchange, command: _ProcessTerminated) -> None:
         """Settle a run that asked the user something and then terminated.
 
-        The obligation normally stays open (the reply resumes it). Two
-        exceptions: a user cancel closes it — otherwise the nudge would
-        re-ask a question the user explicitly stopped — and a run that
-        asked but then answered anyway closes it as answered, or its stale
-        pending question would be nudged forever.
+        The obligation stays open: the question went out, so the next move
+        is the user's and their reply resumes it. The one exception is a
+        user cancel, which closes it — otherwise the nudge would re-ask a
+        question the user explicitly stopped.
+
+        A run cannot "ask but answer anyway": once it asked, its output is
+        muted (`_muted_after_ask`), so the terminal carries nothing to close
+        the obligation with.
         """
         if command.exchange_status is ExchangeStatus.CANCELLED:
             await self._exchanges.set_status(exchange.id, ExchangeStatus.CANCELLED)
-            return
-        answered_anyway = (
-            command.exchange_status is ExchangeStatus.ANSWERED
-            and isinstance(command.terminal, Finished)
-            and bool(command.terminal.message.content.strip())
-        )
-        if answered_anyway:
-            await self._exchanges.set_status(exchange.id, ExchangeStatus.ANSWERED)
 
     async def _resume_open_exchange(self, exchange_id: str, *, notify_limit: bool = True) -> None:
         """Give an OPEN exchange a fresh run (its last one missed something)."""
@@ -1742,6 +1782,16 @@ class ConversationRunner:
         # during the assemble is not in this branch and must stay unseen
         process.watermark = watermark
 
+    def _outgoing(self, process: _Process, event: LoopEvent) -> LoopEvent | None:
+        """The event as subscribers should see it; None when it is not shown at all."""
+        out = event
+        if isinstance(event, Finished):
+            # reply threading: the loop knows nothing about tasks
+            out = replace(event, source_client_message_id=process.source_client_message_id)
+        if process.asked:
+            return _muted_after_ask(out)
+        return out
+
     def _fail_run(self, process: _Process, error: str) -> LoopEvent:
         """Broadcast and return a Failed terminal for the process."""
         terminal = Failed(error=error)
@@ -1770,10 +1820,9 @@ class ConversationRunner:
                     # pull model: re-sync the narrative part of the branch
                     # before the loop's next LLM call reads it
                     await self._sync_branch(process)
-                out: LoopEvent = event
-                if isinstance(event, Finished):
-                    # reply threading: the loop knows nothing about tasks
-                    out = replace(event, source_client_message_id=process.source_client_message_id)
+                out = self._outgoing(process, event)
+                if out is None:
+                    continue
                 if process.exchange_id is not None:
                     accepted = self._broadcast(out, exchange_id=process.exchange_id)
                     if isinstance(out, (Finished, Failed)):

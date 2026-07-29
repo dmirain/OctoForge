@@ -8,7 +8,13 @@ DEFAULT_EMBEDDING_BATCH_SIZE = 16
 # vision calls are slower than text ones (a measured 4-8s for the cheap
 # model, 15-30s for the strong one), so they get their own budget
 VISION_TIMEOUT_SECONDS = 90.0
-VISION_MAX_TOKENS = 900
+# a photographed page of text (a menu, a document) is the common case, and
+# 900 tokens truncated it mid-sentence — the ingestion description has to
+# fit a full quote of what is written on the picture
+VISION_MAX_TOKENS = 1600
+# the strong tier is asked precisely when the cheap description fell short,
+# usually about that same wall of text, and it may be shown several pages
+VISION_DEEP_MAX_TOKENS = 2400
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_SECONDS = 1.0
 DEFAULT_RETRY_MAX_SECONDS = 30.0

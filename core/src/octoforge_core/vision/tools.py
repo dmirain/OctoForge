@@ -15,10 +15,13 @@ from octoforge_core.vision.api import VisionUnavailableError
 NAME = "image_look"
 QUESTION_PARAM = "question"
 DESCRIPTION = (
-    "Look again at the picture the user sent, with a specific question about "
-    "it. The conversation already contains a short description of every image; "
+    "Look again at the picture(s) the user sent, with a specific question about "
+    "them. The conversation already contains a short description of every image; "
     "use this only when that description does not answer what is being asked — "
     "to read fine print, check a detail or a corner, count or identify objects. "
+    "ALWAYS call it when the description is marked as cut off or incomplete and "
+    "the question is about what was cut, and whenever you are about to tell the "
+    "user that something 'is not visible in the image' — look before saying that. "
     "Costs a slow call to a stronger model, so ask one precise question."
 )
 UNAVAILABLE_MESSAGE = (

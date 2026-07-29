@@ -5,7 +5,12 @@ from typing import Annotated
 
 from octoforge_core import EmbeddingConfig, LLMConfig
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, SYSTEM_PROMPT_NAME
-from octoforge_core.config import DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddingBackend, VisionConfig
+from octoforge_core.config import (
+    DEFAULT_EMBEDDING_BATCH_SIZE,
+    VISION_DEEP_MAX_TOKENS,
+    EmbeddingBackend,
+    VisionConfig,
+)
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES
 from octoforge_core.net.external import ExternalCallAuth
 from pydantic import BaseModel, Field, field_validator
@@ -173,10 +178,15 @@ class Settings(BaseSettings):
         return bool(self.vision_model)
 
     def to_deep_vision_config(self) -> VisionConfig:
-        """Build the strong-tier vision configuration; mirrors `to_vision_config()`."""
+        """Build the strong-tier vision configuration; mirrors `to_vision_config()`.
+
+        Only the answer budget differs: this tier is asked about text the
+        cheap description could not fit, and may be shown several pages.
+        """
         return VisionConfig(
             api_key=self.vision_api_key or self.llm_api_key,
             model=self.vision_deep_model,
+            max_tokens=VISION_DEEP_MAX_TOKENS,
         )
 
     def deep_vision_configured(self) -> bool:
