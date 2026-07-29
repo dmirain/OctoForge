@@ -32,6 +32,7 @@ class AttachmentKind(StrEnum):
     """What a message carries besides its text."""
 
     IMAGE = "image"
+    AUDIO = "audio"
 
 
 @dataclass(frozen=True, slots=True)

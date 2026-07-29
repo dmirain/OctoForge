@@ -73,6 +73,8 @@ from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.serper import SerperSearchProvider
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.secrets.store import SqlAlchemySecretStore
+from octoforge_core.speech.api import TranscriptionClient
+from octoforge_core.speech.client import OpenAITranscriptionClient
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.vision.api import ImageResolver, VisionClient
 from octoforge_core.vision.client import OpenAIVisionClient
@@ -169,12 +171,14 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             httpx.AsyncClient(base_url=settings.llm_base_url) as llm_http,
             httpx.AsyncClient(base_url=settings.embedding_base_url) as embed_http,
             httpx.AsyncClient(base_url=settings.resolved_vision_base_url()) as vision_http,
+            httpx.AsyncClient(base_url=settings.stt_base_url) as speech_http,
             httpx.AsyncClient() as outbound_http,
         ):
             llm_client = build_llm_client(llm_http, settings.to_llm_config())
             embedder = _build_embedder(settings, embed_http)
             vision_client = _build_vision_client(settings, vision_http)
             deep_vision_client = _build_deep_vision_client(settings, vision_http)
+            speech_client = _build_speech_client(settings, speech_http)
             image_resolver = _build_telegram_image_resolver(settings, outbound_http)
             instructions = build_instruction_service(
                 SqlAlchemyInstructionStore(session_factory),
@@ -292,6 +296,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         else None
                     ),
                     vision=vision_client,
+                    speech=speech_client,
                 ),
             )
             try:
@@ -526,6 +531,20 @@ def _build_deep_vision_client(
     return OpenAIVisionClient(http_client=http_client, config=settings.to_deep_vision_config())
 
 
+def _build_speech_client(
+    settings: Settings, http_client: httpx.AsyncClient
+) -> TranscriptionClient | None:
+    """Build the optional transcription client; None (feature off) when unconfigured.
+
+    Deliberately no fallback to the main LLM's endpoint: `/audio/transcriptions`
+    is a different endpoint kind, and a chat-only gateway 404s on it — a silent
+    fallback would turn "voice is off" into "every voice message errors".
+    """
+    if not settings.speech_configured():
+        return None
+    return OpenAITranscriptionClient(http_client=http_client, config=settings.to_speech_config())
+
+
 def _build_telegram_image_resolver(
     settings: Settings, http_client: httpx.AsyncClient
 ) -> ImageResolver | None:
@@ -671,6 +690,8 @@ class _TelegramExtras:
     secrets_link: Callable[[str], str] | None = None
     # None: vision is off, Telegram keeps today's placeholder/text-only path
     vision: VisionClient | None = None
+    # None: speech-to-text is off, a recording keeps the "text only" notice
+    speech: TranscriptionClient | None = None
 
 
 def _secrets_link_builder(
@@ -720,6 +741,8 @@ def _start_telegram(
             secrets_link=resolved.secrets_link,
             directory=resolved.stores.directory if resolved.stores is not None else None,
             vision=resolved.vision,
+            speech=resolved.speech,
+            voice_max_seconds=settings.voice_max_seconds,
         ),
     )
     task = asyncio.create_task(_run_telegram(poller, registry, dialogs))

@@ -9,6 +9,7 @@ from octoforge_core.config import (
     DEFAULT_EMBEDDING_BATCH_SIZE,
     VISION_DEEP_MAX_TOKENS,
     EmbeddingBackend,
+    SpeechConfig,
     VisionConfig,
 )
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES
@@ -30,6 +31,8 @@ DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./octoforge.db"
 DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT = 50
 DEFAULT_DATASETS_QUERY_MAX_LIMIT = 200
 DEFAULT_HISTORY_SEARCH_DEFAULT_LIMIT = 20
+# 10 minutes of audio: a cap on both latency and the provider's daily quota
+DEFAULT_VOICE_MAX_SECONDS = 600.0
 DEFAULT_HISTORY_SEARCH_MAX_LIMIT = 100
 DEFAULT_CONTEXT_HOT_MAX_CHARS = 12000
 DEFAULT_CONTEXT_COMPACT_TARGET_CHARS = 6000
@@ -157,6 +160,18 @@ class Settings(BaseSettings):
     # picture); shares the cheap tier's base URL/key fallbacks, only the
     # model differs. Empty means the tool is off.
     vision_deep_model: str = DEFAULT_VISION_DEEP_MODEL
+    # Speech-to-text for voice messages. Unlike vision there is NO fallback to
+    # the main LLM's endpoint: transcription is a different endpoint kind and a
+    # chat-only gateway answers 404 for it, so both the URL and the model must
+    # be set explicitly — either missing means the feature is off (a recording
+    # keeps the "text only" notice).
+    stt_base_url: str = ""
+    stt_api_key: str = ""
+    stt_model: str = ""
+    stt_language: str = ""
+    # Longest recording accepted: a cap on latency and on the provider's daily
+    # audio quota, checked against the duration the update carries.
+    voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
 
     def resolved_public_base_url(self) -> str:
         """Base URL for user-facing links: configured public one or self."""
@@ -192,6 +207,18 @@ class Settings(BaseSettings):
     def deep_vision_configured(self) -> bool:
         """Whether the strong vision tier (`image_look`) is on; empty model = off."""
         return bool(self.vision_deep_model)
+
+    def to_speech_config(self) -> SpeechConfig:
+        """Build the transcription configuration (own endpoint, no LLM fallback)."""
+        return SpeechConfig(
+            api_key=self.stt_api_key,
+            model=self.stt_model,
+            language=self.stt_language,
+        )
+
+    def speech_configured(self) -> bool:
+        """Whether voice messages are transcribed; a missing URL or model = off."""
+        return bool(self.stt_model and self.stt_base_url)
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

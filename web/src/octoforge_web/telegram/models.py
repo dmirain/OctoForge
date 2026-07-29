@@ -9,6 +9,14 @@ from pydantic import BaseModel, ConfigDict, Field
 # them to JPEG regardless of the original upload format.
 DEFAULT_PHOTO_MEDIA_TYPE = "image/jpeg"
 IMAGE_MEDIA_TYPE_PREFIX = "image/"
+AUDIO_MEDIA_TYPE_PREFIX = "audio/"
+# Telegram voice notes are Ogg/Opus and carry no file name; video notes are
+# mp4. The name matters because transcription endpoints pick the decoder by
+# extension (and reject Telegram's own `.oga` — see `speech.api.upload_name`).
+DEFAULT_VOICE_MEDIA_TYPE = "audio/ogg"
+DEFAULT_VOICE_FILE_NAME = "voice.ogg"
+DEFAULT_VIDEO_NOTE_FILE_NAME = "note.mp4"
+DEFAULT_AUDIO_FILE_NAME = "audio.mp3"
 
 
 class TelegramChatType(StrEnum):
@@ -117,6 +125,38 @@ class TelegramDocument(BaseModel):
     file_name: str = ""
 
 
+class TelegramVoice(BaseModel):
+    """A voice note (`voice`), a video note (`video_note`) or an audio file.
+
+    One model for all three: what ingestion needs of them is identical — the
+    file id, how long it is (the guard that runs before any download) and the
+    declared type. `file_name` exists only on `audio`/`document` uploads.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    file_id: str
+    duration: int = 0
+    mime_type: str = ""
+    file_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramAudioRef:
+    """A downloadable recording found on a message.
+
+    `duration_seconds` comes from the update itself, so a recording too long
+    (or a mis-tap too short) is refused before a byte is downloaded. None
+    means Telegram did not say: a document carries no duration, and "unknown"
+    must not read as "zero seconds long".
+    """
+
+    file_id: str
+    duration_seconds: int | None
+    media_type: str
+    file_name: str
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramImageRef:
     """A downloadable image found on a message: its file id and media type."""
@@ -144,6 +184,10 @@ class TelegramMessage(BaseModel):
     # as a document instead of a photo lands here rather than in `photo`
     photo: list[TelegramPhotoSize] = Field(default_factory=list)
     document: TelegramDocument | None = None
+    # a recorded voice note, a round video note, or an uploaded audio file
+    voice: TelegramVoice | None = None
+    video_note: TelegramVoice | None = None
+    audio: TelegramVoice | None = None
 
     @property
     def body(self) -> str | None:
@@ -167,6 +211,37 @@ class TelegramMessage(BaseModel):
         ):
             return TelegramImageRef(
                 file_id=self.document.file_id, media_type=self.document.mime_type
+            )
+        return None
+
+    @property
+    def best_audio(self) -> TelegramAudioRef | None:
+        """The recording on this message, if any.
+
+        A recorded voice note first (the common case), then a round video
+        note, then an uploaded audio file; a document is included when its
+        declared type says it is audio. None when the message carries none.
+        """
+        for candidate, fallback_name in (
+            (self.voice, DEFAULT_VOICE_FILE_NAME),
+            (self.video_note, DEFAULT_VIDEO_NOTE_FILE_NAME),
+            (self.audio, DEFAULT_AUDIO_FILE_NAME),
+        ):
+            if candidate is not None:
+                return TelegramAudioRef(
+                    file_id=candidate.file_id,
+                    duration_seconds=candidate.duration,
+                    media_type=candidate.mime_type or DEFAULT_VOICE_MEDIA_TYPE,
+                    file_name=candidate.file_name or fallback_name,
+                )
+        if self.document is not None and self.document.mime_type.startswith(
+            AUDIO_MEDIA_TYPE_PREFIX
+        ):
+            return TelegramAudioRef(
+                file_id=self.document.file_id,
+                duration_seconds=None,
+                media_type=self.document.mime_type,
+                file_name=self.document.file_name or DEFAULT_AUDIO_FILE_NAME,
             )
         return None
 

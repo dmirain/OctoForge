@@ -10,6 +10,7 @@ from enum import StrEnum
 
 import httpx
 from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
+from octoforge_core.speech.api import AudioData, TranscriptionClient
 from octoforge_core.vision.api import ImageData, VisionClient
 
 from octoforge_web.telegram.bridge import RunnerProvider, TelegramBridge, TelegramBridgeOptions
@@ -29,6 +30,7 @@ from octoforge_web.telegram.invites.api import (
     MemberDirectory,
 )
 from octoforge_web.telegram.models import (
+    TelegramAudioRef,
     TelegramChatType,
     TelegramImageRef,
     TelegramMessage,
@@ -106,6 +108,22 @@ MAX_CONCURRENT_INGESTIONS = 4
 INBOX_BACKLOG_WARNING = 50
 # Telegram expires a chat action after ~5s, so slow work re-sends it
 ACTIVITY_INTERVAL_SECONDS = 4.0
+# marks a transcribed recording in the narrative: the agent must know the
+# words were heard, not typed — misheard words and false starts are expected,
+# and an ambiguous transcript is worth a question rather than a guess
+VOICE_TAG = "[голосовое]"
+# a recording this short is a mis-tap, and a recognizer does not stay silent
+# about silence: on an empty 0.2s clip this deployment's model returned a
+# confident "Продолжение следует...", with no low-confidence signal at all
+VOICE_MIN_SECONDS = 1
+SECONDS_PER_MINUTE = 60
+DEFAULT_VOICE_MAX_SECONDS = 600.0
+VOICE_TOO_SHORT_NOTICE = "Запись слишком короткая — я ничего не услышал. Скажи ещё раз?"
+VOICE_TOO_LONG_TEMPLATE = (
+    "Эта запись длиннее {limit} минут — столько я за раз не расшифрую. "
+    "Пришли фрагмент короче или напиши текстом."
+)
+VOICE_EMPTY_NOTICE = "Я не разобрал, что сказано в записи. Напиши текстом или запиши ещё раз?"
 SECRETS_LINK_TEXT = (
     "Ссылка на форму секретов (действует 10 минут):\n{url}\n\n"
     "Значения шифруются, ассистент видит только коды секретов. "
@@ -260,8 +278,12 @@ class TelegramPollerOptions:
     # who-is-who mirror: profiles of gated users, refreshed on every contact
     directory: MemberDirectory | None = None
     vision: VisionClient | None = None
+    # transcribes voice messages; None turns the feature off entirely (a
+    # recording keeps today's "text only" notice, zero extra cost)
+    speech: TranscriptionClient | None = None
     # how long an album's burst must stay quiet before it is submitted
     album_quiet_seconds: float = ALBUM_QUIET_SECONDS
+    voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
 
 
 class TelegramPoller:
@@ -281,7 +303,9 @@ class TelegramPoller:
         self._secrets_link = options.secrets_link
         self._directory = options.directory
         self._vision = options.vision
+        self._speech = options.speech
         self._album_quiet_seconds = options.album_quiet_seconds
+        self._voice_max_seconds = options.voice_max_seconds
         self._offset: int | None = None
         # one ingestion queue per user: the poll loop only enqueues, so no
         # dialog's slow work (download, vision, transcription) can stall the
@@ -473,6 +497,10 @@ class TelegramPoller:
         if image is not None and self._vision is not None:
             await self._dispatch_own_image(message, user_id, chat_id, image)
             return
+        audio = message.best_audio
+        if audio is not None and self._speech is not None:
+            await self._dispatch_voice(message, user_id, chat_id, audio, kind=MessageKind.OWN)
+            return
         await self._dispatch_plain_or_notice(message, user_id, chat_id)
 
     async def _dispatch_plain_or_notice(
@@ -495,7 +523,11 @@ class TelegramPoller:
         )
 
     async def _dispatch_forward(self, message: TelegramMessage, user_id: str, chat_id: int) -> None:
-        """Forwarded material: an image is described via vision, else the placeholder path."""
+        """Forwarded material: a picture or a recording is read, else the placeholder path."""
+        audio = message.best_audio
+        if audio is not None and self._speech is not None:
+            await self._dispatch_voice(message, user_id, chat_id, audio, kind=MessageKind.MATERIAL)
+            return
         image = message.best_image
         if image is not None and self._vision is not None:
             try:
@@ -597,6 +629,93 @@ class TelegramPoller:
                 for image in images
             ),
         )
+
+    async def _dispatch_voice(
+        self,
+        message: TelegramMessage,
+        user_id: str,
+        chat_id: int,
+        audio: TelegramAudioRef,
+        *,
+        kind: MessageKind,
+    ) -> None:
+        """Transcribe a recording and submit the transcript as the message text.
+
+        A voice message the user recorded IS them speaking, so it enters the
+        dialog as their own words (`OWN`) and starts a run — the opposite of
+        a bare picture, which is material because sharing something is not
+        asking for anything. A FORWARDED recording is someone else's voice
+        and stays material, attributed like forwarded text.
+
+        Both guards run before a single byte is downloaded, on the duration
+        the update itself carries: a mis-tap is refused (a recognizer invents
+        confident text for silence — measured), and so is a recording longer
+        than the cap, which would also eat the day's transcription quota.
+        """
+        assert self._speech is not None  # only called when the caller already checked
+        refusal = self._voice_refusal(audio)
+        if refusal is not None:
+            await self._client.send_message(chat_id, refusal)
+            return
+        try:
+            async with self._showing_activity(chat_id, kind):
+                transcript = (await self._transcribe(audio)).strip()
+        except Exception:
+            logger.warning(
+                "Transcription failed for a recording from %s; falling back",
+                user_id,
+                exc_info=True,
+            )
+            await self._dispatch_without_vision(message, user_id, chat_id)
+            return
+        if not transcript:
+            await self._client.send_message(chat_id, VOICE_EMPTY_NOTICE)
+            return
+        forwarded = message.forward_origin is not None
+        origin = message.forward_origin.display_name if message.forward_origin is not None else ""
+        bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
+        await bridge.handle_text(
+            _compose_voice_message(
+                transcript, caption=message.body or "", origin=origin, forwarded=forwarded
+            ),
+            client_message_id=str(message.message_id),
+            reply_to_message_id=(
+                message.reply_to_message.message_id
+                if message.reply_to_message is not None
+                else None
+            ),
+            kind=kind,
+            origin=(origin or None) if forwarded else None,
+            attachments=(
+                Attachment(kind=AttachmentKind.AUDIO, ref=f"{REF_PREFIX}{audio.file_id}"),
+            ),
+        )
+
+    def _voice_refusal(self, audio: TelegramAudioRef) -> str | None:
+        """Why this recording will not be transcribed, or None to go ahead."""
+        if audio.duration_seconds is None:
+            return None  # Telegram did not say how long it is; nothing to check
+        if audio.duration_seconds < VOICE_MIN_SECONDS:
+            return VOICE_TOO_SHORT_NOTICE
+        if audio.duration_seconds > self._voice_max_seconds:
+            return VOICE_TOO_LONG_TEMPLATE.format(
+                limit=int(self._voice_max_seconds // SECONDS_PER_MINUTE)
+            )
+        return None
+
+    async def _transcribe(self, audio: TelegramAudioRef) -> str:
+        """Download one recording and transcribe it (under a global ingestion slot)."""
+        assert self._speech is not None  # only called when the caller already checked
+        async with self._ingest_slots:
+            file_path = await self._client.get_file(audio.file_id)
+            content = await self._client.download_file(file_path)
+            return await self._speech.transcribe(
+                AudioData(
+                    content=content,
+                    file_name=audio.file_name,
+                    media_type=audio.media_type,
+                )
+            )
 
     async def _describe(self, image: TelegramImageRef) -> str:
         """Download one picture and describe it with the cheap vision tier.
@@ -812,6 +931,26 @@ def chat_id_from_user_id(user_id: str) -> int | None:
         return int(user_id.removeprefix(USER_ID_PREFIX))
     except ValueError:
         return None
+
+
+def _compose_voice_message(transcript: str, *, caption: str, origin: str, forwarded: bool) -> str:
+    """Build the narrative text for a transcribed recording.
+
+    Same shape as a described picture: the forward attribution first (when it
+    is someone else's voice), the `[голосовое]` tag, then the words. A
+    caption — Telegram allows one on an audio file — is appended verbatim.
+    """
+    text = f"{VOICE_TAG} {transcript}"
+    if forwarded:
+        attribution = (
+            MATERIAL_ATTRIBUTION_TEMPLATE.format(origin=origin)
+            if origin
+            else MATERIAL_ATTRIBUTION_ANONYMOUS
+        )
+        text = f"{attribution} {text}"
+    if caption:
+        text = f"{text}\n\n{CAPTION_LABEL} {caption}"
+    return text
 
 
 def _compose_images_message(

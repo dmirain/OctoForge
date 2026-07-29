@@ -31,6 +31,7 @@ from octoforge_core.dialogs.store import (
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
+from octoforge_core.speech.api import AudioData, TranscriptionClient
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -49,12 +50,14 @@ from octoforge_web.telegram.models import (
     TelegramReplyToMessage,
     TelegramUpdate,
     TelegramUser,
+    TelegramVoice,
 )
 from octoforge_web.telegram.poller import (
     ACCESS_DENIED_TEXT,
     CAPTION_LABEL,
     COMMAND_CANCEL,
     COMMAND_START,
+    DEFAULT_VOICE_MAX_SECONDS,
     GREETING_TEXT,
     GROUP_NOTICE,
     IMAGE_FAILED_PLACEHOLDER,
@@ -66,6 +69,9 @@ from octoforge_web.telegram.poller import (
     MATERIAL_PLACEHOLDER,
     SECRETS_DISABLED_TEXT,
     TEXT_ONLY_NOTICE,
+    VOICE_EMPTY_NOTICE,
+    VOICE_TAG,
+    VOICE_TOO_SHORT_NOTICE,
     WELCOME_TEXT,
     TelegramBridgeRegistry,
     TelegramMembership,
@@ -325,12 +331,14 @@ async def make_manager(
     )
 
 
-def make_poller(
+def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options bundle
     client: FakeTelegramClient,
     provider: RunnerProvider = forbidden_provider,
     membership: TelegramMembership | None = None,
     secrets_link: Callable[[str], str] | None = None,
     vision: VisionClient | None = None,
+    speech: TranscriptionClient | None = None,
+    voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS,
 ) -> TelegramPoller:
     """A poller whose album window is short enough for a test to wait it out."""
     registry = TelegramBridgeRegistry(
@@ -347,6 +355,8 @@ def make_poller(
             membership=membership,
             secrets_link=secrets_link,
             vision=vision,
+            speech=speech,
+            voice_max_seconds=voice_max_seconds,
             album_quiet_seconds=ALBUM_TEST_QUIET_SECONDS,
         ),
     )
@@ -1354,3 +1364,192 @@ async def test_a_message_typed_mid_description_still_lands_after_the_album() -> 
     await typing
     await settle(poller)
     assert [call[1] for call in bridge.calls] == ["1", "9"]
+
+
+# --- voice messages (speech ingestion) ---------------------------------------
+
+TRANSCRIPT = "посмотри меню и подбери что-нибудь белковое"
+VOICE_FILE_ID = "voice-7"
+VOICE_DURATION = 12
+REPLIED_TO_MESSAGE_ID = 77
+
+
+class FakeTranscriptionClient:
+    """TranscriptionClient stub returning a scripted transcript, recording calls."""
+
+    def __init__(self, transcript: str = TRANSCRIPT) -> None:
+        self._transcript = transcript
+        self.calls: list[AudioData] = []
+
+    async def transcribe(self, audio: AudioData) -> str:
+        self.calls.append(audio)
+        return self._transcript
+
+
+class RaisingTranscriptionClient:
+    """TranscriptionClient stub that always fails (fallback-path tests only)."""
+
+    async def transcribe(self, audio: AudioData) -> str:
+        raise RuntimeError("stt boom")
+
+
+def make_voice_update(  # noqa: PLR0913, PLR0917 — a test builder mirroring the API shape
+    update_id: int,
+    file_id: str = VOICE_FILE_ID,
+    duration: int = VOICE_DURATION,
+    caption: str | None = None,
+    forward_origin: TelegramForwardOrigin | None = None,
+    reply_to_message_id: int | None = None,
+) -> TelegramUpdate:
+    """An update carrying a recorded voice note (own or forwarded)."""
+    return TelegramUpdate(
+        update_id=update_id,
+        message=TelegramMessage(
+            message_id=update_id,
+            from_user=TelegramUser(id=TELEGRAM_USER_ID),
+            chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
+            caption=caption,
+            voice=TelegramVoice(file_id=file_id, duration=duration, mime_type="audio/ogg"),
+            forward_origin=forward_origin,
+            reply_to_message=(
+                TelegramReplyToMessage(message_id=reply_to_message_id)
+                if reply_to_message_id is not None
+                else None
+            ),
+        ),
+    )
+
+
+async def test_own_voice_message_is_the_user_speaking() -> None:
+    """A recording the user made IS their request — the opposite of a bare photo.
+
+    Sharing a picture asks nothing, so it collects as material; recording a
+    voice message is the user talking, so the transcript opens an obligation
+    and starts a run like typed text would.
+    """
+    client = FakeTelegramClient()
+    speech = FakeTranscriptionClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, speech=speech)
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_voice_update(1))
+
+    (content, client_message_id, _), (kind, origin) = bridge.calls[0], bridge.kinds[0]
+    assert content == f"{VOICE_TAG} {TRANSCRIPT}"
+    assert client_message_id == "1"
+    assert kind is MessageKind.OWN
+    assert origin is None
+    assert bridge.attachments[0] == (
+        Attachment(kind=AttachmentKind.AUDIO, ref=f"tg:{VOICE_FILE_ID}"),
+    )
+    assert client.downloaded_file_ids == [VOICE_FILE_ID]
+    assert client.sent == []  # no notice: the recording was understood
+
+
+async def test_a_voice_reply_keeps_its_reply_target() -> None:
+    """Answering by voice must resolve back to the exchange it replies to."""
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, speech=FakeTranscriptionClient())
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_voice_update(1, reply_to_message_id=REPLIED_TO_MESSAGE_ID))
+
+    assert bridge.calls[0][2] == REPLIED_TO_MESSAGE_ID
+
+
+async def test_forwarded_voice_is_someone_elses_words() -> None:
+    """A forwarded recording is material with attribution, like forwarded text."""
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, speech=FakeTranscriptionClient())
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_voice_update(1, forward_origin=make_forward_origin()))
+
+    (content, _, _), (kind, origin) = bridge.calls[0], bridge.kinds[0]
+    assert content == f"[переслано от Иван] {VOICE_TAG} {TRANSCRIPT}"
+    assert kind is MessageKind.MATERIAL
+    assert origin == "Иван"
+
+
+async def test_the_recording_travels_with_a_name_the_provider_accepts() -> None:
+    """Telegram voice notes have no file name; the fallback must be a usable one."""
+    client = FakeTelegramClient()
+    speech = FakeTranscriptionClient()
+    poller = make_poller(client, speech=speech)
+    use_bridge(poller, RecordingBridge())
+
+    await deliver(poller, make_voice_update(1))
+
+    assert speech.calls[0].file_name == "voice.ogg"
+    assert speech.calls[0].media_type == "audio/ogg"
+
+
+async def test_a_mistap_is_refused_before_anything_is_downloaded() -> None:
+    """Silence does not come back empty: the recognizer invents words for it.
+
+    Measured against this deployment's model — a 0.2s silent clip produced a
+    confident "Продолжение следует...", with `no_speech_prob` at 0. So the
+    guard is the duration the update already carries, not the transcript.
+    """
+    client = FakeTelegramClient()
+    speech = FakeTranscriptionClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, speech=speech)
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_voice_update(1, duration=0))
+
+    assert [text for _, text, _ in client.sent] == [VOICE_TOO_SHORT_NOTICE]
+    assert client.downloaded_file_ids == []
+    assert speech.calls == []
+    assert bridge.calls == []
+
+
+async def test_a_recording_over_the_cap_is_refused_before_the_download() -> None:
+    """The cap protects latency and the provider's daily audio quota alike."""
+    client = FakeTelegramClient()
+    speech = FakeTranscriptionClient()
+    poller = make_poller(client, speech=speech, voice_max_seconds=60.0)
+    use_bridge(poller, RecordingBridge())
+
+    await deliver(poller, make_voice_update(1, duration=600))
+
+    assert client.sent and "минут" in client.sent[0][1]
+    assert client.downloaded_file_ids == []
+    assert speech.calls == []
+
+
+async def test_an_unintelligible_recording_asks_instead_of_guessing() -> None:
+    """An empty transcript must not become an empty user message."""
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, speech=FakeTranscriptionClient(transcript="   "))
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_voice_update(1))
+
+    assert [text for _, text, _ in client.sent] == [VOICE_EMPTY_NOTICE]
+    assert bridge.calls == []
+
+
+async def test_voice_without_speech_configured_keeps_todays_notice() -> None:
+    """Speech off: a recording behaves exactly like before the feature."""
+    client = FakeTelegramClient()
+    poller = make_poller(client)  # speech=None
+
+    await deliver(poller, make_voice_update(1))
+
+    assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE, None)]
+    assert client.downloaded_file_ids == []
+
+
+async def test_transcription_failure_falls_back_without_propagating() -> None:
+    client = FakeTelegramClient()
+    poller = make_poller(client, speech=RaisingTranscriptionClient())
+
+    await deliver(poller, make_voice_update(1))
+
+    assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE, None)]

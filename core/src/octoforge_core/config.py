@@ -15,6 +15,8 @@ VISION_MAX_TOKENS = 1600
 # the strong tier is asked precisely when the cheap description fell short,
 # usually about that same wall of text, and it may be shown several pages
 VISION_DEEP_MAX_TOKENS = 2400
+# transcription is an upload plus a decode: a long voice note needs room
+SPEECH_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_SECONDS = 1.0
 DEFAULT_RETRY_MAX_SECONDS = 30.0
@@ -55,6 +57,23 @@ class VisionConfig:
     model: str
     timeout_seconds: float = VISION_TIMEOUT_SECONDS
     max_tokens: int = VISION_MAX_TOKENS
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechConfig:
+    """Settings of the model that transcribes voice messages.
+
+    Its own endpoint/model pair, and — unlike vision — the base URL cannot
+    fall back to the main LLM's: transcription is a different endpoint kind,
+    and a chat-only gateway answers 404 for it (measured against this
+    deployment's provider). An empty `model` means the feature is off.
+    """
+
+    api_key: str
+    model: str
+    timeout_seconds: float = SPEECH_TIMEOUT_SECONDS
+    # a hint for the recognizer; empty leaves autodetection on
+    language: str = ""
 
 
 @dataclass(frozen=True, slots=True)
