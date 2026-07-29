@@ -6,7 +6,11 @@ import httpx
 import pytest
 
 from octoforge_web.telegram import client as client_module
-from octoforge_web.telegram.client import TelegramApiError, TelegramBotClient
+from octoforge_web.telegram.client import (
+    MAX_DOWNLOADED_FILE_BYTES,
+    TelegramApiError,
+    TelegramBotClient,
+)
 
 BOT_TOKEN = "123:secret-token"
 CHAT_ID = 42
@@ -15,6 +19,7 @@ UPDATE_ID = 10
 EXPECTED_REQUEST_COUNT = 2
 THREE_REQUESTS = 3
 RETRY_AFTER_SECONDS = 0.01
+FILE_PATH = "photos/file_1.jpg"
 
 
 def json_response(payload: dict[str, object], status_code: int = 200) -> httpx.Response:
@@ -247,6 +252,86 @@ async def test_retry_gives_up_after_the_attempt_budget(
             await client.send_message(CHAT_ID, "hi")
 
     assert requests == THREE_REQUESTS  # MAX_CALL_ATTEMPTS, then gives up
+
+
+# --- files (get_file / download_file) -----------------------------------------
+
+
+async def test_get_file_returns_the_file_path() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/bot{BOT_TOKEN}/getFile"
+        assert json.loads(request.content) == {"file_id": "abc"}
+        return json_response({"ok": True, "result": {"file_path": FILE_PATH}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        assert await client.get_file("abc") == FILE_PATH
+
+
+async def test_get_file_rejects_an_unexpected_result_shape() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response({"ok": True, "result": {}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        with pytest.raises(TelegramApiError, match="unexpected result shape"):
+            await client.get_file("abc")
+
+
+async def test_download_file_returns_the_bytes() -> None:
+    content = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/file/bot{BOT_TOKEN}/{FILE_PATH}"
+        return httpx.Response(200, content=content)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        assert await client.download_file(FILE_PATH) == content
+
+
+async def test_download_file_refuses_a_file_over_the_size_cap() -> None:
+    oversized = b"x" * (MAX_DOWNLOADED_FILE_BYTES + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=oversized)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        with pytest.raises(TelegramApiError, match="too large"):
+            await client.download_file(FILE_PATH)
+
+
+async def test_download_file_propagates_a_hard_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, content=b"Not Found")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        with pytest.raises(TelegramApiError, match="HTTP 404"):
+            await client.download_file(FILE_PATH)
+
+
+async def test_download_file_retries_a_transient_5xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_module, "TRANSIENT_RETRY_DELAY_SECONDS", 0.0)
+    requests = 0
+    content = b"ok-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(503, content=b"Service Unavailable")
+        return httpx.Response(200, content=content)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        result = await client.download_file(FILE_PATH)
+
+    assert result == content
+    assert requests == EXPECTED_REQUEST_COUNT
 
 
 async def test_send_chat_action_does_not_retry() -> None:

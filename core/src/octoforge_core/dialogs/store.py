@@ -26,7 +26,15 @@ from octoforge_core.dialogs.api import (
     MessageStatsList,
 )
 from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
-from octoforge_core.domain import ChatMessage, Dialog, MessageKind, MessageRole, ToolCall
+from octoforge_core.domain import (
+    Attachment,
+    AttachmentKind,
+    ChatMessage,
+    Dialog,
+    MessageKind,
+    MessageRole,
+    ToolCall,
+)
 from octoforge_core.llm.usage import Usage
 from octoforge_core.time import utc_now
 
@@ -143,6 +151,7 @@ class SqlAlchemyMessageRepository:
                         task_id=message.task_id,
                         exchange_id=message.exchange_id,
                         kind=_kind_to_column(message.kind),
+                        attachments=_attachments_to_json(message.attachments),
                     )
                 )
                 dialog = await session.get(DialogRow, dialog_id)
@@ -195,6 +204,7 @@ class SqlAlchemyMessageRepository:
                             task_id=message.task_id,
                             exchange_id=message.exchange_id,
                             kind=_kind_to_column(message.kind),
+                            attachments=_attachments_to_json(message.attachments),
                         )
                     )
                 dialog = await session.get(DialogRow, dialog_id)
@@ -465,8 +475,24 @@ def _to_chat_message(row: MessageRow) -> ChatMessage:
         tool_call_id=row.tool_call_id,
         task_id=row.task_id,
         kind=MessageKind(row.kind) if row.kind else MessageKind.OWN,
+        attachments=_attachments_from_json(row.attachments),
         id=row.id,
         exchange_id=row.exchange_id,
+    )
+
+
+def _attachments_to_json(items: tuple[Attachment, ...]) -> list[dict[str, Any]] | None:
+    """Store attachments only when there are any; NULL keeps legacy rows clean."""
+    if not items:
+        return None
+    return [{"kind": item.kind.value, "ref": item.ref} for item in items]
+
+
+def _attachments_from_json(raw: list[dict[str, Any]] | None) -> tuple[Attachment, ...]:
+    if not raw:
+        return ()
+    return tuple(
+        Attachment(kind=AttachmentKind(item["kind"]), ref=str(item["ref"])) for item in raw
     )
 
 

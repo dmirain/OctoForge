@@ -1,8 +1,14 @@
 """Pydantic models of the Telegram Bot API objects the adapter consumes."""
 
+from dataclasses import dataclass
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# Telegram photos carry no explicit media type; the Bot API always transcodes
+# them to JPEG regardless of the original upload format.
+DEFAULT_PHOTO_MEDIA_TYPE = "image/jpeg"
+IMAGE_MEDIA_TYPE_PREFIX = "image/"
 
 
 class TelegramChatType(StrEnum):
@@ -90,6 +96,35 @@ class TelegramForwardOrigin(BaseModel):
         return source.title if source is not None else ""
 
 
+class TelegramPhotoSize(BaseModel):
+    """One rendition of an uploaded photo; the Bot API sends several sizes."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    file_id: str
+    file_size: int = 0
+    width: int = 0
+    height: int = 0
+
+
+class TelegramDocument(BaseModel):
+    """A file sent as a document (used here only when it is an image)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    file_id: str
+    mime_type: str = ""
+    file_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramImageRef:
+    """A downloadable image found on a message: its file id and media type."""
+
+    file_id: str
+    media_type: str
+
+
 class TelegramMessage(BaseModel):
     """A message payload of an update (`from` is a keyword, hence the alias)."""
 
@@ -105,11 +140,35 @@ class TelegramMessage(BaseModel):
     media_group_id: str | None = None
     forward_origin: TelegramForwardOrigin | None = None
     reply_to_message: TelegramReplyToMessage | None = None
+    # Telegram sends one entry per rendered size (ascending); an image sent
+    # as a document instead of a photo lands here rather than in `photo`
+    photo: list[TelegramPhotoSize] = Field(default_factory=list)
+    document: TelegramDocument | None = None
 
     @property
     def body(self) -> str | None:
         """The message's text wherever it lives (plain text or a caption)."""
         return self.text if self.text is not None else self.caption
+
+    @property
+    def best_image(self) -> TelegramImageRef | None:
+        """The best downloadable image on this message, if any.
+
+        Prefers the largest `photo` rendition (picked by pixel area rather
+        than trusting the ascending-order convention blindly); falls back to
+        `document` when its declared MIME type says it is an image. None
+        when the message carries neither.
+        """
+        if self.photo:
+            largest = max(self.photo, key=lambda size: size.width * size.height)
+            return TelegramImageRef(file_id=largest.file_id, media_type=DEFAULT_PHOTO_MEDIA_TYPE)
+        if self.document is not None and self.document.mime_type.startswith(
+            IMAGE_MEDIA_TYPE_PREFIX
+        ):
+            return TelegramImageRef(
+                file_id=self.document.file_id, media_type=self.document.mime_type
+            )
+        return None
 
 
 class TelegramUpdate(BaseModel):

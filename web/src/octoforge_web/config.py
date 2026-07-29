@@ -5,7 +5,7 @@ from typing import Annotated
 
 from octoforge_core import EmbeddingConfig, LLMConfig
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, SYSTEM_PROMPT_NAME
-from octoforge_core.config import DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddingBackend
+from octoforge_core.config import DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddingBackend, VisionConfig
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES
 from octoforge_core.net.external import ExternalCallAuth
 from pydantic import BaseModel, Field, field_validator
@@ -54,6 +54,9 @@ DEFAULT_TELEGRAM_DATABASE_URL = "sqlite+aiosqlite:///./telegram.db"
 DEFAULT_TELEGRAM_INVITE_TTL_SECONDS = 259200.0  # 3 days
 FILE_SCHEME_PREFIX = "file:"
 DEFAULT_ADMIN_USERNAME = "admin"
+# the cheap tier of the two-tier vision setup (see core.vision.api); the
+# stronger tier is picked elsewhere, only for explicit follow-up questions
+DEFAULT_VISION_MODEL = "minimax-m3"
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -134,10 +137,32 @@ class Settings(BaseSettings):
     # Public base URL of this installation (the /secrets one-time links are
     # built against it); defaults to the loopback self_base_url for dev.
     public_base_url: str = ""
+    # The separate model that looks at images (the main LLM is text-only).
+    # Base URL/key default to the main LLM's when unset — the common case is
+    # one OpenAI-compatible gateway serving both. An empty model turns the
+    # whole feature off (Telegram keeps today's placeholder/text-only path).
+    vision_model: str = DEFAULT_VISION_MODEL
+    vision_base_url: str = ""
+    vision_api_key: str = ""
 
     def resolved_public_base_url(self) -> str:
         """Base URL for user-facing links: configured public one or self."""
         return (self.public_base_url or self.self_base_url).rstrip("/")
+
+    def resolved_vision_base_url(self) -> str:
+        """Base URL of the vision endpoint: configured one, else the main LLM's."""
+        return self.vision_base_url or self.llm_base_url
+
+    def to_vision_config(self) -> VisionConfig:
+        """Build the core vision configuration; key defaults to the main LLM's."""
+        return VisionConfig(
+            api_key=self.vision_api_key or self.llm_api_key,
+            model=self.vision_model,
+        )
+
+    def vision_configured(self) -> bool:
+        """Whether the vision feature is on (a model is set); empty model = off."""
+        return bool(self.vision_model)
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

@@ -74,6 +74,8 @@ from octoforge_core.search.serper import SerperSearchProvider
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.tasks.store import TaskStore
+from octoforge_core.vision.api import VisionClient
+from octoforge_core.vision.client import OpenAIVisionClient
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -165,10 +167,12 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
         async with (
             httpx.AsyncClient(base_url=settings.llm_base_url) as llm_http,
             httpx.AsyncClient(base_url=settings.embedding_base_url) as embed_http,
+            httpx.AsyncClient(base_url=settings.resolved_vision_base_url()) as vision_http,
             httpx.AsyncClient() as outbound_http,
         ):
             llm_client = build_llm_client(llm_http, settings.to_llm_config())
             embedder = _build_embedder(settings, embed_http)
+            vision_client = _build_vision_client(settings, vision_http)
             instructions = build_instruction_service(
                 SqlAlchemyInstructionStore(session_factory),
                 embedder,
@@ -282,6 +286,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         if secret_store is not None
                         else None
                     ),
+                    vision=vision_client,
                 ),
             )
             try:
@@ -489,6 +494,19 @@ def _build_embedder(settings: Settings, http_client: httpx.AsyncClient) -> Embed
     )
 
 
+def _build_vision_client(settings: Settings, http_client: httpx.AsyncClient) -> VisionClient | None:
+    """Build the optional vision client; None (feature off) when no model is configured.
+
+    The transport (`TelegramPoller`) only ever sees the `VisionClient` port —
+    this is the one place a concrete implementation is chosen, so swapping
+    providers (another vendor, a local model, an OCR engine) is a change
+    here and in config, never in the poller.
+    """
+    if not settings.vision_configured():
+        return None
+    return OpenAIVisionClient(http_client=http_client, config=settings.to_vision_config())
+
+
 def _build_reranker(settings: Settings, http_client: httpx.AsyncClient) -> RerankerClient | None:
     """Build the optional reranker: HTTP backend when an API key is set, else local."""
     if not settings.reranker_model:
@@ -612,6 +630,8 @@ class _TelegramExtras:
 
     stores: _TelegramStores | None = None
     secrets_link: Callable[[str], str] | None = None
+    # None: vision is off, Telegram keeps today's placeholder/text-only path
+    vision: VisionClient | None = None
 
 
 def _secrets_link_builder(
@@ -660,6 +680,7 @@ def _start_telegram(
             membership=membership,
             secrets_link=resolved.secrets_link,
             directory=resolved.stores.directory if resolved.stores is not None else None,
+            vision=resolved.vision,
         ),
     )
     task = asyncio.create_task(_run_telegram(poller, registry, dialogs))

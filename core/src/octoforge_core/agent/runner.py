@@ -52,7 +52,13 @@ from octoforge_core.dialogs.api import (
     ExchangeStatus,
     MessageRepository,
 )
-from octoforge_core.domain import ChatMessage, Dialog, MessageKind, MessageRole
+from octoforge_core.domain import (
+    ChatMessage,
+    Dialog,
+    MessageKind,
+    MessageRole,
+    MessageSource,
+)
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
@@ -454,8 +460,7 @@ class ConversationRunner:
         content: str,
         client_message_id: str | None = None,
         reply_to_exchange_id: str | None = None,
-        kind: MessageKind = MessageKind.OWN,
-        origin: str | None = None,
+        source: MessageSource | None = None,
     ) -> None:
         """Submit a user message; the router decides which exchange it joins.
 
@@ -463,18 +468,25 @@ class ConversationRunner:
         already-recorded key is skipped (delivery retries are normal).
         `reply_to_exchange_id` lets a transport that knows the user replied to
         a specific message name the exchange outright, skipping the router.
-        `kind=MATERIAL` marks content the user shared rather than wrote (a
-        forward): it never opens an obligation and never starts a run —
-        `origin` describes where it came from, for the title of the exchange
-        that eventually collects it.
+        `source` says what the message is: `MATERIAL` marks content the user
+        shared rather than wrote (a forward), which never opens an obligation
+        and never starts a run — its `origin` titles the exchange that
+        collects it, and its `attachments` reference files the transport has
+        already described in the text, so a tool can revisit them.
         """
+        resolved = source or MessageSource()
         await self._inbox.put(
             _Submit(
-                ChatMessage(role=MessageRole.USER, content=content, kind=kind),
+                ChatMessage(
+                    role=MessageRole.USER,
+                    content=content,
+                    kind=resolved.kind,
+                    attachments=resolved.attachments,
+                ),
                 client_message_id=client_message_id,
                 reply_to_exchange_id=reply_to_exchange_id,
                 cancel_epoch=self._cancel_epoch,
-                origin=origin,
+                origin=resolved.origin,
             )
         )
 

@@ -26,6 +26,8 @@ RETRYABLE_HTTP_STATUS_CODES = frozenset({500, 502, 503, 504})
 MAX_CALL_ATTEMPTS = 3
 MAX_TOTAL_RETRY_WAIT_SECONDS = 10.0
 TRANSIENT_RETRY_DELAY_SECONDS = 1.0
+# a bot must not become a memory hog over a single incoming picture
+MAX_DOWNLOADED_FILE_BYTES = 12 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,14 @@ class TelegramClient(Protocol):
         """Send a chat action (e.g. typing)."""
         ...
 
+    async def get_file(self, file_id: str) -> str:
+        """Resolve a file id to its Bot API file path, for `download_file`."""
+        ...
+
+    async def download_file(self, file_path: str) -> bytes:
+        """Download file bytes; raises `TelegramApiError` over the size cap or on failure."""
+        ...
+
 
 class TelegramBotClient:
     """Bot API client: token in the method path, JSON payloads, long-poll timeouts."""
@@ -80,6 +90,7 @@ class TelegramBotClient:
     def __init__(self, http_client: httpx.AsyncClient, token: str) -> None:
         self._http = http_client
         self._base_url = f"{API_BASE_URL}/bot{token}"
+        self._file_base_url = f"{API_BASE_URL}/file/bot{token}"
 
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[TelegramUpdate]:
         payload: dict[str, Any] = {"timeout": timeout_seconds, "allowed_updates": ALLOWED_UPDATES}
@@ -131,6 +142,56 @@ class TelegramBotClient:
         # fire-and-forget UX hint (a typing indicator): worth failing fast on
         # rather than queuing behind a rate-limit retry.
         await self._call("sendChatAction", {"chat_id": chat_id, "action": action}, retry=False)
+
+    async def get_file(self, file_id: str) -> str:
+        result = await self._call("getFile", {"file_id": file_id})
+        if not isinstance(result, dict) or "file_path" not in result:
+            raise TelegramApiError("getFile: unexpected result shape")
+        return str(result["file_path"])
+
+    async def download_file(self, file_path: str) -> bytes:
+        """GET the file's bytes; not a JSON call, so it gets its own small retry loop."""
+        url = f"{self._file_base_url}/{file_path}"
+        total_wait = 0.0
+        for attempt in range(1, MAX_CALL_ATTEMPTS + 1):
+            try:
+                return await self._download_once(url)
+            except _RetryableCallError as exc:
+                exhausted = attempt == MAX_CALL_ATTEMPTS
+                over_cap = total_wait + exc.wait_seconds > MAX_TOTAL_RETRY_WAIT_SECONDS
+                if exhausted or over_cap:
+                    raise TelegramApiError(str(exc)) from None
+                logger.warning(
+                    "downloadFile: %s; retrying in %.1fs (attempt %d/%d)",
+                    exc,
+                    exc.wait_seconds,
+                    attempt,
+                    MAX_CALL_ATTEMPTS,
+                )
+                await asyncio.sleep(exc.wait_seconds)
+                total_wait += exc.wait_seconds
+        raise AssertionError("unreachable: the loop above always returns or raises")
+
+    async def _download_once(self, url: str) -> bytes:
+        """Make one download attempt; raises `_RetryableCallError` for a transient failure."""
+        try:
+            response = await self._http.get(url, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise _RetryableCallError(
+                TRANSIENT_RETRY_DELAY_SECONDS, f"downloadFile: {exc}"
+            ) from exc
+        if response.status_code in RETRYABLE_HTTP_STATUS_CODES:
+            raise _RetryableCallError(
+                TRANSIENT_RETRY_DELAY_SECONDS, f"downloadFile: HTTP {response.status_code}"
+            )
+        if response.status_code != httpx.codes.OK:
+            raise TelegramApiError(f"downloadFile: HTTP {response.status_code}")
+        if len(response.content) > MAX_DOWNLOADED_FILE_BYTES:
+            logger.warning(
+                "downloadFile: file exceeds the %d byte cap; refusing", MAX_DOWNLOADED_FILE_BYTES
+            )
+            raise TelegramApiError("downloadFile: file too large")
+        return response.content
 
     async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
         payload: dict[str, Any] = {

@@ -66,7 +66,14 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
 )
-from octoforge_core.domain import ChatMessage, Dialog, MessageKind, MessageRole, ToolCall
+from octoforge_core.domain import (
+    ChatMessage,
+    Dialog,
+    MessageKind,
+    MessageRole,
+    MessageSource,
+    ToolCall,
+)
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
@@ -3768,9 +3775,15 @@ async def test_forwarding_material_collects_without_routing_or_starting_a_run(
     manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    await runner.submit(MATERIAL_THREE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(
+        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
+    await runner.submit(
+        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
+    await runner.submit(
+        MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
     await wait_for_condition(lambda: len(runner.history()) == THREE_MATERIAL_MESSAGES)
 
     assert router.calls == []
@@ -3793,7 +3806,9 @@ async def test_forwarding_material_without_origin_titles_the_exchange_anonymous(
     manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)  # no origin: anonymous forward
+    await runner.submit(
+        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL)
+    )  # no origin: anonymous forward
     await wait_for_condition(lambda: len(runner.history()) == 1)
 
     exchange = await SqlAlchemyExchangeRepository(session_factory).find_collecting(runner.dialog_id)
@@ -3812,9 +3827,15 @@ async def test_promote_collected_starts_one_run_covering_all_collected_material(
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    await runner.submit(MATERIAL_THREE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(
+        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
+    await runner.submit(
+        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
+    await runner.submit(
+        MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
     await wait_for_condition(lambda: len(runner.history()) == THREE_MATERIAL_MESSAGES)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
@@ -3844,7 +3865,7 @@ async def test_promote_collected_is_a_noop_once_the_exchange_left_collecting(
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
@@ -3856,7 +3877,7 @@ async def test_promote_collected_is_a_noop_once_the_exchange_left_collecting(
     await runner.promote_collected(exchange.id)
     # FIFO proof: this submit's effect can only land after the promote above
     # was fully dispatched, since both go through the same single-consumer inbox
-    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     settled = await exchanges.get(exchange.id)
@@ -3876,14 +3897,16 @@ async def test_promote_collected_is_a_noop_when_material_just_touched_it(
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
     # not backdated: the touch from the submit above is still fresh
 
     await runner.promote_collected(exchange.id)
-    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL)  # FIFO ordering proof
+    await runner.submit(
+        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL)
+    )  # FIFO ordering proof
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     settled = await exchanges.get(exchange.id)
@@ -3902,7 +3925,9 @@ async def test_own_message_routed_into_the_collection_starts_a_run_and_leaves_co
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(
+        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
@@ -3925,7 +3950,7 @@ async def test_cancel_cancels_a_collecting_exchange_and_blocks_later_promotion(
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
@@ -3937,7 +3962,9 @@ async def test_cancel_cancels_a_collecting_exchange_and_blocks_later_promotion(
 
     await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
     await runner.promote_collected(exchange.id)
-    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL)  # FIFO ordering proof
+    await runner.submit(
+        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL)
+    )  # FIFO ordering proof
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     still_cancelled = await exchanges.get(exchange.id)
@@ -3963,7 +3990,7 @@ async def test_material_never_triggers_the_process_limit_notice(
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     # no canned notice was inserted: exactly the question and the forward
@@ -4011,9 +4038,15 @@ async def test_promotion_reparents_material_into_a_live_exchange_with_one_router
     await wait_for_condition(lambda: not runner._processes)  # asked, parked, run ended
     target_id = (await exchanges.list_live(runner.dialog_id))[0].id
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    await runner.submit(MATERIAL_THREE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(
+        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
+    await runner.submit(
+        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
+    await runner.submit(
+        MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
     await wait_for_condition(
         lambda: (
             sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL)
@@ -4075,7 +4108,7 @@ async def test_router_new_decision_promotes_the_collection_as_its_own_exchange(
     await collect_until(queue, is_delivered(tool.question))
     await wait_for_condition(lambda: not runner._processes)  # asked, parked, run ended
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(
         lambda: sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL) == 1
     )
@@ -4119,7 +4152,7 @@ async def test_material_routing_ignores_cancel_ids_from_the_decision(
     await wait_for_condition(lambda: not runner._processes)  # asked, parked, run ended
     target_id = (await exchanges.list_live(runner.dialog_id))[0].id
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(
         lambda: sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL) == 1
     )
@@ -4165,7 +4198,7 @@ async def test_command_decision_at_promotion_promotes_the_collection_on_its_own(
     await collect_until(queue, is_delivered(tool.question))
     await wait_for_condition(lambda: not runner._processes)  # asked, parked, run ended
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(
         lambda: sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL) == 1
     )
@@ -4207,9 +4240,9 @@ async def test_material_landing_in_a_live_exchange_parks_it_instead_of_reopening
     await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
     target_id = (await exchanges.list_live(runner.dialog_id))[0].id
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
-    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL)
-    await runner.submit(MATERIAL_THREE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    await runner.submit(MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL))
+    await runner.submit(MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL))
     await wait_for_condition(
         lambda: (
             sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL)
@@ -4264,7 +4297,9 @@ async def test_material_arriving_while_a_run_is_live_joins_its_exchange_directly
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     target_id = (await exchanges.list_live(runner.dialog_id))[0].id
 
-    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(
+        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     # no collection was ever created: the forward joined the live question's

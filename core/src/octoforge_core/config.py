@@ -5,6 +5,10 @@ from enum import StrEnum
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_EMBEDDING_BATCH_SIZE = 16
+# vision calls are slower than text ones (a measured 4-8s for the cheap
+# model, 15-30s for the strong one), so they get their own budget
+VISION_TIMEOUT_SECONDS = 90.0
+VISION_MAX_TOKENS = 900
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_SECONDS = 1.0
 DEFAULT_RETRY_MAX_SECONDS = 30.0
@@ -30,6 +34,21 @@ class LLMConfig:
     max_retries: int = DEFAULT_MAX_RETRIES
     retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS
     retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS
+
+
+@dataclass(frozen=True, slots=True)
+class VisionConfig:
+    """Settings of the model that looks at images (separate from the main LLM).
+
+    The main model is text-only, so vision is its own endpoint/model pair;
+    base URL and key default to the main LLM's in the composition root. An
+    empty `model` means the feature is off and images keep their placeholder.
+    """
+
+    api_key: str
+    model: str
+    timeout_seconds: float = VISION_TIMEOUT_SECONDS
+    max_tokens: int = VISION_MAX_TOKENS
 
 
 @dataclass(frozen=True, slots=True)

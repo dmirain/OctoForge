@@ -61,7 +61,16 @@ from octoforge_core.dialogs.api import (
     ExchangeRepository,
     MessageRepository,
 )
-from octoforge_core.domain import ChatMessage, Dialog, MessageKind, MessageRole, ToolCall
+from octoforge_core.domain import (
+    Attachment,
+    AttachmentKind,
+    ChatMessage,
+    Dialog,
+    MessageKind,
+    MessageRole,
+    MessageSource,
+    ToolCall,
+)
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import (
     InstructionService,
@@ -107,6 +116,8 @@ from octoforge_core.tools.registry import ToolRegistry
 __all__ = [
     "AgentLoop",
     "AssistantMessage",
+    "Attachment",
+    "AttachmentKind",
     "AuthError",
     "Cancelled",
     "ChatMessage",
@@ -148,6 +159,7 @@ __all__ = [
     "MessageRepository",
     "MessageRole",
     "MessageRouter",
+    "MessageSource",
     "ProcessCompleted",
     "ProcessStarted",
     "PromptProvider",

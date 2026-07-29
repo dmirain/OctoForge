@@ -9,6 +9,8 @@ import httpx
 import pytest
 from octoforge_core import (
     AgentLoop,
+    Attachment,
+    AttachmentKind,
     ChatMessage,
     ConversationManager,
     MessageKind,
@@ -30,10 +32,11 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.vision.api import ImageData, VisionClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.telegram.bridge import PARSE_MODE_HTML, RunnerProvider
-from octoforge_web.telegram.client import USER_ID_PREFIX
+from octoforge_web.telegram.client import USER_ID_PREFIX, TelegramApiError
 from octoforge_web.telegram.invites.api import MemberProfile
 from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
@@ -42,17 +45,22 @@ from octoforge_web.telegram.models import (
     TelegramChatType,
     TelegramForwardOrigin,
     TelegramMessage,
+    TelegramPhotoSize,
     TelegramReplyToMessage,
     TelegramUpdate,
     TelegramUser,
 )
 from octoforge_web.telegram.poller import (
     ACCESS_DENIED_TEXT,
+    CAPTION_LABEL,
     COMMAND_CANCEL,
     COMMAND_START,
     GREETING_TEXT,
     GROUP_NOTICE,
+    IMAGE_TAG,
+    INGESTION_PROMPT,
     INVITE_INVALID_TEXT,
+    MATERIAL_PLACEHOLDER,
     SECRETS_DISABLED_TEXT,
     TEXT_ONLY_NOTICE,
     WELCOME_TEXT,
@@ -96,6 +104,8 @@ class FakeTelegramClient:
         self.sent: list[tuple[int, str, str | None]] = []
         self.replies: list[int | None] = []
         self.edited: list[tuple[int, int, str, str | None]] = []
+        self.downloaded_file_ids: list[str] = []
+        self.download_error: Exception | None = None
         self._next_message_id = 0
 
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[TelegramUpdate]:
@@ -127,6 +137,15 @@ class FakeTelegramClient:
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         pass
 
+    async def get_file(self, file_id: str) -> str:
+        return f"path/{file_id}"
+
+    async def download_file(self, file_path: str) -> bytes:
+        if self.download_error is not None:
+            raise self.download_error
+        self.downloaded_file_ids.append(file_path.removeprefix("path/"))
+        return b"fake-image-bytes"
+
 
 class RecordingBridge:
     """TelegramBridge stub recording `handle_text` calls (poller-forwarding tests only)."""
@@ -134,17 +153,20 @@ class RecordingBridge:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None, int | None]] = []
         self.kinds: list[tuple[MessageKind, str | None]] = []
+        self.attachments: list[tuple[Attachment, ...]] = []
 
-    async def handle_text(
+    async def handle_text(  # noqa: PLR0913, PLR0917 — mirrors TelegramBridge.handle_text
         self,
         content: str,
         client_message_id: str | None = None,
         reply_to_message_id: int | None = None,
         kind: MessageKind = MessageKind.OWN,
         origin: str | None = None,
+        attachments: tuple[Attachment, ...] = (),
     ) -> None:
         self.calls.append((content, client_message_id, reply_to_message_id))
         self.kinds.append((kind, origin))
+        self.attachments.append(attachments)
 
     async def cancel(self) -> None:
         raise AssertionError("cancel should not be called in these tests")
@@ -201,6 +223,25 @@ class PassthroughRouter:
         return RouteDecision()
 
 
+class FakeVisionClient:
+    """VisionClient stub returning a scripted description, recording every call."""
+
+    def __init__(self, description: str) -> None:
+        self._description = description
+        self.calls: list[tuple[tuple[ImageData, ...], str]] = []
+
+    async def look(self, images: tuple[ImageData, ...], prompt: str) -> str:
+        self.calls.append((images, prompt))
+        return self._description
+
+
+class RaisingVisionClient:
+    """VisionClient stub that always fails (fallback-path tests only)."""
+
+    async def look(self, images: tuple[ImageData, ...], prompt: str) -> str:
+        raise RuntimeError("vision boom")
+
+
 def make_update(
     update_id: int,
     text: str | None = "hi",
@@ -216,6 +257,26 @@ def make_update(
             from_user=TelegramUser(id=TELEGRAM_USER_ID),
             chat=TelegramChat(id=TELEGRAM_USER_ID, type=chat_type),
             text=text,
+        ),
+    )
+
+
+def make_photo_update(
+    update_id: int,
+    file_id: str = "photo-1",
+    caption: str | None = None,
+    forward_origin: TelegramForwardOrigin | None = None,
+) -> TelegramUpdate:
+    """An update carrying a single-size photo (own or forwarded)."""
+    return TelegramUpdate(
+        update_id=update_id,
+        message=TelegramMessage(
+            message_id=update_id,
+            from_user=TelegramUser(id=TELEGRAM_USER_ID),
+            chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
+            caption=caption,
+            photo=[TelegramPhotoSize(file_id=file_id, width=800, height=600)],
+            forward_origin=forward_origin,
         ),
     )
 
@@ -261,6 +322,7 @@ def make_poller(
     provider: RunnerProvider = forbidden_provider,
     membership: TelegramMembership | None = None,
     secrets_link: Callable[[str], str] | None = None,
+    vision: VisionClient | None = None,
 ) -> TelegramPoller:
     registry = TelegramBridgeRegistry(
         runner_provider=provider,
@@ -275,6 +337,7 @@ def make_poller(
             error_backoff_seconds=NO_BACKOFF,
             membership=membership,
             secrets_link=secrets_link,
+            vision=vision,
         ),
     )
 
@@ -839,3 +902,146 @@ async def test_non_text_message_is_answered_only_past_the_gate(
     await poller.dispatch(make_update(1, text=None))
 
     assert [text for _, text, _ in client.sent] == [ACCESS_DENIED_TEXT]
+
+
+# --- vision (image ingestion) -------------------------------------------------
+
+VISION_DESCRIPTION = "Фото: кот сидит на подоконнике возле окна."
+PHOTO_FILE_ID = "photo-42"
+FORWARD_ORIGIN_PAYLOAD = {
+    "type": "user",
+    "date": 1,
+    "sender_user": {"id": 5, "first_name": "Иван"},
+}
+
+
+def make_forward_origin() -> TelegramForwardOrigin:
+    return TelegramForwardOrigin.model_validate(FORWARD_ORIGIN_PAYLOAD)
+
+
+async def test_own_photo_with_vision_submits_the_description_and_attachment() -> None:
+    client = FakeTelegramClient()
+    vision = FakeVisionClient(VISION_DESCRIPTION)
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=vision)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    await poller.dispatch(make_photo_update(1, file_id=PHOTO_FILE_ID))
+
+    (content, client_message_id, _), (kind, origin) = bridge.calls[0], bridge.kinds[0]
+    assert content == f"{IMAGE_TAG} {VISION_DESCRIPTION}"
+    assert client_message_id == "1"
+    assert kind is MessageKind.OWN
+    assert origin is None
+    expected_ref = f"tg:{PHOTO_FILE_ID}"
+    assert bridge.attachments[0] == (Attachment(kind=AttachmentKind.IMAGE, ref=expected_ref),)
+    assert client.downloaded_file_ids == [PHOTO_FILE_ID]
+    assert vision.calls[0][1] == INGESTION_PROMPT
+    assert client.sent == []  # no text-only notice, vision handled it
+
+
+async def test_own_photo_with_caption_appends_it_after_the_description() -> None:
+    client = FakeTelegramClient()
+    vision = FakeVisionClient(VISION_DESCRIPTION)
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=vision)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    await poller.dispatch(make_photo_update(1, caption="что это?"))
+
+    content = bridge.calls[0][0]
+    assert content == f"{IMAGE_TAG} {VISION_DESCRIPTION}\n\n{CAPTION_LABEL} что это?"
+
+
+async def test_forwarded_photo_with_vision_is_material_with_attribution() -> None:
+    client = FakeTelegramClient()
+    vision = FakeVisionClient(VISION_DESCRIPTION)
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=vision)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    await poller.dispatch(make_photo_update(1, forward_origin=make_forward_origin()))
+
+    (content, _, _), (kind, call_origin) = bridge.calls[0], bridge.kinds[0]
+    assert content == f"[переслано от Иван] {IMAGE_TAG} {VISION_DESCRIPTION}"
+    assert kind is MessageKind.MATERIAL
+    assert call_origin == "Иван"
+
+
+async def test_own_photo_without_vision_keeps_todays_notice() -> None:
+    """No vision configured: an uncaptioned photo behaves exactly like before the feature."""
+    client = FakeTelegramClient()
+    poller = make_poller(client)  # vision=None
+
+    await poller.dispatch(make_photo_update(1))
+
+    assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE, None)]
+    assert client.downloaded_file_ids == []
+
+
+async def test_forwarded_photo_without_vision_keeps_the_placeholder() -> None:
+    """No vision configured: a forwarded photo behaves exactly like before the feature."""
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client)  # vision=None
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    await poller.dispatch(make_photo_update(1, forward_origin=make_forward_origin()))
+
+    content = bridge.calls[0][0]
+    assert content == f"[переслано от Иван] {MATERIAL_PLACEHOLDER}"
+    assert client.downloaded_file_ids == []
+
+
+async def test_own_photo_vision_failure_falls_back_without_propagating() -> None:
+    client = FakeTelegramClient()
+    poller = make_poller(client, vision=RaisingVisionClient())
+
+    await poller.dispatch(make_photo_update(1))
+
+    assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE, None)]
+
+
+async def test_own_photo_download_failure_falls_back_without_propagating() -> None:
+    client = FakeTelegramClient()
+    client.download_error = TelegramApiError("boom")
+    poller = make_poller(client, vision=FakeVisionClient(VISION_DESCRIPTION))
+
+    await poller.dispatch(make_photo_update(1))
+
+    assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE, None)]
+
+
+async def test_forwarded_photo_vision_failure_falls_back_to_the_placeholder() -> None:
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=RaisingVisionClient())
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    await poller.dispatch(make_photo_update(1, forward_origin=make_forward_origin()))
+
+    content = bridge.calls[0][0]
+    assert content == f"[переслано от Иван] {MATERIAL_PLACEHOLDER}"
+
+
+async def test_image_document_is_treated_as_a_photo() -> None:
+    """An image sent as a document (not a compressed photo) is described too."""
+    client = FakeTelegramClient()
+    vision = FakeVisionClient(VISION_DESCRIPTION)
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=vision)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+    update = TelegramUpdate(
+        update_id=1,
+        message=TelegramMessage(
+            message_id=1,
+            from_user=TelegramUser(id=TELEGRAM_USER_ID),
+            chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
+            document={"file_id": "doc-1", "mime_type": "image/png"},
+        ),
+    )
+
+    await poller.dispatch(update)
+
+    assert bridge.calls[0][0] == f"{IMAGE_TAG} {VISION_DESCRIPTION}"
+    assert client.downloaded_file_ids == ["doc-1"]

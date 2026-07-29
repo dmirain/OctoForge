@@ -6,7 +6,9 @@ from pydantic import ValidationError
 from octoforge_web.telegram.models import (
     TelegramChat,
     TelegramChatType,
+    TelegramDocument,
     TelegramMessage,
+    TelegramPhotoSize,
     TelegramUpdate,
     TelegramUser,
 )
@@ -17,6 +19,7 @@ MESSAGE_ID = 7
 USER_NAME = "Alice"
 MESSAGE_TEXT = "hello"
 MESSAGE_DATE = 1784353000
+PHOTO_FILE_SIZE = 123
 
 
 def test_update_parses_with_extra_fields_ignored() -> None:
@@ -150,3 +153,74 @@ def test_caption_is_the_body_of_a_media_message() -> None:
     assert photo.body == "смотри"
     assert photo.media_group_id == "album-1"
     assert bare.body is None
+
+
+# --- image detection (best_image) ---------------------------------------------
+
+
+def make_message(**extra: object) -> TelegramMessage:
+    return TelegramMessage.model_validate(
+        {"message_id": 1, "chat": {"id": 1, "type": "private"}, **extra}
+    )
+
+
+def test_best_image_is_none_without_photo_or_image_document() -> None:
+    non_image_doc = {"file_id": "doc-1", "mime_type": "application/pdf"}
+    assert make_message().best_image is None
+    assert make_message(document=non_image_doc).best_image is None
+
+
+def test_best_image_picks_the_largest_photo_by_area() -> None:
+    message = make_message(
+        photo=[
+            {"file_id": "small", "width": 90, "height": 90},
+            {"file_id": "large", "width": 800, "height": 600},
+            {"file_id": "medium", "width": 320, "height": 240},
+        ]
+    )
+
+    image = message.best_image
+
+    assert image is not None
+    assert image.file_id == "large"
+    assert image.media_type == "image/jpeg"
+
+
+def test_best_image_falls_back_to_an_image_document() -> None:
+    message = make_message(document={"file_id": "doc-9", "mime_type": "image/png"})
+
+    image = message.best_image
+
+    assert image is not None
+    assert image.file_id == "doc-9"
+    assert image.media_type == "image/png"
+
+
+def test_best_image_prefers_photo_over_document() -> None:
+    message = make_message(
+        photo=[{"file_id": "photo-1", "width": 100, "height": 100}],
+        document={"file_id": "doc-1", "mime_type": "image/png"},
+    )
+
+    image = message.best_image
+
+    assert image is not None
+    assert image.file_id == "photo-1"
+
+
+def test_photo_size_ignores_extra_fields() -> None:
+    size = TelegramPhotoSize.model_validate(
+        {
+            "file_id": "f1",
+            "width": 10,
+            "height": 10,
+            "file_size": PHOTO_FILE_SIZE,
+            "unexpected": "x",
+        }
+    )
+    document = TelegramDocument.model_validate(
+        {"file_id": "d1", "mime_type": "image/jpeg", "file_name": "a.jpg", "unexpected": "x"}
+    )
+
+    assert size.file_size == PHOTO_FILE_SIZE
+    assert document.file_name == "a.jpg"

@@ -12,6 +12,7 @@ from octoforge_core import (
     ConversationManager,
     MessageKind,
     MessageRole,
+    MessageSource,
     ToolRegistry,
     ToolSpec,
 )
@@ -260,11 +261,10 @@ class FakeRunner:
         content: str,
         client_message_id: str | None = None,
         reply_to_exchange_id: str | None = None,
-        kind: MessageKind = MessageKind.OWN,
-        origin: str | None = None,
+        source: MessageSource | None = None,
     ) -> None:
         self.submitted.append((content, client_message_id, reply_to_exchange_id))
-        self.kinds.append(kind)
+        self.kinds.append((source or MessageSource()).kind)
 
     async def cancel(self) -> None:
         raise AssertionError("cancel should not be called in these tests")

@@ -21,7 +21,7 @@ from octoforge_core.agent.events import (
     ToolCallRequested,
 )
 from octoforge_core.agent.runner import ConversationEvent, ConversationRunner
-from octoforge_core.domain import MessageKind
+from octoforge_core.domain import Attachment, MessageKind, MessageSource
 
 from octoforge_web.telegram.client import (
     CHAT_ACTION_TYPING,
@@ -121,13 +121,14 @@ class TelegramBridge:
         queue = runner.subscribe()  # subscribe before the run starts, events are not replayed
         self._forwarder = asyncio.create_task(self._forward(runner, queue))
 
-    async def handle_text(
+    async def handle_text(  # noqa: PLR0913, PLR0917 — transport-shaped boundary signature
         self,
         content: str,
         client_message_id: str | None = None,
         reply_to_message_id: int | None = None,
         kind: MessageKind = MessageKind.OWN,
         origin: str | None = None,
+        attachments: tuple[Attachment, ...] = (),
     ) -> None:
         """Submit user text into the dialog, starting the forwarder on first contact.
 
@@ -141,6 +142,9 @@ class TelegramBridge:
         back to the router, same as before. `kind=MATERIAL` marks forwarded
         content: no answer follows it directly, so the typing indicator is
         skipped — it would promise a reply that is not coming yet.
+        `attachments` carries transport-scoped references (e.g. an ingested
+        Telegram photo) alongside the already-described text; empty for a
+        plain text message.
         """
         runner = await self._ensure_runner()
         await self.start()
@@ -155,8 +159,7 @@ class TelegramBridge:
             content,
             client_message_id=client_message_id,
             reply_to_exchange_id=reply_to_exchange_id,
-            kind=kind,
-            origin=origin,
+            source=MessageSource(kind=kind, origin=origin, attachments=attachments),
         )
 
     async def cancel(self) -> None:

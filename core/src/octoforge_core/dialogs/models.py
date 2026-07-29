@@ -58,6 +58,9 @@ class MessageRow(Base):
     # MessageKind for the exceptional kinds only: NULL means the user's own
     # words, so legacy rows keep their meaning without a backfill
     kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    # files that came with the message, as transport-scoped references
+    # ([{kind, ref}]); NULL when the message carried none
+    attachments: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
 
 
