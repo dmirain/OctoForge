@@ -52,6 +52,7 @@ from octoforge_core.agent.runner import (
     RunnerConfig,
     TaskOutcomeListener,
     _ProcessTerminated,
+    _Unseen,
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, AssembledContext, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
@@ -122,6 +123,7 @@ THREE_MATERIAL_MESSAGES = 3
 TWO_MESSAGES = 2
 MATERIAL_REACTION = "reacted to the batch"
 ADOPTING_TASK_ID = "adopting-task"
+TARGET_QUESTION = "target question"
 
 
 @pytest.fixture
@@ -1032,6 +1034,10 @@ async def _is_cancelled(exchanges: SqlAlchemyExchangeRepository, exchange_id: st
 
 async def _is_failed(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
     return (await exchanges.get(exchange_id)).status is ExchangeStatus.FAILED
+
+
+async def _is_collecting(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
+    return (await exchanges.get(exchange_id)).status is ExchangeStatus.COLLECTING
 
 
 async def _backdate_exchange(
@@ -3021,7 +3027,7 @@ async def test_settle_skips_when_the_exchange_changed_hands(
             task_id=DEAD_TASK_ID,
             exchange_id=exchange.id,
             exchange_status=ExchangeStatus.ANSWERED,
-            unseen_messages=True,
+            unseen_messages=_Unseen.SPOKEN,
         )
     )
 
@@ -3048,7 +3054,7 @@ async def test_settle_does_not_resurrect_a_cancelled_exchange(
             task_id=DEAD_TASK_ID,
             exchange_id=exchange.id,
             exchange_status=ExchangeStatus.ANSWERED,
-            unseen_messages=True,
+            unseen_messages=_Unseen.SPOKEN,
         )
     )
 
@@ -3965,3 +3971,234 @@ async def test_material_never_triggers_the_process_limit_notice(
 
     tool.release.set()
     await collect_until(queue, is_completed)
+
+
+# --- Phase 3: promotion targeting another live exchange -------------------
+#
+# `_material_target` (agent/runner.py) asks the router ONCE, for the whole
+# batch, whether a settled collection belongs to one of the dialog's other
+# live exchanges. Only a CONTINUE into a known id counts as a target; the
+# decision's `cancel_ids` are dropped entirely — forwarded text is untrusted,
+# so a batch cannot cancel anything on its own say-so.
+
+
+async def test_promotion_reparents_material_into_a_live_exchange_with_one_router_call(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A CONTINUE decision moves the whole batch into the named exchange
+    instead of starting a run of its own, and the router is asked exactly
+    once for the batch (not once per forward)."""
+    tool = BlockingTool()
+    router = FakeRouter()
+    llm = ScriptedLLM([blocking_call(), reply("target final")])
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(TARGET_QUESTION)
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    target_id = (await exchanges.list_live(runner.dialog_id))[0].id
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(MATERIAL_THREE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await wait_for_condition(lambda: len(runner.history()) == 1 + THREE_MATERIAL_MESSAGES)
+    collection = await exchanges.find_collecting(runner.dialog_id)
+    assert collection is not None
+    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+
+    router.decide_continue()  # CONTINUE into exchanges[0]: the only other live exchange
+    await runner.promote_collected(collection.id)
+    await wait_for_async_condition(lambda: _is_cancelled(exchanges, collection.id))
+
+    assert len(router.calls) == 1  # one call for the whole batch, not one per forward
+    routed_exchanges, digest = router.calls[0]
+    assert [item.id for item in routed_exchanges] == [target_id]  # the collection is excluded
+    assert f"forwarded {THREE_MATERIAL_MESSAGES} message" in digest
+    assert MATERIAL_ONE in digest
+    assert MATERIAL_TWO in digest
+    assert MATERIAL_THREE in digest
+
+    reparented = [m for m in runner.history() if m.kind is MessageKind.MATERIAL]
+    assert len(reparented) == THREE_MATERIAL_MESSAGES
+    assert all(m.exchange_id == target_id for m in reparented)
+    still_live = await exchanges.get(target_id)
+    assert still_live.status is ExchangeStatus.IN_PROGRESS  # its own run, untouched
+
+    tool.release.set()
+    await collect_until(queue, is_delivered("target final"))
+    await wait_for_async_condition(lambda: _is_answered(exchanges, target_id))
+
+
+async def test_router_new_decision_promotes_the_collection_as_its_own_exchange(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A NEW decision means the batch belongs to nobody else: it is promoted
+    as its own exchange, with no reparenting, just like with no other live
+    exchange at all."""
+    tool = BlockingTool()
+    router = FakeRouter()  # default action is NEW
+    llm = ScriptedLLM([blocking_call(), reply(MATERIAL_REACTION), reply("target final")])
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(TARGET_QUESTION)
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+    collection = await exchanges.find_collecting(runner.dialog_id)
+    assert collection is not None
+    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+
+    await runner.promote_collected(collection.id)
+    events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
+
+    assert len(router.calls) == 1  # consulted, but declined to claim the batch
+    material_message = next(m for m in runner.history() if m.content == MATERIAL_ONE)
+    assert material_message.exchange_id == collection.id  # never reparented
+    await wait_for_async_condition(lambda: _is_answered(exchanges, collection.id))
+    assert any(isinstance(e.payload, Finished) for e in events)
+
+    tool.release.set()
+    await collect_completions(queue, TWO_PROCESSES)
+
+
+async def test_material_routing_ignores_cancel_ids_from_the_decision(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Injection guard: forwarded content is untrusted third-party text, so
+    even a router decision that names `cancel_ids` for the batch must not
+    cancel anything — only the user's own words can do that."""
+    tool = BlockingTool()
+    router = FakeRouter()
+    llm = ScriptedLLM([blocking_call(), reply("target final")])
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(TARGET_QUESTION)
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    target_id = (await exchanges.list_live(runner.dialog_id))[0].id
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+    collection = await exchanges.find_collecting(runner.dialog_id)
+    assert collection is not None
+    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+
+    router.decide_continue()
+    router.decide_cancel(target_id)  # a confused/hostile decision naming the live exchange
+    await runner.promote_collected(collection.id)
+    await wait_for_async_condition(lambda: _is_cancelled(exchanges, collection.id))
+
+    still_live = await exchanges.get(target_id)
+    assert still_live.status is ExchangeStatus.IN_PROGRESS  # not cancelled by the material decision
+    assert still_live.owner_task_id is not None
+
+    tool.release.set()
+    await collect_until(queue, is_delivered("target final"))
+    await wait_for_async_condition(lambda: _is_answered(exchanges, target_id))
+
+
+async def test_command_decision_at_promotion_promotes_the_collection_on_its_own(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A COMMAND decision answers nothing about ownership: it reads as "no
+    target", same as NEW — the collection is promoted on its own."""
+    tool = BlockingTool()
+    router = FakeRouter()
+    router.action = RouteAction.COMMAND
+    llm = ScriptedLLM([blocking_call(), reply(MATERIAL_REACTION), reply("target final")])
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(TARGET_QUESTION)
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+    collection = await exchanges.find_collecting(runner.dialog_id)
+    assert collection is not None
+    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+
+    await runner.promote_collected(collection.id)
+    events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
+
+    assert len(router.calls) == 1
+    await wait_for_async_condition(lambda: _is_answered(exchanges, collection.id))
+    assert any(isinstance(e.payload, Finished) for e in events)
+
+    tool.release.set()
+    await collect_completions(queue, TWO_PROCESSES)
+
+
+async def test_material_landing_in_a_live_exchange_parks_it_instead_of_reopening(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No answer loops: material that lands in a live exchange after its run's
+    last sync must not reopen it (that would be one requeue per forward — the
+    very bug this model replaced). The run settles the exchange as COLLECTING,
+    and the batch earns exactly one later reaction once it is promoted."""
+    router = FakeRouter()
+    llm = GatedLLM()
+    manager = make_manager(llm, quick_registry(), session_factory, ManagerOptions(router=router))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("start")
+    # the run has synced once (the quick tool call) and is now stalled mid-
+    # second-iteration, past its last sync — exactly like test_late_message_
+    # reopens_the_exchange, but with material instead of a real reply
+    await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
+    target_id = (await exchanges.list_live(runner.dialog_id))[0].id
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL)
+    await runner.submit(MATERIAL_THREE, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == 1 + THREE_MATERIAL_MESSAGES)
+    collection = await exchanges.find_collecting(runner.dialog_id)
+    assert collection is not None
+    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+
+    router.decide_continue()  # the only other live exchange is the run in progress
+    await runner.promote_collected(collection.id)
+    await wait_for_async_condition(lambda: _is_cancelled(exchanges, collection.id))
+
+    llm.release.set()  # the run finishes, unaware of material it never synced
+    events = await collect_until(queue, is_completed)
+
+    # settling is a separate step the actor does after the ProcessCompleted
+    # broadcast (via the queued _ProcessTerminated command): poll for it
+    await wait_for_async_condition(lambda: _is_collecting(exchanges, target_id))
+    first_completions = completions(events)
+    assert len(first_completions) == 1  # exactly the run's own completion
+
+    # the parked material later earns its own, single, later reaction — with
+    # no other live exchange left, this promotion needs no further router call
+    await _backdate_exchange(session_factory, target_id, seconds=MATERIAL_QUIET_SECONDS + 1)
+    await runner.promote_collected(target_id)
+    later_events = await collect_until(queue, is_completed)
+
+    total_completions = first_completions + completions(later_events)
+    assert len(total_completions) == TWO_PROCESSES  # the run, plus exactly one later reaction
+    assert len(router.calls) == 1  # the second promotion found nothing else to ask about

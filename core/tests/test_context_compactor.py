@@ -7,6 +7,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -153,6 +154,29 @@ class FailingLLM(SummarizingLLM):
         tools: list[ToolSpec] | None = None,
     ) -> Completion:
         raise RuntimeError("llm down")
+
+
+class CountingSummaryStore:
+    """SummaryStore/MessageArchive wrapper counting `max_seq_to` reads.
+
+    `compact_now` starts by reading the boundary; observing that read
+    return is the deterministic moment it is about to attach to the running
+    compaction, which a bare `sleep(0)` only approximated (and lost under
+    load: the read goes through aiosqlite's worker thread, so event-loop
+    yields alone never guarantee it finished).
+    """
+
+    def __init__(self, inner: SqlAlchemySummaryStore) -> None:
+        self._inner = inner
+        self.max_seq_to_calls = 0
+
+    async def max_seq_to(self, dialog_id: str) -> int:
+        value = await self._inner.max_seq_to(dialog_id)
+        self.max_seq_to_calls += 1
+        return value
+
+    def __getattr__(self, name: str) -> Any:  # noqa: ANN401 - transparent delegation
+        return getattr(self._inner, name)
 
 
 def make_compactor(
@@ -708,13 +732,18 @@ async def test_compact_now_skips_recompacting_when_the_awaited_run_advanced(
 ) -> None:
     dialog = await make_dialog(session_factory)
     llm = GatedSummarizingLLM([SUMMARY_REPLY])
-    compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
+    counting = CountingSummaryStore(store)
+    compactor = make_compactor(cast(SqlAlchemySummaryStore, counting), llm, 20, 25)
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
 
     await compactor.assemble(dialog, history)  # overflow: background compaction starts
     await wait_for_condition(lambda: llm.calls == 1)
+    # the background run is parked inside complete(), so the next boundary
+    # read can only be compact_now's — once it returns, compact_now attaches
+    # to the running task without any further await
+    attached_after = counting.max_seq_to_calls + 1
     compacted = asyncio.create_task(compactor.compact_now(dialog))
-    await asyncio.sleep(0)
+    await wait_for_condition(lambda: counting.max_seq_to_calls >= attached_after)
     llm.release.set()
 
     assert await compacted is True  # the awaited background run counts

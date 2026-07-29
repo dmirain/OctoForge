@@ -20,6 +20,7 @@ import logging
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any, Protocol
 
 from octoforge_core.agent.branch import render_branch
@@ -98,6 +99,14 @@ NUDGE_AFTER_SECONDS = 300.0
 MATERIAL_QUIET_SECONDS = 30.0
 MATERIAL_TITLE_TEMPLATE = "Переслано от {origin}"
 MATERIAL_TITLE_ANONYMOUS = "Пересланные сообщения"
+# the routing decision sees a preview, not the whole batch: the narrative
+# keeps everything, the prompt stays bounded
+MATERIAL_DIGEST_MESSAGES = 20
+MATERIAL_DIGEST_CHARS = 200
+MATERIAL_DIGEST_TEMPLATE = (
+    "The user forwarded {count} message(s) — third-party content, not their "
+    "own words. Which exchange does this material belong to?\n{lines}"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +252,19 @@ class _Flush:
     """A fresh subscriber asking the actor to drain the delivery outbox."""
 
 
+class _Unseen(StrEnum):
+    """What a run missed: nothing, only forwarded material, or the user speaking.
+
+    The distinction decides the settle: the user's own words reopen the
+    exchange for a fresh answer, material only parks it as a collection so a
+    burst gets one reaction instead of one per forward.
+    """
+
+    NONE = "none"
+    MATERIAL_ONLY = "material_only"
+    SPOKEN = "spoken"
+
+
 @dataclass(frozen=True, slots=True)
 class _PromoteCollected:
     """The sweep nominating a settled collection for promotion (re-checked)."""
@@ -268,7 +290,7 @@ class _ProcessTerminated:
     exchange_status: ExchangeStatus | None = None
     # a message of the same exchange arrived after the run's last sync: the
     # answer could not have accounted for it, so the exchange reopens
-    unseen_messages: bool = False
+    unseen_messages: _Unseen = _Unseen.NONE
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -823,8 +845,81 @@ class ConversationRunner:
             self._dialog.id,
             exchange.id,
         )
+        target = await self._material_target(exchange)
+        if target is not None:
+            await self._reparent_material(exchange, target)
+            return
         await self._exchanges.set_status(exchange.id, ExchangeStatus.OPEN)
         await self._resume_open_exchange(exchange.id, notify_limit=False)
+
+    async def _material_target(self, collection: Exchange) -> Exchange | None:
+        """Ask the router whether the batch belongs to another live exchange.
+
+        Only asked when there is something to belong to, and only once per
+        batch — the decision rides the quiet window, so its latency is free.
+        The material itself is untrusted third-party text, so the decision is
+        narrowed to "which exchange": `cancel_ids` are dropped and COMMAND is
+        read as "no target". A forwarded "stop everything" must stay text.
+        """
+        live = [
+            item
+            for item in await self._exchanges.list_live(self._dialog.id)
+            if item.id != collection.id and item.status is not ExchangeStatus.COLLECTING
+        ]
+        if not live:
+            return None
+        infos = tuple(
+            ExchangeInfo(
+                id=item.id,
+                title=item.title,
+                status=item.status,
+                pending_question=item.pending_question,
+                age_seconds=(utc_now() - item.updated_at).total_seconds(),
+            )
+            for item in live
+        )
+        decision = await self._router.route(
+            infos, self._material_digest(collection.id), self._max_processes
+        )
+        if decision.action is not RouteAction.CONTINUE or decision.exchange_id is None:
+            return None
+        return next((item for item in live if item.id == decision.exchange_id), None)
+
+    def _material_digest(self, exchange_id: str) -> str:
+        """A compact preview of the batch for the routing decision."""
+        pieces = [
+            message.content
+            for message in self._narrative
+            if message.exchange_id == exchange_id and message.kind is MessageKind.MATERIAL
+        ][:MATERIAL_DIGEST_MESSAGES]
+        lines = [piece[:MATERIAL_DIGEST_CHARS] for piece in pieces]
+        return MATERIAL_DIGEST_TEMPLATE.format(count=len(pieces), lines="\n".join(lines))
+
+    async def _reparent_material(self, collection: Exchange, target: Exchange) -> None:
+        """Move the batch into the exchange it belongs to and drop the shell.
+
+        The target gets the material as clarifying context: a live run pulls
+        it in at the next sync, a finished one is reopened by the
+        unseen-messages rule, and a parked one resumes.
+        """
+        logger.info(
+            "material reparented: dialog=%s from=%s to=%s",
+            self._dialog.id,
+            collection.id,
+            target.id,
+        )
+        for index, message in enumerate(self._narrative):
+            if message.exchange_id != collection.id:
+                continue
+            self._narrative[index] = replace(message, exchange_id=target.id)
+            if message.id is not None:
+                await self._messages.set_exchange(message.id, target.id)
+        await self._exchanges.set_status(collection.id, ExchangeStatus.CANCELLED)
+        await self._exchanges.touch(target.id)
+        if target.owner_task_id in self._processes:
+            return  # a live run pulls the material in at its next sync
+        await self._exchanges.set_status(target.id, ExchangeStatus.OPEN)
+        await self._resume_open_exchange(target.id, notify_limit=False)
 
     async def _route(self, message: ChatMessage, command: _Submit) -> RouteDecision:
         """Decide which exchange the message belongs to (deterministic first).
@@ -994,14 +1089,22 @@ class ConversationRunner:
                 exchange.owner_task_id,
             )
             return
-        if command.unseen_messages and command.exchange_status is not ExchangeStatus.CANCELLED:
-            # a message of this exchange arrived after the run's last sync —
-            # even one the run asked for (AWAITING_USER): reopen, fresh run.
-            # A user-cancelled run must NOT resurrect itself this way: the
-            # stop came after the message, so the stop covers it.
-            await self._exchanges.set_status(exchange.id, ExchangeStatus.OPEN)
-            await self._resume_open_exchange(exchange.id)
-            return
+        if command.exchange_status is not ExchangeStatus.CANCELLED:
+            # something arrived after the run's last sync. The user's own
+            # words reopen immediately — even ones the run asked for
+            # (AWAITING_USER). Material only parks the exchange as a
+            # collection: a forward burst would otherwise reopen it once per
+            # message, and the sweep reacts once when the batch settles.
+            # A user-cancelled run resurrects itself either way: the stop
+            # came after the message, so the stop covers it.
+            if command.unseen_messages is _Unseen.SPOKEN:
+                await self._exchanges.set_status(exchange.id, ExchangeStatus.OPEN)
+                await self._resume_open_exchange(exchange.id)
+                return
+            if command.unseen_messages is _Unseen.MATERIAL_ONLY:
+                await self._exchanges.set_status(exchange.id, ExchangeStatus.COLLECTING)
+                await self._exchanges.touch(exchange.id)
+                return
         if exchange.status is ExchangeStatus.AWAITING_USER:
             await self._settle_awaiting(exchange, command)
             return
@@ -1613,23 +1716,33 @@ class ConversationRunner:
                 exchange_id=process.exchange_id,
                 delivered_live=process.terminal_accepted,
                 exchange_status=_exchange_outcome(status),
-                unseen_messages=self._has_unseen_messages(process),
+                unseen_messages=self._unseen_kind(process),
             )
         )
 
-    def _has_unseen_messages(self, process: _Process) -> bool:
-        """Whether messages of this run's exchange arrived after its last sync.
+    def _unseen_kind(self, process: _Process) -> _Unseen:
+        """What arrived for this run's exchange after its last sync.
 
         Replaces the requeue heuristic: instead of re-submitting messages, the
-        exchange simply goes back to OPEN and gets a fresh run — the durable
-        state decides, not an in-memory scan.
+        exchange goes back to OPEN and gets a fresh run — the durable state
+        decides, not an in-memory scan. Material is distinguished from the
+        user's own words: a forward burst landing in a live exchange would
+        otherwise reopen it once per message, which is the very "one answer
+        per forward" bug this whole model exists to remove. Material instead
+        parks the exchange as a collection and reacts once, when it settles.
         """
         if not process.narrative_built or process.exchange_id is None:
-            return False
-        return any(
-            message.role is MessageRole.USER and message.exchange_id == process.exchange_id
+            return _Unseen.NONE
+        arrived = [
+            message
             for message in self._narrative[process.watermark :]
-        )
+            if message.role is MessageRole.USER and message.exchange_id == process.exchange_id
+        ]
+        if not arrived:
+            return _Unseen.NONE
+        if all(message.kind is MessageKind.MATERIAL for message in arrived):
+            return _Unseen.MATERIAL_ONLY
+        return _Unseen.SPOKEN
 
     async def _finalize(self, process: _Process, terminal: LoopEvent) -> TaskStatus:
         """Fold the run outcome into the narrative and the task store.

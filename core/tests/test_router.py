@@ -258,6 +258,23 @@ async def test_prompt_renders_the_exchanges_staleness_in_seconds() -> None:
     assert f"{int(STALE_AGE_SECONDS)}s ago" in system
 
 
+def collecting() -> ExchangeInfo:
+    return ExchangeInfo(id=OPEN_ID, title="Переслано от Иван", status=ExchangeStatus.COLLECTING)
+
+
+async def test_prompt_describes_a_collecting_exchange_as_forwarded_material() -> None:
+    """Phase 3: `_describe`'s COLLECTING line, the router's whole view of a
+    material batch, is pinned exactly."""
+    llm = ScriptedLLM(reply=route_reply())
+    router = make_router(llm)
+
+    await router.route((collecting(),), MESSAGE, MAX_EXCHANGES)
+
+    system = llm.last_messages[0].content
+    assert "material the user forwarded, not answered yet" in system
+    assert "a message about that material belongs here" in system
+
+
 async def test_router_prompt_comes_from_the_prompt_provider() -> None:
     llm = ScriptedLLM(reply=route_reply())
     router = LLMRouter(
