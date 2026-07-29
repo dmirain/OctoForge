@@ -58,6 +58,8 @@ from octoforge_core.search.tools import WebSearchTool
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool, TaskListTool
 from octoforge_core.tools.registry import ToolRegistry
+from octoforge_core.vision.api import ImageResolver, VisionClient
+from octoforge_core.vision.tools import ImageLookTool
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,10 +99,19 @@ class ToolServices:
 
 @dataclass(frozen=True, slots=True)
 class RunnerOptions:
-    """Tuning knobs of the conversation runners (limit, listener)."""
+    """Tuning knobs of the conversation runners (limit, listener, vision).
+
+    `vision`/`image_resolver` back the strong vision tier's `image_look`
+    tool (bound into `ToolContext.image_inspector` only when both are
+    present — see `ConversationRunner._can_see_images`). Leaving either
+    None keeps the tool hidden: the default for composition roots without a
+    transport able to re-fetch an attachment's bytes.
+    """
 
     max_processes: int
     task_outcome_listener: TaskOutcomeListener | None = None
+    vision: VisionClient | None = None
+    image_resolver: ImageResolver | None = None
 
 
 def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMClient:
@@ -159,10 +170,15 @@ def build_tool_registry(
     """Build the registry with the full set of code tools.
 
     All tools are wired to the given ports; the web_search tool is
-    registered only when a search provider is supplied.
+    registered only when a search provider is supplied. `image_look` is
+    always registered — its own `visible_to` hook hides it per dialog when
+    `ToolContext.image_inspector` is None (no vision client/resolver wired
+    into that dialog's `RunnerConfig`), so no conditional registration is
+    needed here.
     """
     registry = ToolRegistry()
     _register_core_tools(registry, outbound_http, guard, stores.tasks, stores.cron)
+    registry.register(ImageLookTool())
     if services.search_provider is not None:
         registry.register(WebSearchTool(provider=services.search_provider))
     _register_instruction_tools(registry, services, limits)
@@ -228,6 +244,8 @@ def build_runner_config(
         max_processes=options.max_processes,
         compactor=compactor,
         task_outcome_listener=options.task_outcome_listener,
+        vision=options.vision,
+        image_resolver=options.image_resolver,
     )
 
 

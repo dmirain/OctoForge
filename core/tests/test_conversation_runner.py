@@ -67,6 +67,8 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyMessageRepository,
 )
 from octoforge_core.domain import (
+    Attachment,
+    AttachmentKind,
     ChatMessage,
     Dialog,
     MessageKind,
@@ -85,6 +87,12 @@ from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import TaskDeleteOutcome, ToolContext, ToolSpec
 from octoforge_core.tools.registry import ToolRegistry
+from octoforge_core.vision.api import (
+    ImageData,
+    ImageResolver,
+    VisionClient,
+    VisionUnavailableError,
+)
 
 PROMPT = "test system prompt"
 REPLY = "hello"
@@ -111,6 +119,8 @@ ONE_PROCESS = 1
 TWO_PROCESSES = 2
 USER_ID = "user-1"
 CHANNEL = "web"
+OLD_IMAGE = Attachment(kind=AttachmentKind.IMAGE, ref="tg:file-1")
+NEW_IMAGE = Attachment(kind=AttachmentKind.IMAGE, ref="tg:file-42")
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 FIRST_CALL = 1
 SECOND_CALL = 2
@@ -544,6 +554,8 @@ class ManagerOptions:
     max_processes: int = MAX_PROCESSES
     listener: TaskOutcomeListener | None = None
     compactor: ContextCompactor | None = None
+    vision: VisionClient | None = None
+    image_resolver: ImageResolver | None = None
 
 
 def make_manager(
@@ -563,6 +575,8 @@ def make_manager(
             resolved.compactor if resolved.compactor is not None else NoopContextCompactor()
         ),
         task_outcome_listener=resolved.listener,
+        vision=resolved.vision,
+        image_resolver=resolved.image_resolver,
     )
     return ConversationManager(
         config=config,
@@ -4317,3 +4331,89 @@ async def test_material_arriving_while_a_run_is_live_joins_its_exchange_directly
     assert any(
         MATERIAL_NOTE_TEMPLATE.format(content=MATERIAL_ONE) in m.content for m in second_request
     )
+
+
+# --- 2026-07-29: looking again at an image the dialog already received --------
+
+
+IMAGE_ANSWER = "в правом верхнем углу дата 12.2026"
+IMAGE_QUESTION = "что в правом верхнем углу?"
+
+
+class RecordingVision:
+    """VisionClient stub recording what it was asked."""
+
+    def __init__(self, answer: str = IMAGE_ANSWER) -> None:
+        self.answer = answer
+        self.prompts: list[str] = []
+        self.images: list[bytes] = []
+
+    async def look(self, images: tuple[ImageData, ...], prompt: str) -> str:
+        self.prompts.append(prompt)
+        self.images.extend(image.content for image in images)
+        return self.answer
+
+
+class RecordingResolver:
+    """ImageResolver stub returning fixed bytes for a known ref."""
+
+    def __init__(self) -> None:
+        self.refs: list[str] = []
+
+    async def fetch(self, ref: str) -> ImageData:
+        self.refs.append(ref)
+        return ImageData(content=b"jpeg-bytes", media_type="image/jpeg")
+
+
+async def test_look_at_image_asks_about_the_newest_picture_of_the_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    vision, resolver = RecordingVision(), RecordingResolver()
+    manager = make_manager(
+        ScriptedLLM([]),
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(vision=vision, image_resolver=resolver),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    await runner.submit("старое фото", source=MessageSource(attachments=(OLD_IMAGE,)))
+    await runner.submit("новое фото", source=MessageSource(attachments=(NEW_IMAGE,)))
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+
+    answer = await runner.look_at_image(IMAGE_QUESTION)
+
+    assert answer == IMAGE_ANSWER
+    assert resolver.refs == [NEW_IMAGE.ref]  # the newest one, not the first
+    assert vision.prompts == [IMAGE_QUESTION]
+    assert vision.images == [b"jpeg-bytes"]
+    await manager.stop_all()
+
+
+async def test_look_at_image_without_any_picture_is_refused(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = make_manager(
+        ScriptedLLM([]),
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(vision=RecordingVision(), image_resolver=RecordingResolver()),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    with pytest.raises(VisionUnavailableError):
+        await runner.look_at_image(IMAGE_QUESTION)
+    await manager.stop_all()
+
+
+async def test_look_at_image_without_vision_configured_is_refused(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The whole capability is optional: no model, no resolver, no tool."""
+    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    await runner.submit("фото", source=MessageSource(attachments=(NEW_IMAGE,)))
+    await wait_for_condition(lambda: len(runner.history()) == 1)
+
+    with pytest.raises(VisionUnavailableError):
+        await runner.look_at_image(IMAGE_QUESTION)
+    await manager.stop_all()

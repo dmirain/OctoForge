@@ -57,6 +57,10 @@ DEFAULT_ADMIN_USERNAME = "admin"
 # the cheap tier of the two-tier vision setup (see core.vision.api); the
 # stronger tier is picked elsewhere, only for explicit follow-up questions
 DEFAULT_VISION_MODEL = "minimax-m3"
+# the strong tier: spent only when `image_look` is called with a specific
+# question. An empty value turns the tool off entirely while tier-1
+# ingestion keeps working.
+DEFAULT_VISION_DEEP_MODEL = "qwen3.5:397b"
 
 
 class ExternalCallAuthSettings(BaseModel):
@@ -144,6 +148,10 @@ class Settings(BaseSettings):
     vision_model: str = DEFAULT_VISION_MODEL
     vision_base_url: str = ""
     vision_api_key: str = ""
+    # The strong vision tier (the `image_look` tool's re-examination of a
+    # picture); shares the cheap tier's base URL/key fallbacks, only the
+    # model differs. Empty means the tool is off.
+    vision_deep_model: str = DEFAULT_VISION_DEEP_MODEL
 
     def resolved_public_base_url(self) -> str:
         """Base URL for user-facing links: configured public one or self."""
@@ -163,6 +171,17 @@ class Settings(BaseSettings):
     def vision_configured(self) -> bool:
         """Whether the vision feature is on (a model is set); empty model = off."""
         return bool(self.vision_model)
+
+    def to_deep_vision_config(self) -> VisionConfig:
+        """Build the strong-tier vision configuration; mirrors `to_vision_config()`."""
+        return VisionConfig(
+            api_key=self.vision_api_key or self.llm_api_key,
+            model=self.vision_deep_model,
+        )
+
+    def deep_vision_configured(self) -> bool:
+        """Whether the strong vision tier (`image_look`) is on; empty model = off."""
+        return bool(self.vision_deep_model)
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""

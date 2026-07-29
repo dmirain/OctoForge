@@ -20,6 +20,18 @@ class TaskSpawner(Protocol):
         ...
 
 
+class ImageInspector(Protocol):
+    """Looks again at an image the dialog already received."""
+
+    async def look(self, question: str) -> str:
+        """Answer the question about the dialog's most recent image.
+
+        Raises `VisionUnavailableError` when vision is off, there is no
+        image to look at, or the file can no longer be fetched.
+        """
+        ...
+
+
 class UserPrompter(Protocol):
     """Asks the user a question on behalf of the run that needs an answer."""
 
@@ -80,6 +92,8 @@ class ToolContext:
     task_spawner: TaskSpawner | None = None
     task_deleter: TaskDeleter | None = None
     user_prompter: UserPrompter | None = None
+    # re-examines an image of this dialog (None: vision not configured)
+    image_inspector: ImageInspector | None = None
     owner_task_id: str | None = None
 
 

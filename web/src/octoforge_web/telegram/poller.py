@@ -17,6 +17,7 @@ from octoforge_web.telegram.client import (
     TelegramApiError,
     TelegramClient,
 )
+from octoforge_web.telegram.images import REF_PREFIX
 from octoforge_web.telegram.invites.api import (
     InviteAlreadyClaimedError,
     InviteExpiredError,
@@ -364,12 +365,13 @@ class TelegramPoller:
             message, description, forwarded=kind is MessageKind.MATERIAL
         )
         bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
+        image_ref = f"{REF_PREFIX}{image.file_id}"
         await bridge.handle_text(
             text,
             client_message_id=str(message.message_id),
             kind=kind,
             origin=origin,
-            attachments=(Attachment(kind=AttachmentKind.IMAGE, ref=f"tg:{image.file_id}"),),
+            attachments=(Attachment(kind=AttachmentKind.IMAGE, ref=image_ref),),
         )
 
     def _is_extra_album_item(self, message: TelegramMessage) -> bool:

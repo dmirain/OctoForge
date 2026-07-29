@@ -24,6 +24,7 @@ from octoforge_web.config import (
     DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS,
     DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
     DEFAULT_TELEGRAM_RICH_MESSAGES,
+    DEFAULT_VISION_DEEP_MODEL,
     Settings,
 )
 from octoforge_web.main import _build_reranker
@@ -291,3 +292,45 @@ def test_telegram_admin_ids_default_empty(monkeypatch: pytest.MonkeyPatch) -> No
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
 
     assert settings.telegram_admin_ids == []
+
+
+# --- deep vision (image_look tool) ---------------------------------------------
+
+
+def test_deep_vision_model_defaults_and_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OF_VISION_DEEP_MODEL", raising=False)
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.vision_deep_model == DEFAULT_VISION_DEEP_MODEL
+    assert settings.deep_vision_configured()
+
+
+def test_empty_deep_vision_model_turns_the_tool_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_VISION_DEEP_MODEL", "")
+
+    settings = Settings()
+
+    assert not settings.deep_vision_configured()
+
+
+def test_deep_vision_config_mirrors_the_cheap_tier_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OF_LLM_API_KEY", "llm-key")
+    monkeypatch.delenv("OF_VISION_API_KEY", raising=False)
+    monkeypatch.setenv("OF_VISION_DEEP_MODEL", "qwen3.5:397b")
+
+    config = Settings().to_deep_vision_config()
+
+    assert config.model == "qwen3.5:397b"
+    assert config.api_key == "llm-key"  # falls back to the main LLM's key, like to_vision_config()
+
+
+def test_deep_vision_config_prefers_its_own_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_LLM_API_KEY", "llm-key")
+    monkeypatch.setenv("OF_VISION_API_KEY", "vision-key")
+
+    config = Settings().to_deep_vision_config()
+
+    assert config.api_key == "vision-key"

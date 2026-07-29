@@ -53,6 +53,8 @@ from octoforge_core.dialogs.api import (
     MessageRepository,
 )
 from octoforge_core.domain import (
+    Attachment,
+    AttachmentKind,
     ChatMessage,
     Dialog,
     MessageKind,
@@ -65,6 +67,7 @@ from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStat
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import TaskDeleteOutcome, TaskDeleter, TaskSpawner, ToolContext
+from octoforge_core.vision.api import ImageResolver, VisionClient, VisionUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +227,22 @@ class _DialogUserPrompter:
         return await self._runner.ask_user(self._process_id, question)
 
 
+class _DialogImageInspector:
+    """ImageInspector bound to one dialog: re-reads its most recent image.
+
+    "The image" is the newest one in the narrative rather than an id the
+    model has to quote: the follow-up question is virtually always about the
+    picture just sent, and exposing internal refs to the LLM would invite it
+    to invent them.
+    """
+
+    def __init__(self, runner: "ConversationRunner") -> None:
+        self._runner = runner
+
+    async def look(self, question: str) -> str:
+        return await self._runner.look_at_image(question)
+
+
 @dataclass(frozen=True, slots=True)
 class _RunnerStores:
     """Persistence collaborators of one dialog actor."""
@@ -369,6 +388,10 @@ class RunnerConfig:
     task_outcome_listener: TaskOutcomeListener | None = None
     # quiet window before collected material earns a reaction of its own
     material_quiet_seconds: float = MATERIAL_QUIET_SECONDS
+    # the strong vision tier plus the surface that can fetch an attachment
+    # back into bytes; either being None turns `image_look` off entirely
+    vision: VisionClient | None = None
+    image_resolver: ImageResolver | None = None
 
 
 class ConversationRunner:
@@ -388,6 +411,8 @@ class ConversationRunner:
         self._router = config.router
         self._max_processes = config.max_processes
         self._material_quiet_seconds = config.material_quiet_seconds
+        self._vision = config.vision
+        self._image_resolver = config.image_resolver
         self._task_outcome_listener = config.task_outcome_listener
         self._compactor = config.compactor
         self._messages = messages
@@ -1016,6 +1041,39 @@ class ConversationRunner:
                 pending_question=question,
             )
         return True
+
+    @property
+    def _can_see_images(self) -> bool:
+        """Whether this dialog has both a vision model and a way to fetch files."""
+        return self._vision is not None and self._image_resolver is not None
+
+    async def look_at_image(self, question: str) -> str:
+        """Ask the strong vision model about the dialog's most recent image.
+
+        The cheap description written at ingestion answers most questions;
+        this is the escape hatch for the ones it cannot, so it is spent only
+        when a tool call asked for it.
+        """
+        if self._vision is None or self._image_resolver is None:
+            raise VisionUnavailableError("vision is not configured")
+        attachment = self._latest_image()
+        if attachment is None:
+            raise VisionUnavailableError("no image in this dialog")
+        logger.info(
+            "looking at image again: dialog=%s ref=%s",
+            self._dialog.id,
+            attachment.ref,
+        )
+        image = await self._image_resolver.fetch(attachment.ref)
+        return await self._vision.look((image,), question)
+
+    def _latest_image(self) -> Attachment | None:
+        """The newest image attachment still present in the hot narrative."""
+        for message in reversed(self._narrative):
+            for attachment in message.attachments:
+                if attachment.kind is AttachmentKind.IMAGE:
+                    return attachment
+        return None
 
     async def _is_duplicate(self, client_message_id: str | None) -> bool:
         """Whether a submit with this idempotency key was already recorded."""
@@ -1692,6 +1750,7 @@ class ConversationRunner:
             task_spawner=self._spawner,
             task_deleter=self._deleter,
             user_prompter=_DialogUserPrompter(self, process.id),
+            image_inspector=_DialogImageInspector(self) if self._can_see_images else None,
             owner_task_id=process.task_id,
         )
         terminal: LoopEvent = Failed(error="loop ended without a terminal event")

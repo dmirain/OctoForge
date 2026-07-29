@@ -74,7 +74,7 @@ from octoforge_core.search.serper import SerperSearchProvider
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.tasks.store import TaskStore
-from octoforge_core.vision.api import VisionClient
+from octoforge_core.vision.api import ImageResolver, VisionClient
 from octoforge_core.vision.client import OpenAIVisionClient
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -93,6 +93,7 @@ from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
 from octoforge_web.telegram.admin import AdminAccess, AdminManageTool, AdminStores
 from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
+from octoforge_web.telegram.images import TelegramImageResolver
 from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
@@ -173,6 +174,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             llm_client = build_llm_client(llm_http, settings.to_llm_config())
             embedder = _build_embedder(settings, embed_http)
             vision_client = _build_vision_client(settings, vision_http)
+            deep_vision_client = _build_deep_vision_client(settings, vision_http)
+            image_resolver = _build_telegram_image_resolver(settings, outbound_http)
             instructions = build_instruction_service(
                 SqlAlchemyInstructionStore(session_factory),
                 embedder,
@@ -261,6 +264,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     options=RunnerOptions(
                         max_processes=settings.max_processes,
                         task_outcome_listener=build_cron_outcome_reporter(cron_store),
+                        vision=deep_vision_client,
+                        image_resolver=image_resolver,
                     ),
                 ),
                 dialogs=dialogs,
@@ -505,6 +510,40 @@ def _build_vision_client(settings: Settings, http_client: httpx.AsyncClient) -> 
     if not settings.vision_configured():
         return None
     return OpenAIVisionClient(http_client=http_client, config=settings.to_vision_config())
+
+
+def _build_deep_vision_client(
+    settings: Settings, http_client: httpx.AsyncClient
+) -> VisionClient | None:
+    """Build the optional strong vision tier client (the `image_look` tool).
+
+    Reuses the same vision `httpx.AsyncClient` as the cheap ingestion tier
+    (`_build_vision_client`) — same base URL, only the model differs. None
+    (the tool stays hidden) when `OF_VISION_DEEP_MODEL` is empty.
+    """
+    if not settings.deep_vision_configured():
+        return None
+    return OpenAIVisionClient(http_client=http_client, config=settings.to_deep_vision_config())
+
+
+def _build_telegram_image_resolver(
+    settings: Settings, http_client: httpx.AsyncClient
+) -> ImageResolver | None:
+    """Build the Telegram-backed `ImageResolver`; None when the bot is not configured.
+
+    A dedicated `TelegramBotClient` rather than reusing the one `_start_telegram`
+    builds for the poller: `TelegramBotClient` is a thin, stateless wrapper over
+    the shared `outbound_http` client (base URLs plus the token), so a second
+    instance costs nothing extra, and the runner config is assembled here —
+    before `_start_telegram` runs — so the standalone Telegram entry point
+    (which shares this same `runtime()`, no HTTP surface) gets a working
+    resolver too, independent of when or whether the poller itself starts.
+    """
+    if not settings.telegram_bot_token:
+        return None
+    return TelegramImageResolver(
+        TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token)
+    )
 
 
 def _build_reranker(settings: Settings, http_client: httpx.AsyncClient) -> RerankerClient | None:

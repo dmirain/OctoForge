@@ -93,6 +93,7 @@ ALL_BASIC_TOOLS = {
     "memory_store",
     "memory_delete",
     "history_search",
+    "image_look",
 }
 
 CONTEXT = ToolContext(user_id=USER_ID, channel=CHANNEL, dialog_id=DIALOG_ID)
