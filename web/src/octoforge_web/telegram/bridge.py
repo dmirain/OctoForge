@@ -21,6 +21,7 @@ from octoforge_core.agent.events import (
     ToolCallRequested,
 )
 from octoforge_core.agent.runner import ConversationEvent, ConversationRunner
+from octoforge_core.domain import MessageKind
 
 from octoforge_web.telegram.client import (
     CHAT_ACTION_TYPING,
@@ -125,6 +126,8 @@ class TelegramBridge:
         content: str,
         client_message_id: str | None = None,
         reply_to_message_id: int | None = None,
+        kind: MessageKind = MessageKind.OWN,
+        origin: str | None = None,
     ) -> None:
         """Submit user text into the dialog, starting the forwarder on first contact.
 
@@ -135,11 +138,14 @@ class TelegramBridge:
         it names a message this bridge sent for a live exchange, routing
         skips the LLM router entirely (`ConversationRunner.submit`'s
         deterministic reply shortcut). An unknown or absent reply id falls
-        back to the router, same as before.
+        back to the router, same as before. `kind=MATERIAL` marks forwarded
+        content: no answer follows it directly, so the typing indicator is
+        skipped — it would promise a reply that is not coming yet.
         """
         runner = await self._ensure_runner()
         await self.start()
-        await self._client.send_chat_action(self._chat_id, CHAT_ACTION_TYPING)
+        if kind is MessageKind.OWN:
+            await self._client.send_chat_action(self._chat_id, CHAT_ACTION_TYPING)
         reply_to_exchange_id = (
             self._reply_targets.get(reply_to_message_id)
             if reply_to_message_id is not None
@@ -149,6 +155,8 @@ class TelegramBridge:
             content,
             client_message_id=client_message_id,
             reply_to_exchange_id=reply_to_exchange_id,
+            kind=kind,
+            origin=origin,
         )
 
     async def cancel(self) -> None:

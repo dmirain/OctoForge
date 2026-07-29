@@ -25,7 +25,7 @@ from octoforge_core.dialogs.api import (
     MessageStatsList,
 )
 from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
-from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
+from octoforge_core.domain import ChatMessage, Dialog, MessageKind, MessageRole, ToolCall
 from octoforge_core.llm.usage import Usage
 from octoforge_core.time import utc_now
 
@@ -141,6 +141,7 @@ class SqlAlchemyMessageRepository:
                         completion_tokens=usage.completion_tokens if usage is not None else None,
                         task_id=message.task_id,
                         exchange_id=message.exchange_id,
+                        kind=_kind_to_column(message.kind),
                     )
                 )
                 dialog = await session.get(DialogRow, dialog_id)
@@ -192,6 +193,7 @@ class SqlAlchemyMessageRepository:
                             tool_call_id=message.tool_call_id,
                             task_id=message.task_id,
                             exchange_id=message.exchange_id,
+                            kind=_kind_to_column(message.kind),
                         )
                     )
                 dialog = await session.get(DialogRow, dialog_id)
@@ -419,9 +421,15 @@ def _to_chat_message(row: MessageRow) -> ChatMessage:
         tool_calls=_tool_calls_from_json(row.tool_calls),
         tool_call_id=row.tool_call_id,
         task_id=row.task_id,
+        kind=MessageKind(row.kind) if row.kind else MessageKind.OWN,
         id=row.id,
         exchange_id=row.exchange_id,
     )
+
+
+def _kind_to_column(kind: MessageKind) -> str | None:
+    """Store only the exceptional kind; NULL keeps legacy rows meaningful."""
+    return None if kind is MessageKind.OWN else kind.value
 
 
 def _tool_calls_to_json(tool_calls: tuple[ToolCall, ...]) -> list[dict[str, Any]] | None:

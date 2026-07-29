@@ -2,11 +2,13 @@
 
 import asyncio
 import logging
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
 import httpx
+from octoforge_core.domain import MessageKind
 
 from octoforge_web.telegram.bridge import RunnerProvider, TelegramBridge, TelegramBridgeOptions
 from octoforge_web.telegram.client import (
@@ -22,7 +24,12 @@ from octoforge_web.telegram.invites.api import (
     InviteStore,
     MemberDirectory,
 )
-from octoforge_web.telegram.models import TelegramChatType, TelegramUpdate, TelegramUser
+from octoforge_web.telegram.models import (
+    TelegramChatType,
+    TelegramMessage,
+    TelegramUpdate,
+    TelegramUser,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,13 @@ INVITE_INVALID_TEXT = (
     "Этот код недействителен или уже использован. Обратитесь к администратору за новым кодом."
 )
 TEXT_ONLY_NOTICE = "Пока понимаю только текстовые сообщения."
+# forwarded content enters the dialog attributed: the agent must never mistake
+# someone else's words for the user's own request
+MATERIAL_ATTRIBUTION_TEMPLATE = "[переслано от {origin}]"
+MATERIAL_ATTRIBUTION_ANONYMOUS = "[переслано]"
+MATERIAL_PLACEHOLDER = "(вложение без текста)"
+# how many recent album ids are remembered to collapse an album into one entry
+ALBUM_MEMORY_SIZE = 64
 SECRETS_LINK_TEXT = (
     "Ссылка на форму секретов (действует 10 минут):\n{url}\n\n"
     "Значения шифруются, ассистент видит только коды секретов. "
@@ -184,6 +198,10 @@ class TelegramPoller:
         self._secrets_link = options.secrets_link
         self._directory = options.directory
         self._offset: int | None = None
+        # albums arrive as N updates sharing one media_group_id; only the
+        # first becomes an entry (bounded, lost on restart — worst case an
+        # album spanning a restart yields two entries)
+        self._seen_albums: OrderedDict[str, None] = OrderedDict()
 
     async def run_forever(self) -> None:
         """Poll updates until cancelled.
@@ -216,7 +234,7 @@ class TelegramPoller:
             await self._dispatch_safely(update)
 
     async def dispatch(self, update: TelegramUpdate) -> None:
-        """Route one update: commands, non-text/group notices, or text into the bridge."""
+        """Route one update: commands, group/non-text notices, forwards or plain text."""
         message = update.message
         if message is None or message.from_user is None:
             return
@@ -224,19 +242,58 @@ class TelegramPoller:
         if message.chat.type is not TelegramChatType.PRIVATE:
             await self._client.send_message(chat_id, GROUP_NOTICE)
             return
-        if message.text is None:
-            await self._client.send_message(chat_id, TEXT_ONLY_NOTICE)
-            return
         user_id = f"{USER_ID_PREFIX}{message.from_user.id}"
-        if not await self._check_membership(user_id, chat_id, message.text):
+        # the gate comes before every reply: a stranger must not be able to
+        # make the bot answer anything, not even the "text only" notice
+        if not await self._check_membership(user_id, chat_id, message.body or ""):
             return
         # only past the gate: strangers knocking with bad codes stay unrecorded
         await self._record_member(user_id, message.from_user)
+        if self._is_extra_album_item(message):
+            return  # one entry per album, not one per photo
+        if message.forward_origin is not None:
+            await self._dispatch_material(message, user_id, chat_id)
+            return
+        if message.body is None:
+            await self._client.send_message(chat_id, TEXT_ONLY_NOTICE)
+            return
         reply_to_message_id = (
             message.reply_to_message.message_id if message.reply_to_message is not None else None
         )
         await self._dispatch_text(
-            message.message_id, user_id, chat_id, message.text, reply_to_message_id
+            message.message_id, user_id, chat_id, message.body, reply_to_message_id
+        )
+
+    def _is_extra_album_item(self, message: TelegramMessage) -> bool:
+        """Whether this message is a follow-up item of an already-seen album."""
+        group_id = message.media_group_id
+        if group_id is None:
+            return False
+        if group_id in self._seen_albums:
+            return True
+        self._seen_albums[group_id] = None
+        if len(self._seen_albums) > ALBUM_MEMORY_SIZE:
+            self._seen_albums.popitem(last=False)
+        return False
+
+    async def _dispatch_material(
+        self, message: TelegramMessage, user_id: str, chat_id: int
+    ) -> None:
+        """Hand a forwarded message to the dialog as material, never as a question."""
+        origin = message.forward_origin.display_name if message.forward_origin is not None else ""
+        body = message.body
+        content = body if body is not None else MATERIAL_PLACEHOLDER
+        attribution = (
+            MATERIAL_ATTRIBUTION_TEMPLATE.format(origin=origin)
+            if origin
+            else MATERIAL_ATTRIBUTION_ANONYMOUS
+        )
+        bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
+        await bridge.handle_text(
+            f"{attribution} {content}",
+            client_message_id=str(message.message_id),
+            kind=MessageKind.MATERIAL,
+            origin=origin or None,
         )
 
     async def _dispatch_text(

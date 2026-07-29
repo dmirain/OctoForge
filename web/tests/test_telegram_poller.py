@@ -11,6 +11,7 @@ from octoforge_core import (
     AgentLoop,
     ChatMessage,
     ConversationManager,
+    MessageKind,
     MessageRole,
     ToolRegistry,
     ToolSpec,
@@ -39,6 +40,7 @@ from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
 from octoforge_web.telegram.models import (
     TelegramChat,
     TelegramChatType,
+    TelegramForwardOrigin,
     TelegramMessage,
     TelegramReplyToMessage,
     TelegramUpdate,
@@ -131,14 +133,18 @@ class RecordingBridge:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None, int | None]] = []
+        self.kinds: list[tuple[MessageKind, str | None]] = []
 
     async def handle_text(
         self,
         content: str,
         client_message_id: str | None = None,
         reply_to_message_id: int | None = None,
+        kind: MessageKind = MessageKind.OWN,
+        origin: str | None = None,
     ) -> None:
         self.calls.append((content, client_message_id, reply_to_message_id))
+        self.kinds.append((kind, origin))
 
     async def cancel(self) -> None:
         raise AssertionError("cancel should not be called in these tests")
@@ -764,3 +770,72 @@ async def test_stranger_denied_by_the_gate_is_not_recorded(
     )
     await poller.dispatch(make_update(1, text="hello"))
     assert directory.records == []
+
+
+def make_forward_update(
+    update_id: int,
+    text: str | None = "чужой текст",
+    origin: dict[str, object] | None = None,
+    media_group_id: str | None = None,
+    caption: str | None = None,
+) -> TelegramUpdate:
+    """An update carrying a forwarded message (optionally an album item)."""
+    return TelegramUpdate(
+        update_id=update_id,
+        message=TelegramMessage(
+            message_id=update_id,
+            from_user=TelegramUser(id=TELEGRAM_USER_ID),
+            chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
+            text=text,
+            caption=caption,
+            media_group_id=media_group_id,
+            forward_origin=TelegramForwardOrigin.model_validate(
+                origin
+                or {"type": "user", "date": 1, "sender_user": {"id": 5, "first_name": "Иван"}}
+            ),
+        ),
+    )
+
+
+async def test_forwarded_message_reaches_the_dialog_as_attributed_material() -> None:
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    await poller.dispatch(make_forward_update(1))
+
+    (content, client_message_id, _), (kind, origin) = bridge.calls[0], bridge.kinds[0]
+    assert content == "[переслано от Иван] чужой текст"
+    assert client_message_id == "1"
+    assert kind is MessageKind.MATERIAL
+    assert origin == "Иван"
+    assert client.sent == []  # no "text only" notice, no greeting
+
+
+async def test_forwarded_attachment_becomes_one_placeholder_per_album() -> None:
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client)
+    poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
+
+    await poller.dispatch(
+        make_forward_update(1, text=None, media_group_id="album", caption="гляди")
+    )
+    await poller.dispatch(make_forward_update(2, text=None, media_group_id="album"))
+    await poller.dispatch(make_forward_update(3, text=None, media_group_id="album"))
+
+    assert [call[0] for call in bridge.calls] == ["[переслано от Иван] гляди"]
+    assert client.sent == []  # the album never triggers the text-only notice
+
+
+async def test_non_text_message_is_answered_only_past_the_gate(
+    invite_store: SqlAlchemyInviteStore,
+) -> None:
+    """A stranger's photo must not make the bot reply at all."""
+    client = FakeTelegramClient()
+    poller = make_poller(client, forbidden_provider, membership=make_membership(invite_store))
+
+    await poller.dispatch(make_update(1, text=None))
+
+    assert [text for _, text, _ in client.sent] == [ACCESS_DENIED_TEXT]

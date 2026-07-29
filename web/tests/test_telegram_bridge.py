@@ -10,6 +10,7 @@ from octoforge_core import (
     AgentLoop,
     ChatMessage,
     ConversationManager,
+    MessageKind,
     MessageRole,
     ToolRegistry,
     ToolSpec,
@@ -246,6 +247,7 @@ class FakeRunner:
 
     def __init__(self) -> None:
         self.submitted: list[tuple[str, str | None, str | None]] = []
+        self.kinds: list[MessageKind] = []
 
     def subscribe(self) -> asyncio.Queue[Any]:
         return asyncio.Queue()
@@ -258,8 +260,11 @@ class FakeRunner:
         content: str,
         client_message_id: str | None = None,
         reply_to_exchange_id: str | None = None,
+        kind: MessageKind = MessageKind.OWN,
+        origin: str | None = None,
     ) -> None:
         self.submitted.append((content, client_message_id, reply_to_exchange_id))
+        self.kinds.append(kind)
 
     async def cancel(self) -> None:
         raise AssertionError("cancel should not be called in these tests")
@@ -816,4 +821,28 @@ async def test_terminal_flush_pops_the_draft_even_when_both_attempts_fail(
 
     assert bridge._drafts == {}  # never left stale despite the lost message
     assert any(record.levelno == logging.ERROR for record in caplog.records)
+    await bridge.aclose()
+
+
+async def test_material_submits_without_promising_an_answer() -> None:
+    """A forward must not raise a typing indicator: no answer follows it directly."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = TelegramBridge(
+        user_id=TELEGRAM_USER_ID,
+        chat_id=CHAT_ID,
+        runner_provider=make_fake_provider(runner),
+        client=client,
+        options=TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE),
+    )
+
+    await bridge.handle_text(
+        "[переслано от Иван] чужой текст",
+        client_message_id="7",
+        kind=MessageKind.MATERIAL,
+        origin="Иван",
+    )
+
+    assert runner.kinds == [MessageKind.MATERIAL]
+    assert client.actions == []
     await bridge.aclose()

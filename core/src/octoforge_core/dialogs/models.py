@@ -55,6 +55,9 @@ class MessageRow(Base):
     # clarifications and the answer join it. NULL on legacy rows and on
     # messages of RUN tasks (cron/spawned work owes the user nothing).
     exchange_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # MessageKind for the exceptional kinds only: NULL means the user's own
+    # words, so legacy rows keep their meaning without a backfill
+    kind: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
 
 

@@ -51,7 +51,7 @@ from octoforge_core.dialogs.api import (
     ExchangeStatus,
     MessageRepository,
 )
-from octoforge_core.domain import ChatMessage, Dialog, MessageRole
+from octoforge_core.domain import ChatMessage, Dialog, MessageKind, MessageRole
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
@@ -228,6 +228,9 @@ class _Submit:
     # the runner's cancel epoch at enqueue time: a stop pressed while this
     # message was still being routed must cover it (see _start_answer)
     cancel_epoch: int = 0
+    # where forwarded material came from ("Иван Петров", "канал «Ъ»"), used to
+    # title the exchange that collects it; None for the user's own words
+    origin: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +417,8 @@ class ConversationRunner:
         content: str,
         client_message_id: str | None = None,
         reply_to_exchange_id: str | None = None,
+        kind: MessageKind = MessageKind.OWN,
+        origin: str | None = None,
     ) -> None:
         """Submit a user message; the router decides which exchange it joins.
 
@@ -421,13 +426,18 @@ class ConversationRunner:
         already-recorded key is skipped (delivery retries are normal).
         `reply_to_exchange_id` lets a transport that knows the user replied to
         a specific message name the exchange outright, skipping the router.
+        `kind=MATERIAL` marks content the user shared rather than wrote (a
+        forward): it never opens an obligation and never starts a run —
+        `origin` describes where it came from, for the title of the exchange
+        that eventually collects it.
         """
         await self._inbox.put(
             _Submit(
-                ChatMessage(role=MessageRole.USER, content=content),
+                ChatMessage(role=MessageRole.USER, content=content, kind=kind),
                 client_message_id=client_message_id,
                 reply_to_exchange_id=reply_to_exchange_id,
                 cancel_epoch=self._cancel_epoch,
+                origin=origin,
             )
         )
 
@@ -721,8 +731,26 @@ class ConversationRunner:
         # the routed/narrative copy carries its row id: the answer task links
         # back to it via source_message_id
         message = replace(message, id=message_id)
+        if message.kind is MessageKind.MATERIAL:
+            await self._collect_material(message, command)
+            return
         decision = await self._route(message, command)
         await self._apply_route(message, decision, command)
+
+    async def _collect_material(self, message: ChatMessage, command: _Submit) -> None:
+        """Take in forwarded material: it owes nothing, so nothing starts.
+
+        Material is someone else's text the user shared. It enters the
+        narrative as context and never opens an obligation — the reaction
+        comes later, when the user asks something or the collection settles.
+        """
+        self._narrative.append(message)
+        logger.info(
+            "material collected: dialog=%s message=%s origin=%s",
+            self._dialog.id,
+            message.id,
+            command.origin,
+        )
 
     async def _route(self, message: ChatMessage, command: _Submit) -> RouteDecision:
         """Decide which exchange the message belongs to (deterministic first).

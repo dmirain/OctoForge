@@ -24,7 +24,7 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
 )
-from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
+from octoforge_core.domain import ChatMessage, MessageKind, MessageRole, ToolCall
 from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
@@ -859,3 +859,25 @@ async def test_sql_stores_satisfy_the_dialogs_ports(
     assert [m.content for m in await messages.list(dialog.id)] == ["hi"]
     assert await messages.list_after(dialog.id, 1) == []
     assert (await dialogs.get(dialog.id)).id == dialog.id
+
+
+async def test_message_kind_round_trips_and_legacy_rows_are_own(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Only the exceptional kind is stored; a NULL column means the user's own words."""
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="мой вопрос"))
+    await messages.append(
+        dialog.id,
+        ChatMessage(role=MessageRole.USER, content="чужой текст", kind=MessageKind.MATERIAL),
+    )
+
+    own, material = await messages.list(dialog.id)
+
+    assert own.kind is MessageKind.OWN
+    assert material.kind is MessageKind.MATERIAL
+    async with session_factory() as session:
+        rows = (await session.scalars(select(MessageRow).order_by(MessageRow.seq))).all()
+    assert [row.kind for row in rows] == [None, MessageKind.MATERIAL.value]

@@ -60,7 +60,7 @@ from octoforge_core.dialogs.api import (
     ExchangeRepository,
     MessageRepository,
 )
-from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
+from octoforge_core.domain import ChatMessage, Dialog, MessageKind, MessageRole, ToolCall
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.instructions.api import (
     InstructionService,
@@ -143,6 +143,7 @@ __all__ = [
     "LoopEvent",
     "Memory",
     "MessageArchive",
+    "MessageKind",
     "MessageRepository",
     "MessageRole",
     "MessageRouter",
