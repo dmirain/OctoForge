@@ -93,6 +93,11 @@ NUDGE_TEMPLATE = (
 )
 # how stale an awaiting exchange must be before a new message triggers a nudge
 NUDGE_AFTER_SECONDS = 300.0
+# how long a collection of forwarded material must stay quiet before the
+# agent reacts to it on its own (no question ever came)
+MATERIAL_QUIET_SECONDS = 30.0
+MATERIAL_TITLE_TEMPLATE = "Переслано от {origin}"
+MATERIAL_TITLE_ANONYMOUS = "Пересланные сообщения"
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +244,13 @@ class _Flush:
 
 
 @dataclass(frozen=True, slots=True)
+class _PromoteCollected:
+    """The sweep nominating a settled collection for promotion (re-checked)."""
+
+    exchange_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ProcessTerminated:
     """A process (or a recovery sweep) asking the actor to deliver a task outcome.
 
@@ -273,7 +285,7 @@ class _Delivery:
     exchange_id: str | None = None
 
 
-_Command = _Submit | _ProcessTerminated | _Flush
+_Command = _Submit | _ProcessTerminated | _Flush | _PromoteCollected
 
 
 @dataclass(slots=True)
@@ -327,6 +339,8 @@ class RunnerConfig:
     max_processes: int
     compactor: ContextCompactor
     task_outcome_listener: TaskOutcomeListener | None = None
+    # quiet window before collected material earns a reaction of its own
+    material_quiet_seconds: float = MATERIAL_QUIET_SECONDS
 
 
 class ConversationRunner:
@@ -345,6 +359,7 @@ class ConversationRunner:
         self._prompts = config.prompts
         self._router = config.router
         self._max_processes = config.max_processes
+        self._material_quiet_seconds = config.material_quiet_seconds
         self._task_outcome_listener = config.task_outcome_listener
         self._compactor = config.compactor
         self._messages = messages
@@ -709,6 +724,8 @@ class ConversationRunner:
             await self._handle_terminated(command)
         elif isinstance(command, _Flush):
             await self._flush_deliveries()
+        elif isinstance(command, _PromoteCollected):
+            await self._handle_promote(command)
 
     async def _handle_submit(self, command: _Submit) -> None:
         message = command.message
@@ -740,17 +757,74 @@ class ConversationRunner:
     async def _collect_material(self, message: ChatMessage, command: _Submit) -> None:
         """Take in forwarded material: it owes nothing, so nothing starts.
 
-        Material is someone else's text the user shared. It enters the
-        narrative as context and never opens an obligation — the reaction
-        comes later, when the user asks something or the collection settles.
+        Material is someone else's text the user shared. It joins the
+        dialog's single collecting exchange (created on the first forward),
+        which is durable state, not a buffer: a restart mid-burst loses
+        nothing and the sweep still reacts. The touch is the quiet clock —
+        a burst that keeps arriving keeps postponing the reaction.
         """
+        exchange = await self._collecting_exchange(command.origin)
+        message = replace(message, exchange_id=exchange.id)
         self._narrative.append(message)
+        if message.id is not None:
+            await self._messages.set_exchange(message.id, exchange.id)
+        await self._exchanges.touch(exchange.id)
         logger.info(
-            "material collected: dialog=%s message=%s origin=%s",
+            "material collected: dialog=%s exchange=%s origin=%s",
             self._dialog.id,
-            message.id,
+            exchange.id,
             command.origin,
         )
+
+    async def _collecting_exchange(self, origin: str | None) -> Exchange:
+        """The dialog's collecting exchange, created on the first forward.
+
+        One per dialog: a burst is one reaction, not one per message. The
+        title comes from the first forward's origin — it stays as the honest
+        description of where the material came from even after a question
+        joins the exchange.
+        """
+        existing = await self._exchanges.find_collecting(self._dialog.id)
+        if existing is not None:
+            return existing
+        title = (
+            MATERIAL_TITLE_TEMPLATE.format(origin=origin) if origin else MATERIAL_TITLE_ANONYMOUS
+        )
+        return await self._exchanges.create(
+            self._dialog.id, title, status=ExchangeStatus.COLLECTING
+        )
+
+    async def promote_collected(self, exchange_id: str) -> None:
+        """Turn a settled collection into an obligation (sweep entry point).
+
+        Routed through the inbox: the decision must be serialized with
+        routing and run starts, or a promotion could race a question that is
+        already starting a run on the same exchange.
+        """
+        await self._inbox.put(_PromoteCollected(exchange_id=exchange_id))
+
+    async def _handle_promote(self, command: _PromoteCollected) -> None:
+        """Promote a collection whose quiet window elapsed; re-checked here.
+
+        The sweep only nominates: by the time the actor gets here a question
+        may have adopted the collection (it is no longer COLLECTING) or fresh
+        material may have restarted the clock. Both mean "not now".
+        """
+        try:
+            exchange = await self._exchanges.get(command.exchange_id)
+        except ExchangeNotFoundError:
+            return
+        if exchange.status is not ExchangeStatus.COLLECTING:
+            return
+        if (utc_now() - exchange.updated_at).total_seconds() < self._material_quiet_seconds:
+            return  # material arrived after the sweep picked it: let it settle
+        logger.info(
+            "promoting collected material: dialog=%s exchange=%s",
+            self._dialog.id,
+            exchange.id,
+        )
+        await self._exchanges.set_status(exchange.id, ExchangeStatus.OPEN)
+        await self._resume_open_exchange(exchange.id, notify_limit=False)
 
     async def _route(self, message: ChatMessage, command: _Submit) -> RouteDecision:
         """Decide which exchange the message belongs to (deterministic first).
@@ -830,10 +904,13 @@ class ConversationRunner:
         them here would race the actor's start path.
         """
         for exchange in await self._exchanges.list_live(self._dialog.id):
-            if (
+            parked = (
                 exchange.status is ExchangeStatus.AWAITING_USER
                 and exchange.owner_task_id not in self._processes
-            ):
+            )
+            # a stop also drops material waiting for a reaction: the user
+            # said "never mind", so the collection must not fire later
+            if parked or exchange.status is ExchangeStatus.COLLECTING:
                 await self._exchanges.set_status(exchange.id, ExchangeStatus.CANCELLED)
 
     def _handle_cancel(self) -> None:
@@ -1823,6 +1900,11 @@ class ConversationManager:
         runner.start()
         self._runners[dialog.id] = runner
         return runner
+
+    async def promote_collection(self, user_id: str, channel: str, exchange_id: str) -> None:
+        """Hand a settled material collection to its dialog (sweep entry point)."""
+        runner = await self.get_or_create_runner(user_id, channel)
+        await runner.promote_collected(exchange_id)
 
     async def wake(
         self,

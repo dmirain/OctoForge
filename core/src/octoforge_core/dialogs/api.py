@@ -30,9 +30,12 @@ class ExchangeStatus(StrEnum):
     OPEN is the only state that means work for the SYSTEM: the "what is left
     to do" predicate is `OPEN and no owner`, and it also drives restart
     recovery. AWAITING_USER means work for the USER — the exchange is not
-    closed, but nobody must restart it.
+    closed, but nobody must restart it. COLLECTING means work for NOBODY yet:
+    forwarded material is accumulating and the reaction is deferred until the
+    user asks something or the collection falls quiet.
     """
 
+    COLLECTING = "collecting"
     OPEN = "open"
     IN_PROGRESS = "in_progress"
     AWAITING_USER = "awaiting_user"
@@ -43,6 +46,7 @@ class ExchangeStatus(StrEnum):
 
 #: statuses an incoming message may still be routed into
 LIVE_EXCHANGE_STATUSES = (
+    ExchangeStatus.COLLECTING,
     ExchangeStatus.OPEN,
     ExchangeStatus.IN_PROGRESS,
     ExchangeStatus.AWAITING_USER,
@@ -75,9 +79,18 @@ class ExchangeRepository(Protocol):
     """Port over the exchanges of a dialog."""
 
     async def create(
-        self, dialog_id: str, title: str, owner_task_id: str | None = None
+        self,
+        dialog_id: str,
+        title: str,
+        owner_task_id: str | None = None,
+        status: ExchangeStatus | None = None,
     ) -> Exchange:
-        """Open a new exchange; IN_PROGRESS when an owner is given, OPEN otherwise."""
+        """Open a new exchange; IN_PROGRESS when an owner is given, OPEN otherwise.
+
+        `status` overrides that default in one write: a collecting exchange
+        must never exist as OPEN-and-unowned, not even briefly, or the
+        recovery sweep would grab it as work to do.
+        """
         ...
 
     async def get(self, exchange_id: str) -> Exchange:
@@ -86,6 +99,26 @@ class ExchangeRepository(Protocol):
 
     async def list_live(self, dialog_id: str) -> ExchangeList:
         """Return the dialog's non-terminal exchanges, oldest first."""
+        ...
+
+    async def find_collecting(self, dialog_id: str) -> Exchange | None:
+        """Return the dialog's collecting exchange, None when there is none.
+
+        At most one exists per dialog: material joins it instead of opening a
+        second collection, so one forward burst yields one reaction.
+        """
+        ...
+
+    async def list_stale_collecting(self, quiet_seconds: float) -> ExchangeList:
+        """Collecting exchanges untouched for longer than `quiet_seconds`.
+
+        The promotion predicate of the sweep: the batch has fallen quiet, so
+        it is time to react to it.
+        """
+        ...
+
+    async def touch(self, exchange_id: str) -> None:
+        """Bump `updated_at` — the clock the quiet window is measured against."""
         ...
 
     async def list_unowned_open(self, dialog_id: str | None = None) -> ExchangeList:

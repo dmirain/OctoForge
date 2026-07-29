@@ -170,6 +170,10 @@ class LLMRouter:
 def _describe(item: ExchangeInfo) -> str:
     """One human-readable line about a live exchange (the router's whole input)."""
     state = {
+        ExchangeStatus.COLLECTING: (
+            "material the user forwarded, not answered yet — a message about "
+            "that material belongs here"
+        ),
         ExchangeStatus.OPEN: "queued",
         ExchangeStatus.IN_PROGRESS: "being answered right now",
         ExchangeStatus.AWAITING_USER: "waiting for the user to reply",

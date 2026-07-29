@@ -7,6 +7,7 @@ objects (`Dialog`, `ChatMessage` from the shared kernel) at the boundary.
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from typing import Any, cast
 
 from sqlalchemy import ColumnElement, case, delete, func, insert, select, update
@@ -303,21 +304,63 @@ class SqlAlchemyExchangeRepository:
         self._session_factory = session_factory
 
     async def create(
-        self, dialog_id: str, title: str, owner_task_id: str | None = None
+        self,
+        dialog_id: str,
+        title: str,
+        owner_task_id: str | None = None,
+        status: ExchangeStatus | None = None,
     ) -> Exchange:
         """Open a new exchange; IN_PROGRESS when an owner is given, OPEN otherwise."""
-        status = ExchangeStatus.IN_PROGRESS if owner_task_id else ExchangeStatus.OPEN
+        resolved = status or (ExchangeStatus.IN_PROGRESS if owner_task_id else ExchangeStatus.OPEN)
         async with self._session_factory() as session:
             row = ExchangeRow(
                 id=uuid.uuid4().hex,
                 dialog_id=dialog_id,
-                status=status.value,
+                status=resolved.value,
                 title=title[:TITLE_MAX_LENGTH],
                 owner_task_id=owner_task_id,
             )
             session.add(row)
             await session.commit()
             return _to_exchange(row)
+
+    async def find_collecting(self, dialog_id: str) -> Exchange | None:
+        """Return the dialog's collecting exchange, None when there is none."""
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(ExchangeRow)
+                .where(
+                    ExchangeRow.dialog_id == dialog_id,
+                    ExchangeRow.status == ExchangeStatus.COLLECTING.value,
+                )
+                .order_by(ExchangeRow.created_at)
+                .limit(1)
+            )
+            row = result.first()
+            return _to_exchange(row) if row is not None else None
+
+    async def list_stale_collecting(self, quiet_seconds: float) -> ExchangeList:
+        """Collecting exchanges untouched for longer than `quiet_seconds`."""
+        threshold = utc_now() - timedelta(seconds=quiet_seconds)
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(ExchangeRow)
+                .where(
+                    ExchangeRow.status == ExchangeStatus.COLLECTING.value,
+                    ExchangeRow.updated_at < threshold,
+                )
+                .order_by(ExchangeRow.updated_at)
+            )
+            return [_to_exchange(row) for row in result.all()]
+
+    async def touch(self, exchange_id: str) -> None:
+        """Bump `updated_at`; a missing row is a no-op (it may have been deleted)."""
+        async with self._session_factory() as session:
+            row = await session.get(ExchangeRow, exchange_id)
+            if row is None:
+                return
+            row.updated_at = utc_now()
+            await session.commit()
 
     async def get(self, exchange_id: str) -> Exchange:
         async with self._session_factory() as session:

@@ -11,7 +11,12 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.agent.branch import CLARIFICATION_NOTE_TEMPLATE, TASK_NOTE_TEMPLATE
+from octoforge_core.agent.branch import (
+    CLARIFICATION_NOTE_TEMPLATE,
+    MATERIAL_NOTE_TEMPLATE,
+    MATERIAL_TASK_NOTE_TEMPLATE,
+    TASK_NOTE_TEMPLATE,
+)
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
     Cancelled,
@@ -33,6 +38,9 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
+    MATERIAL_QUIET_SECONDS,
+    MATERIAL_TITLE_ANONYMOUS,
+    MATERIAL_TITLE_TEMPLATE,
     NUDGE_AFTER_SECONDS,
     NUDGE_TEMPLATE,
     RESTART_LIMIT_ERROR,
@@ -57,7 +65,7 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
 )
-from octoforge_core.domain import ChatMessage, Dialog, MessageRole, ToolCall
+from octoforge_core.domain import ChatMessage, Dialog, MessageKind, MessageRole, ToolCall
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
@@ -106,6 +114,14 @@ OTHER_TASK_ID = "other"
 DEAD_TASK_ID = "dead"
 NUDGE_STALE_SECONDS = NUDGE_AFTER_SECONDS + 100.0
 TWO_PENDING_DELIVERIES = 2
+MATERIAL_ORIGIN = "Ivan Petrov"
+MATERIAL_ONE = "forwarded one"
+MATERIAL_TWO = "forwarded two"
+MATERIAL_THREE = "forwarded three"
+THREE_MATERIAL_MESSAGES = 3
+TWO_MESSAGES = 2
+MATERIAL_REACTION = "reacted to the batch"
+ADOPTING_TASK_ID = "adopting-task"
 
 
 @pytest.fixture
@@ -3722,3 +3738,230 @@ def test_critical_events_are_never_evicted_by_a_later_critical_event() -> None:
     only_criticals.put_nowait(envelope(Failed(error="x"), 2))
     assert ConversationRunner._evict_and_put(only_criticals, incoming) is False
     assert [only_criticals.get_nowait().seq for _ in range(2)] == [1, 2]
+
+
+# --- Forwarded material (MessageKind.MATERIAL) and the collecting exchange -
+#
+# Forwarded material never opens an obligation on its own: it joins the
+# dialog's single COLLECTING exchange (agent/runner.py:_collect_material),
+# which only turns into a run either because a real (OWN) message adopts it
+# or because CollectingSweeper nominates it once it falls quiet
+# (agent/runner.py:_handle_promote). The actor's inbox is a single FIFO
+# queue consumed one command at a time (`_run_actor`); several tests below
+# exploit that to prove a "no-op" promotion already ran to completion,
+# without a real sleep: a harmless follow-up submit is queued right after
+# the command under test, and waiting for ITS effect to land guarantees the
+# earlier command was fully handled first.
+
+
+async def test_forwarding_material_collects_without_routing_or_starting_a_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    router = FakeRouter()
+    llm = ScriptedLLM([])  # a router call or a run would starve this and blow up
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(MATERIAL_THREE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await wait_for_condition(lambda: len(runner.history()) == THREE_MATERIAL_MESSAGES)
+
+    assert router.calls == []
+    assert llm.requests == []
+    exchange = await SqlAlchemyExchangeRepository(session_factory).find_collecting(runner.dialog_id)
+    assert exchange is not None
+    assert exchange.status is ExchangeStatus.COLLECTING
+    # the title is pinned exactly: "Переслано от {origin}"
+    assert exchange.title == MATERIAL_TITLE_TEMPLATE.format(origin=MATERIAL_ORIGIN)
+    assert exchange.title == f"Переслано от {MATERIAL_ORIGIN}"
+    forwarded = runner.history()
+    assert [m.content for m in forwarded] == [MATERIAL_ONE, MATERIAL_TWO, MATERIAL_THREE]
+    assert all(m.kind is MessageKind.MATERIAL for m in forwarded)
+    assert all(m.exchange_id == exchange.id for m in forwarded)
+
+
+async def test_forwarding_material_without_origin_titles_the_exchange_anonymous(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)  # no origin: anonymous forward
+    await wait_for_condition(lambda: len(runner.history()) == 1)
+
+    exchange = await SqlAlchemyExchangeRepository(session_factory).find_collecting(runner.dialog_id)
+    assert exchange is not None
+    # the title is pinned exactly: "Пересланные сообщения"
+    assert exchange.title == MATERIAL_TITLE_ANONYMOUS
+    assert exchange.title == "Пересланные сообщения"
+
+
+async def test_promote_collected_starts_one_run_covering_all_collected_material(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = ScriptedLLM([reply(MATERIAL_REACTION)])
+    manager = make_manager(llm, ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await runner.submit(MATERIAL_THREE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await wait_for_condition(lambda: len(runner.history()) == THREE_MATERIAL_MESSAGES)
+    exchange = await exchanges.find_collecting(runner.dialog_id)
+    assert exchange is not None
+    await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+
+    await runner.promote_collected(exchange.id)
+    events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
+
+    assert len(llm.requests) == 1  # exactly one run for the whole batch
+    branch_contents = [m.content for m in llm.requests[0]]
+    assert MATERIAL_NOTE_TEMPLATE.format(content=MATERIAL_ONE) in branch_contents
+    assert MATERIAL_NOTE_TEMPLATE.format(content=MATERIAL_TWO) in branch_contents
+    # the last piece of material is the task; the date envelope wraps the tail
+    assert branch_contents[-1].endswith(MATERIAL_TASK_NOTE_TEMPLATE.format(content=MATERIAL_THREE))
+    assert any(isinstance(e.payload, Finished) for e in events)
+    await wait_for_async_condition(lambda: _is_answered(exchanges, exchange.id))
+
+
+async def test_promote_collected_is_a_noop_once_the_exchange_left_collecting(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A question already adopted the collection between the sweep's nomination
+    and the actor picking up the promotion: the re-check inside the actor
+    must see that and do nothing (the anti-race guard `_handle_promote` exists for)."""
+    llm = ScriptedLLM([])
+    manager = make_manager(llm, ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == 1)
+    exchange = await exchanges.find_collecting(runner.dialog_id)
+    assert exchange is not None
+    await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+    await exchanges.set_status(
+        exchange.id, ExchangeStatus.IN_PROGRESS, owner_task_id=ADOPTING_TASK_ID
+    )
+
+    await runner.promote_collected(exchange.id)
+    # FIFO proof: this submit's effect can only land after the promote above
+    # was fully dispatched, since both go through the same single-consumer inbox
+    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+
+    settled = await exchanges.get(exchange.id)
+    assert settled.status is ExchangeStatus.IN_PROGRESS
+    assert settled.owner_task_id == ADOPTING_TASK_ID
+    assert llm.requests == []
+
+
+async def test_promote_collected_is_a_noop_when_material_just_touched_it(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Fresh material restarts the quiet clock: a promotion nominated before
+    that arrival must find the window unmet and back off (the sweep's stale
+    snapshot can lag the actor's live state by a full sweep interval)."""
+    llm = ScriptedLLM([])
+    manager = make_manager(llm, ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == 1)
+    exchange = await exchanges.find_collecting(runner.dialog_id)
+    assert exchange is not None
+    # not backdated: the touch from the submit above is still fresh
+
+    await runner.promote_collected(exchange.id)
+    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL)  # FIFO ordering proof
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+
+    settled = await exchanges.get(exchange.id)
+    assert settled.status is ExchangeStatus.COLLECTING
+    assert llm.requests == []
+
+
+async def test_own_message_routed_into_the_collection_starts_a_run_and_leaves_collecting(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    router = FakeRouter()
+    router.decide_continue()  # the only live exchange is the collection
+    llm = ScriptedLLM([reply(MATERIAL_REACTION)])
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await wait_for_condition(lambda: len(runner.history()) == 1)
+    exchange = await exchanges.find_collecting(runner.dialog_id)
+    assert exchange is not None
+
+    await runner.submit("please summarize this")
+    events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
+
+    assert router.calls != []  # the OWN message was actually routed
+    left_collecting = await exchanges.get(exchange.id)
+    assert left_collecting.status is not ExchangeStatus.COLLECTING
+    assert any(isinstance(e.payload, Finished) for e in events)
+    await wait_for_async_condition(lambda: _is_answered(exchanges, exchange.id))
+
+
+async def test_cancel_cancels_a_collecting_exchange_and_blocks_later_promotion(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = ScriptedLLM([])
+    manager = make_manager(llm, ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == 1)
+    exchange = await exchanges.find_collecting(runner.dialog_id)
+    assert exchange is not None
+
+    await runner.cancel()  # the stop button: "never mind", drop the pending material
+
+    cancelled = await exchanges.get(exchange.id)
+    assert cancelled.status is ExchangeStatus.CANCELLED
+
+    await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+    await runner.promote_collected(exchange.id)
+    await runner.submit(MATERIAL_TWO, kind=MessageKind.MATERIAL)  # FIFO ordering proof
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+
+    still_cancelled = await exchanges.get(exchange.id)
+    assert still_cancelled.status is ExchangeStatus.CANCELLED
+    assert llm.requests == []
+
+
+async def test_material_never_triggers_the_process_limit_notice(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A blind spot the actor must not have: material bypasses routing/limit
+    checks entirely (`_collect_material` never calls `_apply_route`), so a
+    dialog sitting at its process limit still absorbs a forward silently."""
+    tool = BlockingTool()
+    llm = ScriptedLLM([blocking_call()])
+    manager = make_manager(
+        llm, blocking_registry(tool), session_factory, ManagerOptions(max_processes=ONE_PROCESS)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("start")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+
+    await runner.submit(MATERIAL_ONE, kind=MessageKind.MATERIAL)
+    await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
+
+    # no canned notice was inserted: exactly the question and the forward
+    assert [m.content for m in runner.history()] == ["start", MATERIAL_ONE]
+
+    tool.release.set()
+    await collect_until(queue, is_completed)

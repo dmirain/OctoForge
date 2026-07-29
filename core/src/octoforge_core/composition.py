@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from octoforge_core.agent.collecting import CollectingSweeper, CollectionPromoter
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.prompts import PromptProvider
 from octoforge_core.agent.router import LLMRouter, MessageRouter
@@ -256,6 +257,24 @@ def build_cron_scheduler(
 ) -> Scheduler:
     """Build the default cron scheduler; starting `run_forever()` is the caller's job."""
     return CronScheduler(store=store, waker=waker, owner=owner, config=config)
+
+
+def build_collecting_sweeper(
+    exchanges: ExchangeRepository,
+    dialogs: DialogRepository,
+    promoter: CollectionPromoter,
+    *,
+    quiet_seconds: float,
+    interval_seconds: float,
+) -> CollectingSweeper:
+    """Build the material-collection sweep; starting `run_forever()` is the caller's job."""
+    return CollectingSweeper(
+        exchanges=exchanges,
+        dialogs=dialogs,
+        promoter=promoter,
+        quiet_seconds=quiet_seconds,
+        interval_seconds=interval_seconds,
+    )
 
 
 def _register_core_tools(

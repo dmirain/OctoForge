@@ -21,6 +21,7 @@ from octoforge_core import (
     SqlAlchemyTaskStore,
     bootstrap_schema,
     build_agent_loop,
+    build_collecting_sweeper,
     build_compactor,
     build_conversation_manager,
     build_cron_outcome_reporter,
@@ -268,6 +269,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             # that never reached their dialog are redelivered.
             await manager.recover_interrupted()
             scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
+            sweeper_task = _start_collecting_sweeper(exchanges, dialogs, manager, settings)
             telegram = _start_telegram(
                 settings,
                 manager.get_or_create_runner,
@@ -305,7 +307,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     ),
                 )
             finally:
-                await _stop_background_tasks(scheduler_task, telegram)
+                await _stop_background_tasks(scheduler_task, sweeper_task, telegram)
                 await manager.stop_all()
     finally:
         await engine.dispose()
@@ -556,6 +558,24 @@ def _start_cron_scheduler(
     return asyncio.create_task(scheduler.run_forever())
 
 
+def _start_collecting_sweeper(
+    exchanges: ExchangeRepository,
+    dialogs: DialogRepository,
+    manager: ConversationManager,
+    settings: Settings,
+) -> asyncio.Task[None]:
+    """Start the loop that reacts to forwarded material once it falls quiet."""
+    sweeper = build_collecting_sweeper(
+        exchanges,
+        dialogs,
+        # ConversationManager satisfies the CollectionPromoter port structurally
+        manager,
+        quiet_seconds=settings.material_quiet_seconds,
+        interval_seconds=settings.material_sweep_interval_seconds,
+    )
+    return asyncio.create_task(sweeper.run_forever())
+
+
 @dataclass(frozen=True, slots=True)
 class _TelegramStores:
     """The Telegram surface's own database: invites plus member profiles."""
@@ -678,12 +698,14 @@ def _report_telegram_task_failure(task: asyncio.Task[None]) -> None:
 
 async def _stop_background_tasks(
     scheduler_task: asyncio.Task[None],
+    sweeper_task: asyncio.Task[None],
     telegram: tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None,
 ) -> None:
-    """Stop the cron scheduler and the Telegram adapter, if it was started."""
-    scheduler_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await scheduler_task
+    """Stop the background loops and the Telegram adapter, if it was started."""
+    for task in (scheduler_task, sweeper_task):
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
     if telegram is not None:
         registry, poller_task = telegram
         poller_task.cancel()

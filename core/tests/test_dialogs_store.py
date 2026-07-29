@@ -28,6 +28,7 @@ from octoforge_core.domain import ChatMessage, MessageKind, MessageRole, ToolCal
 from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
+from octoforge_core.time import utc_now
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 USER_ID = "user-1"
@@ -58,6 +59,8 @@ PENDING_QUESTION = "which quarter?"
 OTHER_PENDING_QUESTION = "which city?"
 EXPECTED_LIVE_EXCHANGE_COUNT = 3
 EXPECTED_REOPENED_COUNT = 2
+COLLECTING_TITLE = "forwarded material"
+STALE_QUIET_SECONDS = 30.0
 
 
 @pytest.fixture
@@ -657,10 +660,16 @@ async def _insert_exchange(  # noqa: PLR0913 — mirrors the ExchangeRow columns
     title: str = EXCHANGE_TITLE,
     status: ExchangeStatus,
     created_at: datetime,
+    updated_at: datetime | None = None,
     owner_task_id: str | None = None,
     pending_question: str | None = None,
 ) -> str:
-    """Insert an ExchangeRow directly, controlling `created_at` for ordering tests."""
+    """Insert an ExchangeRow directly, controlling `created_at`/`updated_at`.
+
+    `updated_at` defaults to `created_at`: ordering tests only care about the
+    latter, while the staleness tests (`list_stale_collecting`) need to
+    backdate the former independently.
+    """
     row_id = uuid.uuid4().hex
     async with session_factory() as session:
         session.add(
@@ -672,6 +681,7 @@ async def _insert_exchange(  # noqa: PLR0913 — mirrors the ExchangeRow columns
                 owner_task_id=owner_task_id,
                 pending_question=pending_question,
                 created_at=created_at,
+                updated_at=updated_at if updated_at is not None else created_at,
             )
         )
         await session.commit()
@@ -839,6 +849,105 @@ async def test_exchange_delete_for_dialog_scopes_to_one_dialog(
     with pytest.raises(ExchangeNotFoundError):
         await repo.get(own.id)
     assert (await repo.get(other.id)).id == other.id
+
+
+async def test_exchange_create_with_collecting_status_has_no_owner(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A `status=` override wins over the owner-based default: COLLECTING must
+    never pass through OPEN-and-unowned, not even briefly (the unowned-open
+    sweep would grab it as work to do)."""
+    repo = SqlAlchemyExchangeRepository(session_factory)
+
+    exchange = await repo.create(DIALOG_ID, COLLECTING_TITLE, status=ExchangeStatus.COLLECTING)
+
+    assert exchange.status is ExchangeStatus.COLLECTING
+    assert exchange.owner_task_id is None
+    assert exchange.title == COLLECTING_TITLE
+
+
+async def test_find_collecting_returns_the_dialogs_collecting_exchange(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    collecting = await repo.create(DIALOG_ID, COLLECTING_TITLE, status=ExchangeStatus.COLLECTING)
+    await repo.create(DIALOG_ID, "an open question")  # live, but not a collection
+
+    found = await repo.find_collecting(DIALOG_ID)
+
+    assert found is not None
+    assert found.id == collecting.id
+
+
+async def test_find_collecting_returns_none_without_a_collection(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    await repo.create(DIALOG_ID, "an open question")
+
+    assert await repo.find_collecting(DIALOG_ID) is None
+
+
+async def test_find_collecting_returns_none_once_promoted(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    collecting = await repo.create(DIALOG_ID, COLLECTING_TITLE, status=ExchangeStatus.COLLECTING)
+
+    await repo.set_status(collecting.id, ExchangeStatus.OPEN)
+
+    assert await repo.find_collecting(DIALOG_ID) is None
+
+
+async def test_list_stale_collecting_only_returns_exchanges_past_the_quiet_window(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    now = utc_now()
+    stale_id = await _insert_exchange(
+        session_factory,
+        title="stale",
+        status=ExchangeStatus.COLLECTING,
+        created_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+        updated_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 1),
+    )
+    await _insert_exchange(  # touched too recently: must not come back yet
+        session_factory,
+        title="fresh",
+        status=ExchangeStatus.COLLECTING,
+        created_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+        updated_at=now,
+    )
+    await _insert_exchange(  # not a collection at all, however stale
+        session_factory,
+        title="open",
+        status=ExchangeStatus.OPEN,
+        created_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+        updated_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+    )
+
+    stale = await repo.list_stale_collecting(STALE_QUIET_SECONDS)
+
+    assert [item.id for item in stale] == [stale_id]
+
+
+async def test_touch_moves_updated_at_forward(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    old_timestamp = CREATED_EARLIER
+    exchange_id = await _insert_exchange(
+        session_factory,
+        title=COLLECTING_TITLE,
+        status=ExchangeStatus.COLLECTING,
+        created_at=old_timestamp,
+        updated_at=old_timestamp,
+    )
+
+    await repo.touch(exchange_id)
+
+    touched = await repo.get(exchange_id)
+    assert touched.updated_at > old_timestamp
 
 
 async def test_sql_stores_satisfy_the_dialogs_ports(

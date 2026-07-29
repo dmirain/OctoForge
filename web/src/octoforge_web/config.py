@@ -38,6 +38,10 @@ DEFAULT_LLM_RETRY_BASE_SECONDS = 1.0
 DEFAULT_LLM_RETRY_MAX_SECONDS = 30.0
 DEFAULT_SELF_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CRON_POLL_INTERVAL_SECONDS = 1.0
+# how long forwarded material may stay quiet before the agent reacts on
+# its own, and how often the sweep looks for settled collections
+DEFAULT_MATERIAL_QUIET_SECONDS = 30.0
+DEFAULT_MATERIAL_SWEEP_INTERVAL_SECONDS = 10.0
 DEFAULT_CRON_LEASE_TTL_SECONDS = 60.0
 DEFAULT_CRON_REPLAY_LIMIT = 5
 DEFAULT_RERANKER_MODEL = ""
@@ -98,6 +102,8 @@ class Settings(BaseSettings):
     llm_retry_max_seconds: float = DEFAULT_LLM_RETRY_MAX_SECONDS
     self_base_url: str = DEFAULT_SELF_BASE_URL
     cron_poll_interval_seconds: float = DEFAULT_CRON_POLL_INTERVAL_SECONDS
+    material_quiet_seconds: float = DEFAULT_MATERIAL_QUIET_SECONDS
+    material_sweep_interval_seconds: float = DEFAULT_MATERIAL_SWEEP_INTERVAL_SECONDS
     cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
     cron_replay_limit: int = DEFAULT_CRON_REPLAY_LIMIT
     telegram_bot_token: str = ""
