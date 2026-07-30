@@ -64,7 +64,7 @@ services:
     volumes:
       # the host's model cache: without it the container re-downloads the
       # 1.1 GB embedding model on first start
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface
       # system-skill overlay (OF_SYSTEM_SKILLS_SOURCE): scenario tuning for this
       # installation — edit the file and restart, no rebuild
       - ./docker/system_skills.ru.json:/etc/octoforge/system_skills.json:ro
@@ -113,7 +113,7 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface
     # No ports and no healthcheck on purpose: this surface only makes outbound
     # connections (Bot API long poll, LLM, embeddings) and exposes no endpoint
     # to probe. Liveness is left to `restart`.
