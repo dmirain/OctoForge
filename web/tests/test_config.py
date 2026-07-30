@@ -346,6 +346,25 @@ def test_telegram_admin_ids_parsed_from_csv(monkeypatch: pytest.MonkeyPatch) -> 
     assert settings.telegram_admin_ids == [123456, 789012]
 
 
+def test_telegram_bot_username_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    written = (
+        "octoforge_bot",
+        "@octoforge_bot",
+        "https://t.me/octoforge_bot",
+        " t.me/octoforge_bot/ ",
+    )
+    for raw in written:
+        monkeypatch.setenv("OF_TELEGRAM_BOT_USERNAME", raw)
+
+        assert Settings().resolved_telegram_bot_username() == "octoforge_bot"
+
+
+def test_telegram_bot_username_defaults_to_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OF_TELEGRAM_BOT_USERNAME", raising=False)
+
+    assert Settings().resolved_telegram_bot_username() == ""
+
+
 def test_telegram_admin_ids_default_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OF_TELEGRAM_ADMIN_IDS", raising=False)
 

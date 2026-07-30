@@ -25,6 +25,7 @@ from octoforge_web.telegram.admin import (
     ACTION_RESTORE_INVITE,
     ACTION_REVOKE_INVITE,
     ACTION_SEARCH_INSTRUCTIONS,
+    NO_BOT_USERNAME_HINT,
     NOT_AUTHORIZED_MESSAGE,
     PUBLISH_NOT_FOUND_MESSAGE,
     AdminAccess,
@@ -42,6 +43,7 @@ ADMIN_USER_ID = "tg:999"
 USER_ID = "tg:111"
 DIALOG_ID = "dlg-1"
 NOTE = "for Alice"
+BOT_USERNAME = "octoforge_demo_bot"
 CRON_SCHEDULE = "0 9 * * *"
 NEXT_FIRE = datetime(2026, 1, 2, 9, 0, tzinfo=UTC)
 
@@ -87,9 +89,10 @@ async def stores() -> AsyncIterator[StoresTuple]:
 
 def make_tool(
     stores: StoresTuple,
+    bot_username: str = "",
 ) -> AdminManageTool:
     invites, cron_store, messages, dialogs, instructions = stores
-    access = AdminAccess(admin_ids=frozenset({ADMIN_TELEGRAM_ID}))
+    access = AdminAccess(admin_ids=frozenset({ADMIN_TELEGRAM_ID}), bot_username=bot_username)
     backends = AdminStores(
         invites=invites,
         cron_store=cron_store,
@@ -175,6 +178,35 @@ async def test_generate_invite_returns_the_code(
     assert pending[0].status is InviteStatus.PENDING
     assert pending[0].note == NOTE
     assert pending[0].code in result
+    # no handle configured: the bare code plus the hint that fixes it
+    assert NO_BOT_USERNAME_HINT in result
+    assert "t.me" not in result
+
+
+async def test_generate_invite_returns_a_markdown_link_with_a_bot_handle(
+    stores: StoresTuple,
+) -> None:
+    invites = stores[0]
+    tool = make_tool(stores, bot_username=BOT_USERNAME)
+
+    result = await tool.execute({"action": ACTION_GENERATE_INVITE}, ADMIN_CONTEXT)
+
+    code = (await invites.list_all())[0].code
+    assert f"[@{BOT_USERNAME}](https://t.me/{BOT_USERNAME}?start={code})" in result
+    assert NO_BOT_USERNAME_HINT not in result
+
+
+async def test_pending_invites_are_listed_as_links_when_the_handle_is_known(
+    stores: StoresTuple,
+) -> None:
+    invites = stores[0]
+    tool = make_tool(stores, bot_username=BOT_USERNAME)
+    invite = await invites.create(NOTE)
+
+    result = await tool.execute({"action": ACTION_LIST_USERS}, ADMIN_CONTEXT)
+
+    assert f"https://t.me/{BOT_USERNAME}?start={invite.code}" in result
+    assert NOTE in result
 
 
 async def test_list_users_reports_access_stats_and_cron(

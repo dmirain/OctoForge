@@ -152,6 +152,7 @@ The hash uses `:` separators rather than `$` because docker compose interpolates
 |---|---|---|
 | `OF_TELEGRAM_BOT_TOKEN` | *(empty)* | Bot token from @BotFather; empty means the adapter does not start |
 | `OF_TELEGRAM_ADMIN_IDS` | *(empty)* | Comma-separated numeric ids. Admins bypass the invite gate and get the `admin_manage` tool. **While this list is empty the invite gate is inactive and the bot answers everyone** |
+| `OF_TELEGRAM_BOT_USERNAME` | *(empty)* | The bot's public handle; accepts `name`, `@name` or a t.me URL. Set it and `admin_manage` hands out invites as `https://t.me/<bot>?start=<code>` deep links instead of bare codes |
 | `OF_TELEGRAM_INVITE_TTL_SECONDS` | `259200.0` | How long a generated invite code stays claimable (3 days) |
 | `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` | `30.0` | Long-poll timeout |
 | `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` | `1.5` | Minimum interval between edits of a streaming draft message |

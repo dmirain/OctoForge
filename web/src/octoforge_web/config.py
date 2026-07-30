@@ -132,6 +132,10 @@ class Settings(BaseSettings):
     telegram_database_url: str = DEFAULT_TELEGRAM_DATABASE_URL
     telegram_invite_ttl_seconds: float = DEFAULT_TELEGRAM_INVITE_TTL_SECONDS
     telegram_admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    # The bot's public @handle. Only the Bot API knows it, and nothing in the
+    # code may assume it: with it configured, an invite is handed out as a
+    # t.me deep link instead of a bare code the recipient has to paste.
+    telegram_bot_username: str = ""
     serper_token: str = ""
     system_prompt_source: str = ""
     router_prompt_source: str = ""
@@ -176,6 +180,15 @@ class Settings(BaseSettings):
     # Longest recording accepted: a cap on latency and on the provider's daily
     # audio quota, checked against the duration the update carries.
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
+
+    def resolved_telegram_bot_username(self) -> str:
+        """Bot handle without decoration: `@name`, a t.me URL or a bare name all work."""
+        raw = self.telegram_bot_username.strip()
+        for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
+            if raw.lower().startswith(prefix.lower()):
+                raw = raw[len(prefix) :]
+                break
+        return raw.strip("/").strip()
 
     def resolved_public_base_url(self) -> str:
         """Base URL for user-facing links: configured public one or self."""

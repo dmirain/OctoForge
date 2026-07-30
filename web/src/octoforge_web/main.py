@@ -235,6 +235,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                             telegram=TelegramBotClient(
                                 http_client=outbound_http, token=settings.telegram_bot_token
                             ),
+                            bot_username=settings.resolved_telegram_bot_username(),
                         ),
                     )
                 )

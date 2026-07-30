@@ -51,6 +51,12 @@ and no Alembic chain — invites are a Telegram-specific concept and core knows 
 - Admins (`OF_TELEGRAM_ADMIN_IDS`) always pass.
 - Everyone else needs `/start <code>` with a code that is `PENDING` and not older than
   `OF_TELEGRAM_INVITE_TTL_SECONDS`. Codes move `PENDING → CLAIMED`, or `REVOKED`.
+- With `OF_TELEGRAM_BOT_USERNAME` set, `admin_manage` hands out the invite as a markdown deep link
+  (`[@bot](https://t.me/<bot>?start=<code>)`) instead of a bare code: opening it starts the bot and
+  claims the invite in one tap, because Telegram delivers the payload as `/start <code>`. The handle
+  is configuration rather than a constant — only the Bot API knows a bot's public name, and guessing
+  it in code would point invitations at somebody else's chat. Without it the tool returns the code
+  and says which variable would improve that.
 - **The gate only activates once the admin list is non-empty.** With no admins configured the bot answers
   everyone — a deliberate first-run behavior that the startup capability report flags in capitals.
 
@@ -91,6 +97,7 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 |---|---|
 | `OF_TELEGRAM_BOT_TOKEN` | The bot; empty means the adapter does not start |
 | `OF_TELEGRAM_ADMIN_IDS` | Admins; while empty the invite gate is inactive |
+| `OF_TELEGRAM_BOT_USERNAME` | The bot's public handle (`name`, `@name` or a t.me URL). Turns generated invites into one-tap deep links |
 | `OF_TELEGRAM_INVITE_TTL_SECONDS` | How long a code stays claimable |
 | `OF_TELEGRAM_DATABASE_URL` | The invite/member database |
 | `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` | Long-poll timeout |
@@ -109,6 +116,7 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 | Vision or transcription unavailable | The message still arrives, with a placeholder or a "text only" notice |
 | Unknown or expired invite code | Explained to the user; access denied |
 | No admins configured | The bot answers everyone until an admin id is set |
+| `OF_TELEGRAM_BOT_USERNAME` unset or wrong | Invites are handed out as bare codes; a wrong handle produces a link into another bot's chat, where the code cannot be claimed |
 | Bridge dies mid-answer | The terminal was not accepted by any subscriber, so the result stays in the outbox and is delivered on reconnect |
 
 ## Code anchors

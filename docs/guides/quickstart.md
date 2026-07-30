@@ -81,11 +81,13 @@ Create a bot with @BotFather, then:
 ```bash
 OF_TELEGRAM_BOT_TOKEN=123456:ABC-...   # in .env (quickstart stack: OF_QUICKSTART_TELEGRAM_TOKEN)
 OF_TELEGRAM_ADMIN_IDS=<your numeric id>
+OF_TELEGRAM_BOT_USERNAME=<the bot's @handle>   # optional, but invites become one-tap links
 ```
 
 Restart. The bot starts alongside the web app, or on its own with `make run-telegram` (no HTTP port opened).
 Until `OF_TELEGRAM_ADMIN_IDS` is non-empty **the invite gate is inactive and the bot answers everyone** —
-set your own id first, then hand out codes with `admin_manage` in the chat.
+set your own id first, then hand out invites with `admin_manage` in the chat. With the handle configured
+they arrive as links the recipient only has to tap.
 
 ## First things worth trying
 

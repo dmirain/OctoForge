@@ -41,6 +41,13 @@ ACTION_REVOKE_INVITE = "revoke_invite"
 ACTION_RESTORE_INVITE = "restore_invite"
 ACTION_SEARCH_INSTRUCTIONS = "search_instructions"
 ACTION_PUBLISH_INSTRUCTION = "publish_instruction"
+INVITE_LINK_TEMPLATE = "https://t.me/{bot}?start={code}"
+# Without a configured handle the tool cannot build a link: only the Bot API
+# knows the bot's public name, and guessing it in code would hand out a link
+# into somebody else's chat.
+NO_BOT_USERNAME_HINT = (
+    "set OF_TELEGRAM_BOT_USERNAME to hand out a one-tap link instead of a bare code"
+)
 MAX_INSTRUCTION_RESULTS = 10
 INSTRUCTION_SNIPPET_CHARS = 120
 PUBLISH_NOT_FOUND_MESSAGE = "error: instruction not found (give the id from search_instructions)"
@@ -95,6 +102,9 @@ class AdminAccess:
 
     admin_ids: frozenset[int]
     telegram: TelegramClient | None = None
+    # the bot's public @handle (no decoration), used to build invite deep
+    # links; empty means invites are handed out as bare codes
+    bot_username: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,9 +150,12 @@ class AdminManageTool:
             description=(
                 "Administer the Telegram bot: list users (name, @username, which "
                 "invite they entered through, usage stats), generate "
-                "an invite code, revoke a user's access (disables their cron jobs, "
+                "an invite, revoke a user's access (disables their cron jobs, "
                 "reversible) or restore it back; search instructions across all users "
-                "and publish one by id (makes it visible to everyone). Admins only."
+                "and publish one by id (makes it visible to everyone). Admins only. "
+                "generate_invite answers with a ready-to-forward markdown link when "
+                "this installation knows the bot's handle — pass that link through to "
+                "the admin verbatim instead of retyping the bare code."
             ),
             parameters_schema=SCHEMA,
         )
@@ -187,9 +200,17 @@ class AdminManageTool:
             )
         pending = [invite for invite in invites if invite.status is InviteStatus.PENDING]
         if pending:
-            lines.append("pending invite codes:")
-            lines.extend(f"- {invite.code} ({invite.note or 'no note'})" for invite in pending)
+            lines.append("pending invites:")
+            lines.extend(self._pending_line(invite) for invite in pending)
         return "\n".join(lines)
+
+    def _pending_line(self, invite: Invite) -> str:
+        """One pending invite: its link when a handle is configured, else the code."""
+        note = invite.note or "no note"
+        link = self._invite_link(invite.code)
+        if link is None:
+            return f"- {invite.code} ({note})"
+        return f"- {link} ({note}, code {invite.code})"
 
     async def _member_profiles(self) -> dict[str, MemberProfile]:
         if self._directory is None:
@@ -231,10 +252,30 @@ class AdminManageTool:
 
     async def _generate_invite(self, arguments: dict[str, Any]) -> str:
         invite = await self._invites.create(str(arguments.get("note") or ""))
+        link = self._invite_link(invite.code)
+        if link is None:
+            return (
+                f"invite created: {invite.code}\n"
+                f"share it; the user activates it with /start {invite.code}\n"
+                f"({NO_BOT_USERNAME_HINT})"
+            )
         return (
-            f"invite created: {invite.code}\n"
-            f"share it; the user activates it with /start {invite.code}"
+            f"invite created (code {invite.code}).\n"
+            f"Give the user this link exactly as written — opening it starts the bot "
+            f"and claims the invite:\n{link}"
         )
+
+    def _invite_link(self, code: str) -> str | None:
+        """Markdown link claiming the invite on first /start; None without a handle.
+
+        The label is the bot's own handle rather than a word, so relaying the
+        link never injects English into an answer written in another language.
+        """
+        bot = self._access.bot_username
+        if not bot:
+            return None
+        url = INVITE_LINK_TEMPLATE.format(bot=bot, code=code)
+        return f"[@{bot}]({url})"
 
     async def _revoke(self, arguments: dict[str, Any]) -> str:
         invite = await self._find_invite(arguments)
