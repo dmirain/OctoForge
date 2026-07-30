@@ -12,6 +12,7 @@ from typing import Any
 from octoforge_core.datasets.api import (
     Dataset,
     DatasetHit,
+    DatasetLexicalSearch,
     DatasetNotFoundError,
     DatasetRecord,
     DatasetSchema,
@@ -19,7 +20,7 @@ from octoforge_core.datasets.api import (
     DatasetVectorSearch,
     EmbeddedDataset,
 )
-from octoforge_core.datasets.ranking import rank
+from octoforge_core.datasets.ranking import fuse, rank
 from octoforge_core.llm.embeddings import EmbeddingClient
 
 EMBEDDED_TEXT_SEPARATOR = "\n"
@@ -118,7 +119,10 @@ class LocalDatasetService:
             return []
         (query_embedding,) = await self._embedder.embed((query,))
         candidates = await self._candidates(owner_user_id, query_embedding, k)
-        return rank(candidates, query, query_embedding, k)
+        lexical = await self._lexical_candidates(owner_user_id, query, k)
+        if lexical is None:
+            return rank(candidates, query, query_embedding, k)
+        return fuse([candidates, lexical], query, k)
 
     async def _candidates(
         self,
@@ -130,6 +134,22 @@ class LocalDatasetService:
         if isinstance(self._store, DatasetVectorSearch):
             return await self._store.search_by_vector(owner_user_id, query_embedding, k)
         return await self._store.list_with_embeddings(owner_user_id)
+
+    async def _lexical_candidates(
+        self,
+        owner_user_id: str,
+        query: str,
+        k: int,
+    ) -> list[EmbeddedDataset] | None:
+        """BM25 candidates, or None when the store has no lexical capability.
+
+        None rather than an empty list: "this database cannot" and "nothing
+        matched the words" must not collapse into one, or an unmatched query
+        would silently halve the ranking evidence.
+        """
+        if not isinstance(self._store, DatasetLexicalSearch):
+            return None
+        return await self._store.search_by_text(owner_user_id, query, k)
 
 
 def _embedded_text(name: str, description: str, usage_notes: str) -> str:

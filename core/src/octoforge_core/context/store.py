@@ -127,7 +127,7 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
             if limit is not None:
                 statement = statement.limit(limit)
             result = await session.scalars(statement)
-            return [_to_archived(row) for row in result.all()]
+            return [to_archived(row) for row in result.all()]
 
     async def latest_prompt_tokens(self, dialog_id: str, after_seq: int) -> int | None:
         """Return prompt_tokens of the newest tail assistant message with usage."""
@@ -179,7 +179,7 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
             result = await session.scalars(
                 select(MessageRow).where(*clauses).order_by(MessageRow.seq).limit(limit)
             )
-            return [_to_archived(row) for row in result.all()]
+            return [to_archived(row) for row in result.all()]
 
 
 def _escape_like(text: str) -> str:
@@ -203,7 +203,7 @@ def _to_summary(row: SummaryRow) -> DialogueSummary:
     )
 
 
-def _to_archived(row: MessageRow) -> ArchivedMessage:
+def to_archived(row: MessageRow) -> ArchivedMessage:
     return ArchivedMessage(
         seq=row.seq,
         role=MessageRole(row.role),

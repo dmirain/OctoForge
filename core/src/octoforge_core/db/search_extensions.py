@@ -141,13 +141,23 @@ def _create_russian_unaccent(connection: Connection) -> None:
     savepoint.commit()
 
 
-# BM25 indexes over the instructions table. Two rather than one over the
-# concatenation: BM25 normalizes by document length, and a title of two tokens
-# folded in with a body of a hundred would be drowned by it. See migration
-# c7e2a91f4d38, which does the same for a database that already exists.
-INSTRUCTION_BM25_INDEXES = (
-    ("ix_instructions_bm25_content", "content"),
-    ("ix_instructions_bm25_title", "title"),
+# Every BM25 index the retrieval paths expect, as (index, table, column).
+#
+# `instructions` gets two rather than one over the concatenation: BM25
+# normalizes by document length, and a title of two tokens folded in with a
+# body of a hundred would be drowned by it.
+#
+# `messages` is what turns history_search from an ILIKE substring scan into a
+# ranked search that survives Russian inflection. `datasets` covers naming a
+# dataset by a word from its description.
+#
+# Migrations c7e2a91f4d38 and d5a3f8c1e627 do the same for databases that
+# already exist; this list is for the fresh-database path, which skips them.
+BM25_INDEXES = (
+    ("ix_instructions_bm25_content", "instructions", "content"),
+    ("ix_instructions_bm25_title", "instructions", "title"),
+    ("ix_messages_bm25_content", "messages", "content"),
+    ("ix_datasets_bm25_description", "datasets", "description"),
 )
 FALLBACK_TEXT_CONFIG = "pg_catalog.russian"
 
@@ -169,10 +179,10 @@ def ensure_bm25_indexes(connection: Connection) -> bool:
     )
     savepoint = connection.begin_nested()
     try:
-        for name, column in INSTRUCTION_BM25_INDEXES:
+        for name, table, column in BM25_INDEXES:
             connection.execute(
                 sa.text(
-                    f"CREATE INDEX IF NOT EXISTS {name} ON instructions "
+                    f"CREATE INDEX IF NOT EXISTS {name} ON {table} "
                     f"USING bm25 ({column}) WITH (text_config='{config}')"
                 )
             )

@@ -24,13 +24,17 @@ from octoforge_core.agent.runner import (
 from octoforge_core.config import LLMConfig
 from octoforge_core.context.api import ContextCompactor, MessageArchive, SummaryStore
 from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
+from octoforge_core.context.pg_store import PostgresSummaryStore
+from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.context.tools import HistorySearchTool
 from octoforge_core.cron.api import CronStore, CronWaker, Scheduler
 from octoforge_core.cron.reporter import CronOutcomeReporter
 from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
 from octoforge_core.cron.tools import CronPauseTool, CronResumeTool
 from octoforge_core.datasets.api import DatasetService, DatasetStore
+from octoforge_core.datasets.pg_store import PostgresDatasetStore
 from octoforge_core.datasets.service import LocalDatasetService
+from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.datasets.tools import DataForgetTool, DataPutTool, DataQueryTool
 from octoforge_core.dialogs.api import (
     DialogRepository,
@@ -134,10 +138,43 @@ def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMCl
     )
 
 
+def build_summary_store(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    lexical_search: bool,
+) -> SqlAlchemySummaryStore:
+    """Pick the summary/archive store: BM25-ranked history search where possible.
+
+    Returns the concrete base class rather than a port because callers need
+    both of the ports it implements (`SummaryStore` for compaction,
+    `MessageArchive` for history_search) and Python has no anonymous
+    intersection type.
+
+    Without pg_textsearch `history_search` stays a substring match ordered by
+    position in the dialog, which is what it always was; with it, the query is
+    stemmed and results come back by relevance.
+    """
+    if lexical_search:
+        return PostgresSummaryStore(session_factory)
+    return SqlAlchemySummaryStore(session_factory)
+
+
+def build_dataset_store(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    lexical_search: bool,
+) -> DatasetStore:
+    """Pick the dataset store: BM25 over descriptions where the database can."""
+    if lexical_search:
+        return PostgresDatasetStore(session_factory)
+    return SqlAlchemyDatasetStore(session_factory)
+
+
 def build_instruction_store(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     vector_search: bool,
+    lexical_search: bool = False,
 ) -> InstructionStore:
     """Pick the instruction store: pgvector-backed when the database can, else portable.
 
@@ -149,7 +186,7 @@ def build_instruction_store(
     `pg_extension`, which is what makes a database without the extension a
     supported configuration rather than a crash.
     """
-    if vector_search:
+    if vector_search or lexical_search:
         return PostgresInstructionStore(session_factory)
     return SqlAlchemyInstructionStore(session_factory)
 

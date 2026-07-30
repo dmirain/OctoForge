@@ -121,13 +121,7 @@ class SqlAlchemyDatasetStore:
                     select(DatasetRow).where(DatasetRow.owner_user_id == owner_user_id)
                 )
             ).all()
-            return [
-                EmbeddedDataset(
-                    dataset=_to_dataset(row),
-                    embedding=tuple(row.embedding),
-                )
-                for row in rows
-            ]
+            return [to_embedded_dataset(row) for row in rows]
 
     async def query_candidates(
         self,
@@ -187,3 +181,8 @@ def _to_record(row: DatasetRecordRow) -> DatasetRecord:
         payload=row.payload,
         created_at=row.created_at,
     )
+
+
+def to_embedded_dataset(row: DatasetRow) -> EmbeddedDataset:
+    """Map a descriptor row to the search DTO (shared with `pg_store.py`)."""
+    return EmbeddedDataset(dataset=_to_dataset(row), embedding=tuple(row.embedding))

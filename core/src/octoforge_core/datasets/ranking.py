@@ -5,6 +5,7 @@ self-contained and must not import from the instructions module.
 """
 
 import math
+from collections.abc import Sequence
 
 from octoforge_core.datasets.api import DatasetHit, EmbeddedDataset
 
@@ -61,3 +62,44 @@ def _score(
     if candidate.dataset.name.casefold() == query.casefold():
         score += EXACT_NAME_BOOST
     return score
+
+
+# See instructions/ranking.py for why reciprocal rank and not a weighted sum:
+# cosine is bounded and BM25 is not, so no normalization between them stays
+# valid as the corpus grows. Duplicated rather than imported because this
+# module must not depend on the instructions module.
+RRF_SMOOTHING = 60
+FIRST_RANK = 1
+
+
+def fuse(
+    rankings: Sequence[Sequence[EmbeddedDataset]],
+    query: str,
+    k: int,
+) -> list[DatasetHit]:
+    """Merge ranked candidate lists into scored hits, best first.
+
+    The exact-name guarantee survives: a descriptor named exactly as the query
+    gets EXACT_NAME_BOOST, which dwarfs any fused score (with two rankings the
+    maximum is 2/61), so naming a dataset still finds that dataset.
+    """
+    if k <= 0:
+        return []
+    scores: dict[str, float] = {}
+    records: dict[str, EmbeddedDataset] = {}
+    for ranking in rankings:
+        for position, candidate in enumerate(ranking, start=FIRST_RANK):
+            key = candidate.dataset.id
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_SMOOTHING + position)
+            records.setdefault(key, candidate)
+    folded_query = query.casefold()
+    hits = [
+        DatasetHit(
+            dataset=candidate.dataset,
+            score=scores[key]
+            + (EXACT_NAME_BOOST if candidate.dataset.name.casefold() == folded_query else 0.0),
+        )
+        for key, candidate in records.items()
+    ]
+    hits.sort(key=lambda hit: (-hit.score, hit.dataset.name))
+    return hits[:k]

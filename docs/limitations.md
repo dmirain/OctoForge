@@ -76,8 +76,14 @@ delivered. Scrollback comes from stored messages, not from replaying the stream.
   `OF_AGENT_MAX_ITERATIONS`.
 - **No structured-output contract.** Answers are text; there is no schema-constrained final result.
 - **Retrieval quality is the ceiling.** If `recall` does not surface a record, the capability effectively does
-  not exist for that request. Ranking is cosine plus an exact-title boost plus an optional rerank — there is no
-  hybrid keyword search, no MMR diversification and no decay.
+  not exist for that request. Ranking is vector search fused with BM25, plus an exact-title boost and an
+  optional rerank — there is still no MMR diversification and no recency decay.
+- **The lexical half needs an extension managed Postgres cannot install.** `pg_textsearch` requires
+  `shared_preload_libraries`, which RDS, Cloud SQL, Supabase and Neon do not expose. Those deployments — and
+  SQLite ones — get embeddings-only recall and a substring `history_search`. The startup report says which.
+- **No approximate-nearest-neighbour index.** The vector column is declared without a dimension so that the
+  embedding model can be changed without a migration, and pgvector cannot build an HNSW index on such a
+  column. Searches are exact scans; that is comfortable well past this scale, but it is a ceiling.
 - **No lifecycle for learned records.** Usage counters exist, but nothing promotes, retires or reviews stored
   skills; curation is manual.
 - **Endpoint parameters are strings only.** Complex request bodies cannot be expressed in an endpoint record —

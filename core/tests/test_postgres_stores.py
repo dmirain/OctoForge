@@ -27,9 +27,11 @@ from sqlalchemy import inspect, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from octoforge_core.context.pg_store import PostgresSummaryStore
 from octoforge_core.cron.api import CronJob
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.api import DatasetSchema
+from octoforge_core.datasets.pg_store import PostgresDatasetStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import bootstrap_schema, create_engine, create_session_factory
 from octoforge_core.db.search_extensions import (
@@ -623,3 +625,143 @@ async def test_lexical_search_is_the_capability_the_service_detects(
     """Only the Postgres store may claim it; the portable one must not."""
     assert isinstance(PostgresInstructionStore(session_factory), InstructionLexicalSearch)
     assert not isinstance(SqlAlchemyInstructionStore(session_factory), InstructionLexicalSearch)
+
+
+async def _dialog_with_messages(
+    session_factory: async_sessionmaker[AsyncSession],
+    bodies: tuple[str, ...],
+) -> str:
+    """Insert one dialog and its messages; return the dialog id."""
+    dialog_id = "dialog-history"
+    async with session_factory() as session:
+        session.add(DialogRow(id=dialog_id, user_id=USER_A, channel=CHANNEL))
+        for seq, body in enumerate(bodies, start=1):
+            session.add(
+                MessageRow(
+                    id=f"m{seq}",
+                    dialog_id=dialog_id,
+                    seq=seq,
+                    role=MessageRole.USER.value,
+                    content=body,
+                )
+            )
+        await session.commit()
+    return dialog_id
+
+
+async def test_history_search_matches_across_russian_inflection(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The reason BM25 replaced ILIKE here.
+
+    The old implementation matched `content ILIKE '%query%'`, so asking about
+    "задача" could not find a message that said "задачи" — which is most of
+    them, in a language with cases. The user had to guess the exact inflected
+    form somebody typed months ago.
+    """
+    dialog_id = await _dialog_with_messages(
+        session_factory,
+        ("Поставь мне несколько задач на завтра", "Погода на выходных обещает дождь"),
+    )
+    store = PostgresSummaryStore(session_factory)
+
+    hits = await store.search(dialog_id, "задача", limit=SEARCH_LIMIT)
+
+    assert [hit.seq for hit in hits] == [1]
+
+
+async def test_history_search_ranks_by_relevance_not_by_position(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A passing mention must not outrank the message actually about the topic
+    merely by having been said first."""
+    dialog_id = await _dialog_with_messages(
+        session_factory,
+        ("Кстати про корвалол вскользь", "Корвалол, корвалол и ещё раз корвалол"),
+    )
+    store = PostgresSummaryStore(session_factory)
+
+    hits = await store.search(dialog_id, "корвалол", limit=SEARCH_LIMIT)
+
+    assert [hit.seq for hit in hits] == [2, 1]
+
+
+async def test_history_search_stays_inside_its_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Ranking moved into SQL; the dialog predicate must move with it."""
+    dialog_id = await _dialog_with_messages(session_factory, ("общий уникальный термин",))
+    async with session_factory() as session:
+        session.add(DialogRow(id="other-dialog", user_id=USER_B, channel=CHANNEL))
+        session.add(
+            MessageRow(
+                id="m-other",
+                dialog_id="other-dialog",
+                seq=1,
+                role=MessageRole.USER.value,
+                content="общий уникальный термин",
+            )
+        )
+        await session.commit()
+    store = PostgresSummaryStore(session_factory)
+
+    hits = await store.search(dialog_id, "термин", limit=SEARCH_LIMIT)
+
+    assert len(hits) == 1
+
+
+async def test_history_search_returns_nothing_when_no_word_matches(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dialog_id = await _dialog_with_messages(session_factory, ("совсем про другое",))
+    store = PostgresSummaryStore(session_factory)
+
+    assert await store.search(dialog_id, "квазистационарный", limit=SEARCH_LIMIT) == []
+
+
+async def test_dataset_lexical_search_finds_a_word_the_embedding_would_not(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Small win, but a real one: an abbreviation nowhere near the query in
+    vector space still names its dataset."""
+    store = PostgresDatasetStore(session_factory)
+    wanted = await store.create(
+        owner_user_id=USER_A,
+        name="meals",
+        description="Дневник питания и расчёт КБЖУ по каждому приёму пищи",
+        schema=DatasetSchema(fields=()),
+        usage_notes="",
+        retention="",
+        embedding=EMBEDDING,
+    )
+    await store.create(
+        owner_user_id=USER_A,
+        name="expenses",
+        description="Учёт трат по категориям",
+        schema=DatasetSchema(fields=()),
+        usage_notes="",
+        retention="",
+        embedding=EMBEDDING,
+    )
+
+    hits = await store.search_by_text(USER_A, "КБЖУ", limit=SEARCH_LIMIT)
+
+    assert [hit.dataset.id for hit in hits] == [wanted.id]
+
+
+async def test_dataset_lexical_search_is_owner_scoped(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Owner isolation is the store's duty on every path, this one included."""
+    store = PostgresDatasetStore(session_factory)
+    await store.create(
+        owner_user_id=USER_B,
+        name="theirs",
+        description="Дневник питания и расчёт КБЖУ",
+        schema=DatasetSchema(fields=()),
+        usage_notes="",
+        retention="",
+        embedding=EMBEDDING,
+    )
+
+    assert await store.search_by_text(USER_A, "КБЖУ", limit=SEARCH_LIMIT) == []

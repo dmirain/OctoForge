@@ -196,6 +196,31 @@ class DatasetVectorSearch(Protocol):
         ...
 
 
+@runtime_checkable
+class DatasetLexicalSearch(Protocol):
+    """Optional DatasetStore capability: BM25 over descriptions.
+
+    Deliberately narrower in value than its instructions counterpart, and worth
+    saying so: an owner has a handful of descriptors, so the vector search over
+    them was never slow. What this adds is the kind of match an embedding
+    misses — an abbreviation, a code, a proper noun that appears in the
+    description but is nowhere near it in vector space.
+    """
+
+    async def search_by_text(
+        self,
+        owner_user_id: str,
+        query: str,
+        limit: int,
+    ) -> list[EmbeddedDataset]:
+        """Return up to `limit` of this owner's descriptors matching the words.
+
+        Descriptors sharing no term with the query are absent rather than
+        ranked last, so a non-match casts no vote in the fusion.
+        """
+        ...
+
+
 class DatasetService(Protocol):
     """Facade of the datasets module: store descriptors, records and search.
 

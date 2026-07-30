@@ -18,6 +18,40 @@ Running OctoForge for real: one host, three containers, TLS obtained automatical
 schedulers and two recovery sweeps on one database, and neither filters by channel — a Telegram user's cron
 firing could be executed by the web process, whose runner has no bridge to deliver it.
 
+
+## Upgrading a deployment that predates the search extensions
+
+The Postgres service builds from `docker/postgres/`, a thin layer on `pgvector/pgvector:pg18` that adds
+`pg_textsearch`. Two things are worth knowing before switching an existing deployment onto it.
+
+**The base image changed libc.** Older deployments ran `postgres:18-alpine` (musl); this one is Debian
+(glibc). The database's default collation is libc-based, and musl and glibc order text differently, so
+every B-tree index on a text column is left sorted by the wrong rules — lookups start missing rows that
+are really there. Postgres does **not** warn about it here: musl records no collation version, so there
+is nothing for it to compare against.
+
+Reindexing repairs the indexes, but a cluster initialised by musl cannot have its collation version
+recorded afterwards (`ALTER DATABASE ... REFRESH COLLATION VERSION` refuses), so the next libc change
+would be just as silent. Restoring into a fresh cluster avoids both problems:
+
+```sh
+tools/pg_backup.sh ~/octoforge-backups     # while the app is stopped, for a consistent dump
+docker compose stop app
+docker compose stop postgres && docker compose rm -f postgres
+docker volume rm <project>_pg-data         # keep a copy first if you want a way back
+docker compose up -d --wait postgres       # fresh initdb under glibc, init scripts recreate the databases
+zcat ~/octoforge-backups/<db>-<stamp>.sql.gz | docker compose exec -T postgres psql -U octoforge -d <db>
+docker compose start app                   # migrations create the extensions and indexes
+```
+
+Compare row counts before and after, and check the startup report says `vector search on` and
+`lexical search on`.
+
+**A deployment that cannot install the extensions still works.** Managed Postgres cannot set
+`shared_preload_libraries`, so `pg_textsearch` is unavailable there; an application role that is not a
+superuser cannot create any of them. Both are supported: recall falls back to in-process ranking and
+`history_search` to a substring match. Nothing fails at startup.
+
 ## Before the first start
 
 ```bash

@@ -54,6 +54,13 @@ optional filters by topic (resolved to the seq ranges of matching summaries) and
 block in the prompt is what tells the model such history exists and what it is about — which is why the
 summary carries topic tags rather than being free prose.
 
+How the query matches depends on the database. With `pg_textsearch` it is a **BM25 search**: the query
+is stemmed through the same `russian_unaccent` configuration the rest of retrieval uses, and hits come
+back by relevance. Without it, the fallback is a **substring match** (`content ILIKE '%query%'`)
+ordered by position in the dialog. The difference is not cosmetic in an inflected language — a
+substring search for "задача" does not find "задачи", so the tool only works when the user happens to
+type the exact form somebody wrote months earlier.
+
 Compaction is a one-time cost to provider prompt caching: replacing a prefix invalidates the cache from
 that point. It happens rarely and in the background, so the amortized effect is small — see
 [../guides/performance.md](../guides/performance.md).
@@ -92,6 +99,7 @@ that point. It happens rarely and in the background, so the amortized effect is 
 | Provider context overflow | `compact_now()`, branch rebuilt, run retried once; a second overflow fails the run |
 | Compaction disabled (`NoopContextCompactor`) | Prompts grow with the dialog; the provider's window becomes the limit |
 | `history_search` with a topic that matches no summary | Returns "no hits" rather than searching everything |
+| `pg_textsearch` absent | `history_search` falls back to a substring match with no stemming and no relevance ordering |
 | Long-uncompacted backlog | Compaction advances in bounded windows instead of reading everything at once |
 
 ## Code anchors
@@ -102,4 +110,5 @@ that point. It happens rarely and in the background, so the amortized effect is 
 - `core/src/octoforge_core/context/prompts.py` — the summarization prompt and reply parsing
 - `core/src/octoforge_core/context/store.py` — summaries and archive search
 - `core/src/octoforge_core/context/tools.py` — the `history_search` tool
+- `core/src/octoforge_core/context/pg_store.py` — the BM25-ranked archive search
 - `core/tests/test_context_compactor.py`, `core/tests/test_context_integration.py` — behavior

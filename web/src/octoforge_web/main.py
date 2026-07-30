@@ -27,12 +27,14 @@ from octoforge_core import (
     build_cron_outcome_reporter,
     build_cron_scheduler,
     build_dataset_service,
+    build_dataset_store,
     build_external_executor,
     build_instruction_service,
     build_instruction_store,
     build_llm_client,
     build_router,
     build_runner_config,
+    build_summary_store,
     build_tool_registry,
     create_engine,
     create_session_factory,
@@ -45,12 +47,14 @@ from octoforge_core.composition import RunnerOptions, ToolLimits, ToolServices, 
 from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
 from octoforge_core.context.api import SummaryStore
 from octoforge_core.context.compactor import CompactorConfig
-from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.api import CronStore
 from octoforge_core.cron.scheduler import CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
-from octoforge_core.datasets.store import SqlAlchemyDatasetStore
-from octoforge_core.db.search_extensions import VECTOR, installed_search_extensions
+from octoforge_core.db.search_extensions import (
+    PG_TEXTSEARCH,
+    VECTOR,
+    installed_search_extensions,
+)
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
@@ -193,12 +197,19 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 rerank_candidates=settings.reranker_candidates,
                 embedding_model=settings.embedding_model,
             )
-            datasets = build_dataset_service(SqlAlchemyDatasetStore(session_factory), embedder)
+            datasets = build_dataset_service(
+                build_dataset_store(
+                    session_factory, lexical_search=PG_TEXTSEARCH in search_extensions
+                ),
+                embedder,
+            )
             await _sync_system_skills(instructions, settings)
             # The app's own base URL is allowlisted so tool records can
             # target our loopback HTTP API (cron jobs) past the SSRF guard.
             guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
-            summary_store = SqlAlchemySummaryStore(session_factory)
+            summary_store = build_summary_store(
+                session_factory, lexical_search=PG_TEXTSEARCH in search_extensions
+            )
             registry = build_tool_registry(
                 outbound_http,
                 guard,

@@ -42,7 +42,13 @@ the session. Two users may keep datasets with the same name and never see each o
 dataset that belongs to somebody else is indistinguishable from a request for one that does not exist.
 
 Like the instruction store, a dataset store may implement the runtime-checkable `DatasetVectorSearch`
-capability, in which case the service stops pulling descriptors into the process for ranking.
+capability, in which case the service stops pulling descriptors into the process for ranking, and
+`DatasetLexicalSearch`, which adds BM25 over descriptions and is fused with the vector ordering the
+same way `recall` does it.
+
+Worth being plain about the size of that second win: an owner has a handful of descriptors, so nothing
+here is about speed. It is about the matches an embedding does not make — an abbreviation, an internal
+code, a proper noun that sits in the description but nowhere near the query in vector space.
 
 ## Invariants
 
