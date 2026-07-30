@@ -13,7 +13,6 @@ tuples-to-array conversion is chunked so the worker thread the service runs
 at 10k records (was 847 ms inline).
 """
 
-import math
 from collections.abc import Sequence
 
 import numpy as np
@@ -25,19 +24,6 @@ from octoforge_core.instructions.api import EmbeddedInstruction, SearchHit
 # above any non-exact hit regardless of vector similarity.
 EXACT_TITLE_BOOST = 2.0
 ZERO_NORM_SIMILARITY = 0.0
-
-
-def cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:
-    """Return the cosine similarity of two equal-length vectors (0 for zero norms)."""
-    left_norm = math.sqrt(sum(component * component for component in left))
-    right_norm = math.sqrt(sum(component * component for component in right))
-    if left_norm == 0 or right_norm == 0:
-        return ZERO_NORM_SIMILARITY
-    dot = sum(
-        left_component * right_component
-        for left_component, right_component in zip(left, right, strict=True)
-    )
-    return dot / (left_norm * right_norm)
 
 
 def rank(

@@ -1124,8 +1124,13 @@ class ConversationRunner:
             self._dialog.id,
             [item.ref for item in attachments],
         )
+        # concurrently: an album can carry several images, and fetching them one
+        # after another made the user wait for the sum of the round trips while
+        # the actor was blocked on each in turn
         images = tuple(
-            [await self._image_resolver.fetch(attachment.ref) for attachment in attachments]
+            await asyncio.gather(
+                *(self._image_resolver.fetch(attachment.ref) for attachment in attachments)
+            )
         )
         return await self._vision.look(images, question)
 

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, ForeignKey, String
+from sqlalchemy import JSON, ForeignKey, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from octoforge_core.db.base import Base, UTCDateTime
@@ -16,6 +16,18 @@ class TaskRow(Base):
     """A background task belonging to a dialog and a user."""
 
     __tablename__ = "tasks"
+    __table_args__ = (
+        # `list_undelivered` runs at startup over a table whose DONE branch
+        # grows without bound by design; the partial index keeps that sweep
+        # proportional to what is pending (migration f3b8d2c5a714). The
+        # predicate is spelled per dialect or SQLite builds a full index.
+        Index(
+            "ix_tasks_undelivered",
+            "status",
+            sqlite_where=text("delivered_at IS NULL"),
+            postgresql_where=text("delivered_at IS NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
     dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), index=True)

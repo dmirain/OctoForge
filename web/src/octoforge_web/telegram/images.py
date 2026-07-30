@@ -16,10 +16,18 @@ from octoforge_web.telegram.client import TelegramApiError, TelegramClient
 
 logger = logging.getLogger(__name__)
 
-# the ref prefix an `Attachment` of Telegram origin carries (the sole
-# producer is `poller.py`'s `_dispatch_image`); a ref lacking it belongs to
-# a different transport and must never be treated as ours
-REF_PREFIX = "tg:"
+# The ref prefix an `Attachment` of Telegram origin carries (the sole producer
+# is `poller.py`); a ref lacking it belongs to a different transport and must
+# never be treated as ours.
+#
+# `tgfile:` rather than `tg:` because `tg:` is already the prefix of a Telegram
+# USER ID (`client.py:USER_ID_PREFIX`). Two different kinds of identifier
+# sharing one namespace is a bug waiting for the first piece of code that
+# checks the prefix to decide what it is holding.
+REF_PREFIX = "tgfile:"
+# Refs written before the rename are in the message history forever, so reads
+# still accept the old prefix. Writes never use it.
+LEGACY_REF_PREFIX = "tg:"
 # Telegram photos are always transcoded to JPEG by the Bot API; documents
 # keep their declared MIME type at ingestion, but that type does not travel
 # with the ref, so a cheap extension check on the resolved file path is the
@@ -34,7 +42,7 @@ FETCH_FAILED_ERROR = "could not fetch image: {error}"
 
 
 class TelegramImageResolver:
-    """Resolves a Telegram-origin attachment ref (`tg:<file_id>`) to bytes.
+    """Resolves a Telegram-origin attachment ref (`tgfile:<file_id>`) to bytes.
 
     A ref with a foreign prefix, an unknown file, or any Bot API failure
     turns into `VisionUnavailableError`: the vision port must never leak
@@ -46,9 +54,9 @@ class TelegramImageResolver:
 
     async def fetch(self, ref: str) -> ImageData:
         """Resolve `ref` to image bytes; raises `VisionUnavailableError` on any failure."""
-        if not ref.startswith(REF_PREFIX):
+        file_id = _file_id(ref)
+        if file_id is None:
             raise VisionUnavailableError(UNKNOWN_REF_ERROR.format(ref=ref))
-        file_id = ref.removeprefix(REF_PREFIX)
         try:
             file_path = await self._client.get_file(file_id)
             content = await self._client.download_file(file_path)
@@ -65,3 +73,16 @@ def _media_type(file_path: str) -> str:
         if lowered.endswith(suffix):
             return media_type
     return DEFAULT_MEDIA_TYPE
+
+
+def _file_id(ref: str) -> str | None:
+    """Extract the Bot API file id from a ref, or None when it is not ours.
+
+    Accepts the legacy prefix as well: attachments stored before the rename
+    live in the message history indefinitely, and a picture sent last month
+    must still resolve.
+    """
+    for prefix in (REF_PREFIX, LEGACY_REF_PREFIX):
+        if ref.startswith(prefix):
+            return ref.removeprefix(prefix)
+    return None

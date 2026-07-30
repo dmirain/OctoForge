@@ -44,6 +44,12 @@ Unsubscribing happens automatically when the client disconnects.
 `external_call`, which has no body), `GET /api/cron/jobs`, `DELETE /api/cron/jobs/{id}`,
 `POST /api/cron/jobs/{id}/pause`, `POST /api/cron/jobs/{id}/resume`. All owner-scoped by `X-User-Id`.
 
+**Operator-only, like the rest of the surface.** These are behind the same single credential, and
+`X-User-Id` is a trusted string — so anyone who can reach them can schedule work as any user. That is
+not a gap in the router but the same trust model the whole HTTP surface has: the agent reaches these
+through `OF_SELF_BASE_URL` on loopback, and a deployment exposing them to end users must put an
+authenticating proxy in front. See [../security.md](../security.md).
+
 ### Admin endpoints
 
 `GET /api/admin/...` — paginated read-only listings across users (totals, dialogs, messages, tasks, cron,

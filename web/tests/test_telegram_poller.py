@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_web.telegram.bridge import PARSE_MODE_HTML, RunnerProvider
 from octoforge_web.telegram.client import USER_ID_PREFIX, TelegramApiError
+from octoforge_web.telegram.images import REF_PREFIX
 from octoforge_web.telegram.invites.api import MemberProfile
 from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
@@ -1003,7 +1004,7 @@ async def test_bare_photo_is_material_like_a_forward() -> None:
     assert kind is MessageKind.MATERIAL
     assert origin is None  # nobody forwarded it, so no attribution
     assert MATERIAL_ATTRIBUTION_ANONYMOUS not in content
-    expected_ref = f"tg:{PHOTO_FILE_ID}"
+    expected_ref = f"{REF_PREFIX}{PHOTO_FILE_ID}"
     assert bridge.attachments[0] == (Attachment(kind=AttachmentKind.IMAGE, ref=expected_ref),)
     assert client.downloaded_file_ids == [PHOTO_FILE_ID]
     assert vision.calls[0][1] == INGESTION_PROMPT
@@ -1188,7 +1189,7 @@ async def test_album_becomes_one_message_with_every_page_described() -> None:
     assert client_message_id == "1"  # the album's first item: dedup key and reply target
     assert bridge.kinds[0][0] is MessageKind.OWN  # the caption is the user speaking
     assert bridge.attachments[0] == tuple(
-        Attachment(kind=AttachmentKind.IMAGE, ref=f"tg:{file_id}") for file_id in PAGES
+        Attachment(kind=AttachmentKind.IMAGE, ref=f"{REF_PREFIX}{file_id}") for file_id in PAGES
     )
     assert sorted(vision.described) == sorted(PAGES)  # every page looked at, none dropped
 
@@ -1441,7 +1442,7 @@ async def test_own_voice_message_is_the_user_speaking() -> None:
     assert kind is MessageKind.OWN
     assert origin is None
     assert bridge.attachments[0] == (
-        Attachment(kind=AttachmentKind.AUDIO, ref=f"tg:{VOICE_FILE_ID}"),
+        Attachment(kind=AttachmentKind.AUDIO, ref=f"{REF_PREFIX}{VOICE_FILE_ID}"),
     )
     assert client.downloaded_file_ids == [VOICE_FILE_ID]
     assert client.sent == []  # no notice: the recording was understood

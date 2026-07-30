@@ -6,8 +6,12 @@ import httpx
 import pytest
 from octoforge_core.vision.api import ImageData, VisionUnavailableError
 
-from octoforge_web.telegram.client import TelegramBotClient
-from octoforge_web.telegram.images import TelegramImageResolver
+from octoforge_web.telegram.client import USER_ID_PREFIX, TelegramBotClient
+from octoforge_web.telegram.images import (
+    LEGACY_REF_PREFIX,
+    REF_PREFIX,
+    TelegramImageResolver,
+)
 
 BOT_TOKEN = "123:secret-token"
 FILE_ID = "abc123"
@@ -111,3 +115,40 @@ async def test_fetch_wraps_a_download_failure_as_vision_unavailable() -> None:
     async with http:
         with pytest.raises(VisionUnavailableError, match="could not fetch image"):
             await resolver.fetch(f"tg:{FILE_ID}")
+
+
+async def test_a_ref_written_before_the_rename_still_resolves() -> None:
+    """Attachments live in the message history forever, so the old `tg:` prefix
+    has to keep working — a picture sent last month must still resolve."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/bot{BOT_TOKEN}/getFile":
+            return json_response({"ok": True, "result": {"file_path": FILE_PATH}})
+        return httpx.Response(200, content=IMAGE_BYTES)
+
+    resolver, http = _resolver(httpx.MockTransport(handler))
+    async with http:
+        result = await resolver.fetch(f"{LEGACY_REF_PREFIX}{FILE_ID}")
+
+    assert result == ImageData(content=IMAGE_BYTES, media_type="image/jpeg")
+
+
+async def test_a_ref_written_today_carries_the_new_prefix() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/bot{BOT_TOKEN}/getFile":
+            assert json.loads(request.content) == {"file_id": FILE_ID}
+            return json_response({"ok": True, "result": {"file_path": FILE_PATH}})
+        return httpx.Response(200, content=IMAGE_BYTES)
+
+    resolver, http = _resolver(httpx.MockTransport(handler))
+    async with http:
+        result = await resolver.fetch(f"{REF_PREFIX}{FILE_ID}")
+
+    assert result == ImageData(content=IMAGE_BYTES, media_type="image/jpeg")
+
+
+def test_an_attachment_ref_no_longer_shares_a_namespace_with_a_user_id() -> None:
+    """`tg:` was both a Telegram user id and an attachment ref. Two kinds of
+    identifier in one namespace only need one prefix check to be confused."""
+    assert not REF_PREFIX.startswith(USER_ID_PREFIX)
+    assert not USER_ID_PREFIX.startswith(REF_PREFIX)

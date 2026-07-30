@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from octoforge_core.db.base import Base, UTCDateTime
@@ -35,6 +35,12 @@ class DatasetRecordRow(Base):
     """One JSON record of a dataset, owned by the dataset's owner."""
 
     __tablename__ = "dataset_records"
+    __table_args__ = (
+        # `datasets_query` filters a date range and orders by created_at; with
+        # only dataset_id indexed the sort grew with the dataset's whole history
+        # (migration f3b8d2c5a714)
+        Index("ix_dataset_records_dataset_created", "dataset_id", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), index=True)

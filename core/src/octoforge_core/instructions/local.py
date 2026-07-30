@@ -173,8 +173,12 @@ class LocalInstructionService:
         so the author's save updates their published record in place (it
         stays public, they stay its author).
         """
-        await self._ensure_not_system(kind, title)
+        # one lookup, two questions: whether a system record blocks the write
+        # and whether this caller authored the published one. Asking twice cost
+        # an extra round trip on every save.
         published = await self._store.get_by_title(title, kind)
+        if published is not None and published.system:
+            raise SystemInstructionError(SYSTEM_RECORD_MESSAGE.format(title=title))
         author_edit = (
             published is not None and not published.system and published.author_id == user_id
         )
@@ -322,11 +326,6 @@ class LocalInstructionService:
                 exc_info=True,
             )
             return ()
-
-    async def _ensure_not_system(self, kind: InstructionType, title: str) -> None:
-        existing = await self._store.get_by_title(title, kind)
-        if existing is not None and existing.system:
-            raise SystemInstructionError(SYSTEM_RECORD_MESSAGE.format(title=title))
 
     def _shortlist_size(self, k: int) -> int:
         return max(k, self._rerank_candidates) if self._reranker is not None else k
