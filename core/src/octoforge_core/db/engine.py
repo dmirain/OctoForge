@@ -30,6 +30,7 @@ import octoforge_core.instructions.models
 import octoforge_core.secrets.models
 import octoforge_core.tasks.models  # noqa: F401
 from octoforge_core.db.base import Base
+from octoforge_core.db.search_extensions import ensure_search_extensions
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _BASELINE_REVISION = "675056c8fffd"
@@ -175,8 +176,14 @@ def _create_and_stamp(connection: Connection, config: Config) -> None:
     retrofitted; instead a fresh non-SQLite database gets today's schema
     directly and is stamped at head, after which later migrations apply
     normally — those must be written dialect-neutrally (see AGENTS.md).
+
+    Skipping the chain also skips whatever the chain does beyond tables, so the
+    optional search extensions are created here explicitly. Without this a fresh
+    Postgres deployment would be stamped at head having never run
+    `a2f7c5e9d148`, and would silently lack pgvector and BM25 forever.
     """
     Base.metadata.create_all(connection)
+    ensure_search_extensions(connection)
     command.stamp(config, "head")
 
 

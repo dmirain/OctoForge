@@ -25,7 +25,15 @@ x-app-databases: &app-databases
 
 services:
   postgres:
-    image: postgres:18-alpine
+    # Stock pgvector plus pg_textsearch — see docker/postgres/Dockerfile for why
+    # this is a two-line layer rather than a third-party Postgres distribution.
+    build: ./docker/postgres
+    image: octoforge-postgres:local
+    # pg_textsearch uses shared memory and hooks, so it must be preloaded before
+    # `CREATE EXTENSION` can work. This lives next to the image that provides the
+    # library on purpose: point the service at a Postgres without it and the
+    # server refuses to start.
+    command: ["-c", "shared_preload_libraries=pg_textsearch"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-octoforge}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-octoforge}

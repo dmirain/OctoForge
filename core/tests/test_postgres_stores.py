@@ -32,6 +32,12 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.api import DatasetSchema
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import bootstrap_schema, create_engine, create_session_factory
+from octoforge_core.db.search_extensions import (
+    UNACCENT,
+    VECTOR,
+    has_russian_unaccent,
+    installed_search_extensions,
+)
 from octoforge_core.dialogs.models import DialogRow, MessageRow
 from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
@@ -84,6 +90,9 @@ EXPECTED_TABLES = frozenset(
         "tasks",
     }
 )
+# spelled without the diaeresis, and a nominative singular against an
+# inflected plural in the document
+RUSSIAN_QUERY_VARIANTS = ("ежик", "объем", "задача")
 TWO_APPENDS = 2
 SECOND_VERSION = 2
 SEARCH_LIMIT = 10
@@ -180,7 +189,48 @@ async def test_bootstrap_creates_the_schema_and_stamps_head(
     assert len(versions) == 1
 
 
-async def test_bootstrap_is_idempotent(engine: AsyncEngine) -> None:
+async def test_bootstrap_installs_the_optional_search_extensions(
+    pristine_engine: AsyncEngine,
+) -> None:
+    """A fresh database must not miss pgvector and BM25 by taking the create_all path.
+
+    `_create_and_stamp` skips the migration chain outside SQLite, so the
+    extensions have to be created by that branch too. The regression this pins
+    is silent: search would simply stay on brute-force cosine forever.
+    """
+    await bootstrap_schema(pristine_engine)
+
+    async with pristine_engine.connect() as connection:
+        installed = await connection.run_sync(installed_search_extensions)
+        russian = await connection.run_sync(has_russian_unaccent)
+
+    assert VECTOR in installed, "pgvector is expected in the image this suite runs against"
+    assert UNACCENT in installed
+    assert russian is True
+
+
+async def test_russian_lexical_config_folds_case_accents_and_inflection(
+    engine: AsyncEngine,
+) -> None:
+    """`russian_unaccent` must match across the diaeresis and across inflected forms.
+
+    This is the whole reason for a custom configuration: the stock `russian`
+    config treats ё as a letter of its own, so a query spelled without the
+    diaeresis would not find a record that has it. Asserted through `to_tsquery`
+    rather than a BM25 index, so it also covers deployments without pg_textsearch.
+    """
+    document = "Ёжик собирает объём отложенных задач"
+    async with engine.connect() as connection:
+        for query in RUSSIAN_QUERY_VARIANTS:
+            matched = await connection.scalar(
+                text(
+                    "SELECT to_tsvector('public.russian_unaccent', :document) "
+                    "@@ to_tsquery('public.russian_unaccent', :query)"
+                ),
+                {"document": document, "query": query},
+            )
+            assert matched is True, f"{query!r} should have matched {document!r}"
+
     """A second startup over the same database must be a no-op, not an error."""
     await bootstrap_schema(engine)
 
