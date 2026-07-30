@@ -118,5 +118,5 @@ Mandatory across all project code:
 
 ## Documentation
 
-- `docs/` — the documentation set: `concept.md`, `architecture.md`, `glossary.md`, `security.md`, `limitations.md`, one `reference/` page per aspect, `guides/` for tasks, `comparisons/` for the studies of adjacent projects. Entry point `docs/README.md`; writing rules `docs/CONVENTIONS.md`; `docs/archive/` is frozen Russian working notes, not documentation.
+- `docs/` — the documentation set: `concept.md`, `architecture.md`, `glossary.md`, `security.md`, `limitations.md`, one `reference/` page per aspect, `guides/` for tasks, `comparisons/` for the studies of adjacent projects. Entry point `docs/README.md`; writing rules `docs/CONVENTIONS.md`.
 - `AGENTS.md` (this file) — code conventions, commands, and workflow rules.

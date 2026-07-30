@@ -84,5 +84,3 @@ Code-level studies of adjacent projects, and what OctoForge takes or refuses fro
 
 - [../AGENTS.md](../AGENTS.md) — conventions for writing code here (aimed at AI coding agents)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md) — how to contribute
-- [archive/](archive/) — the Russian working notes this project grew from. Unmaintained, kept for
-  research value only.

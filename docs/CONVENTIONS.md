@@ -1,7 +1,8 @@
 # How this documentation is written
 
-Rules for anyone — human or agent — editing files under `docs/` (except `docs/archive/`, which is
-frozen). They exist because the previous documentation set failed in specific, repeatable ways.
+Rules for anyone — human or agent — editing files under `docs/`. They exist because the previous
+documentation set failed in specific, repeatable ways, and was deleted rather than kept around to
+confuse readers — git remembers it if anyone needs the archaeology.
 
 ## 1. The code is the truth
 
@@ -33,10 +34,10 @@ against another project's code at a point in time.
 
 ## 3. English
 
-All of `docs/` is English, including comparisons, and so are code comments and commit messages.
-`docs/archive/` is Russian and stays that way. This is not a preference about languages: the docs
-are the surface a stranger evaluates the project through, and they must be readable by the same
-audience the README addresses.
+All of `docs/` is English, including comparisons, and so are code comments and commit messages. This
+is not a preference about languages: the docs are the surface a stranger evaluates the project
+through, and they must be readable by the same audience the README addresses. Conversation and
+issue threads follow whatever language the participants use.
 
 ## 4. One aspect per file, one shape per page
 

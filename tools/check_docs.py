@@ -13,9 +13,6 @@ Two classes of rot are mechanical, so they are checked mechanically:
   same page break the same silent way.
 
 What this cannot check is whether a sentence is *true* — see docs/CONVENTIONS.md.
-
-`docs/archive/` is exempt: it is frozen historical material and is expected to
-name files that have since moved.
 """
 
 from __future__ import annotations
@@ -27,7 +24,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DOCS_DIR = REPO_ROOT / "docs"
 # Documentation and agent guidance name module paths two ways: from the
 # repository root (`core/src/octoforge_core/agent/loop.py`) and package-relative
 # (`agent/loop.py`, `telegram/bridge.py`), which is how the code itself and the
@@ -46,7 +42,6 @@ PATH_ALIASES = (
     ("core/", "core/src/octoforge_core/"),
     ("web/", "web/src/octoforge_web/"),
 )
-EXEMPT_DIRS = (DOCS_DIR / "archive",)
 ROOT_MARKDOWN = (
     "README.md",
     "AGENTS.md",
@@ -108,12 +103,8 @@ class Problem:
 
 
 def markdown_files(root: Path) -> list[Path]:
-    """Every documentation file to check, archive excluded."""
-    docs = [
-        path
-        for path in sorted((root / "docs").rglob("*.md"))
-        if not any(exempt in path.parents for exempt in EXEMPT_DIRS)
-    ]
+    """Every documentation file to check, plus the root markdown files."""
+    docs = sorted((root / "docs").rglob("*.md"))
     return docs + [root / name for name in ROOT_MARKDOWN if (root / name).exists()]
 
 
