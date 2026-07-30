@@ -2,7 +2,7 @@ VENV := .venv
 BIN := $(VENV)/bin
 
 .PHONY: install upgrade lint format typecheck test check test-pg db-up db-down db-psql run run-telegram \
-	quickstart quickstart-logs quickstart-down bench
+	quickstart quickstart-logs quickstart-down bench docs
 
 # Test database of the compose postgres service. Separate from the app database
 # on purpose: the Postgres store tests drop and recreate the public schema.
@@ -48,7 +48,13 @@ test:
 	cd core && ../$(BIN)/pytest
 	cd web && ../$(BIN)/pytest
 
-check: lint typecheck test
+# Mechanical documentation check: every repository path named in docs/ (and in
+# the root markdown files) exists, every internal link resolves. It cannot check
+# whether a sentence is true — see docs/CONVENTIONS.md.
+docs:
+	$(BIN)/python tools/check_docs.py
+
+check: lint typecheck docs test
 
 db-up:
 	docker compose up -d --wait postgres

@@ -1,0 +1,126 @@
+# HTTP API
+
+A thin FastAPI adapter over the conversation engine: submit a message, subscribe to events, manage cron
+jobs, read the admin model, and serve the two static pages. Everything is behind one operator credential
+except the health probes and the token-authenticated secret form.
+
+## How it works
+
+`create_app()` builds the application; the lifespan enters `runtime()` (the composition root) and exposes
+the assembled services on `app.state`, which the dependency providers in `deps.py` read. Handlers
+therefore contain no wiring: they take ports and call them.
+
+### Dialog endpoints
+
+| Method and path | Purpose |
+|---|---|
+| `POST /api/dialog/messages` | Submit a user message. Body: `content`, optional `client_message_id` (idempotency key), optional `reply_to_exchange_id` (skips the router). Answers `202 Accepted` |
+| `POST /api/dialog/cancel` | Stop the dialog's live answer runs |
+| `GET /api/dialog/events` | Subscribe to the dialog's event stream over SSE |
+
+The dialog is selected by the `X-User-Id` header and the channel (`web` by default) — a dialog is created
+on first contact.
+
+Submitting is deliberately asynchronous: the message is accepted, and the answer arrives on the event
+stream. A retry with an already-seen `client_message_id` is accepted and skipped, so a flaky network does
+not double-run anything.
+
+### The SSE stream
+
+Each frame is a JSON object with `seq`, `dialog_id`, `exchange_id` and the event's own fields. Event types
+mirror the loop's: `text_delta`, `assistant_message`, `tool_call_requested`, `tool_call_completed`,
+`tool_call_failed`, `retry_scheduled`, `finished`, `cancelled`, `failed`, plus the actor's
+`process_started` / `process_completed` markers and `iteration_started`.
+
+`exchange_id` is what makes concurrent answers usable: a client keeps one bubble per exchange and appends
+deltas to the right one. A comment frame (`: heartbeat`) is sent every 15 seconds of silence so proxies do
+not drop the connection.
+
+Unsubscribing happens automatically when the client disconnects.
+
+### Cron endpoints
+
+`POST /api/cron/jobs` (parameters in the query string, because stored endpoints call it through
+`external_call`, which has no body), `GET /api/cron/jobs`, `DELETE /api/cron/jobs/{id}`,
+`POST /api/cron/jobs/{id}/pause`, `POST /api/cron/jobs/{id}/resume`. All owner-scoped by `X-User-Id`.
+
+### Admin endpoints
+
+`GET /api/admin/...` — paginated read-only listings across users (totals, dialogs, messages, tasks, cron,
+instructions, datasets and their records, memories, summaries, exchanges, Telegram users) plus two
+mutations that go through owner-scoped services: publishing an instruction and toggling a cron job. See
+[admin-console.md](admin-console.md).
+
+### Secret endpoints
+
+`GET /api/secrets/session`, `POST /api/secrets/set`, `POST /api/secrets/delete` — authorized by the
+one-time token from the Telegram `/secrets` flow, not by the operator credential, because dialog users do
+not have one. See [secrets.md](secrets.md).
+
+### Static pages and probes
+
+| Path | What |
+|---|---|
+| `/` | The streaming chat UI |
+| `/admin.html` | The operator console |
+| `/secrets.html` | The secret-entry form (token-authenticated) |
+| `/docs`, `/openapi.json` | FastAPI's own documentation |
+| `/health` | Liveness |
+| `/health/ready` | Readiness — checks the database |
+
+### Authentication
+
+One HTTP Basic credential guards the whole surface, applied as middleware in `create_app` rather than as a
+per-router dependency, so it also covers static files and `/docs`. Open paths: `/health`,
+`/health/ready`, `/secrets.html` and `/api/secrets/*`.
+
+The password is stored as a PBKDF2-HMAC-SHA256 hash in the format `pbkdf2_sha256:iterations:salt:digest`
+(`:` rather than `$` because docker compose interpolates `$` in `.env`), verified in constant time. An
+empty hash answers **503** — it fails closed, never open.
+
+This authenticates the **operator**, not the agent's users. `X-User-Id` selects the dialog and is a trusted
+string: front the deployment with a proxy that authenticates people and sets that header. See
+[../security.md](../security.md).
+
+## Invariants
+
+- **Handlers hold no wiring.** Everything comes from `app.state` through `deps.py`.
+- **Message submission is idempotent** on `client_message_id`.
+- **Every SSE frame carries its `exchange_id`.**
+- **The gate is middleware**, so no route can be added outside it by accident; only the explicit open
+  paths bypass it.
+- **An empty credential means 503**, not open access.
+- **`/health` needs no credential** (container healthchecks and uptime monitors depend on it), and
+  `/health/ready` additionally touches the database.
+- **Cron creation takes query parameters**, because the agent's own `external_call` cannot send a body.
+
+## Configuration
+
+| Variable | Effect |
+|---|---|
+| `OF_ADMIN_USERNAME`, `OF_ADMIN_PASSWORD_HASH` | The operator credential; empty hash = 503 |
+| `OF_SELF_BASE_URL` | How the agent addresses this API (also allowlisted in the SSRF guard) |
+| `OF_PUBLIC_BASE_URL` | Origin used in user-facing links |
+
+## Failure modes
+
+| Situation | Outcome |
+|---|---|
+| No credential configured | Every guarded request answers 503 with "admin credentials are not configured" |
+| Wrong credential | 401 with a Basic challenge; the attempt is logged with the client address |
+| Missing `X-User-Id` | 400 |
+| Client disconnects mid-stream | Subscription removed; the run keeps going and its result is delivered through the outbox on the next subscribe |
+| Slow client | Stream events dropped for that subscriber; terminals still delivered |
+| Database unavailable | `/health/ready` fails (logged), `/health` still answers |
+
+## Code anchors
+
+- `web/src/octoforge_web/main.py` — `create_app()`, the middleware gate, health probes, static mounts
+- `web/src/octoforge_web/api/dialog.py` — messages, cancel, SSE
+- `web/src/octoforge_web/api/sse.py` — frame encoding and event payloads
+- `web/src/octoforge_web/api/cron.py`, `api/admin.py`, `api/secrets.py` — the other routers
+- `web/src/octoforge_web/api/schemas.py` — request and response models
+- `web/src/octoforge_web/auth.py` — hashing, verification, the open-path rules
+- `web/src/octoforge_web/deps.py` — dependency providers
+- `web/tests/test_dialog_api.py`, `web/tests/test_sse.py`, `web/tests/test_admin_api.py`,
+  `web/tests/test_cron_api.py`, `web/tests/test_secrets_api.py`

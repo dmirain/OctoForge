@@ -1,0 +1,114 @@
+# Teaching it without writing code
+
+The three things that change what the agent can do without touching Python: a **skill** (how to do
+something), a **knowledge** record (a fact), and an **endpoint** record (a system it can call). All of them
+are rows the agent finds by meaning at request time.
+
+## Skills
+
+A skill is a scenario in plain text, retrieved by `recall`. Good ones read like an internal runbook: what
+this is for, the steps in order, the tools by name, and what to do when something is missing.
+
+```
+Scenario: onboard a new contractor.
+1. Ask for the full name, the start date and the team, if they were not given.
+2. Look up the team lead: external_call with name 'staff_directory', params {"team": "<team>"}.
+3. Create the checklist: data_put into the dataset 'onboarding' with fields
+   name, start_date, team, lead, status="pending".
+4. Confirm to the user what was recorded and who the lead is.
+If the directory call fails, say so and record the entry without the lead
+rather than inventing one.
+```
+
+What separates a skill that works from one that does not:
+
+- **Name the tools and the record names.** "Look it up" is a wish; `external_call with name 'staff_directory'`
+  is an instruction.
+- **Say what to do on failure.** Otherwise the model improvises, and improvisation is where invented data
+  comes from.
+- **Keep it about doing, not about being.** Tone and house style belong in the system prompt, not in every
+  skill.
+- **One scenario per record.** Two loosely related procedures in one record rank worse for both.
+- **Write triggers in the language your users type.** Ranking is embedding-based: a Russian phrasing does not
+  reliably find an English scenario. Either write the record in that language or append the trigger phrases
+  to it.
+
+Save with `instruction_save` — ask the agent to save it, or write it yourself through the API. New records are
+**private to their author**; an operator publishes what should be shared (see below).
+
+## Knowledge
+
+Same store, type `knowledge`: a fact, a policy, a piece of reference material worth remembering
+installation-wide ("our fiscal year starts in April", "escalation path for production incidents").
+
+The line between knowledge and memory is who it is about: something about *one person* is a
+[memory](../reference/memory.md); something true for everyone is knowledge.
+
+## Endpoint records
+
+An endpoint record makes a system callable. Its content is a small JSON document:
+
+```json
+{"method": "GET",
+ "url_template": "https://directory.internal/api/teams/{team}/lead",
+ "params_schema": {"team": {"type": "string", "required": true}},
+ "auth": {"secret": "directory_token", "header": "Authorization", "format": "Bearer {value}"}}
+```
+
+- `url_template` — placeholders are filled from validated parameters and URL-escaped.
+- `params_schema` — declared parameters, `required` per parameter. Unknown parameters are refused, and a
+  validation error hands the model this contract back, so a wrong call corrects itself in one step.
+- `auth` — `"none"`, or a per-user secret **by code**. The value never appears in the record, the prompt or
+  the logs; it is injected as a header at call time and scrubbed from the response.
+
+Then write a skill that names the endpoint (as in the example above) so the agent knows when to use it. The
+usual pattern is one endpoint record plus one scenario per task it serves — `web/src/octoforge_web/system_skills.py`
+ships exactly that shape as an example (a weather endpoint and the scenario that reads it).
+
+Users add their own secrets themselves: `/secrets` in Telegram returns a one-time link to a form. See
+[../reference/secrets.md](../reference/secrets.md).
+
+### Constraints worth knowing before you write one
+
+- Outbound calls go through the SSRF guard: private, loopback and metadata addresses are refused. To call an
+  internal service, either give it a publicly resolvable name or route through a gateway. The one exception is
+  this installation's own API (`OF_SELF_BASE_URL`).
+- Redirects are not followed.
+- Response bodies are truncated at 8000 characters — return JSON, not HTML pages.
+- Only `http`/`https`, and only the five usual methods.
+- Parameters are strings; complex bodies are not expressible in an endpoint record today. That is where a
+  [code tool](add-a-tool.md) starts making sense.
+
+## Sharing and lifecycle
+
+| Action | Who | How |
+|---|---|---|
+| Create | Any user | `instruction_save`, or the agent doing it on request |
+| Publish to everyone | Operator | The console's publish action, or `admin_manage` in Telegram |
+| Edit a published record | Its author | Ordinary save — publication moved visibility, not authorship |
+| Shadow a public record for yourself | Any user | Saving over it creates your private copy |
+| Delete | Its owner | `instruction_delete` (only your own) |
+| Ship with the installation | Deployment | The system registry in code, plus `OF_SYSTEM_SKILLS_SOURCE` for per-installation tuning |
+
+System records (`system=true`) are owned by the registry and cannot be edited by the agent. The overlay file
+is the sanctioned way to change them per installation — replace content, append trigger phrases, or add
+records — and a broken overlay is a logged warning, never a failed startup.
+
+## Checking your work
+
+1. Ask the agent to `recall` the phrasing a user would actually type, and see whether your record comes back
+   at all.
+2. Then ask for the task itself and watch which tools it calls.
+3. If the record does not surface: shorten the title to the words people use, add trigger phrases in their
+   language, or split the scenario. Ranking is cosine plus an exact-title boost, optionally reranked — a title
+   that matches the query wins outright.
+4. The operator console lists every record with its owner, version and usage count, which is the quickest way
+   to see what is actually being retrieved.
+
+## Code anchors
+
+- `core/src/octoforge_core/instructions/registry.py` — the shipped scenarios, as writing examples
+- `web/src/octoforge_web/system_skills.py` — an endpoint record plus its scenario
+- `core/src/octoforge_core/net/tool_spec.py` — the endpoint document format and its validation
+- `web/src/octoforge_web/skill_overlay.py` — the overlay format
+- [../reference/instructions.md](../reference/instructions.md) — ranking, ownership, the sync
