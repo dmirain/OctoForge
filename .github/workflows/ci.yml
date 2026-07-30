@@ -8,6 +8,12 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # The whole job takes ~4 minutes. Without a bound, a deadlocked test runs
+    # into the 6-hour runner limit and the result reads "cancelled" — which
+    # looks like infrastructure noise rather than a broken build, and hid a
+    # real shutdown deadlock for two days. `faulthandler_timeout` dumps the
+    # stacks but does not abort, so the bound has to live here.
+    timeout-minutes: 20
 
     services:
       # The Postgres store tests (core/tests/test_postgres_stores.py) need a

@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any
@@ -51,6 +52,7 @@ from octoforge_core.agent.runner import (
     ConversationRunner,
     RunnerConfig,
     TaskOutcomeListener,
+    _Flush,
     _ProcessTerminated,
     _Unseen,
 )
@@ -764,6 +766,42 @@ async def test_branch_keeps_system_prompt_stable_and_envelopes_last_message(
     dialog = await get_dialog(session_factory)
     stored = await SqlAlchemyMessageRepository(session_factory).list(dialog.id)
     assert stored[0] == ChatMessage(role=MessageRole.USER, content="hi")
+
+
+async def test_stop_honors_a_cancellation_the_store_swallowed(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A cancel absorbed by a store call must still end the actor.
+
+    SQLAlchemy's greenlet bridge swallows the `CancelledError` of a query in
+    flight and lets the await return normally, so the dispatch finishes, the
+    loop parks on the inbox again, and `stop()` waits on a task that never
+    ends. That deadlock hung app shutdown and admin dialog deletion on Python
+    3.11 — the version the container and CI run, while a 3.12 dev venv hides
+    it. The swallow is simulated here rather than provoked through the store,
+    so the test pins the actor loop's contract on every version.
+    """
+    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    entered = asyncio.Event()
+
+    async def swallowing_flush() -> None:
+        entered.set()
+        with suppress(asyncio.CancelledError):
+            await asyncio.sleep(TIMEOUT_SECONDS * 10)
+
+    runner._flush_deliveries = swallowing_flush  # type: ignore[method-assign]
+    runner._inbox.put_nowait(_Flush())
+    await asyncio.wait_for(entered.wait(), timeout=TIMEOUT_SECONDS)
+    actor = runner._actor_task
+    assert actor is not None
+
+    await asyncio.wait_for(runner.stop(), timeout=TIMEOUT_SECONDS)
+
+    # stop() returning is not enough: it suppresses CancelledError, so a
+    # rescued-by-timeout stop looks successful. The actor itself must be done.
+    assert actor.done()
+    await manager.stop_all()
 
 
 async def test_evict_stops_the_runner_and_the_next_contact_rebuilds(

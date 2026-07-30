@@ -811,6 +811,16 @@ class ConversationRunner:
                     # silence); the unowned-open sweep revives an exchange
                     # stranded mid-apply.
                     self._broadcast(Failed(error=SUBMIT_FAILED_ERROR))
+            if self._cancellation_pending():
+                # A cancel can also be absorbed WITHOUT surfacing as an error:
+                # SQLAlchemy's greenlet bridge swallows the CancelledError of
+                # a store call in flight and lets the await return normally.
+                # The dispatch then finishes, the loop parks on the inbox
+                # again, and `stop()` waits on a task that will never end —
+                # a deadlock that hangs app shutdown and admin dialog
+                # deletion. Measured on Python 3.11 (what the container and CI
+                # run); 3.12 schedules just differently enough to hide it.
+                raise asyncio.CancelledError from None
 
     @staticmethod
     def _cancellation_pending() -> bool:
