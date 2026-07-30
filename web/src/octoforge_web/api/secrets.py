@@ -47,6 +47,16 @@ class DeleteSecretRequest(BaseModel):
     code: str
 
 
+class SessionRequest(BaseModel):
+    """Token of the form session; a body rather than a query parameter.
+
+    A query string is logged by every proxy and kept in browser history, and
+    this token is a capability over one user's secrets.
+    """
+
+    token: str
+
+
 def _authorize(links: SecretLinkService, store: SecretStore | None, token: str) -> str:
     if store is None:
         raise HTTPException(
@@ -58,10 +68,10 @@ def _authorize(links: SecretLinkService, store: SecretStore | None, token: str) 
     return user_id
 
 
-@router.get("/session")
-async def session(token: str, store: StoreDep, links: LinksDep) -> dict[str, Any]:
+@router.post("/session")
+async def session(request: SessionRequest, store: StoreDep, links: LinksDep) -> dict[str, Any]:
     """Validate the token and list the user's secrets metadata (never values)."""
-    user_id = _authorize(links, store, token)
+    user_id = _authorize(links, store, request.token)
     assert store is not None  # _authorize raised otherwise
     infos = await store.list(user_id)
     return {

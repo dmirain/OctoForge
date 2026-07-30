@@ -71,6 +71,8 @@ class ToolLimits:
     datasets_query_max_limit: int
     history_search_default_limit: int
     history_search_max_limit: int
+    # origins `http_request` may call; empty means the open web (see net/tools.py)
+    http_request_allowed_origins: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +179,7 @@ def build_tool_registry(
     needed here.
     """
     registry = ToolRegistry()
-    _register_core_tools(registry, outbound_http, guard, stores.tasks, stores.cron)
+    _register_core_tools(registry, outbound_http, guard, stores, limits)
     registry.register(ImageLookTool())
     if services.search_provider is not None:
         registry.register(WebSearchTool(provider=services.search_provider))
@@ -299,17 +301,23 @@ def _register_core_tools(
     registry: ToolRegistry,
     outbound_http: httpx.AsyncClient,
     guard: SsrfGuard,
-    task_store: TaskStore,
-    cron_store: CronStore,
+    stores: ToolStores,
+    limits: ToolLimits,
 ) -> None:
     """Register the HTTP and deferred-work (task/cron) tools."""
-    registry.register(HttpRequestTool(http_client=outbound_http, guard=guard))
+    registry.register(
+        HttpRequestTool(
+            http_client=outbound_http,
+            guard=guard,
+            allowed_origins=limits.http_request_allowed_origins,
+        )
+    )
     registry.register(AskUserTool())
-    registry.register(TaskCreateTool(cron_store=cron_store))
-    registry.register(TaskListTool(store=task_store, cron_store=cron_store))
-    registry.register(TaskDeleteTool(store=task_store, cron_store=cron_store))
-    registry.register(CronPauseTool(store=cron_store))
-    registry.register(CronResumeTool(store=cron_store))
+    registry.register(TaskCreateTool(cron_store=stores.cron))
+    registry.register(TaskListTool(store=stores.tasks, cron_store=stores.cron))
+    registry.register(TaskDeleteTool(store=stores.tasks, cron_store=stores.cron))
+    registry.register(CronPauseTool(store=stores.cron))
+    registry.register(CronResumeTool(store=stores.cron))
 
 
 def _register_instruction_tools(

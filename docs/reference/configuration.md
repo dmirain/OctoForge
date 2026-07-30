@@ -96,6 +96,7 @@ and dataset search are unavailable — the system-record sync is skipped too.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OF_SERPER_TOKEN` | *(empty)* | serper.dev token; empty hides the `web_search` tool |
+| `OF_HTTP_REQUEST_ALLOWLIST` | *(empty)* | Comma-separated origins `http_request` may call. Empty means the open web; a list confines the agent's raw HTTP to named destinations, which closes the prompt-injection exfiltration channel |
 | `OF_SELF_BASE_URL` | `http://127.0.0.1:8000` | This application's own API as the agent sees it; allowlisted in the SSRF guard so stored endpoints can target it |
 | `OF_EXTERNAL_CALL_AUTH_WHITELIST` | `[]` | JSON list of `{base_url_prefix, header_name, header_value}`: infrastructure auth injected by `external_call` for matching prefixes |
 | `OF_DATASETS_QUERY_DEFAULT_LIMIT` | `50` | Default `data_query` page size |

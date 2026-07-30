@@ -13,7 +13,7 @@ from octoforge_core.instructions.api import InstructionService
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
 
-from octoforge_web.auth import check_basic_auth
+from octoforge_web.auth import AuthGate
 from octoforge_web.config import Settings
 from octoforge_web.secret_links import SecretLinkService
 from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
@@ -91,15 +91,30 @@ def get_secret_links(request: Request) -> "SecretLinkService":
     return cast("SecretLinkService", request.app.state.secret_links)
 
 
-def require_admin(request: Request) -> None:
+def get_auth_gate(request: Request) -> AuthGate:
+    """Return the operator gate built at application startup."""
+    return cast(AuthGate, request.app.state.auth_gate)
+
+
+async def require_admin(request: Request) -> None:
     """Gate a route behind the operator credential (HTTP Basic).
 
-    Attached to the admin router and to the dialog/cron routers: on a publicly
-    reachable host the `X-User-Id` trust model is only defensible behind a
-    credential.
+    Attached to the admin router: defense in depth behind the middleware, and
+    the same gate object, so a request that already authenticated in the
+    middleware hits the credential cache instead of hashing a second time.
     """
-    settings = get_settings(request)
-    check_basic_auth(request, settings.admin_username, settings.admin_password_hash)
+    await get_auth_gate(request).authenticate(request)
+
+
+def get_operator(request: Request) -> str:
+    """Identify the operator for the audit trail: credential name plus client address.
+
+    There is one operator credential, so the name alone would say little; the
+    address is what distinguishes two people sharing it.
+    """
+    username = get_settings(request).admin_username
+    client = request.client.host if request.client is not None else "unknown"
+    return f"{username}@{client}"
 
 
 def get_user_id(x_user_id: Annotated[str | None, Header()] = None) -> str:

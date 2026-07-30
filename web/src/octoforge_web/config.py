@@ -136,6 +136,12 @@ class Settings(BaseSettings):
     # code may assume it: with it configured, an invite is handed out as a
     # t.me deep link instead of a bare code the recipient has to paste.
     telegram_bot_username: str = ""
+    # Origins the raw `http_request` tool may call, comma-separated. Empty is
+    # the open web: the SSRF guard still blocks private space, but nothing stops
+    # an agent that read a prompt-injected page from posting a dialog's contents
+    # to a public address. An installation whose agents only ever call known
+    # services closes that channel by listing them.
+    http_request_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
     serper_token: str = ""
     system_prompt_source: str = ""
     router_prompt_source: str = ""
@@ -288,6 +294,14 @@ class Settings(BaseSettings):
             or bool(self.embedding_api_key)
             or self.embeddings_inherit_llm()
         )
+
+    @field_validator("http_request_allowlist", mode="before")
+    @classmethod
+    def _parse_allowlist(cls, value: object) -> object:
+        """Accept a comma-separated string of origins (`.env` friendly)."""
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod

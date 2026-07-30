@@ -43,6 +43,7 @@ from octoforge_core.memory.api import Memory
 from octoforge_core.tasks.api import Task, TaskNotFoundError
 from octoforge_core.tasks.store import TaskStore
 
+from octoforge_web import audit
 from octoforge_web.deps import (
     get_admin_read_model,
     get_conversation_manager,
@@ -50,6 +51,7 @@ from octoforge_web.deps import (
     get_dialog_repository,
     get_exchange_repository,
     get_instruction_service,
+    get_operator,
     get_summary_store,
     get_task_store,
     get_telegram_invites,
@@ -66,6 +68,7 @@ TaskStoreDep = Annotated[TaskStore, Depends(get_task_store)]
 InstructionsDep = Annotated[InstructionService, Depends(get_instruction_service)]
 ManagerDep = Annotated[ConversationManager, Depends(get_conversation_manager)]
 DialogsDep = Annotated[DialogRepository, Depends(get_dialog_repository)]
+OperatorDep = Annotated[str, Depends(get_operator)]
 ExchangesDep = Annotated[ExchangeRepository, Depends(get_exchange_repository)]
 SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
 MembersDep = Annotated["MemberDirectory | None", Depends(get_telegram_members)]
@@ -139,6 +142,7 @@ async def dialog_messages(
 @router.delete("/dialogs/{dialog_id}")
 async def delete_dialog(
     dialog_id: str,
+    operator: OperatorDep,
     dialogs: DialogsDep,
     manager: ManagerDep,
     stores: Annotated[_DialogCascade, Depends(_dialog_cascade)],
@@ -160,6 +164,7 @@ async def delete_dialog(
         await dialogs.delete(dialog_id)
     except DialogNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    audit.record("dialog.delete", operator, dialog_id)
     return DELETED_STATUS
 
 
@@ -214,12 +219,13 @@ async def tasks(
 
 
 @router.delete("/tasks/{task_id}")
-async def delete_task(task_id: str, store: TaskStoreDep) -> dict[str, str]:
+async def delete_task(task_id: str, operator: OperatorDep, store: TaskStoreDep) -> dict[str, str]:
     """Drop a task row. Only for terminal rows: a live process keeps its own."""
     try:
         await store.delete(task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    audit.record("task.delete", operator, task_id)
     return DELETED_STATUS
 
 
@@ -238,6 +244,7 @@ async def cron_jobs(
 async def set_cron_enabled(
     job_id: str,
     enabled: bool,
+    operator: OperatorDep,
     store: CronStoreDep,
 ) -> dict[str, Any]:
     """Pause or resume a job through the store's owner-checked path."""
@@ -246,16 +253,20 @@ async def set_cron_enabled(
         await store.set_enabled(job.user_id, job_id, enabled)
     except CronJobNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    audit.record("cron.enabled" if enabled else "cron.paused", operator, job_id)
     return {"id": job_id, "enabled": enabled}
 
 
 @router.delete("/cron/{job_id}")
-async def delete_cron_job(job_id: str, store: CronStoreDep) -> dict[str, str]:
+async def delete_cron_job(
+    job_id: str, operator: OperatorDep, store: CronStoreDep
+) -> dict[str, str]:
     try:
         job = await store.get(job_id)
         await store.delete_for_user(job.user_id, job_id)
     except CronJobNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    audit.record("cron.delete", operator, job_id)
     return DELETED_STATUS
 
 
@@ -272,17 +283,23 @@ async def instructions(
 
 
 @router.post("/instructions/{instruction_id}/publish")
-async def publish_instruction(instruction_id: str, service: InstructionsDep) -> dict[str, Any]:
+async def publish_instruction(
+    instruction_id: str, operator: OperatorDep, service: InstructionsDep
+) -> dict[str, Any]:
     """Make a private record public (the same action the admin tool exposes)."""
     try:
-        return _instruction_to_dict(await service.publish(instruction_id))
+        published = _instruction_to_dict(await service.publish(instruction_id))
     except InstructionNotFoundError as exc:
+        audit.record("instruction.publish", operator, instruction_id, outcome="not_found")
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    audit.record("instruction.publish", operator, instruction_id)
+    return published
 
 
 @router.delete("/instructions/{instruction_id}")
 async def delete_instruction(
     instruction_id: str,
+    operator: OperatorDep,
     service: InstructionsDep,
     owner_id: str | None = None,
 ) -> dict[str, str]:
@@ -300,6 +317,7 @@ async def delete_instruction(
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
     except SystemInstructionError as exc:
         raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=str(exc)) from exc
+    audit.record("instruction.delete", operator, instruction_id)
     return DELETED_STATUS
 
 
@@ -340,6 +358,7 @@ async def memories(
 @router.delete("/memories/{key}")
 async def delete_memory(
     key: str,
+    operator: OperatorDep,
     service: InstructionsDep,
     user_id: str | None = None,
 ) -> dict[str, str]:
@@ -356,6 +375,7 @@ async def delete_memory(
             await service.delete(record.owner_id, record.id)
     except InstructionNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    audit.record("memory.delete", operator, key)
     return DELETED_STATUS
 
 

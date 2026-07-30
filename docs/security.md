@@ -22,6 +22,19 @@ static files and `/docs`. The password is stored as PBKDF2-HMAC-SHA256
 (`pbkdf2_sha256:iterations:salt:digest`, 240k iterations) and verified in constant time. An empty hash answers
 **503** — it fails closed.
 
+That verification costs ~60 ms of CPU, which on a single event loop is a weapon pointed at the
+installation, so three things stand between an attacker and it: a per-client failure budget
+(`AttemptLimiter`, five failures then a cooldown that refuses without hashing), verification in a worker
+thread (`asyncio.to_thread`, so even the attempts that do hash never stall a dialog), and a short-lived
+cache of the verified credential so ordinary console traffic hashes once rather than per request.
+
+**State-changing requests from another site are refused.** With Basic auth a browser attaches the
+operator's credential to any request to this origin, so a form on an attacker's page could publish a
+record as the operator. The middleware reads the browser's own account of the request's origin
+(`Sec-Fetch-Site`, falling back to `Origin`) and refuses cross-site mutations. Requests with neither
+header are not browsers — curl, the agent, a deployment script — and pass, because they carry no ambient
+credential to abuse.
+
 Be explicit about what that is *not*: it does not authenticate your employees. `X-User-Id` selects the dialog
 and is trusted, so a deployment serving end users through the web UI must sit behind a proxy that
 authenticates people and sets that header. Until then, treat the HTTP surface as operator-only.
@@ -47,7 +60,10 @@ API tokens live encrypted (Fernet) and never reach the model, the narrative or t
   prompt-injected agent has no exfiltration channel;
 - responses are scrubbed of value echoes;
 - the store's DTO has no value field, so no listing surface can leak one by accident;
-- values arrive through a one-time link to a web form, not through chat.
+- values arrive through a one-time link to a web form, not through chat;
+- the link carries its token in the URL **fragment**, which browsers never send to a server, so the
+  capability cannot land in an access log, a proxy log or a `Referer`; the page strips it from the
+  address bar after reading it and posts it in a request body.
 
 Details: [reference/secrets.md](reference/secrets.md).
 
@@ -85,9 +101,13 @@ users forward. The mitigations are structural rather than filter-based:
 - **No exec**, so an injected instruction has no host to act on.
 - **Egress is guarded**, so "POST this to my server" fails against private targets and is at least visible for
   public ones.
+- **Raw HTTP can be confined.** `OF_HTTP_REQUEST_ALLOWLIST` restricts `http_request` to named origins;
+  without it the tool can reach any public address, which is the channel an injected instruction would
+  use to exfiltrate a dialog's contents. An installation whose agents only call known services should
+  set it.
 
 What remains: an injected instruction can still make the agent call a *permitted* tool with attacker-chosen
-arguments — write a wrong dataset record, fetch a public URL, or produce a misleading answer. There is no
+arguments — write a wrong dataset record, fetch an allowed URL, or produce a misleading answer. There is no
 content-level defense today, and no per-tool authorization policy.
 
 ## Logging and data handling
@@ -97,7 +117,11 @@ because Bot API URLs contain the bot token. The capability report prints hosts a
 credentials. Dialog content, however, **is** stored in full (`messages`), and the operator console can read
 any of it — the operator is trusted with everything by design.
 
-There is no audit log of operator actions.
+**Operator actions are audited.** Every mutation through the console or the in-chat `admin_manage` tool
+writes one line to the `octoforge.audit` logger — `audit action=… actor=… target=… outcome=…`, where the
+actor is the credential name plus client address (or the admin's Telegram id) and the target is an id,
+never content. It is a log rather than a table on purpose: an operator with database access could edit a
+table, and a log ships to wherever the rest of them already go.
 
 ## Deployment hardening checklist
 
@@ -107,6 +131,8 @@ There is no audit log of operator actions.
 - Keep Postgres on loopback; do not publish 5432.
 - Back up `OF_SECRETS_KEY` separately from database dumps — together in one place defeats the encryption.
 - Keep the `caddy-data` volume (certificates and the ACME account).
+- Consider `OF_HTTP_REQUEST_ALLOWLIST` if your agents only ever call known services.
+- Run `make audit` (pip-audit) periodically — CI does it on every push.
 - Review stored endpoint records the way you would review code: they name URLs the agent will call.
 
 ## Reporting

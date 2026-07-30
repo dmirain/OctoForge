@@ -86,7 +86,7 @@ from octoforge_web.api.admin import router as admin_router
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.api.secrets import router as secrets_router
-from octoforge_web.auth import check_basic_auth, is_open_path
+from octoforge_web.auth import CROSS_SITE_MESSAGE, AuthGate, is_cross_site_mutation, is_open_path
 from octoforge_web.capabilities import log_capabilities
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
@@ -373,22 +373,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)
 
+    gate = AuthGate(
+        username=resolved_settings.admin_username,
+        password_hash=resolved_settings.admin_password_hash,
+    )
+    # the admin router's own dependency resolves the same object, so a request
+    # verified by the middleware does not hash again
+    app.state.auth_gate = gate
+
     @app.middleware("http")
     async def authenticate(request: Request, call_next: NextCall) -> Response:
         """Require the operator credential for everything but the health probes.
 
         A middleware rather than per-router dependencies because it has to cover
         what routers do not: the static console, `/docs` and `/openapi.json`.
-        Exceptions raised here bypass the app's handlers, so the 401 is built by
-        hand.
+        Exceptions raised here bypass the app's handlers, so the responses are
+        built by hand.
+
+        Two checks, in order. The first refuses state-changing requests a
+        browser sends from another site: with Basic auth the credential rides
+        along automatically, so a form on an attacker's page would otherwise
+        act as the operator. The second is the credential itself.
         """
+        if is_cross_site_mutation(request):
+            logger.warning("cross-site %s to %s refused", request.method, request.url.path)
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": CROSS_SITE_MESSAGE},
+            )
         if not is_open_path(request.url.path):
             try:
-                check_basic_auth(
-                    request,
-                    resolved_settings.admin_username,
-                    resolved_settings.admin_password_hash,
-                )
+                await gate.authenticate(request)
             except HTTPException as denied:
                 return JSONResponse(
                     status_code=denied.status_code,
@@ -603,6 +618,7 @@ def _tool_limits(settings: Settings) -> ToolLimits:
         datasets_query_max_limit=settings.datasets_query_max_limit,
         history_search_default_limit=settings.history_search_default_limit,
         history_search_max_limit=settings.history_search_max_limit,
+        http_request_allowed_origins=tuple(settings.http_request_allowlist),
     )
 
 
@@ -700,11 +716,17 @@ class _TelegramExtras:
 def _secrets_link_builder(
     settings: Settings, secret_links: SecretLinkService
 ) -> Callable[[str], str]:
-    """Build the /secrets URL factory: a fresh one-time token per request."""
+    """Build the /secrets URL factory: a fresh one-time token per request.
+
+    The token rides in the URL *fragment*, not the query string: a fragment is
+    never sent to the server, so it cannot land in an access log (Caddy logs
+    the request URI), in a proxy log or in a Referer header. The page reads it
+    from `location.hash` and posts it in a request body.
+    """
 
     def build(user_id: str) -> str:
         token = secret_links.issue(user_id)
-        return f"{settings.resolved_public_base_url()}/secrets.html?token={token}"
+        return f"{settings.resolved_public_base_url()}/secrets.html#token={token}"
 
     return build
 

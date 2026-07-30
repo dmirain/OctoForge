@@ -53,9 +53,10 @@ mutations that go through owner-scoped services: publishing an instruction and t
 
 ### Secret endpoints
 
-`GET /api/secrets/session`, `POST /api/secrets/set`, `POST /api/secrets/delete` — authorized by the
+`POST /api/secrets/session`, `POST /api/secrets/set`, `POST /api/secrets/delete` — authorized by the
 one-time token from the Telegram `/secrets` flow, not by the operator credential, because dialog users do
-not have one. See [secrets.md](secrets.md).
+not have one. The token travels in request bodies and reaches the browser in the link's fragment, so it
+never appears in a URL a proxy would log. See [secrets.md](secrets.md).
 
 ### Static pages and probes
 
@@ -73,6 +74,14 @@ not have one. See [secrets.md](secrets.md).
 One HTTP Basic credential guards the whole surface, applied as middleware in `create_app` rather than as a
 per-router dependency, so it also covers static files and `/docs`. Open paths: `/health`,
 `/health/ready`, `/secrets.html` and `/api/secrets/*`.
+
+Before the credential is checked, the middleware refuses **cross-site state-changing requests**: a browser
+attaches Basic credentials automatically, so a form on another site could act as the operator. Origin is read
+from `Sec-Fetch-Site` (falling back to `Origin`); requests with neither header are not browsers and pass.
+
+Verification itself runs in a worker thread and behind a per-client failure budget, so a flood of wrong
+passwords cannot stall the event loop; a verified credential is cached briefly. See
+[../security.md](../security.md).
 
 The password is stored as a PBKDF2-HMAC-SHA256 hash in the format `pbkdf2_sha256:iterations:salt:digest`
 (`:` rather than `$` because docker compose interpolates `$` in `.env`), verified in constant time. An
@@ -108,6 +117,8 @@ string: front the deployment with a proxy that authenticates people and sets tha
 |---|---|
 | No credential configured | Every guarded request answers 503 with "admin credentials are not configured" |
 | Wrong credential | 401 with a Basic challenge; the attempt is logged with the client address |
+| Repeated wrong credentials | 429 after five failures, for a cooldown, without hashing anything |
+| Cross-site POST/DELETE from a browser | 403, before authentication |
 | Missing `X-User-Id` | 400 |
 | Client disconnects mid-stream | Subscription removed; the run keeps going and its result is delivered through the outbox on the next subscribe |
 | Slow client | Stream events dropped for that subscriber; terminals still delivered |

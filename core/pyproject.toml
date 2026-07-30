@@ -43,6 +43,9 @@ dev = [
     # Bump deliberately, with the fallout in the same change.
     "ruff>=0.16,<0.17",
     "mypy>=2.3,<3",
+    # dependency CVE scan; uncapped on purpose — its job is to know about
+    # advisories published after this line was written
+    "pip-audit>=2.7",
 ]
 
 [tool.setuptools.packages.find]

@@ -43,7 +43,7 @@ def test_form_and_api_are_reachable_without_the_operator_credential(
 ) -> None:
     """Dialog users have no Basic credential; the token is the auth."""
     assert client.get("/secrets.html").status_code == HTTPStatus.OK
-    response = client.get("/api/secrets/session", params={"token": "nope"})
+    response = client.post("/api/secrets/session", json={"token": "nope"})
     assert response.status_code == HTTPStatus.FORBIDDEN  # not 401 Basic
 
 
@@ -54,9 +54,9 @@ def test_full_form_flow(client: TestClient) -> None:
         "/api/secrets/set",
         json={"token": token, "code": CODE, "value": VALUE, "allowed_host": HOST},
     )
-    listed = client.get("/api/secrets/session", params={"token": token}).json()
+    listed = client.post("/api/secrets/session", json={"token": token}).json()
     deleted = client.post("/api/secrets/delete", json={"token": token, "code": CODE})
-    empty = client.get("/api/secrets/session", params={"token": token}).json()
+    empty = client.post("/api/secrets/session", json={"token": token}).json()
 
     assert stored.status_code == HTTPStatus.OK
     assert [item["code"] for item in listed["secrets"]] == [CODE]
@@ -103,7 +103,7 @@ def test_disabled_secrets_answer_503(tmp_path: Path) -> None:
         links: SecretLinkService = client.app.state.secret_links  # type: ignore[attr-defined]
         token = links.issue(USER)
 
-        response = client.get("/api/secrets/session", params={"token": token})
+        response = client.post("/api/secrets/session", json={"token": token})
 
     assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
 

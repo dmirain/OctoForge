@@ -19,7 +19,7 @@ from octoforge_core.instructions.api import (
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.time import utc_now
 
-from octoforge_web.auth import hash_password, verify_password
+from octoforge_web.auth import MAX_FAILED_ATTEMPTS, hash_password, verify_password
 from octoforge_web.config import Settings
 from octoforge_web.main import create_app
 from octoforge_web.telegram.invites.api import Invite, InviteStatus, MemberProfile
@@ -103,6 +103,52 @@ def test_everything_else_demands_a_credential(anonymous: TestClient, path: str) 
 
     assert response.status_code == HTTPStatus.UNAUTHORIZED
     assert response.headers["www-authenticate"].startswith("Basic")
+
+
+def test_operator_actions_leave_an_audit_line(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every mutation names who did what to which id — and no content."""
+    with caplog.at_level(logging.INFO, logger="octoforge.audit"):
+        client.delete("/api/admin/tasks/unknown-task")  # 404 leaves no line
+        client.post("/api/admin/instructions/unknown-id/publish")
+
+    lines = [record.getMessage() for record in caplog.records]
+    assert any("action=instruction.publish" in line for line in lines)
+    assert any("outcome=not_found" in line for line in lines)
+    assert all(f"actor={ADMIN_USER}@" in line for line in lines)
+
+
+def test_cross_site_mutation_is_refused(client: TestClient) -> None:
+    """A browser posting from another site carries the credential; refuse it."""
+    response = client.post(
+        "/api/admin/instructions/whatever/publish",
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+
+    assert response.status_code == HTTPStatus.FORBIDDEN
+
+
+def test_same_origin_mutation_is_allowed_through(client: TestClient) -> None:
+    """The console's own requests pass the CSRF check (404 = it reached the handler)."""
+    response = client.post(
+        "/api/admin/instructions/unknown-id/publish",
+        headers={"Sec-Fetch-Site": "same-origin"},
+    )
+
+    assert response.status_code == HTTPStatus.NOT_FOUND
+
+
+def test_repeated_bad_credentials_are_refused_without_hashing(anonymous: TestClient) -> None:
+    """The failure budget answers 429 instead of burning PBKDF2 per attempt."""
+    for _ in range(MAX_FAILED_ATTEMPTS):
+        anonymous.get("/api/admin/totals", headers=basic_auth_header(ADMIN_USER, WRONG_PASSWORD))
+
+    refused = anonymous.get(
+        "/api/admin/totals", headers=basic_auth_header(ADMIN_USER, WRONG_PASSWORD)
+    )
+
+    assert refused.status_code == HTTPStatus.TOO_MANY_REQUESTS
 
 
 def test_wrong_password_is_rejected(anonymous: TestClient) -> None:

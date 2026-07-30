@@ -2,7 +2,7 @@ VENV := .venv
 BIN := $(VENV)/bin
 
 .PHONY: install upgrade lint format typecheck test check test-pg db-up db-down db-psql run run-telegram \
-	quickstart quickstart-logs quickstart-down bench docs
+	quickstart quickstart-logs quickstart-down bench docs audit
 
 # Test database of the compose postgres service. Separate from the app database
 # on purpose: the Postgres store tests drop and recreate the public schema.
@@ -90,6 +90,12 @@ quickstart-logs:
 
 quickstart-down:
 	$(LOCAL_COMPOSE) down
+
+# Known vulnerabilities in the installed dependency tree. Not part of `check`:
+# it needs the network and its verdict changes without the code changing, which
+# would make the gate non-deterministic. CI runs it as its own step.
+audit:
+	$(BIN)/pip-audit --desc --skip-editable
 
 # Latency harness behind the numbers in README.md ("Why it feels fast").
 bench:

@@ -20,6 +20,7 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.tools.base import ToolContext, ToolSpec
 
+from octoforge_web import audit
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, USER_ID_PREFIX, TelegramClient
 from octoforge_web.telegram.invites.api import (
     Invite,
@@ -123,6 +124,16 @@ class AdminStores:
 ActionHandler = Callable[[dict[str, Any]], Awaitable[str]]
 
 
+def _audit_target(arguments: dict[str, Any]) -> str:
+    """The id an admin action names, for the audit line (never free text)."""
+    # "id" is what the tool's own schema calls the instruction/invite argument
+    for key in ("id", "instruction_id", "invite_id", "user_id"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return audit.UNKNOWN_TARGET
+
+
 class AdminManageTool:
     """Manages Telegram access: invite codes, user list, revoke/restore, publishing."""
 
@@ -165,12 +176,17 @@ class AdminManageTool:
         return self._is_admin(context)
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        action = str(arguments["action"])
         if not self._is_admin(context):
+            audit.record(f"admin.{action}", context.user_id, outcome="denied")
             return NOT_AUTHORIZED_MESSAGE
-        handler = self._handlers.get(str(arguments["action"]))
+        handler = self._handlers.get(action)
         if handler is None:
             return f"error: unknown action {arguments['action']!r}"
-        return await handler(arguments)
+        result = await handler(arguments)
+        # the trail records that an operator acted and on what, never the answer
+        audit.record(f"admin.{action}", context.user_id, _audit_target(arguments))
+        return result
 
     def _is_admin(self, context: ToolContext) -> bool:
         if context.channel != TELEGRAM_CHANNEL:
