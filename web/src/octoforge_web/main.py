@@ -82,6 +82,7 @@ from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient
 from octoforge_core.net.external import CallCredentials, ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.retention_sweep import RetentionSweeper
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.serper import SerperSearchProvider
 from octoforge_core.secrets.api import SecretStore
@@ -177,6 +178,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     lexical_backend = await _probe_lexical_backend(engine, search_extensions)
     log_capabilities(settings, logger, search_extensions, lexical_backend)
     session_factory = create_session_factory(engine)
+    await _sweep_retention(settings, session_factory)
     dialogs = SqlAlchemyDialogRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
@@ -457,6 +459,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(secrets_router)
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
+
+
+async def _sweep_retention(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Apply the configured retention policy once at startup.
+
+    A no-op unless an operator set a limit, and never fatal: failing to prune
+    old rows is not a reason to refuse to serve. Runs at startup rather than on
+    a timer because the tables it touches grow slowly and a restart is frequent
+    enough — a background schedule would be more machinery for the same effect.
+    """
+    policy = settings.retention_policy()
+    if not policy.enabled():
+        return
+    try:
+        outcome = await RetentionSweeper(session_factory, policy).sweep()
+    except SQLAlchemyError:
+        logger.warning("retention sweep failed; starting without it", exc_info=True)
+        return
+    logger.info("retention (%s): removed %s", policy.describe(), outcome.describe())
 
 
 async def _probe_search_extensions(engine: AsyncEngine) -> frozenset[str]:

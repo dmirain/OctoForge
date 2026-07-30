@@ -69,6 +69,7 @@ def describe_capabilities(
         *_multimodal_capabilities(settings),
         *_tool_capabilities(settings),
         *_surface_capabilities(settings),
+        *_retention_capabilities(settings),
         *_search_capabilities(search_extensions, lexical_backend),
     )
 
@@ -260,3 +261,13 @@ def _search_capabilities(
             detail=LEXICAL_DETAIL[lexical_backend],
         ),
     )
+
+
+def _retention_capabilities(settings: Settings) -> tuple[Capability, ...]:
+    """Report the retention policy, because silent deletion is the worst kind.
+
+    "off" is the normal state and says so plainly: an operator reading this
+    should be able to tell at a glance whether anything is being deleted.
+    """
+    policy = settings.retention_policy()
+    return (Capability(name="retention", enabled=policy.enabled(), detail=policy.describe()),)

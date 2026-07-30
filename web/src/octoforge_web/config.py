@@ -15,6 +15,7 @@ from octoforge_core.config import (
 )
 from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES
 from octoforge_core.net.external import ExternalCallAuth
+from octoforge_core.retention import RetentionPolicy
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -120,6 +121,12 @@ class Settings(BaseSettings):
     # Wall-clock ceiling on one tool call. A tool that never returns holds its
     # iteration open forever and freezes that dialog until the process restarts.
     agent_tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS
+    # How many days of each kind of row to keep. 0 means forever, which is the
+    # default for every one of them: a retention policy switched on by an
+    # upgrade would destroy data the installation believed it had.
+    retention_messages_days: int = 0
+    retention_exchanges_days: int = 0
+    retention_tasks_days: int = 0
     llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
     llm_retry_base_seconds: float = DEFAULT_LLM_RETRY_BASE_SECONDS
     llm_retry_max_seconds: float = DEFAULT_LLM_RETRY_MAX_SECONDS
@@ -351,6 +358,14 @@ class Settings(BaseSettings):
             if source:
                 files[name] = _parse_prompt_source(source)
         return files
+
+    def retention_policy(self) -> RetentionPolicy:
+        """Build the retention policy; 0 reads as "keep forever", not "delete now"."""
+        return RetentionPolicy(
+            messages_days=self.retention_messages_days or None,
+            exchanges_days=self.retention_exchanges_days or None,
+            tasks_days=self.retention_tasks_days or None,
+        )
 
 
 def _parse_prompt_source(source: str) -> Path:

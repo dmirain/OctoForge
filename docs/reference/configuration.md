@@ -29,6 +29,29 @@ endpoint kinds:
 Speech deliberately does **not** inherit: `/audio/transcriptions` is a different endpoint kind and a
 chat-only gateway answers 404, so both `OF_STT_BASE_URL` and `OF_STT_MODEL` must be set explicitly.
 
+## Retention
+
+How long each kind of row is kept. **Every one defaults to forever, and nothing is deleted until an
+operator sets a limit** — a retention policy switched on by an upgrade would destroy data the
+installation believed it had.
+
+| Variable | Effect |
+|---|---|
+| `OF_RETENTION_MESSAGES_DAYS` | Age at which a message may be pruned; 0 = keep forever |
+| `OF_RETENTION_EXCHANGES_DAYS` | Age at which a settled exchange may be pruned; 0 = keep forever |
+| `OF_RETENTION_TASKS_DAYS` | Age at which a delivered task may be pruned; 0 = keep forever |
+
+Only transcript-shaped data ages out. Instructions, datasets and their records are things a user
+wrote on purpose — a skill, a memory, a food diary — and retention never touches them.
+
+The sweep runs once at startup and refuses to delete three things regardless of age: a message at or
+after its dialog's compaction boundary (those are what a restarting runner reloads as its narrative),
+an exchange that is still live, and a task whose result has not reached the user. Age-based rather
+than count-based, so a quiet week never empties a dialog.
+
+The startup capability report prints the policy, so "is anything being deleted here" is answerable at
+a glance.
+
 ## The model
 
 | Variable | Default | Meaning |
