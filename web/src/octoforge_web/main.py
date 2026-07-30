@@ -87,6 +87,7 @@ from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.api.secrets import router as secrets_router
 from octoforge_web.auth import check_basic_auth, is_open_path
+from octoforge_web.capabilities import log_capabilities
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
 from octoforge_web.secret_links import SecretLinkService
@@ -155,6 +156,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     assembled from the reusable builders of `octoforge_core.composition`;
     only the settings/transport specifics live here.
     """
+    log_capabilities(settings, logger)
     engine = create_engine(settings.database_url)
     await _bootstrap_schema(engine)
     session_factory = create_session_factory(engine)
@@ -169,7 +171,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     try:
         async with (
             httpx.AsyncClient(base_url=settings.llm_base_url) as llm_http,
-            httpx.AsyncClient(base_url=settings.embedding_base_url) as embed_http,
+            httpx.AsyncClient(base_url=settings.resolved_embedding_base_url()) as embed_http,
             httpx.AsyncClient(base_url=settings.resolved_vision_base_url()) as vision_http,
             httpx.AsyncClient(base_url=settings.stt_base_url) as speech_http,
             httpx.AsyncClient() as outbound_http,

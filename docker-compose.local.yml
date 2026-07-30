@@ -1,0 +1,56 @@
+# Overlay for trying OctoForge on your own machine: Postgres + the app on
+# http://127.0.0.1:8000, no domain, no TLS, no certificate to obtain.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --wait
+#
+# `make quickstart` does exactly that (after generating .env). The production
+# topology in docker-compose.yml is untouched: there the app publishes no port
+# and only Caddy answers, so a deployment can never accidentally serve the
+# console over plain HTTP.
+#
+# The project name differs from the default one on purpose: on a host that also
+# runs the production stack from this same checkout, the local try-it stack must
+# get its own containers and its own Postgres volume instead of recreating the
+# real app container with a lite image.
+name: octoforge-quickstart
+
+services:
+  postgres:
+    # Nothing outside the compose network needs this database, and publishing
+    # 5432 would collide with any Postgres already on the host (including a real
+    # deployment's). `!reset` clears the base file's mapping instead of adding
+    # a second one — merging ports appends.
+    ports: !reset []
+
+  app:
+    build:
+      context: .
+      args:
+        # No torch in the local image: the try-it path uses the HTTP embeddings
+        # backend (which inherits OF_LLM_*), so the local sentence-transformers
+        # backend would cost minutes of build time and a gigabyte of wheels for
+        # nothing. Set OF_EMBEDDING_BACKEND=local only on an image built with
+        # the default CORE_EXTRAS.
+        CORE_EXTRAS: postgres
+    # A tag of its own: the production image (docker-compose.yml) carries torch,
+    # and building the lite one must not silently replace it.
+    image: octoforge:quickstart
+    environment:
+      # This image has no sentence-transformers, so the backend is pinned to the
+      # HTTP one here rather than left to .env — a copied-over
+      # OF_EMBEDDING_BACKEND=local would otherwise fail at startup.
+      OF_EMBEDDING_BACKEND: openai
+      # Telegram is opt-in for the local stack, even when .env carries a token:
+      # a bot can only be long-polled by one process, so trying things out in a
+      # checkout that also serves a live bot would steal that bot's updates.
+      # To see the bot here, set OF_QUICKSTART_TELEGRAM_TOKEN (shell or .env).
+      OF_TELEGRAM_BOT_TOKEN: ${OF_QUICKSTART_TELEGRAM_TOKEN:-}
+    ports:
+      # loopback only: reachable from this machine, not from the network
+      - "127.0.0.1:${OF_LOCAL_PORT:-8000}:8000"
+
+  caddy:
+    # Compose merges this list with the base service's (which has none), so
+    # caddy is no longer part of the default set and stays down unless someone
+    # asks for the `tls` profile explicitly.
+    profiles: ["tls"]

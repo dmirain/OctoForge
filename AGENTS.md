@@ -46,6 +46,8 @@ OctoForge is a multi-user LLM agent: Python, FastAPI, SQLAlchemy (async, SQLite)
 
 ## Build and test commands
 
+- `make quickstart` — first run from a fresh clone: `tools/quickstart.py` writes `.env` (operator password printed once, Fernet key, LLM endpoint; an existing `.env` is validated, never overwritten), then the local compose overlay comes up (`docker-compose.local.yml`: project `octoforge-quickstart`, image `octoforge:quickstart` built with `CORE_EXTRAS=postgres` so no torch, no Caddy, `127.0.0.1:8000`). `make quickstart-logs` / `make quickstart-down` to follow and stop it
+- `make bench` — `tools/bench_latency.py`: the real stack against a scripted LLM (framework overhead, delta delivery, concurrent tools, concurrent exchanges). Its numbers are quoted in README — update both together
 - `make install` — create `.venv` and install both projects editable with dev dependencies
 - `make upgrade` — refresh an existing `.venv` to what CI installs (CI resolves everything fresh every run, `install` keeps already-satisfied deps); reach for it when `make check` fails locally on code CI accepts
 - `make check` — ruff (lint + format check) → mypy strict → pytest, for both projects
@@ -71,6 +73,7 @@ Take these from here, don't guess:
 | Deployment | `docker compose up -d` = postgres + app + caddy. The app is one process serving the HTTP API, the operator console and the Telegram bot — split across containers and two cron schedulers/recovery sweeps would race on one database with no channel filter. `--profile standalone` keeps the bot-only service. See `docs/deploy.md` |
 | Operator console | `/admin.html` behind HTTP Basic; cross-user reads via `octoforge_core.admin`, mutations via the owner-scoped services |
 | Logs | stdout/stderr only (`logging.basicConfig`, no file handler) — redirect yourself if backgrounding, e.g. `make run > /tmp/octoforge.log 2>&1 &` |
+| Startup capability report | `web/capabilities.py`, logged at the top of `runtime()`: every optional capability on/off with its endpoint/model (never a secret value); embeddings and the operator credential also warn when off. Read it first when a feature "does nothing" |
 
 ## Code conventions
 

@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     llm_base_url: str = DEFAULT_LLM_BASE_URL
     llm_api_key: str = ""
     llm_model: str = DEFAULT_LLM_MODEL
+    # Left untouched, the embeddings endpoint inherits the LLM's URL and key
+    # (see `embeddings_inherit_llm`): one OpenAI-compatible gateway serving
+    # both is the common case, and the alternative was a silent loss of
+    # `recall` — the agent's single most important tool.
     embedding_base_url: str = DEFAULT_EMBEDDING_BASE_URL
     embedding_api_key: str = ""
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
@@ -230,10 +234,30 @@ class Settings(BaseSettings):
             retry_max_seconds=self.llm_retry_max_seconds,
         )
 
+    def embeddings_inherit_llm(self) -> bool:
+        """Whether the embeddings endpoint falls back to the main LLM's URL and key.
+
+        True only when nothing embedding-specific was configured at all: the
+        HTTP backend, no key of its own and the base URL still at its default.
+        The condition is deliberately narrow so the fallback is monotone — it
+        can only switch on a feature that used to be silently off, never
+        redirect a deployment that named its own embeddings endpoint.
+        """
+        return (
+            self.embedding_backend == EmbeddingBackend.OPENAI
+            and not self.embedding_api_key
+            and self.embedding_base_url == DEFAULT_EMBEDDING_BASE_URL
+            and bool(self.llm_api_key)
+        )
+
+    def resolved_embedding_base_url(self) -> str:
+        """Base URL of the embeddings endpoint: configured one, else the main LLM's."""
+        return self.llm_base_url if self.embeddings_inherit_llm() else self.embedding_base_url
+
     def to_embedding_config(self) -> EmbeddingConfig:
-        """Build the core embeddings configuration."""
+        """Build the core embeddings configuration; key may come from the LLM's."""
         return EmbeddingConfig(
-            api_key=self.embedding_api_key,
+            api_key=self.llm_api_key if self.embeddings_inherit_llm() else self.embedding_api_key,
             model=self.embedding_model,
             backend=self.embedding_backend,
             batch_size=self.embedding_batch_size,
@@ -242,10 +266,15 @@ class Settings(BaseSettings):
     def embeddings_configured(self) -> bool:
         """Whether an embeddings backend is usable (drives seeding at startup).
 
-        The LOCAL backend needs no credentials; the OPENAI backend is usable
-        only with an API key.
+        The LOCAL backend needs no credentials; the HTTP backend is usable with
+        a key of its own or with the main LLM's, which it inherits when no
+        embeddings endpoint was configured.
         """
-        return self.embedding_backend == EmbeddingBackend.LOCAL or bool(self.embedding_api_key)
+        return (
+            self.embedding_backend == EmbeddingBackend.LOCAL
+            or bool(self.embedding_api_key)
+            or self.embeddings_inherit_llm()
+        )
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod

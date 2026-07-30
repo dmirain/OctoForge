@@ -43,6 +43,8 @@ CUSTOM_RERANK_CANDIDATES = 15
 CUSTOM_TELEGRAM_TOKEN = "123:abc"
 CUSTOM_TELEGRAM_POLL_TIMEOUT = 45.0
 CUSTOM_TELEGRAM_EDIT_THROTTLE = 2.0
+CUSTOM_LLM_BASE_URL = "https://gateway.example.com/v1"
+CUSTOM_LLM_KEY = "sk-llm-key"
 LOCAL_EMBEDDING_MODEL = "intfloat/multilingual-e5-large-instruct"
 LOCAL_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 WHITELIST_JSON = (
@@ -201,12 +203,70 @@ def test_openai_backend_requires_api_key_to_count_as_configured(
 ) -> None:
     monkeypatch.setenv("OF_EMBEDDING_BACKEND", "openai")
     monkeypatch.delenv("OF_EMBEDDING_API_KEY", raising=False)
+    # with no LLM key either there is nothing to inherit from
+    monkeypatch.delenv("OF_LLM_API_KEY", raising=False)
 
     assert not Settings().embeddings_configured()
 
     monkeypatch.setenv("OF_EMBEDDING_API_KEY", "sk-test")
 
     assert Settings().embeddings_configured()
+
+
+def test_embeddings_inherit_the_llm_endpoint_when_nothing_else_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OF_LLM_BASE_URL", CUSTOM_LLM_BASE_URL)
+    monkeypatch.setenv("OF_LLM_API_KEY", CUSTOM_LLM_KEY)
+    monkeypatch.delenv("OF_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OF_EMBEDDING_BASE_URL", raising=False)
+    monkeypatch.delenv("OF_EMBEDDING_BACKEND", raising=False)
+
+    settings = Settings()
+
+    assert settings.embeddings_inherit_llm()
+    assert settings.resolved_embedding_base_url() == CUSTOM_LLM_BASE_URL
+    assert settings.to_embedding_config().api_key == CUSTOM_LLM_KEY
+    assert settings.embeddings_configured()
+
+
+def test_own_embedding_key_keeps_the_default_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_LLM_BASE_URL", CUSTOM_LLM_BASE_URL)
+    monkeypatch.setenv("OF_LLM_API_KEY", CUSTOM_LLM_KEY)
+    monkeypatch.setenv("OF_EMBEDDING_API_KEY", "sk-embeddings")
+    monkeypatch.delenv("OF_EMBEDDING_BASE_URL", raising=False)
+
+    settings = Settings()
+
+    assert not settings.embeddings_inherit_llm()
+    assert settings.resolved_embedding_base_url() == DEFAULT_EMBEDDING_BASE_URL
+    assert settings.to_embedding_config().api_key == "sk-embeddings"
+
+
+def test_own_embedding_base_url_disables_inheritance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_LLM_BASE_URL", CUSTOM_LLM_BASE_URL)
+    monkeypatch.setenv("OF_LLM_API_KEY", CUSTOM_LLM_KEY)
+    monkeypatch.setenv("OF_EMBEDDING_BASE_URL", "http://embeddings.internal/v1")
+    monkeypatch.delenv("OF_EMBEDDING_API_KEY", raising=False)
+
+    settings = Settings()
+
+    assert not settings.embeddings_inherit_llm()
+    assert settings.resolved_embedding_base_url() == "http://embeddings.internal/v1"
+    assert not settings.embeddings_configured()
+
+
+def test_local_backend_never_inherits_the_llm_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_LLM_BASE_URL", CUSTOM_LLM_BASE_URL)
+    monkeypatch.setenv("OF_LLM_API_KEY", CUSTOM_LLM_KEY)
+    monkeypatch.setenv("OF_EMBEDDING_BACKEND", "local")
+    monkeypatch.delenv("OF_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OF_EMBEDDING_BASE_URL", raising=False)
+
+    settings = Settings()
+
+    assert not settings.embeddings_inherit_llm()
+    assert settings.to_embedding_config().api_key == ""
 
 
 def test_prompt_sources_default_to_no_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

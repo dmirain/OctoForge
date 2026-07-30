@@ -14,6 +14,13 @@ RUN apt-get update \
 # and run the container with the NVIDIA Container Toolkit -- not needed for CPU).
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
+# Which extras of octoforge-core go into the image. The default carries the
+# local embeddings/reranker backends (torch: a few hundred MB and minutes of
+# build time). A deployment that uses the HTTP embeddings backend can drop it:
+# docker build --build-arg CORE_EXTRAS=postgres
+# (docker-compose.local.yml does exactly that for the local try-it stack.)
+ARG CORE_EXTRAS=local-embeddings,postgres
+
 # Dependencies live in their own layer keyed ONLY on the two pyproject.toml
 # files: a source-code change must not re-download torch. The extraction reads
 # the manifests directly (no package build, so no sources are needed yet); the
@@ -21,9 +28,10 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 # sources below.
 COPY core/pyproject.toml /tmp/deps/core.toml
 COPY web/pyproject.toml /tmp/deps/web.toml
-RUN <<'SH'
+RUN <<SH
 set -e
-python - > /tmp/deps/requirements.txt <<'PY'
+CORE_EXTRAS="${CORE_EXTRAS}" python - > /tmp/deps/requirements.txt <<'PY'
+import os
 import tomllib
 
 
@@ -36,7 +44,8 @@ def load(path, extras=()):
     return deps
 
 
-deps = load("/tmp/deps/core.toml", ("local-embeddings", "postgres"))
+chosen = tuple(part for part in os.environ["CORE_EXTRAS"].split(",") if part)
+deps = load("/tmp/deps/core.toml", chosen)
 deps += [dep for dep in load("/tmp/deps/web.toml") if not dep.startswith("octoforge-core")]
 print("\n".join(deps))
 PY

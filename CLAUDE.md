@@ -12,6 +12,8 @@ The living design doc is `docs/design.md`; code conventions are `AGENTS.md`. Rea
 
 All checks and runs go through the `Makefile`:
 
+- `make quickstart` — first run from a fresh clone: `tools/quickstart.py` writes `.env` (generated operator password printed once, Fernet key, LLM endpoint), then the local compose overlay (`docker-compose.local.yml`: own project name `octoforge-quickstart`, own image `octoforge:quickstart` built without torch, no Caddy, port on `127.0.0.1:8000`) comes up. `make quickstart-logs` / `make quickstart-down` follow and stop it. Never overwrites an existing `.env`
+- `make bench` — the latency harness (`tools/bench_latency.py`) behind README's «Why it feels fast» table; `--json` for raw numbers
 - `make install` — create `.venv` and install both projects editable with dev deps
 - `make upgrade` — refresh an existing `.venv` to what CI installs; run it when `make check` disagrees with CI on unchanged code (`install` leaves already-satisfied deps alone, so the linter silently drifts). both checkers are capped in the dev extras (`ruff>=0.16,<0.17`, `mypy>=2.3,<3`) precisely because their releases change verdicts on unchanged code
 - `make check` — full gate: `ruff check` → `ruff format --check` → `mypy strict` → `pytest`, for both projects
@@ -88,7 +90,9 @@ Each is a package with an `api.py` boundary (a `Protocol` + DTOs) and a local SQ
 
 ### Embeddings / reranker (optional but needed for instructions & datasets)
 
-`EmbeddingClient` port has two backends chosen by `OF_EMBEDDING_BACKEND`: local sentence-transformers (`llm/local_embeddings.py`) or an OpenAI-compatible HTTP endpoint (`llm/embeddings.py`). Optional `RerankerClient` also has two backends: a local cross-encoder (`llm/reranker.py`) or an HTTP one (`llm/http_reranker.py`, SiliconFlow-compatible, gated on `OF_RERANKER_API_KEY`). Without a working embedding backend the app still starts (the registry sync is skipped), but instruction/dataset search & save are unavailable.
+`EmbeddingClient` port has two backends chosen by `OF_EMBEDDING_BACKEND`: local sentence-transformers (`llm/local_embeddings.py`) or an OpenAI-compatible HTTP endpoint (`llm/embeddings.py`). Optional `RerankerClient` also has two backends: a local cross-encoder (`llm/reranker.py`) or an HTTP one (`llm/http_reranker.py`, SiliconFlow-compatible, gated on `OF_RERANKER_API_KEY`). With nothing embedding-specific configured (HTTP backend, no `OF_EMBEDDING_API_KEY`, untouched `OF_EMBEDDING_BASE_URL`) the embeddings endpoint **inherits `OF_LLM_BASE_URL`/`OF_LLM_API_KEY`** — `Settings.embeddings_inherit_llm()`, vision-style, deliberately narrow so the fallback only ever switches on a feature that used to be silently off. Naming either embedding variable turns it off again. Without a working embedding backend the app still starts (the registry sync is skipped), but instruction/dataset search & save are unavailable.
+
+At startup `web/capabilities.py` logs one block naming every optional capability as on/off with the endpoint or model behind it (no secret values), and warns separately about the two gaps that make an installation useless or unreachable: embeddings and the operator credential.
 
 `sentence-transformers` (and torch) is the optional `local-embeddings` extra on `octoforge-core` — not a hard dependency. Importing `octoforge_core` never requires it; only constructing `SentenceTransformerEmbedder`/`CrossEncoderReranker` does, and each raises a clear `ImportError` with the install command if it's missing. `web` depends on `octoforge-core[local-embeddings]`, so `make install`/`make run` get it by default; a pure-library consumer that only wants the OpenAI-compatible backends can skip it entirely and avoid the torch download.
 

@@ -1,11 +1,17 @@
 VENV := .venv
 BIN := $(VENV)/bin
 
-.PHONY: install upgrade lint format typecheck test check test-pg db-up db-down db-psql run run-telegram
+.PHONY: install upgrade lint format typecheck test check test-pg db-up db-down db-psql run run-telegram \
+	quickstart quickstart-logs quickstart-down bench
 
 # Test database of the compose postgres service. Separate from the app database
 # on purpose: the Postgres store tests drop and recreate the public schema.
 PG_TEST_URL ?= postgresql+asyncpg://octoforge:octoforge@127.0.0.1:5432/octoforge_test
+
+# The local stack: production compose plus the overlay that drops Caddy and
+# publishes the app on loopback (no domain, no certificate).
+LOCAL_COMPOSE := docker compose -f docker-compose.yml -f docker-compose.local.yml
+LOCAL_URL := http://127.0.0.1:8000
 
 install:
 	python3 -m venv $(VENV)
@@ -58,6 +64,30 @@ db-psql:
 # or a migration.
 test-pg: db-up
 	cd core && OF_TEST_DATABASE_URL="$(PG_TEST_URL)" ../$(BIN)/pytest tests/test_postgres_stores.py
+
+# One command from a fresh clone to a running agent: generate .env (operator
+# credential, secret-store key, LLM endpoint), then bring up Postgres + the app
+# on loopback. Needs docker and an OpenAI-compatible key, nothing else — no
+# virtualenv, no model download.
+quickstart:
+	python3 tools/quickstart.py
+	$(LOCAL_COMPOSE) up -d --wait
+	@echo
+	@echo "OctoForge is up:"
+	@echo "  chat UI          $(LOCAL_URL)/"
+	@echo "  operator console $(LOCAL_URL)/admin.html"
+	@echo "  API docs         $(LOCAL_URL)/docs"
+	@echo "Log in with the credential printed above. Logs: make quickstart-logs"
+
+quickstart-logs:
+	$(LOCAL_COMPOSE) logs -f app
+
+quickstart-down:
+	$(LOCAL_COMPOSE) down
+
+# Latency harness behind the numbers in README.md ("Why it feels fast").
+bench:
+	$(BIN)/python tools/bench_latency.py
 
 run:
 	$(BIN)/uvicorn octoforge_web.main:app --reload --reload-dir web/src
