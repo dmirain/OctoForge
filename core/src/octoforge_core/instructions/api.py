@@ -108,6 +108,9 @@ class InstructionDraft:
     content: str
     tags: tuple[str, ...]
     embedding: tuple[float, ...]
+    # which model produced `embedding`; None when it could not be computed, so
+    # the record reads as stale and the startup sweep picks it up
+    embedding_model: str | None = None
     system: bool = False
     owner_id: str | None = None
     # authorship is orthogonal to visibility: it is set once at save time
@@ -193,20 +196,33 @@ class InstructionStore(Protocol):
         """
         ...
 
-    async def list_missing_embeddings(self) -> list[Instruction]:
-        """Return records stored with an empty embedding (deferred embedding).
+    async def list_stale_embeddings(self, model: str, limit: int) -> list[Instruction]:
+        """Return up to `limit` records whose vector `model` did not produce.
 
-        Two sources produce them: a save whose embedding call failed (the
-        fact is kept rather than lost) and data migrations, which run without
-        an embedder. The startup sweep re-embeds them.
+        Three sources: a save whose embedding call failed (the fact is kept
+        rather than lost), data migrations, which run without an embedder, and
+        a changed `OF_EMBEDDING_MODEL` — a record embedded by the previous
+        model is unusable, because vectors from two models are not comparable
+        and a different dimensionality cannot even be scored. A record that has
+        never been stamped (model NULL) counts as stale: nothing knows what
+        wrote it.
+
+        `limit` bounds the work one startup does, so a large table converges
+        over a few restarts instead of holding up the first one.
         """
         ...
 
-    async def set_embedding(self, instruction_id: str, embedding: tuple[float, ...]) -> bool:
-        """Store the embedding without touching content, version or timestamps.
+    async def set_embedding(
+        self,
+        instruction_id: str,
+        embedding: tuple[float, ...],
+        model: str,
+    ) -> bool:
+        """Store the embedding and its model, touching nothing else.
 
-        Returns False when the id is unknown (the record was deleted between
-        the listing and the sweep).
+        No version bump and no `updated_at` stamp: re-embedding is maintenance,
+        not an edit. Returns False when the id is unknown (the record was
+        deleted between the listing and the sweep).
         """
         ...
 
@@ -363,12 +379,19 @@ class InstructionService(Protocol):
         """
         ...
 
-    async def reembed_missing(self) -> int:
-        """Embed and store vectors for records saved without one; return the count.
+    async def resync_embeddings(self) -> int:
+        """Re-embed records whose vector the configured model did not produce.
 
-        Called from the composition root at startup: it finishes what a
-        failed embedding backend or an embedder-less data migration left
-        behind. A record that fails again simply stays in the queue for the
-        next sweep.
+        Called from the composition root at startup. It finishes what a failed
+        embedding backend or an embedder-less data migration left behind, and —
+        the reason it is not merely "fill in the blanks" — it repairs a changed
+        embedding model. Vectors from two models are not comparable, and one of
+        a different dimensionality cannot be scored at all, so without this a
+        model change would leave every pre-existing record permanently
+        unfindable except by an exact title match.
+
+        Bounded per call, so a large table converges over several restarts
+        rather than delaying the first one. A record that fails again simply
+        stays in the queue for the next sweep.
         """
         ...

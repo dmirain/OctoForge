@@ -59,6 +59,11 @@ class SqlAlchemyInstructionStore:
             title=draft.title,
             content=draft.content,
             embedding=list(draft.embedding),
+            # NULL rather than an empty vector when the embedding failed:
+            # pgvector cannot store a zero-dimension value, and NULL is what
+            # `search_by_vector` skips
+            embedding_vector=list(draft.embedding) or None,
+            embedding_model=draft.embedding_model,
             tags=list(draft.tags),
             version=FIRST_VERSION,
             system=draft.system,
@@ -67,7 +72,7 @@ class SqlAlchemyInstructionStore:
         )
         session.add(row)
         await session.commit()
-        return _to_instruction(row)
+        return to_instruction(row)
 
     async def _update_row(
         self,
@@ -77,6 +82,8 @@ class SqlAlchemyInstructionStore:
     ) -> Instruction:
         row.content = draft.content
         row.embedding = list(draft.embedding)
+        row.embedding_vector = list(draft.embedding) or None
+        row.embedding_model = draft.embedding_model
         row.tags = list(draft.tags)
         row.version += 1
         row.system = draft.system
@@ -86,7 +93,7 @@ class SqlAlchemyInstructionStore:
             row.author_id = draft.author_id
         row.updated_at = utc_now()
         await session.commit()
-        return _to_instruction(row)
+        return to_instruction(row)
 
     async def get_by_title(
         self,
@@ -104,13 +111,13 @@ class SqlAlchemyInstructionStore:
                 statement = statement.where(InstructionRow.type == kind.value)
             statement = statement.order_by(InstructionRow.created_at, InstructionRow.id).limit(1)
             row = (await session.scalars(statement)).first()
-            return None if row is None else _to_instruction(row)
+            return None if row is None else to_instruction(row)
 
     async def get(self, instruction_id: str) -> Instruction | None:
         """Return the record by id, or None when the id is unknown."""
         async with self._session_factory() as session:
             row = await session.get(InstructionRow, instruction_id)
-            return None if row is None else _to_instruction(row)
+            return None if row is None else to_instruction(row)
 
     async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
         """Return records visible to `user_id` (None = the whole table)."""
@@ -126,7 +133,7 @@ class SqlAlchemyInstructionStore:
         return await asyncio.to_thread(
             lambda: [
                 EmbeddedInstruction(
-                    instruction=_to_instruction(row),
+                    instruction=to_instruction(row),
                     embedding=tuple(row.embedding),
                 )
                 for row in rows
@@ -142,7 +149,7 @@ class SqlAlchemyInstructionStore:
                 .order_by(InstructionRow.created_at, InstructionRow.id)
             )
             rows = (await session.scalars(statement)).all()
-            return [_to_instruction(row) for row in rows]
+            return [to_instruction(row) for row in rows]
 
     async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
         """Increment usage_count of the given records (search hits proved useful)."""
@@ -185,28 +192,63 @@ class SqlAlchemyInstructionStore:
             row.owner_id = None
             row.updated_at = utc_now()
             await session.commit()
-            return _to_instruction(row)
+            return to_instruction(row)
 
-    async def list_missing_embeddings(self) -> list[Instruction]:
-        """Return records whose embedding is empty (failed or deferred embedding)."""
+    async def list_stale_embeddings(self, model: str, limit: int) -> list[Instruction]:
+        """Return up to `limit` records whose vector `model` did not produce.
+
+        Three cases collapse into one query. An empty embedding is a save whose
+        backend was down or a row written by a migration; a NULL model is a row
+        that predates the column, so nothing knows what wrote it; a different
+        model means `OF_EMBEDDING_MODEL` changed and the stored vector is not
+        comparable with anything the live model produces.
+        """
+        if limit <= 0:
+            return []
         async with self._session_factory() as session:
             statement = (
                 select(InstructionRow)
-                .where(func.json_array_length(InstructionRow.embedding) == 0)
+                .where(
+                    (func.json_array_length(InstructionRow.embedding) == 0)
+                    | InstructionRow.embedding_model.is_(None)
+                    | (InstructionRow.embedding_model != model)
+                )
                 .order_by(InstructionRow.created_at, InstructionRow.id)
+                .limit(limit)
             )
             rows = (await session.scalars(statement)).all()
-            return [_to_instruction(row) for row in rows]
+            return [to_instruction(row) for row in rows]
 
-    async def set_embedding(self, instruction_id: str, embedding: tuple[float, ...]) -> bool:
-        """Store the embedding only; no version bump, no updated_at touch."""
+    async def count_stale_embeddings(self, model: str) -> int:
+        """How many records still need `model` to embed them (for the startup log)."""
+        async with self._session_factory() as session:
+            statement = select(func.count()).where(
+                (func.json_array_length(InstructionRow.embedding) == 0)
+                | InstructionRow.embedding_model.is_(None)
+                | (InstructionRow.embedding_model != model)
+            )
+            return await session.scalar(statement) or 0
+
+    async def set_embedding(
+        self,
+        instruction_id: str,
+        embedding: tuple[float, ...],
+        model: str,
+    ) -> bool:
+        """Store the embedding and its model; no version bump, no updated_at touch."""
+        vector = list(embedding)
         async with self._session_factory() as session:
             statement = (
                 update(InstructionRow)
                 .where(InstructionRow.id == instruction_id)
                 # re-embedding is maintenance, not an edit: the self-assignment
                 # suppresses the column's onupdate stamp
-                .values(embedding=list(embedding), updated_at=InstructionRow.updated_at)
+                .values(
+                    embedding=vector,
+                    embedding_vector=vector or None,
+                    embedding_model=model,
+                    updated_at=InstructionRow.updated_at,
+                )
             )
             result = cast(CursorResult[Any], await session.execute(statement))
             await session.commit()
@@ -249,7 +291,8 @@ def _owner_clause(owner_id: str | None) -> ColumnElement[bool]:
     return InstructionRow.owner_id == owner_id
 
 
-def _to_instruction(row: InstructionRow) -> Instruction:
+def to_instruction(row: InstructionRow) -> Instruction:
+    """Map an ORM row to the facade DTO (shared with `pg_store.py`)."""
     return Instruction(
         id=row.id,
         type=InstructionType(row.type),

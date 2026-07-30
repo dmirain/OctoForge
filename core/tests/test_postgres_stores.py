@@ -41,7 +41,12 @@ from octoforge_core.db.search_extensions import (
 from octoforge_core.dialogs.models import DialogRow, MessageRow
 from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
-from octoforge_core.instructions.api import InstructionDraft, InstructionType
+from octoforge_core.instructions.api import (
+    InstructionDraft,
+    InstructionType,
+    InstructionVectorSearch,
+)
+from octoforge_core.instructions.pg_store import PostgresInstructionStore
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 
 DATABASE_URL_ENV = "OF_TEST_DATABASE_URL"
@@ -96,6 +101,8 @@ RUSSIAN_QUERY_VARIANTS = ("ежик", "объем", "задача")
 TWO_APPENDS = 2
 SECOND_VERSION = 2
 SEARCH_LIMIT = 10
+EMBEDDING_MODEL = "test-embedder"
+WIDER_DIMENSION = 8
 SCAN_LIMIT = 50
 
 
@@ -338,19 +345,55 @@ async def test_two_users_may_share_a_memory_key(
     assert b_row is not None and b_row.content == "b note"
 
 
-async def test_missing_embeddings_roundtrip(
+async def test_stale_embeddings_roundtrip(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """json_array_length must find empty-embedding rows on Postgres too."""
+    """The stale-vector query must work on Postgres, empty JSON arrays included.
+
+    Also covers writing the pgvector column: `set_embedding` stores the same
+    numbers twice, and a `vector` bind that asyncpg cannot adapt would only
+    ever show up here.
+    """
     store = SqlAlchemyInstructionStore(session_factory)
     saved = await store.upsert(memory_draft(SHARED_KEY, GLOBAL_CONTENT, USER_A, embedding=()))
 
-    pending = await store.list_missing_embeddings()
-    stored = await store.set_embedding(saved.id, (1.0, 0.0))
+    pending = await store.list_stale_embeddings(EMBEDDING_MODEL, limit=SEARCH_LIMIT)
+    stored = await store.set_embedding(saved.id, (1.0, 0.0), EMBEDDING_MODEL)
 
     assert [record.id for record in pending] == [saved.id]
     assert stored is True
-    assert await store.list_missing_embeddings() == []
+    assert await store.list_stale_embeddings(EMBEDDING_MODEL, limit=SEARCH_LIMIT) == []
+
+
+async def test_a_changed_model_makes_every_row_stale(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The whole point of the model column: a swap is visible, not silent."""
+    store = SqlAlchemyInstructionStore(session_factory)
+    saved = await store.upsert(memory_draft(SHARED_KEY, GLOBAL_CONTENT, USER_A))
+    await store.set_embedding(saved.id, (1.0, 0.0), EMBEDDING_MODEL)
+
+    settled = await store.list_stale_embeddings(EMBEDDING_MODEL, limit=SEARCH_LIMIT)
+    after_swap = await store.list_stale_embeddings("another-model", limit=SEARCH_LIMIT)
+
+    assert settled == []
+    assert [record.id for record in after_swap] == [saved.id]
+
+
+async def test_the_vector_column_takes_whatever_dimension_the_model_produces(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No dimension in the schema, so two models' vectors can coexist mid-swap.
+
+    `vector(1024)` would have rejected the second write outright, which is
+    exactly the coupling this column is declared unsized to avoid.
+    """
+    store = SqlAlchemyInstructionStore(session_factory)
+    small = await store.upsert(memory_draft("small", GLOBAL_CONTENT, USER_A))
+    large = await store.upsert(memory_draft("large", GLOBAL_CONTENT, USER_B))
+
+    assert await store.set_embedding(small.id, (1.0, 0.0), EMBEDDING_MODEL) is True
+    assert await store.set_embedding(large.id, tuple([0.5] * WIDER_DIMENSION), "wider") is True
 
 
 async def test_private_instruction_shadows_the_public_one(
@@ -393,3 +436,84 @@ async def test_dataset_records_filter_by_date_range(
 
     assert len(inside) == 1
     assert outside == []
+
+
+async def test_vector_search_returns_the_nearest_records_first(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """pgvector must order by cosine distance, not by insertion or id."""
+    store = PostgresInstructionStore(session_factory)
+    near = await store.upsert(memory_draft("near", GLOBAL_CONTENT, USER_A, embedding=(1.0, 0.0)))
+    far = await store.upsert(memory_draft("far", GLOBAL_CONTENT, USER_A, embedding=(-1.0, 0.0)))
+    middle = await store.upsert(
+        memory_draft("middle", GLOBAL_CONTENT, USER_A, embedding=(0.7, 0.7))
+    )
+
+    hits = await store.search_by_vector((1.0, 0.0), limit=SEARCH_LIMIT, user_id=USER_A)
+
+    assert [hit.instruction.id for hit in hits] == [near.id, middle.id, far.id]
+
+
+async def test_vector_search_honours_visibility(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Another user's private record must never reach the ranking input.
+
+    Ownership is a SQL predicate everywhere else; moving the search into the
+    database must not quietly drop it.
+    """
+    store = PostgresInstructionStore(session_factory)
+    mine = await store.upsert(memory_draft("mine", GLOBAL_CONTENT, USER_A, embedding=(1.0, 0.0)))
+    public = await store.upsert(memory_draft("public", GLOBAL_CONTENT, None, embedding=(1.0, 0.0)))
+    await store.upsert(memory_draft("theirs", GLOBAL_CONTENT, USER_B, embedding=(1.0, 0.0)))
+
+    hits = await store.search_by_vector((1.0, 0.0), limit=SEARCH_LIMIT, user_id=USER_A)
+
+    assert {hit.instruction.id for hit in hits} == {mine.id, public.id}
+
+
+async def test_vector_search_skips_records_of_another_dimension(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A half-absorbed model change must degrade, not raise.
+
+    Postgres refuses to compare vectors of different sizes ("different vector
+    dimensions"), so without the vector_dims filter a single leftover record
+    from the previous model would break every recall in the installation until
+    the sweep caught up.
+    """
+    store = PostgresInstructionStore(session_factory)
+    current = await store.upsert(
+        memory_draft("current", GLOBAL_CONTENT, USER_A, embedding=(1.0, 0.0))
+    )
+    await store.upsert(
+        memory_draft("previous", GLOBAL_CONTENT, USER_A, embedding=tuple([0.1] * WIDER_DIMENSION))
+    )
+
+    hits = await store.search_by_vector((1.0, 0.0), limit=SEARCH_LIMIT, user_id=USER_A)
+
+    assert [hit.instruction.id for hit in hits] == [current.id]
+
+
+async def test_vector_search_skips_records_with_no_vector(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A record whose embedding failed is simply not a candidate."""
+    store = PostgresInstructionStore(session_factory)
+    embedded = await store.upsert(
+        memory_draft("embedded", GLOBAL_CONTENT, USER_A, embedding=(1.0, 0.0))
+    )
+    await store.upsert(memory_draft("deferred", GLOBAL_CONTENT, USER_A, embedding=()))
+
+    hits = await store.search_by_vector((1.0, 0.0), limit=SEARCH_LIMIT, user_id=USER_A)
+
+    assert [hit.instruction.id for hit in hits] == [embedded.id]
+
+
+async def test_vector_search_is_the_capability_the_service_detects(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The portable store must NOT claim the capability, or a database without
+    pgvector would fail at the first recall instead of at startup."""
+    assert isinstance(PostgresInstructionStore(session_factory), InstructionVectorSearch)
+    assert not isinstance(SqlAlchemyInstructionStore(session_factory), InstructionVectorSearch)

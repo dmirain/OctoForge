@@ -19,7 +19,10 @@ from octoforge_core.instructions.api import (
     InstructionType,
     SystemInstructionError,
 )
-from octoforge_core.instructions.local import LocalInstructionService
+from octoforge_core.instructions.local import (
+    InstructionSearchPolicy,
+    LocalInstructionService,
+)
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient
 
@@ -31,6 +34,10 @@ USAGE_NEVER = 0
 USAGE_ONCE = 1
 USAGE_TWICE = 2
 TWO_HITS = 2
+THREE_RECORDS = 3
+# two embedding model identities: the sweep compares them, nothing else
+MODEL_A = "model-a"
+MODEL_B = "model-b"
 THREE_HITS = 3
 TWO_EMBED_CALLS = 2
 
@@ -67,9 +74,14 @@ ServiceFactory = Callable[[async_sessionmaker[AsyncSession], EmbeddingClient], I
 def build_local_service(
     session_factory: async_sessionmaker[AsyncSession],
     embedder: EmbeddingClient,
+    embedding_model: str = MODEL_A,
 ) -> InstructionService:
     """Assemble the default local implementation over the SQL store."""
-    return LocalInstructionService(SqlAlchemyInstructionStore(session_factory), embedder)
+    return LocalInstructionService(
+        SqlAlchemyInstructionStore(session_factory),
+        embedder,
+        policy=InstructionSearchPolicy(embedding_model=embedding_model),
+    )
 
 
 @pytest.fixture
@@ -653,7 +665,7 @@ async def test_save_survives_an_embedding_failure(
     assert stored.content == CONTENT_A
 
 
-async def test_reembed_missing_finishes_deferred_embeddings(
+async def test_resync_finishes_deferred_embeddings(
     service: InstructionService,
     embedder: StubEmbedder,
 ) -> None:
@@ -662,12 +674,68 @@ async def test_reembed_missing_finishes_deferred_embeddings(
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)  # backend is back
     embedder.vectors[QUERY] = V_RIGHT
 
-    swept = await service.reembed_missing()
+    swept = await service.resync_embeddings()
     hits = await service.search(USER_ID, QUERY, k=TWO_HITS, kind=InstructionType.MEMORY)
 
     assert swept == 1
-    assert await service.reembed_missing() == 0  # idempotent: nothing left
+    assert await service.resync_embeddings() == 0  # idempotent: nothing left
     assert [hit.instruction.title for hit in hits] == [TITLE_ALPHA]
+
+
+async def test_a_changed_embedding_model_re_embeds_everything(
+    session_factory: async_sessionmaker[AsyncSession],
+    embedder: StubEmbedder,
+) -> None:
+    """Swapping OF_EMBEDDING_MODEL must not silently make old records unfindable.
+
+    Before the `embedding_model` column the sweep only looked for EMPTY
+    embeddings, so a model change left every existing record holding a vector
+    from the old model. Those are not comparable with anything the new model
+    produces -- a different dimensionality is scored 0 outright -- so the whole
+    corpus went dark except for exact title matches, with nothing logged.
+    """
+    old_model = build_local_service(session_factory, embedder, embedding_model=MODEL_A)
+    register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
+    await old_model.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    assert await old_model.resync_embeddings() == 0  # settled under the old model
+
+    new_model = build_local_service(session_factory, embedder, embedding_model=MODEL_B)
+
+    assert await new_model.resync_embeddings() == 1
+    assert await new_model.resync_embeddings() == 0  # and it settles again
+
+
+async def test_a_record_saved_without_a_vector_claims_no_model(
+    service: InstructionService,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A failed embedding must leave the model NULL, or the sweep skips the record."""
+    await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)  # embed fails
+
+    store = SqlAlchemyInstructionStore(session_factory)
+
+    assert len(await store.list_stale_embeddings(MODEL_A, limit=10)) == 1
+
+
+async def test_resync_is_bounded_per_call(
+    session_factory: async_sessionmaker[AsyncSession],
+    embedder: StubEmbedder,
+) -> None:
+    """A model change makes the whole table stale; startup must not embed it all at once."""
+    seeding = build_local_service(session_factory, embedder, embedding_model=MODEL_A)
+    for index in range(THREE_RECORDS):
+        title = f"{TITLE_ALPHA}-{index}"
+        register_vector(embedder, title, CONTENT_A, V_RIGHT)
+        await seeding.save(USER_ID, InstructionType.KNOWLEDGE, title, CONTENT_A)
+
+    swept = LocalInstructionService(
+        SqlAlchemyInstructionStore(session_factory),
+        embedder,
+        policy=InstructionSearchPolicy(embedding_model=MODEL_B, resync_batch=1),
+    )
+
+    assert await swept.resync_embeddings() == 1  # one slice, not the table
+    assert await swept.resync_embeddings() == 1  # converges over restarts
 
 
 # --- endpoint late binding and type caps -------------------------------------

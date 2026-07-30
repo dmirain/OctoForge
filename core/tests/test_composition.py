@@ -126,6 +126,7 @@ class InMemoryInstructionStore:
     def __init__(self) -> None:
         self.records: dict[tuple[str, str, str | None], Instruction] = {}
         self.embeddings: dict[str, tuple[float, ...]] = {}
+        self.models: dict[str, str] = {}
 
     async def upsert(self, draft: InstructionDraft) -> Instruction:
         now = utc_now()
@@ -188,13 +189,24 @@ class InMemoryInstructionStore:
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
         return self.records.pop((kind.value, title, None), None) is not None
 
-    async def list_missing_embeddings(self) -> list[Instruction]:
-        return [record for record in self.records.values() if not self.embeddings.get(record.id)]
+    async def list_stale_embeddings(self, model: str, limit: int) -> list[Instruction]:
+        stale = [
+            record
+            for record in self.records.values()
+            if not self.embeddings.get(record.id) or self.models.get(record.id) != model
+        ]
+        return stale[:limit]
 
-    async def set_embedding(self, instruction_id: str, embedding: tuple[float, ...]) -> bool:
+    async def set_embedding(
+        self,
+        instruction_id: str,
+        embedding: tuple[float, ...],
+        model: str,
+    ) -> bool:
         if all(record.id != instruction_id for record in self.records.values()):
             return False
         self.embeddings[instruction_id] = embedding
+        self.models[instruction_id] = model
         return True
 
     async def publish(self, instruction_id: str) -> Instruction | None:

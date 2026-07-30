@@ -9,7 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import Instruction, InstructionType, SearchHit
-from octoforge_core.instructions.local import LocalInstructionService
+from octoforge_core.instructions.local import (
+    InstructionSearchPolicy,
+    LocalInstructionService,
+)
 from octoforge_core.instructions.ranking import rerank
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.errors import TransportError
@@ -132,7 +135,7 @@ async def test_service_reranks_cosine_shortlist(
         SqlAlchemyInstructionStore(session_factory),
         embedder,
         reranker=reranker,
-        rerank_candidates=RERANK_CANDIDATES,
+        policy=InstructionSearchPolicy(rerank_candidates=RERANK_CANDIDATES),
     )
     for title, vector in ((TITLE_A, V_EXACT), (TITLE_B, V_CLOSE), (TITLE_C, V_FAR)):
         embedder.vectors[f"{title}\n{CONTENT}"] = vector
@@ -180,7 +183,7 @@ async def test_service_falls_back_to_cosine_when_the_reranker_fails(
         SqlAlchemyInstructionStore(session_factory),
         embedder,
         reranker=FailingReranker(),
-        rerank_candidates=RERANK_CANDIDATES,
+        policy=InstructionSearchPolicy(rerank_candidates=RERANK_CANDIDATES),
     )
     for title, vector in ((TITLE_A, V_EXACT), (TITLE_B, V_CLOSE), (TITLE_C, V_FAR)):
         embedder.vectors[f"{title}\n{CONTENT}"] = vector

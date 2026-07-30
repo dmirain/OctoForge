@@ -3,11 +3,14 @@
 import uuid
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import JSON, Boolean, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from octoforge_core.db.base import Base, UTCDateTime
 from octoforge_core.time import utc_now
+
+SQLITE_DIALECT = "sqlite"
 
 
 class InstructionRow(Base):
@@ -43,6 +46,25 @@ class InstructionRow(Base):
     title: Mapped[str] = mapped_column(String, index=True)
     content: Mapped[str] = mapped_column(Text)
     embedding: Mapped[list[float]] = mapped_column(JSON)
+    # The same vector again, in a type Postgres can search with (migration
+    # b4d9e1a7c236). `embedding` above stays the portable source of truth --
+    # SQLite has no vector type and ranks in process -- while this column is
+    # what pgvector scans, so the whole table never has to cross into Python.
+    #
+    # Declared WITHOUT a dimension on purpose. `vector(1024)` would nail the
+    # embedding model into the schema, and swapping the model would then mean a
+    # migration plus a rewrite of every row. Unsized, the column takes whatever
+    # the configured model produces; queries filter on `vector_dims` so vectors
+    # of two different sizes can coexist while a model change is being absorbed
+    # (comparing them would otherwise raise "different vector dimensions").
+    embedding_vector: Mapped[list[float] | None] = mapped_column(
+        Vector().with_variant(JSON, SQLITE_DIALECT), nullable=True, default=None
+    )
+    # Which model produced the vectors above, so a model change is a detectable
+    # event rather than a silent loss of recall: before this column existed, a
+    # swapped model left every pre-existing record scoring 0 forever, because
+    # the re-embed sweep only ever looked for EMPTY embeddings.
+    embedding_model: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     tags: Mapped[list[str]] = mapped_column(JSON)
     version: Mapped[int] = mapped_column(Integer, default=1)
     usage_count: Mapped[int] = mapped_column(Integer, default=0)

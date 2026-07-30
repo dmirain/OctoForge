@@ -181,9 +181,14 @@ def _create_and_stamp(connection: Connection, config: Config) -> None:
     optional search extensions are created here explicitly. Without this a fresh
     Postgres deployment would be stamped at head having never run
     `a2f7c5e9d148`, and would silently lack pgvector and BM25 forever.
+
+    They are created BEFORE the tables, not after: `instructions` declares a
+    `VECTOR` column, and Postgres cannot create a column of a type no extension
+    has defined yet ("type vector does not exist"). In the migration chain the
+    same ordering falls out of the revision order.
     """
-    Base.metadata.create_all(connection)
     ensure_search_extensions(connection)
+    Base.metadata.create_all(connection)
     command.stamp(config, "head")
 
 

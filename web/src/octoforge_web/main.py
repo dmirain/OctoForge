@@ -29,6 +29,7 @@ from octoforge_core import (
     build_dataset_service,
     build_external_executor,
     build_instruction_service,
+    build_instruction_store,
     build_llm_client,
     build_router,
     build_runner_config,
@@ -49,6 +50,7 @@ from octoforge_core.cron.api import CronStore
 from octoforge_core.cron.scheduler import CronSchedulerConfig
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
+from octoforge_core.db.search_extensions import VECTOR, installed_search_extensions
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
@@ -61,7 +63,6 @@ from octoforge_core.instructions.registry import (
     SystemSkill,
     sync_system_registry,
 )
-from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from octoforge_core.llm.errors import LLMError
 from octoforge_core.llm.http_reranker import HttpRerankerClient
@@ -156,9 +157,12 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     assembled from the reusable builders of `octoforge_core.composition`;
     only the settings/transport specifics live here.
     """
-    log_capabilities(settings, logger)
     engine = create_engine(settings.database_url)
     await _bootstrap_schema(engine)
+    # after the bootstrap: the schema step is what creates the extensions, so
+    # probing earlier would report a gap the next line has already filled
+    search_extensions = await _probe_search_extensions(engine)
+    log_capabilities(settings, logger, search_extensions)
     session_factory = create_session_factory(engine)
     dialogs = SqlAlchemyDialogRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
@@ -183,10 +187,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             speech_client = _build_speech_client(settings, speech_http)
             image_resolver = _build_telegram_image_resolver(settings, outbound_http)
             instructions = build_instruction_service(
-                SqlAlchemyInstructionStore(session_factory),
+                build_instruction_store(session_factory, vector_search=VECTOR in search_extensions),
                 embedder,
                 reranker=_build_reranker(settings, outbound_http),
                 rerank_candidates=settings.reranker_candidates,
+                embedding_model=settings.embedding_model,
             )
             datasets = build_dataset_service(SqlAlchemyDatasetStore(session_factory), embedder)
             await _sync_system_skills(instructions, settings)
@@ -437,6 +442,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+async def _probe_search_extensions(engine: AsyncEngine) -> frozenset[str]:
+    """Ask the database which optional search extensions it actually has.
+
+    Read-only and never fatal: a database that cannot answer (or is not
+    Postgres) reports nothing, and search stays on the portable brute-force
+    path. This decides which store class the composition root builds, so it has
+    to run after the schema bootstrap that creates the extensions.
+    """
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(installed_search_extensions)
+    except SQLAlchemyError:
+        logger.warning("could not probe search extensions; assuming none", exc_info=True)
+        return frozenset()
+
+
 async def _bootstrap_schema(engine: AsyncEngine) -> None:
     """Migrate the schema to head; fall back to create_all if Alembic fails.
 
@@ -464,11 +485,12 @@ async def _sync_system_skills(instructions: InstructionService, settings: Settin
         return
     try:
         await sync_system_registry(instructions, _system_registry(settings))
-        # finish deferred embeddings: records saved while the backend was down
-        # and rows produced by embedder-less data migrations
-        reembedded = await instructions.reembed_missing()
-        if reembedded:
-            logger.info("re-embedded %d record(s) stored without a vector", reembedded)
+        # finish deferred embeddings (a backend that was down, rows written by
+        # embedder-less migrations) and repair a changed embedding model, whose
+        # old vectors are not comparable with anything the new one produces
+        resynced = await instructions.resync_embeddings()
+        if resynced:
+            logger.info("re-embedded %d record(s) whose vector was missing or stale", resynced)
     except (LLMError, LLMResponseError, SQLAlchemyError):
         logger.warning(
             "System skill registry sync failed; starting without it",

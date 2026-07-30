@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from octoforge_core.config import EmbeddingBackend
+from octoforge_core.db.search_extensions import PG_TEXTSEARCH, VECTOR
 
 from octoforge_web.config import Settings
 
@@ -41,19 +42,33 @@ class Capability:
         return f"  {self.name:<20} {ON if self.enabled else OFF:<3}  {self.detail}"
 
 
-def describe_capabilities(settings: Settings) -> tuple[Capability, ...]:
-    """Describe every optional capability of the given settings, in report order."""
+def describe_capabilities(
+    settings: Settings,
+    search_extensions: frozenset[str] = frozenset(),
+) -> tuple[Capability, ...]:
+    """Describe every optional capability, in report order.
+
+    `search_extensions` is what the database was probed for, so it is passed in
+    rather than derived from settings: whether pgvector and pg_textsearch exist
+    is a fact about the server, not about configuration, and no OF_ variable
+    can be trusted to describe it.
+    """
     return (
         *_llm_capabilities(settings),
         *_multimodal_capabilities(settings),
         *_tool_capabilities(settings),
         *_surface_capabilities(settings),
+        *_search_capabilities(search_extensions),
     )
 
 
-def log_capabilities(settings: Settings, logger: logging.Logger) -> None:
+def log_capabilities(
+    settings: Settings,
+    logger: logging.Logger,
+    search_extensions: frozenset[str] = frozenset(),
+) -> None:
     """Log the capability report; critical gaps also get their own warning."""
-    capabilities = describe_capabilities(settings)
+    capabilities = describe_capabilities(settings, search_extensions)
     logger.info("%s\n%s", REPORT_HEADER, "\n".join(cap.line() for cap in capabilities))
     for cap in capabilities:
         if not cap.enabled and cap.name in CRITICAL:
@@ -202,3 +217,36 @@ def _database_detail(url: str) -> str:
 def _host(url: str) -> str:
     """Host of a URL, or the raw value when it does not parse as one."""
     return urlsplit(url).netloc or url
+
+
+def _search_capabilities(search_extensions: frozenset[str]) -> tuple[Capability, ...]:
+    """Report what the database itself can contribute to retrieval.
+
+    Neither is required. Without pgvector the whole visible table is pulled
+    into the process and ranked there, which is correct but grows with the
+    corpus; without pg_textsearch there is no lexical half at all. Both are
+    unavailable on managed Postgres and on SQLite, so "off" here is a normal
+    state worth stating plainly rather than a misconfiguration.
+    """
+    vector = VECTOR in search_extensions
+    lexical = PG_TEXTSEARCH in search_extensions
+    return (
+        Capability(
+            name="vector search",
+            enabled=vector,
+            detail=(
+                "pgvector ranks in the database"
+                if vector
+                else "no pgvector — the visible table is ranked in process"
+            ),
+        ),
+        Capability(
+            name="lexical search",
+            enabled=lexical,
+            detail=(
+                "pg_textsearch, BM25 over the russian_unaccent config"
+                if lexical
+                else "no pg_textsearch — recall is embeddings only"
+            ),
+        ),
+    )

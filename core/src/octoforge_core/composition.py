@@ -10,6 +10,7 @@ application settings, no surface adapters (those stay in the web layer).
 from dataclasses import dataclass
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.collecting import CollectingSweeper, CollectionPromoter
 from octoforge_core.agent.loop import AgentLoop
@@ -38,7 +39,14 @@ from octoforge_core.dialogs.api import (
 )
 from octoforge_core.dialogs.tools import AskUserTool
 from octoforge_core.instructions.api import InstructionService, InstructionStore
-from octoforge_core.instructions.local import DEFAULT_RERANK_CANDIDATES, LocalInstructionService
+from octoforge_core.instructions.local import (
+    DEFAULT_RERANK_CANDIDATES,
+    UNKNOWN_EMBEDDING_MODEL,
+    InstructionSearchPolicy,
+    LocalInstructionService,
+)
+from octoforge_core.instructions.pg_store import PostgresInstructionStore
+from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.instructions.tools import (
     InstructionDeleteTool,
     InstructionSaveTool,
@@ -126,19 +134,49 @@ def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMCl
     )
 
 
+def build_instruction_store(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    vector_search: bool,
+) -> InstructionStore:
+    """Pick the instruction store: pgvector-backed when the database can, else portable.
+
+    The capability is detected with `isinstance` against
+    `InstructionVectorSearch`, so it has to be a property of the class rather
+    than a runtime flag — a store that always carried `search_by_vector` would
+    claim vector search on a database without pgvector and fail at the first
+    recall instead of at startup. `vector_search` comes from probing
+    `pg_extension`, which is what makes a database without the extension a
+    supported configuration rather than a crash.
+    """
+    if vector_search:
+        return PostgresInstructionStore(session_factory)
+    return SqlAlchemyInstructionStore(session_factory)
+
+
 def build_instruction_service(
     store: InstructionStore,
     embedder: EmbeddingClient,
     *,
     reranker: RerankerClient | None = None,
     rerank_candidates: int = DEFAULT_RERANK_CANDIDATES,
+    embedding_model: str = UNKNOWN_EMBEDDING_MODEL,
 ) -> InstructionService:
-    """Build the default instructions facade over the given store and embedder."""
+    """Build the default instructions facade over the given store and embedder.
+
+    `embedding_model` is the identity the service stamps on the vectors it
+    writes, so a later change of `OF_EMBEDDING_MODEL` is a detectable event
+    rather than a silent loss of recall. It is passed rather than read off the
+    embedder because only the composition root knows which backend was wired.
+    """
     return LocalInstructionService(
         store,
         embedder,
         reranker=reranker,
-        rerank_candidates=rerank_candidates,
+        policy=InstructionSearchPolicy(
+            rerank_candidates=rerank_candidates,
+            embedding_model=embedding_model,
+        ),
     )
 
 

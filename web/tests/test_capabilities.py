@@ -3,6 +3,7 @@
 import logging
 
 import pytest
+from octoforge_core.db.search_extensions import PG_TEXTSEARCH, VECTOR
 
 from octoforge_web.capabilities import (
     CRITICAL,
@@ -160,3 +161,33 @@ def test_configured_installation_warns_about_nothing(
         log_capabilities(Settings(), logger)
 
     assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+
+
+def test_search_extensions_are_reported_from_the_database_not_from_settings() -> None:
+    """No OF_ variable can say whether the server has pgvector; only a probe can."""
+    absent = {cap.name: cap for cap in describe_capabilities(Settings())}
+    present = {
+        cap.name: cap
+        for cap in describe_capabilities(Settings(), frozenset({VECTOR, PG_TEXTSEARCH}))
+    }
+
+    assert absent["vector search"].enabled is False
+    assert absent["lexical search"].enabled is False
+    assert present["vector search"].enabled is True
+    assert present["lexical search"].enabled is True
+
+
+def test_a_database_without_the_extensions_is_not_a_critical_gap(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Managed Postgres and SQLite simply cannot have these; that is a supported
+    configuration, so it must be stated in the report and never warned about."""
+    monkeypatch.setenv("OF_LLM_API_KEY", LLM_KEY)
+    monkeypatch.setenv("OF_ADMIN_PASSWORD_HASH", "pbkdf2_sha256:1:c2FsdA==:ZGlnZXN0")
+    logger = logging.getLogger("test.capabilities.search")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        log_capabilities(Settings(), logger, frozenset())
+
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+    assert "no pgvector" in caplog.text

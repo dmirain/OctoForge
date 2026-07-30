@@ -15,6 +15,7 @@ admin-facing `publish` makes a record public.
 
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
@@ -35,9 +36,38 @@ logger = logging.getLogger(__name__)
 
 EMBEDDED_TEXT_SEPARATOR = "\n"
 DEFAULT_RERANK_CANDIDATES = 20
+# Stand-in for an unconfigured model name. It is a value the store compares
+# against, never a claim about what produced anything: records stamped with it
+# stay stamped, and the moment a real model name is configured they all read as
+# stale and get re-embedded, which is the correct outcome.
+UNKNOWN_EMBEDDING_MODEL = "unknown"
+# How many records one startup sweep re-embeds. A model change makes the whole
+# table stale at once, and embedding it could take minutes; the sweep takes a
+# slice per boot instead, so startup stays fast and the table converges.
+DEFAULT_RESYNC_BATCH = 256
 SYSTEM_RECORD_MESSAGE = (
     "'{title}' is a system instruction managed by the registry; it cannot be modified"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class InstructionSearchPolicy:
+    """Tuning of the instructions facade, bundled to keep one readable constructor.
+
+    `embedding_model` is the identity stamped on every vector this service
+    writes. It is configuration rather than something read off the embedder:
+    only the composition root knows which backend was wired, and the
+    `EmbeddingClient` port stays a single `embed` method.
+    """
+
+    rerank_candidates: int = DEFAULT_RERANK_CANDIDATES
+    embedding_model: str = UNKNOWN_EMBEDDING_MODEL
+    resync_batch: int = DEFAULT_RESYNC_BATCH
+
+
+# A frozen instance, so the default is shared rather than rebuilt per call and
+# ruff's function-call-in-default rule stays satisfied.
+DEFAULT_SEARCH_POLICY = InstructionSearchPolicy()
 
 
 class LocalInstructionService:
@@ -48,12 +78,14 @@ class LocalInstructionService:
         store: InstructionStore,
         embedder: EmbeddingClient,
         reranker: RerankerClient | None = None,
-        rerank_candidates: int = DEFAULT_RERANK_CANDIDATES,
+        policy: InstructionSearchPolicy = DEFAULT_SEARCH_POLICY,
     ) -> None:
         self._store = store
         self._embedder = embedder
         self._reranker = reranker
-        self._rerank_candidates = rerank_candidates
+        self._rerank_candidates = policy.rerank_candidates
+        self._embedding_model = policy.embedding_model
+        self._resync_batch = policy.resync_batch
 
     async def search(
         self,
@@ -155,12 +187,16 @@ class LocalInstructionService:
         author_edit = (
             published is not None and not published.system and published.author_id == user_id
         )
+        embedding = await self._embed_lenient(title, content)
         draft = InstructionDraft(
             kind=kind,
             title=title,
             content=content,
             tags=tags,
-            embedding=await self._embed_lenient(title, content),
+            embedding=embedding,
+            # no vector means no model claim: the record reads as stale and the
+            # startup sweep finishes what the failed backend could not
+            embedding_model=self._embedding_model if embedding else None,
             system=False,
             owner_id=None if author_edit else user_id,
             author_id=user_id,
@@ -195,6 +231,7 @@ class LocalInstructionService:
             content=content,
             tags=tags,
             embedding=await self._embed(title, content),
+            embedding_model=self._embedding_model,
             system=True,
             owner_id=None,
         )
@@ -253,13 +290,15 @@ class LocalInstructionService:
         if not await self._store.delete_by_title(name, kind):
             raise InstructionNotFoundError(name)
 
-    async def reembed_missing(self) -> int:
-        """Embed and store vectors for records saved without one; return the count.
+    async def resync_embeddings(self) -> int:
+        """Re-embed records the configured model did not produce; return the count.
 
-        Batch-embeds everything in one call; individual `set_embedding` misses
-        (a record deleted mid-sweep) are simply skipped.
+        Batch-embeds one bounded slice per call; individual `set_embedding`
+        misses (a record deleted mid-sweep) are simply skipped. The bound is
+        what keeps a model change from turning the next startup into a
+        full-table job before the process can serve anyone.
         """
-        pending = await self._store.list_missing_embeddings()
+        pending = await self._store.list_stale_embeddings(self._embedding_model, self._resync_batch)
         if not pending:
             return 0
         embeddings = await self._embedder.embed(
@@ -267,7 +306,7 @@ class LocalInstructionService:
         )
         stored = 0
         for record, embedding in zip(pending, embeddings, strict=True):
-            if await self._store.set_embedding(record.id, embedding):
+            if await self._store.set_embedding(record.id, embedding, self._embedding_model):
                 stored += 1
         return stored
 
@@ -280,7 +319,7 @@ class LocalInstructionService:
 
         The fact the user just asked to remember must not vanish because the
         embedding backend is down: the record is stored with an empty vector
-        (found by exact title until then) and the startup `reembed_missing`
+        (found by exact title until then) and the startup `resync_embeddings`
         sweep finishes the job.
         """
         try:

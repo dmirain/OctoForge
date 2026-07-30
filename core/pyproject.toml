@@ -16,6 +16,12 @@ dependencies = [
     "alembic>=1.13",
     "aiosqlite>=0.19",
     "croniter>=6,<7",
+    # SQLAlchemy type for pgvector's VECTOR column. A base dependency rather
+    # than part of the `postgres` extra because the ORM model that declares the
+    # column is imported on every dialect (it renders as JSON on SQLite); a
+    # 31 KB pure-Python package with no dependencies of its own, so making it
+    # conditional would cost more in import guards than it saves.
+    "pgvector>=0.4,<1",
 ]
 
 [project.optional-dependencies]
