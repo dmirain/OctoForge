@@ -23,6 +23,9 @@ from octoforge_core.secrets.api import (
 )
 
 MAX_BODY_CHARS = 8000
+# Byte ceiling for what is read off the wire before the character cap applies:
+# an endpoint answering with gigabytes must not be buffered whole.
+MAX_BODY_BYTES = 2 * 1024 * 1024
 TRUNCATED_SUFFIX = "\n...[truncated]"
 USER_ID_PLACEHOLDER = "{user_id}"
 SECRET_SCRUBBED = "[secret]"
@@ -34,6 +37,26 @@ SECRET_MISSING_TEMPLATE = (
     "secret '{code}' is not set for this user: ask them to run /secrets in "
     "Telegram (it opens a secure form) and add the secret, then retry"
 )
+
+
+async def read_capped_text(response: httpx.Response, limit: int) -> tuple[str, bool]:
+    """Read at most `limit` bytes of a streaming response and decode them.
+
+    Returns the text and whether the body was cut short. Decoding uses the
+    response's own charset with replacement, so a cut in the middle of a
+    multi-byte character degrades to a replacement glyph instead of an error.
+    """
+    chunks: list[bytes] = []
+    size = 0
+    truncated = False
+    async for chunk in response.aiter_bytes():
+        chunks.append(chunk)
+        size += len(chunk)
+        if size >= limit:
+            truncated = True
+            break
+    raw = b"".join(chunks)[:limit]
+    return raw.decode(response.encoding or "utf-8", errors="replace"), truncated
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,17 +146,21 @@ class ExternalCallExecutor:
         if secret_value is not None and spec.secret_auth is not None:
             headers[spec.secret_auth.header] = spec.secret_auth.format.format(value=secret_value)
         try:
-            response = await self._http.request(
+            async with self._http.stream(
                 spec.method,
                 url,
                 headers=headers,
                 follow_redirects=False,  # a redirect would bypass the guard's URL check
                 timeout=self._timeout,
-            )
+            ) as response:
+                raw, truncated = await read_capped_text(response, MAX_BODY_BYTES)
+                status = response.status_code
         except httpx.HTTPError as exc:
             raise ExternalCallError(f"external call failed: {exc}") from exc
-        body = _scrub(response.text, secret_value)
-        return ExternalCallResult(status=response.status_code, body=_truncate(body))
+        body = _truncate(_scrub(raw, secret_value))
+        if truncated and not body.endswith(TRUNCATED_SUFFIX):
+            body += TRUNCATED_SUFFIX
+        return ExternalCallResult(status=status, body=body)
 
     async def _resolve_secret(
         self,

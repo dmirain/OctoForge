@@ -58,6 +58,21 @@ COPY core/ ./core/
 COPY web/ ./web/
 RUN pip install --no-cache-dir --no-deps ./core ./web
 
+# Nothing here needs root: the process binds 8000 (unprivileged), writes only to
+# the model cache, and never installs anything at runtime. uid 1000 matches the
+# usual host user, so a bind-mounted ~/.cache/huggingface stays writable.
+RUN useradd --create-home --uid 1000 app \
+    && mkdir -p /home/app/.cache \
+    && chown -R app:app /app /home/app
+USER app
+ENV HOME=/home/app
+
 EXPOSE 8000
 
-CMD ["uvicorn", "octoforge_web.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --proxy-headers: Caddy terminates TLS, so without it every request looks like
+# it came from the proxy's container address — the login rate limiter would see
+# the whole internet as one client (five bad passwords locking out everyone) and
+# the audit trail would record Caddy instead of the operator. The trust boundary
+# is the compose network, hence the private ranges rather than "*".
+CMD ["uvicorn", "octoforge_web.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", "--forwarded-allow-ips", "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"]

@@ -1,7 +1,10 @@
 """Tests for the streaming mode of the OpenAI-compatible client."""
 
 import json
-from collections.abc import AsyncIterator
+import socket
+import threading
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from http import HTTPStatus
 
 import httpx
@@ -27,6 +30,7 @@ from octoforge_core.llm.events import (
 from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.tools.base import ToolSpec
 
+RETRY_AFTER_SECONDS = 2.0
 BASE_URL = "https://llm.example.com/v1"
 API_KEY = "secret-key"
 MODEL = "test-model"
@@ -297,3 +301,70 @@ async def test_stream_requests_usage_via_stream_options() -> None:
 
     payload = json.loads(captured[0].content)
     assert payload["stream_options"] == {"include_usage": True}
+
+
+@contextmanager
+def error_server(status: int, body: bytes, headers: str = "") -> Iterator[int]:
+    """Serve one real HTTP error response and return its port.
+
+    A real socket, not `MockTransport`: a mocked response arrives with its body
+    already read, which is exactly what used to hide the bug below.
+    """
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+
+    def serve() -> None:
+        connection, _ = sock.accept()
+        connection.recv(65536)
+        connection.sendall(
+            f"HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\n"
+            f"{headers}Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        connection.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+async def test_http_error_at_stream_start_is_typed_and_retryable() -> None:
+    """A 429 before the first event must reach the retry layer as an LLMError.
+
+    Reading the error body of a streaming response requires an explicit
+    `aread()`; without it httpx raises `ResponseNotRead` — a RuntimeError that
+    the retry decorator (which only knows `LLMError`) let through, so a rate
+    limit at stream start failed the run instead of being retried.
+    """
+    body = b'{"error": {"message": "slow down"}}'
+    with error_server(
+        HTTPStatus.TOO_MANY_REQUESTS, body, headers=f"Retry-After: {int(RETRY_AFTER_SECONDS)}\r\n"
+    ) as port:
+        client = OpenAICompatibleClient(
+            http_client=httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}/v1"),
+            config=make_config(),
+        )
+
+        with pytest.raises(RateLimitError) as failure:
+            await collect(client.stream([USER_MESSAGE]))
+
+    assert "slow down" in str(failure.value)
+    assert failure.value.retry_after == RETRY_AFTER_SECONDS
+
+
+async def test_server_error_at_stream_start_keeps_the_provider_message() -> None:
+    body = b'{"error": {"message": "upstream exploded"}}'
+    with error_server(HTTPStatus.INTERNAL_SERVER_ERROR, body) as port:
+        client = OpenAICompatibleClient(
+            http_client=httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}/v1"),
+            config=make_config(),
+        )
+
+        with pytest.raises(ProviderInternalError) as failure:
+            await collect(client.stream([USER_MESSAGE]))
+
+    assert "upstream exploded" in str(failure.value)

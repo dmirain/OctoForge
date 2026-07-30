@@ -5,6 +5,7 @@ set of error kinds; only transient kinds are worth retrying (see
 `RetryingLLMClient` in `llm/retry.py`).
 """
 
+from contextlib import suppress
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
@@ -142,15 +143,36 @@ def parse_retry_after(raw: str | None) -> float | None:
 
 
 def raise_for_error_status(response: httpx.Response) -> None:
-    """Raise a typed LLMError when the response carries an error status."""
+    """Raise a typed LLMError when the response carries an error status.
+
+    Safe on a streaming response whose body was never read: the provider's
+    message is then unavailable, so the status alone decides the kind. Prefer
+    `araise_for_error_status` there — it reads the body first.
+    """
     if response.status_code < HTTPStatus.BAD_REQUEST:
         return
     try:
         body: object = response.json()
-    except ValueError:
+    except (ValueError, httpx.ResponseNotRead):
+        # ResponseNotRead is a RuntimeError, not an HTTPError: left uncaught it
+        # escaped the client untyped, and the retry layer (which only knows
+        # LLMError) never saw a rate limit that arrived at stream start.
         body = None
     retry_after = parse_retry_after(response.headers.get("retry-after"))
     raise classify_http_error(response.status_code, body, retry_after)
+
+
+async def araise_for_error_status(response: httpx.Response) -> None:
+    """Same, for a streaming response: read the error body before classifying.
+
+    An error ends the stream anyway, so reading it costs nothing and keeps the
+    provider's own message ("you exceeded your quota") in the error text.
+    """
+    if response.status_code < HTTPStatus.BAD_REQUEST:
+        return
+    with suppress(httpx.HTTPError):
+        await response.aread()
+    raise_for_error_status(response)
 
 
 def _parse_http_date(raw: str) -> float | None:

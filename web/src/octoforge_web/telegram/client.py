@@ -36,6 +36,23 @@ class TelegramApiError(Exception):
     """The Bot API answered `ok=false` for a method call."""
 
 
+async def _read_capped(response: httpx.Response, limit: int) -> bytes:
+    """Read a streaming response, refusing as soon as it crosses `limit` bytes."""
+    declared = response.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > limit:
+        logger.warning("downloadFile: declared %s bytes over the %d cap; refusing", declared, limit)
+        raise TelegramApiError("downloadFile: file too large")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > limit:
+            logger.warning("downloadFile: exceeded the %d byte cap mid-download; refusing", limit)
+            raise TelegramApiError("downloadFile: file too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class _RetryableCallError(Exception):
     """Internal signal: the call failed but is worth retrying after `wait_seconds`."""
 
@@ -173,25 +190,28 @@ class TelegramBotClient:
         raise AssertionError("unreachable: the loop above always returns or raises")
 
     async def _download_once(self, url: str) -> bytes:
-        """Make one download attempt; raises `_RetryableCallError` for a transient failure."""
+        """Make one download attempt; raises `_RetryableCallError` for a transient failure.
+
+        Streamed and stopped at the cap rather than buffered and measured: the
+        declared size is the sender's word, and a file that ignores the cap must
+        not be held in memory before being refused.
+        """
         try:
-            response = await self._http.get(url, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+            async with self._http.stream(
+                "GET", url, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS
+            ) as response:
+                if response.status_code in RETRYABLE_HTTP_STATUS_CODES:
+                    raise _RetryableCallError(
+                        TRANSIENT_RETRY_DELAY_SECONDS,
+                        f"downloadFile: HTTP {response.status_code}",
+                    )
+                if response.status_code != httpx.codes.OK:
+                    raise TelegramApiError(f"downloadFile: HTTP {response.status_code}")
+                return await _read_capped(response, MAX_DOWNLOADED_FILE_BYTES)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise _RetryableCallError(
                 TRANSIENT_RETRY_DELAY_SECONDS, f"downloadFile: {exc}"
             ) from exc
-        if response.status_code in RETRYABLE_HTTP_STATUS_CODES:
-            raise _RetryableCallError(
-                TRANSIENT_RETRY_DELAY_SECONDS, f"downloadFile: HTTP {response.status_code}"
-            )
-        if response.status_code != httpx.codes.OK:
-            raise TelegramApiError(f"downloadFile: HTTP {response.status_code}")
-        if len(response.content) > MAX_DOWNLOADED_FILE_BYTES:
-            logger.warning(
-                "downloadFile: file exceeds the %d byte cap; refusing", MAX_DOWNLOADED_FILE_BYTES
-            )
-            raise TelegramApiError("downloadFile: file too large")
-        return response.content
 
     async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
         payload: dict[str, Any] = {

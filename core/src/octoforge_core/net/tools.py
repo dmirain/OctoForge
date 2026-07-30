@@ -11,8 +11,9 @@ from octoforge_core.instructions.api import (
     InstructionService,
     InstructionType,
 )
-from octoforge_core.net.external import ExternalCallExecutor
-from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.net.errors import EgressBlockedError
+from octoforge_core.net.external import ExternalCallExecutor, read_capped_text
+from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -26,6 +27,15 @@ REQUEST_DESCRIPTION = (
     "with variations; report the failure instead."
 )
 MAX_RESPONSE_CHARS = 4000
+# Hard byte ceiling read from the wire. The character cap above trims what the
+# model sees; this one decides how much is ever held in memory, because a URL
+# the agent was told to fetch can answer with gigabytes.
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+BODY_TOO_LARGE_SUFFIX = "\n...[response exceeded the size limit and was cut]"
+EGRESS_BLOCKED_TEMPLATE = (
+    "this installation only allows http_request to: {allowed}. "
+    "For anything else, look for a stored endpoint with recall(type=endpoint)."
+)
 TRUNCATED_SUFFIX = "\n...[truncated]"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
@@ -150,6 +160,13 @@ class HttpRequestTool:
     URL, and following a redirect would re-enter unchecked address space.
     (This matches the previous behavior — httpx never followed redirects here
     by default — now made explicit.)
+
+    `allowed_origins` confines the tool to named destinations. The guard blocks
+    private address space, which stops an agent from reaching the intranet, but
+    not from posting a dialog's contents to a public address somebody put in a
+    prompt-injected page. An installation that only ever calls known services
+    closes that channel by listing them; an empty tuple keeps the tool open,
+    which is the default because a general assistant needs the open web.
     """
 
     def __init__(
@@ -157,10 +174,12 @@ class HttpRequestTool:
         http_client: httpx.AsyncClient,
         guard: SsrfGuard,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        allowed_origins: tuple[str, ...] = (),
     ) -> None:
         self._http = http_client
         self._guard = guard
         self._timeout = timeout_seconds
+        self._allowed_origins = allowed_origins
 
     @property
     def spec(self) -> ToolSpec:
@@ -173,19 +192,32 @@ class HttpRequestTool:
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, perform the request and format the response."""
         params = HttpRequestParams.from_arguments(arguments)
+        self._check_allowed(params.url)
         await self._guard.check(params.url)
-        response = await self._http.request(
+        async with self._http.stream(
             params.method.value,
             params.url,
             headers=params.headers,
             content=params.body,
             follow_redirects=False,
             timeout=self._timeout,
-        )
-        body = response.text
+        ) as response:
+            body, truncated = await read_capped_text(response, MAX_RESPONSE_BYTES)
         if len(body) > MAX_RESPONSE_CHARS:
             body = body[:MAX_RESPONSE_CHARS] + TRUNCATED_SUFFIX
+        elif truncated:
+            body += BODY_TOO_LARGE_SUFFIX
         return f"HTTP {response.status_code}\n{body}"
+
+    def _check_allowed(self, url: str) -> None:
+        """Refuse an origin the installation did not list (no list = anywhere)."""
+        if not self._allowed_origins:
+            return
+        if any(matches_url_prefix(url, origin) for origin in self._allowed_origins):
+            return
+        raise EgressBlockedError(
+            EGRESS_BLOCKED_TEMPLATE.format(allowed=", ".join(self._allowed_origins))
+        )
 
 
 class EndpointGetTool:

@@ -11,7 +11,12 @@ import httpx
 from octoforge_core.config import LLMConfig
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.errors import LLMResponseError
-from octoforge_core.llm.errors import TransportError, classify_http_error, raise_for_error_status
+from octoforge_core.llm.errors import (
+    TransportError,
+    araise_for_error_status,
+    classify_http_error,
+    raise_for_error_status,
+)
 from octoforge_core.llm.events import (
     StreamEvent,
     StreamFinished,
@@ -81,7 +86,7 @@ class OpenAICompatibleClient:
                 headers={"Authorization": f"Bearer {self._config.api_key}"},
                 timeout=self._config.timeout_seconds,
             ) as response:
-                raise_for_error_status(response)
+                await araise_for_error_status(response)
                 accumulator = _StreamAccumulator()
                 async for line in response.aiter_lines():
                     if not line.startswith(SSE_DATA_PREFIX):

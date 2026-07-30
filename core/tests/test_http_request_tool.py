@@ -6,7 +6,7 @@ from http import HTTPStatus
 import httpx
 import pytest
 
-from octoforge_core.net.errors import SsrfBlockedError
+from octoforge_core.net.errors import EgressBlockedError, SsrfBlockedError
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import (
     MAX_RESPONSE_CHARS,
@@ -37,10 +37,11 @@ class StubResolver:
 def make_tool(
     handler: Callable[[httpx.Request], httpx.Response],
     ips: tuple[str, ...] = (PUBLIC_IP,),
+    allowed_origins: tuple[str, ...] = (),
 ) -> HttpRequestTool:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     guard = SsrfGuard(resolver=StubResolver(ips))
-    return HttpRequestTool(http_client=client, guard=guard)
+    return HttpRequestTool(http_client=client, guard=guard, allowed_origins=allowed_origins)
 
 
 def test_spec_advertised_to_llm() -> None:
@@ -141,3 +142,25 @@ async def test_invalid_arguments_rejected(arguments: dict[str, object]) -> None:
 
     with pytest.raises(ToolArgumentsError):
         await tool.execute(arguments, CTX)
+
+
+async def test_an_allowlist_confines_the_tool_to_named_origins() -> None:
+    """With a list configured, every other origin is refused before any request."""
+    tool = make_tool(
+        lambda request: httpx.Response(HTTPStatus.OK, text=RESPONSE_BODY),
+        allowed_origins=("https://api.example.com",),
+    )
+
+    allowed = await tool.execute({"method": "GET", "url": TARGET_URL}, CTX)
+
+    assert RESPONSE_BODY in allowed
+    with pytest.raises(EgressBlockedError):
+        await tool.execute({"method": "GET", "url": "https://evil.example/steal"}, CTX)
+
+
+async def test_without_an_allowlist_the_open_web_stays_reachable() -> None:
+    tool = make_tool(lambda request: httpx.Response(HTTPStatus.OK, text=RESPONSE_BODY))
+
+    result = await tool.execute({"method": "GET", "url": "https://anywhere.example/x"}, CTX)
+
+    assert RESPONSE_BODY in result

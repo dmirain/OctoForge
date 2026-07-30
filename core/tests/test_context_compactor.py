@@ -862,3 +862,36 @@ async def test_compaction_reads_a_bounded_window_of_the_backlog(
 
     assert await compactor.compact_now(dialog) is True
     assert fetch_limits == [SEGMENT_FETCH_LIMIT]
+
+
+async def test_compact_now_reports_failure_instead_of_raising() -> None:
+    """A failed summarization degrades to False: the run must survive it."""
+
+    class BrokenLLM:
+        """LLMClient whose summarization always fails."""
+
+        async def complete(
+            self, messages: list[ChatMessage], tools: list[ToolSpec] | None = None
+        ) -> Completion:
+            raise RuntimeError("summarizer exploded")
+
+        def stream(
+            self, messages: list[ChatMessage], tools: list[ToolSpec] | None = None
+        ) -> AsyncIterator[StreamEvent]:
+            raise AssertionError("compaction never streams")
+
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    sessions = create_session_factory(engine)
+    store = SqlAlchemySummaryStore(sessions)
+    messages = SqlAlchemyMessageRepository(sessions)
+    dialog = await SqlAlchemyDialogRepository(sessions).get_or_create("u", "web")
+    for _ in range(6):
+        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="x" * 4000))
+    compactor = LlmContextCompactor(
+        store=store, archive=store, llm=BrokenLLM(), config=CompactorConfig()
+    )
+
+    assert await compactor.compact_now(dialog) is False
+
+    await engine.dispose()

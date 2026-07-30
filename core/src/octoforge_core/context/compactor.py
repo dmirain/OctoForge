@@ -184,7 +184,14 @@ class LlmContextCompactor(ContextCompactor):
         # fresh run during the awaits above, and starting our own would race
         # it — two concurrent summarize+replace runs for one dialog
         task = self._start_compact(dialog)
-        await task
+        try:
+            await task
+        except Exception:
+            # The port promises a bool, and the caller is a live run: a failed
+            # summarization (LLM down, database busy) must degrade to "nothing
+            # was compacted", exactly like the background path already does.
+            logger.warning("synchronous compaction failed for %s", dialog.id, exc_info=True)
+            return False
         return await self._store.max_seq_to(dialog.id) > before
 
     def _trigger_compact(self, dialog: Dialog) -> None:

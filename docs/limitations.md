@@ -42,20 +42,21 @@ delivered. Scrollback comes from stored messages, not from replaying the stream.
 
 - **DNS rebinding (TOCTOU) in the SSRF guard.** The address is validated at check time and resolved again by
   the HTTP client at connect time. Closing it needs connecting by resolved IP with an explicit `Host` header.
-- **No audit log.** Operator actions (publishing a record, deleting a dialog, generating invites) leave no
-  durable trail beyond application logs.
 - **No per-user authentication on the HTTP surface.** `X-User-Id` is a trusted string; the deployment expects
   an authenticating proxy. Without one, treat the HTTP surface as operator-only.
 - **No per-tool authorization policy.** A user's runs can use every registered tool; there is no way to say
   "this group may not call `http_request`".
 - **No content-level prompt-injection defense.** Injected instructions cannot reach secrets or a shell, but
-  they can still make the agent call a permitted tool with attacker-chosen arguments.
+  they can still make the agent call a permitted tool with attacker-chosen arguments. `OF_HTTP_REQUEST_ALLOWLIST`
+  closes the exfiltration half when an installation knows which origins it needs.
+- **The audit trail is a log, not a queryable record.** Operator actions are logged
+  (`audit action=… actor=… target=…`), but there is no retention policy, no UI and no tamper evidence.
 
 ### Operations
 
-- **No rate limiting and no quotas** — per user or per installation. Nothing stops one dialog from spending an
-  unbounded amount of provider tokens; the only bounds are the per-dialog process limit and the per-run
-  iteration cap.
+- **No rate limiting and no quotas** on *usage* — per user or per installation. Nothing stops one dialog from
+  spending an unbounded amount of provider tokens; the only bounds are the per-dialog process limit and the
+  per-run iteration cap. (Failed operator logins *are* rate limited — see [security.md](security.md).)
 - **Token usage is recorded but not aggregated.** Per-assistant-message counts are stored; there is no cost
   reporting, per-user total or budget alert.
 - **No metrics endpoint.** No Prometheus surface, no traces; observability is stdout logs plus the operator

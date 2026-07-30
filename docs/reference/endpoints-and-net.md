@@ -11,7 +11,7 @@ Three tools, in the order the agent is told to prefer them:
 |---|---|
 | `endpoint_get(name)` | Exact-name lookup of a stored endpoint's contract — *late binding*. A skill mentions an endpoint by name; this turns the name into the method, URL template, parameter schema and auth declaration the model needs to call it correctly |
 | `external_call(name, params?)` | Execute a stored endpoint record with validated parameters |
-| `http_request(method, url, headers?, body?)` | A raw outbound request, for what has no stored contract |
+| `http_request(method, url, headers?, body?)` | A raw outbound request, for what has no stored contract. Confined to `OF_HTTP_REQUEST_ALLOWLIST` when that names any origins |
 
 Discovery is `recall`'s job (`type=endpoint`); `endpoint_get` is a lookup, not a search.
 
@@ -96,12 +96,14 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 | `OF_SELF_BASE_URL` | The one allowlisted origin: this application's own API |
 | `OF_EXTERNAL_CALL_AUTH_WHITELIST` | JSON list of `{base_url_prefix, header_name, header_value}`; `header_value` may contain `{user_id}` |
 | `OF_SECRETS_KEY` | Without it, endpoints declaring `auth.secret` fail with a clear message |
+| `OF_HTTP_REQUEST_ALLOWLIST` | Origins `http_request` may call; empty means the open web |
 
 ## Failure modes
 
 | Situation | Outcome |
 |---|---|
 | URL resolves to a private or metadata address | `SsrfBlockedError`; the model is told the target is not allowed |
+| `http_request` targets an origin outside the allowlist | `EgressBlockedError` naming the permitted origins and pointing at `recall(type=endpoint)` |
 | Endpoint record content is not valid JSON | `ToolSpecError`, reported to the model |
 | Missing or unknown parameter | Validation error including the declared contract |
 | Secret not set for this user | Message telling the agent to ask the user to add it via `/secrets` |
