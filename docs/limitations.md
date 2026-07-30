@@ -82,8 +82,8 @@ delivered. Scrollback comes from stored messages, not from replaying the stream.
 - **Endpoint parameters are strings only.** Complex request bodies cannot be expressed in an endpoint record —
   that is where a code tool starts.
 - **Dataset schemas are immutable.** Changing shape means a new dataset.
-- **Tool responses are truncated by character count** (8000 for HTTP calls), not by tokens or by extracting the
-  relevant part. A large HTML page wastes context.
+- **Tool responses are truncated by character count** (8000 for `external_call`, 4000 for `http_request`), not
+  by tokens and not by extracting the relevant part. A large HTML page wastes context.
 
 ### Surfaces
 

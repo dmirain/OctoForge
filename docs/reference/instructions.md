@@ -12,7 +12,7 @@ A record has a type, a title, content, tags, a version, usage counters, an owner
 |---|---|
 | `skill` | A scenario: how to do something, step by step, naming the tools to use |
 | `knowledge` | A fact or a piece of reference material |
-| `endpoint` | The contract of one callable HTTP endpoint — see [endpoints-and-net.md](endpoints-and-net.md) |
+| `endpoint` | The contract of one callable HTTP endpoint. **Kept out of default `recall` results** — see below and [endpoints-and-net.md](endpoints-and-net.md) |
 | `memory` | Something about one user — see [memory.md](memory.md) |
 
 Each record carries an embedding of its text. The embedding is not part of the DTO: it is an
@@ -20,8 +20,13 @@ implementation detail of search.
 
 ### Search (`recall`)
 
-`recall(query, k?, type?)` is one ranked search across everything visible to the caller. Ranking is
-three stages:
+`recall(query, k?, type?)` is one ranked search across what is visible to the caller: skills,
+knowledge, dataset descriptors and the caller's memories. **Endpoint records are excluded from the
+default results** — skills name the endpoints they use and `endpoint_get` resolves a named contract, so
+listing endpoints alongside scenarios only added noise. `type=endpoint` searches them explicitly, which
+is how a new integration is discovered.
+
+Ranking is three stages, then a diversity pass:
 
 1. **Cosine similarity** over embeddings, vectorized with numpy and executed in a worker thread. This
    matters: a pure-Python loop over 10k records froze the whole event loop for ~850 ms, and `recall` runs
@@ -31,6 +36,10 @@ three stages:
    (the boost is larger than the cosine range can be).
 3. **Optional cross-encoder rerank** of the shortlist (`OF_RERANKER_CANDIDATES` candidates → top-k),
    with either a local model or an HTTP reranker.
+
+Finally, **no single type crowds the result out**: each type is capped at `ceil(k/2)` hits so the others
+backfill from the oversampled tail, and the cap relaxes when there is nothing else to show — it
+diversifies without starving.
 
 Hits come back as whole records, not snippets — a truncated scenario is useless to follow. Returned
 records have their `usage_count` incremented. A record stored with an empty or wrong-dimension
@@ -90,7 +99,9 @@ searchability is delayed.
 - **Ranking never runs inline on the event loop.**
 - **The store is authoritative.** There is no derived index to rebuild, so there are no
   reindex/shadow-publish failure modes.
-- **`recall` is one call over all kinds** — a `type` filter narrows it, applied before ranking.
+- **`recall` is one call over the kinds worth mixing** — endpoints are excluded by default; a `type`
+  filter narrows it, applied before ranking.
+- **No type takes more than `ceil(k/2)` of the hits** unless there is nothing else to return.
 
 ## Configuration
 

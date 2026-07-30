@@ -126,8 +126,9 @@ An in-memory run inside an actor, always backed by a task row. Either an answer 
 ### Recall
 
 The tool (and the operation) that searches the instruction store by meaning across skills,
-knowledge, dataset descriptors and the user's memories, returning full records. The agent's first
-move for anything non-trivial.
+knowledge, dataset descriptors and the user's memories, returning full records. Endpoint records are
+deliberately excluded from the default results and only surface with `type=endpoint`. The agent's
+first move for anything non-trivial.
 
 ### Run
 

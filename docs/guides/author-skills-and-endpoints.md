@@ -61,7 +61,9 @@ An endpoint record makes a system callable. Its content is a small JSON document
 - `auth` — `"none"`, or a per-user secret **by code**. The value never appears in the record, the prompt or
   the logs; it is injected as a header at call time and scrubbed from the response.
 
-Then write a skill that names the endpoint (as in the example above) so the agent knows when to use it. The
+Then write a skill that names the endpoint (as in the example above) so the agent knows when to use it.
+This is not optional bookkeeping: endpoint records **do not appear in default `recall` results** (only
+under `type=endpoint`), so an endpoint nobody's scenario mentions is effectively invisible. The
 usual pattern is one endpoint record plus one scenario per task it serves — `web/src/octoforge_web/system_skills.py`
 ships exactly that shape as an example (a weather endpoint and the scenario that reads it).
 
@@ -101,7 +103,8 @@ records — and a broken overlay is a logged warning, never a failed startup.
 2. Then ask for the task itself and watch which tools it calls.
 3. If the record does not surface: shorten the title to the words people use, add trigger phrases in their
    language, or split the scenario. Ranking is cosine plus an exact-title boost, optionally reranked — a title
-   that matches the query wins outright.
+   that matches the query wins outright. Remember the diversity cap too: no type takes more than half the
+   hits, so a scenario can be pushed out by memories or dataset descriptors rather than by other skills.
 4. The operator console lists every record with its owner, version and usage count, which is the quickest way
    to see what is actually being retrieved.
 

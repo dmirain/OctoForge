@@ -103,8 +103,8 @@ tools appear or disappear with configuration and with who is asking:
 
 | Tool | What it does |
 |---|---|
-| `recall` | one ranked search over skills, knowledge, endpoint contracts, dataset descriptors and the user's memories |
-| `instruction_save` | writes a new skill or knowledge record — this is how the agent keeps what it learns |
+| `recall` | one ranked search over skills, knowledge, dataset descriptors and the user's memories, with no record type crowding out the others (endpoints stay out of the default results — ask for them with `type=endpoint`) |
+| `instruction_save` / `instruction_delete` | writes a new skill or knowledge record — this is how the agent keeps what it learns — and removes its own |
 | `endpoint_get` / `external_call` | resolves a stored endpoint's contract, then calls it: SSRF-guarded, with declarative secret auth |
 | `http_request` | a plain outbound HTTP call, for what has no stored endpoint yet |
 | `data_put` / `data_query` / `data_forget` | per-user datasets validated against a JSON schema |
@@ -237,7 +237,8 @@ flowchart TB
     CRON["CronScheduler<br/>CAS lease"] --> CM
 ```
 
-An exchange goes `OPEN → IN_PROGRESS → ANSWERED | AWAITING_USER | CANCELLED | FAILED`, and is not
+An exchange goes `OPEN → IN_PROGRESS → ANSWERED | AWAITING_USER | CANCELLED | FAILED` (plus
+`COLLECTING` for material that has not earned a reaction yet), and is not
 the same thing as a task: a run can finish while its exchange stays open because it asked the user
 something. Forwarded messages are *material*, not questions — they accumulate in one collection and
 get a single reaction once the burst settles, instead of one answer per forward. The full model,
@@ -282,11 +283,14 @@ each seam are [docs/guides/embed-the-core.md](docs/guides/embed-the-core.md),
   loopback, link-local (cloud metadata included), multicast or otherwise not globally routable.
   Redirects are not followed at all — following one would re-enter unchecked address space. Only
   your own base URL is allowlisted, so the agent can reach its own API.
-- **Credentials are per user and never in context** (see above). One known gap is documented rather
-  than glossed over: DNS rebinding between validation and connect is not yet closed by address
-  pinning.
+- **Credentials are per user and never in context** (see above). Gaps are documented rather than
+  glossed over — DNS rebinding between validation and connect is not yet closed by address pinning,
+  there is no audit log, and no rate limiting or quotas; the full list is in
+  [docs/limitations.md](docs/limitations.md).
 - **Telegram access is invite-gated**, admins are explicit, and every member's name and the invite
-  they came through is visible in the console.
+  they came through is visible in the console. One caveat that matters on day one: while the admin
+  list is empty the gate is inactive and the bot answers everyone — the startup report says so in
+  capitals.
 - **The HTTP surface is behind one operator credential** (HTTP Basic, PBKDF2; an empty hash fails
   closed with 503, never open). Be clear-eyed about what that is: it authenticates the *operator*,
   not your employees — `X-User-Id` selects the dialog and is a trusted string. Front it with your SSO

@@ -86,7 +86,8 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 - **Secret values are scrubbed from responses** before they reach the context or the logs.
 - **Redirects are never followed.**
 - **Every outbound URL goes through the guard**, except explicitly allowlisted origins.
-- **Response bodies are truncated** (8000 characters) so one call cannot flood the context.
+- **Response bodies are truncated** so one call cannot flood the context: 8000 characters for
+  `external_call`, 4000 for `http_request`.
 
 ## Configuration
 
@@ -107,7 +108,7 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 | Secret asked for a host it is not bound to | `SecretHostMismatchError` — the value is not sent |
 | Secrets not configured at all | Explicit "secrets are not configured on this installation" |
 | Server redirects | Not followed; the redirect response is what the model sees |
-| Huge response | Truncated with a marker |
+| Huge response | Truncated with a marker (8000 characters via `external_call`, 4000 via `http_request`) |
 | DNS rebinding between check and connect | Not currently prevented — see the gap above |
 
 ## Code anchors
