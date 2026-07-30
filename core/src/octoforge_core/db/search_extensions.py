@@ -139,3 +139,49 @@ def _create_russian_unaccent(connection: Connection) -> None:
         )
         return
     savepoint.commit()
+
+
+# BM25 indexes over the instructions table. Two rather than one over the
+# concatenation: BM25 normalizes by document length, and a title of two tokens
+# folded in with a body of a hundred would be drowned by it. See migration
+# c7e2a91f4d38, which does the same for a database that already exists.
+INSTRUCTION_BM25_INDEXES = (
+    ("ix_instructions_bm25_content", "content"),
+    ("ix_instructions_bm25_title", "title"),
+)
+FALLBACK_TEXT_CONFIG = "pg_catalog.russian"
+
+
+def ensure_bm25_indexes(connection: Connection) -> bool:
+    """Build the lexical indexes when the database can; report whether it did.
+
+    Called on the fresh-database path, which skips the migration chain and so
+    would otherwise produce an installation with pg_textsearch installed and
+    nothing indexed by it. A no-op without the extension, which is the normal
+    state on managed Postgres and SQLite.
+    """
+    if connection.dialect.name != POSTGRESQL:
+        return False
+    if PG_TEXTSEARCH not in installed_search_extensions(connection):
+        return False
+    config = (
+        f"public.{RUSSIAN_UNACCENT}" if has_russian_unaccent(connection) else (FALLBACK_TEXT_CONFIG)
+    )
+    savepoint = connection.begin_nested()
+    try:
+        for name, column in INSTRUCTION_BM25_INDEXES:
+            connection.execute(
+                sa.text(
+                    f"CREATE INDEX IF NOT EXISTS {name} ON instructions "
+                    f"USING bm25 ({column}) WITH (text_config='{config}')"
+                )
+            )
+    except sa.exc.DatabaseError as error:
+        savepoint.rollback()
+        logger.warning(
+            "could not build the BM25 indexes, recall stays embeddings-only: %s",
+            str(error).strip().splitlines()[0],
+        )
+        return False
+    savepoint.commit()
+    return True

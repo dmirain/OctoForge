@@ -171,18 +171,22 @@ class VectorSearchStore(InMemoryInstructionStore):
     def __init__(self) -> None:
         super().__init__()
         self.vector_calls: list[tuple[tuple[float, ...], int, str | None]] = []
+        self.kind_filters: list[tuple[InstructionType, ...]] = []
 
     async def search_by_vector(
         self,
         query_embedding: tuple[float, ...],
         limit: int,
         user_id: str | None,
+        kinds: tuple[InstructionType, ...] = (),
     ) -> list[EmbeddedInstruction]:
         self.vector_calls.append((query_embedding, limit, user_id))
+        self.kind_filters.append(kinds)
         candidates = [
             EmbeddedInstruction(instruction=record, embedding=self.embeddings[record.id])
             for record in self.records.values()
-            if user_id is None or record.owner_id is None or record.owner_id == user_id
+            if (not kinds or record.type in kinds)
+            and (user_id is None or record.owner_id is None or record.owner_id == user_id)
         ]
         return candidates[:limit]
 

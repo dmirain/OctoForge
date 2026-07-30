@@ -242,11 +242,50 @@ class InstructionVectorSearch(Protocol):
         query_embedding: tuple[float, ...],
         limit: int,
         user_id: str | None,
+        kinds: tuple[InstructionType, ...] = (),
     ) -> list[EmbeddedInstruction]:
         """Return up to `limit` visible records closest to the query, best first.
 
         Same visibility rule as `list_with_embeddings`: public plus the user's
         own records; `user_id` None searches the whole table.
+
+        `kinds` restricts the search to those record types and MUST be applied
+        inside the query, not by the caller afterwards: `limit` is spent before
+        any filtering, so a top-20 that happens to be all skills would leave an
+        endpoint search with nothing. Empty means every type.
+        """
+        ...
+
+
+@runtime_checkable
+class InstructionLexicalSearch(Protocol):
+    """Optional InstructionStore capability: keyword ranking on the storage side.
+
+    The half embeddings are bad at. A vector says two texts are *about* the
+    same thing, which is exactly wrong for the queries where only one string
+    will do: a product name, an error code, an API field, a rare acronym. A
+    store implementing this ranks those by BM25 and the service fuses the two
+    orderings.
+
+    Optional in the strong sense: it needs an extension managed Postgres
+    cannot install, so most of the reference behaviour must not depend on it.
+    """
+
+    async def search_by_text(
+        self,
+        query: str,
+        limit: int,
+        user_id: str | None,
+        kinds: tuple[InstructionType, ...] = (),
+    ) -> list[EmbeddedInstruction]:
+        """Return up to `limit` visible records matching the query, best first.
+
+        Records with no lexical match are absent rather than ranked last: BM25
+        is a filter as much as an ordering, and a record sharing no term with
+        the query contributes nothing to the fusion.
+
+        Same visibility and `kinds` contract as `search_by_vector`. Embeddings
+        ride along so a fused candidate can be scored without a second query.
         """
         ...
 

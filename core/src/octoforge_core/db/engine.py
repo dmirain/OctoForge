@@ -30,7 +30,7 @@ import octoforge_core.instructions.models
 import octoforge_core.secrets.models
 import octoforge_core.tasks.models  # noqa: F401
 from octoforge_core.db.base import Base
-from octoforge_core.db.search_extensions import ensure_search_extensions
+from octoforge_core.db.search_extensions import ensure_bm25_indexes, ensure_search_extensions
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _BASELINE_REVISION = "675056c8fffd"
@@ -189,6 +189,9 @@ def _create_and_stamp(connection: Connection, config: Config) -> None:
     """
     ensure_search_extensions(connection)
     Base.metadata.create_all(connection)
+    # after the tables: a BM25 index needs the table it indexes, and this path
+    # never runs c7e2a91f4d38, which builds them for a database that exists
+    ensure_bm25_indexes(connection)
     command.stamp(config, "head")
 
 

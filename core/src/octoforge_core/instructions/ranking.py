@@ -14,6 +14,7 @@ at 10k records (was 847 ms inline).
 """
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -147,3 +148,80 @@ def rerank(
         return rescored[:k]
     rest = [hit for hit in rescored if hit is not exact]
     return [exact, *rest][:k]
+
+
+# Reciprocal Rank Fusion: score = sum over rankings of 1/(RRF_SMOOTHING + rank).
+# Chosen over a weighted sum of scores because the two rankings are not on a
+# common scale and never will be -- cosine similarity is bounded in [-1, 1]
+# while BM25 is unbounded and corpus-dependent, so any normalization would need
+# retuning as the corpus grows. RRF reads only positions, so it needs no
+# weights and no tuning. 60 is the constant from the original paper; it damps
+# the difference between the top few positions so one ranking's confident first
+# place cannot by itself outvote agreement further down the other.
+RRF_SMOOTHING = 60
+FIRST_RANK = 1
+
+
+def _reciprocal_rank_scores(
+    rankings: Sequence[Sequence[EmbeddedInstruction]],
+) -> tuple[dict[str, float], dict[str, EmbeddedInstruction]]:
+    """Accumulate reciprocal-rank scores and keep one record object per id."""
+    scores: dict[str, float] = {}
+    records: dict[str, EmbeddedInstruction] = {}
+    for ranking in rankings:
+        for position, candidate in enumerate(ranking, start=FIRST_RANK):
+            key = candidate.instruction.id
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_SMOOTHING + position)
+            records.setdefault(key, candidate)
+    return scores, records
+
+
+def fuse_rankings(
+    rankings: Sequence[Sequence[EmbeddedInstruction]],
+) -> list[EmbeddedInstruction]:
+    """Merge ranked candidate lists into one, best first, by reciprocal rank.
+
+    A record appearing in several rankings accumulates their contributions, so
+    agreement between independent retrievers wins over a strong showing in one.
+    Ties break by title, for the same determinism `rank` guarantees.
+    """
+    scores, records = _reciprocal_rank_scores(rankings)
+    return sorted(
+        records.values(),
+        key=lambda candidate: (-scores[candidate.instruction.id], candidate.instruction.title),
+    )
+
+
+def fuse(
+    rankings: Sequence[Sequence[EmbeddedInstruction]],
+    query: str,
+    k: int,
+) -> list[SearchHit]:
+    """Fuse ranked candidate lists into scored hits, best first.
+
+    The counterpart of `rank` for the hybrid path: where `rank` scores by
+    cosine because it was handed unordered candidates, this one is handed
+    orderings that already encode each retriever's judgement and only has to
+    combine them.
+
+    The exact-title guarantee survives: a candidate whose title equals the
+    query gets EXACT_TITLE_BOOST, which dwarfs any fused score (with two
+    rankings the maximum is 2/61) and therefore always sorts first — the same
+    promise `rank` and `rerank` make.
+    """
+    if k <= 0:
+        return []
+    scores, records = _reciprocal_rank_scores(rankings)
+    folded_query = query.casefold()
+    hits = [
+        SearchHit(
+            instruction=candidate.instruction,
+            score=scores[key]
+            + (
+                EXACT_TITLE_BOOST if candidate.instruction.title.casefold() == folded_query else 0.0
+            ),
+        )
+        for key, candidate in records.items()
+    ]
+    hits.sort(key=lambda hit: (-hit.score, hit.instruction.title))
+    return hits[:k]

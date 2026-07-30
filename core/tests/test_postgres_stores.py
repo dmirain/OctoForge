@@ -43,6 +43,7 @@ from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyM
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import (
     InstructionDraft,
+    InstructionLexicalSearch,
     InstructionType,
     InstructionVectorSearch,
 )
@@ -517,3 +518,108 @@ async def test_vector_search_is_the_capability_the_service_detects(
     pgvector would fail at the first recall instead of at startup."""
     assert isinstance(PostgresInstructionStore(session_factory), InstructionVectorSearch)
     assert not isinstance(SqlAlchemyInstructionStore(session_factory), InstructionVectorSearch)
+
+
+def text_draft(title: str, content: str, owner_id: str | None) -> InstructionDraft:
+    return InstructionDraft(
+        kind=InstructionType.KNOWLEDGE,
+        title=title,
+        content=content,
+        tags=(),
+        embedding=EMBEDDING,
+        owner_id=owner_id,
+    )
+
+
+async def test_lexical_search_finds_the_exact_term_an_embedding_would_miss(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The reason BM25 is here at all: one literal string, not a topic."""
+    store = PostgresInstructionStore(session_factory)
+    wanted = await store.upsert(
+        text_draft("billing", "При ошибке E_INVOICE_4021 повторите запрос позже", USER_A)
+    )
+    await store.upsert(text_draft("shipping", "Расчёт стоимости доставки по регионам", USER_A))
+
+    hits = await store.search_by_text("E_INVOICE_4021", limit=SEARCH_LIMIT, user_id=USER_A)
+
+    assert [hit.instruction.id for hit in hits] == [wanted.id]
+
+
+async def test_lexical_search_matches_across_russian_inflection(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """russian_unaccent must stem, or Russian keyword search is close to useless."""
+    store = PostgresInstructionStore(session_factory)
+    wanted = await store.upsert(
+        text_draft("tasks", "Агент создаёт отложенные задачи и напоминания", USER_A)
+    )
+
+    hits = await store.search_by_text("задача", limit=SEARCH_LIMIT, user_id=USER_A)
+
+    assert [hit.instruction.id for hit in hits] == [wanted.id]
+
+
+async def test_lexical_search_honours_visibility_and_kind(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Ownership is a SQL predicate everywhere; BM25 must not be the exception.
+
+    The kind filter has to live in the query too: `limit` is spent before the
+    caller could filter, so a top-N of one type would starve a search for
+    another.
+    """
+    store = PostgresInstructionStore(session_factory)
+    mine = await store.upsert(text_draft("mine", "уникальное слово корвалол", USER_A))
+    await store.upsert(text_draft("theirs", "уникальное слово корвалол", USER_B))
+
+    visible = await store.search_by_text("корвалол", limit=SEARCH_LIMIT, user_id=USER_A)
+    wrong_kind = await store.search_by_text(
+        "корвалол", limit=SEARCH_LIMIT, user_id=USER_A, kinds=(InstructionType.ENDPOINT,)
+    )
+
+    assert [hit.instruction.id for hit in visible] == [mine.id]
+    assert wrong_kind == []
+
+
+async def test_lexical_search_returns_nothing_when_no_word_matches(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """BM25 is a filter as much as an ordering: a non-match must not be ranked last."""
+    store = PostgresInstructionStore(session_factory)
+    await store.upsert(text_draft("shipping", "Расчёт стоимости доставки", USER_A))
+
+    hits = await store.search_by_text("квазистационарный", limit=SEARCH_LIMIT, user_id=USER_A)
+
+    assert hits == []
+
+
+async def test_the_title_is_searched_as_a_document_of_its_own(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two BM25 indexes, not one over title||content.
+
+    A record whose term appears ONLY in its title has to come back. A single
+    index over the body would never see it, and one over the concatenation
+    would bury it: BM25 normalizes by document length, so a term in a
+    two-token title carries real weight while the same term folded into a
+    two-hundred-token body barely registers. Both records here must surface,
+    each found by a different index.
+    """
+    store = PostgresInstructionStore(session_factory)
+    title_only = await store.upsert(text_draft("корвалол", "нечто совершенно другое", USER_A))
+    body_only = await store.upsert(
+        text_draft("prose", " ".join(["наполнитель"] * 200) + " корвалол", USER_A)
+    )
+
+    hits = await store.search_by_text("корвалол", limit=SEARCH_LIMIT, user_id=USER_A)
+
+    assert {hit.instruction.id for hit in hits} == {title_only.id, body_only.id}
+
+
+async def test_lexical_search_is_the_capability_the_service_detects(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Only the Postgres store may claim it; the portable one must not."""
+    assert isinstance(PostgresInstructionStore(session_factory), InstructionLexicalSearch)
+    assert not isinstance(SqlAlchemyInstructionStore(session_factory), InstructionLexicalSearch)

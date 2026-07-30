@@ -21,6 +21,7 @@ from octoforge_core.instructions.api import (
     EmbeddedInstruction,
     Instruction,
     InstructionDraft,
+    InstructionLexicalSearch,
     InstructionNotFoundError,
     InstructionStore,
     InstructionType,
@@ -28,7 +29,7 @@ from octoforge_core.instructions.api import (
     SearchHit,
     SystemInstructionError,
 )
-from octoforge_core.instructions.ranking import rank, rerank
+from octoforge_core.instructions.ranking import fuse, rank, rerank
 from octoforge_core.llm.embeddings import EmbeddingClient
 from octoforge_core.llm.reranker import RerankerClient
 
@@ -146,19 +147,9 @@ class LocalInstructionService:
         fetch = self._shortlist_size(k)
         if mixed and self._reranker is None:
             fetch = max(fetch, k * 3)
+        kinds = _wanted_kinds(kind, exclude)
         (query_embedding,) = await self._embedder.embed((query,))
-        candidates = await self._candidates(query_embedding, fetch, user_id)
-        if kind is not None:
-            candidates = [
-                candidate for candidate in candidates if candidate.instruction.type is kind
-            ]
-        else:
-            candidates = [
-                candidate for candidate in candidates if candidate.instruction.type not in exclude
-            ]
-        # off the event loop: brute-force scoring is CPU work that grows with
-        # the table and must not stall every other dialog in the process
-        shortlist = await asyncio.to_thread(rank, candidates, query, query_embedding, fetch)
+        shortlist = await self._shortlist(query, query_embedding, fetch, user_id, kinds)
         hits = await self._apply_reranker(query, shortlist, len(shortlist) if mixed else k)
         if mixed:
             hits = _cap_types(hits, k)
@@ -340,16 +331,61 @@ class LocalInstructionService:
     def _shortlist_size(self, k: int) -> int:
         return max(k, self._rerank_candidates) if self._reranker is not None else k
 
-    async def _candidates(
+    async def _shortlist(
+        self,
+        query: str,
+        query_embedding: tuple[float, ...],
+        fetch: int,
+        user_id: str | None,
+        kinds: tuple[InstructionType, ...],
+    ) -> list[SearchHit]:
+        """Produce the scored shortlist, hybrid where the store can, cosine otherwise.
+
+        Two retrievers answer different questions. The vector search finds
+        records *about* the query; BM25 finds records that literally say it,
+        which is the only thing that works for a product name, an error code or
+        a rare acronym. Where both exist their orderings are fused; where only
+        one does, nothing about the result shape changes.
+        """
+        vector_hits = await self._vector_candidates(query_embedding, fetch, user_id, kinds)
+        lexical_hits = await self._lexical_candidates(query, fetch, user_id, kinds)
+        if lexical_hits is None:
+            # off the event loop: brute-force scoring is CPU work that grows
+            # with the table and must not stall every other dialog
+            return await asyncio.to_thread(rank, vector_hits, query, query_embedding, fetch)
+        # fusion reads positions, not vectors: cheap enough to stay inline
+        return fuse([vector_hits, lexical_hits], query, fetch)
+
+    async def _vector_candidates(
         self,
         query_embedding: tuple[float, ...],
         fetch: int,
         user_id: str | None,
+        kinds: tuple[InstructionType, ...],
     ) -> list[EmbeddedInstruction]:
         """Fetch the ranking input: vector search on the store side when supported."""
         if isinstance(self._store, InstructionVectorSearch):
-            return await self._store.search_by_vector(query_embedding, fetch, user_id)
-        return await self._store.list_with_embeddings(user_id)
+            return await self._store.search_by_vector(query_embedding, fetch, user_id, kinds)
+        rows = await self._store.list_with_embeddings(user_id)
+        return [row for row in rows if not kinds or row.instruction.type in kinds]
+
+    async def _lexical_candidates(
+        self,
+        query: str,
+        fetch: int,
+        user_id: str | None,
+        kinds: tuple[InstructionType, ...],
+    ) -> list[EmbeddedInstruction] | None:
+        """BM25 candidates, or None when the store has no lexical capability.
+
+        None rather than an empty list on purpose: "this database cannot do
+        lexical search" and "nothing matched the words" call for different
+        behaviour upstream, and conflating them would let an unmatched query
+        silently halve the ranking evidence.
+        """
+        if not isinstance(self._store, InstructionLexicalSearch):
+            return None
+        return await self._store.search_by_text(query, fetch, user_id, kinds)
 
     async def _apply_reranker(
         self,
@@ -402,3 +438,18 @@ def _cap_types(hits: list[SearchHit], k: int) -> list[SearchHit]:
 
 def _embedded_text(title: str, content: str) -> str:
     return f"{title}{EMBEDDED_TEXT_SEPARATOR}{content}"
+
+
+def _wanted_kinds(
+    kind: InstructionType | None,
+    exclude: tuple[InstructionType, ...],
+) -> tuple[InstructionType, ...]:
+    """Turn "this kind" / "all but these" into the explicit list the store takes.
+
+    The store needs the positive form because it applies the predicate inside
+    the query: filtering after a top-N would spend the whole budget on types
+    the caller did not ask for and hand back nothing.
+    """
+    if kind is not None:
+        return (kind,)
+    return tuple(candidate for candidate in InstructionType if candidate not in exclude)
