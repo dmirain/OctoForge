@@ -30,7 +30,8 @@ make quickstart      # generates .env (credentials included), starts Postgres + 
 - [Try it](#try-it) · [What you get](#what-you-get) · [What is unusual about it](#what-is-unusual-about-it)
 - [Why it feels fast](#why-it-feels-fast) · [The exchange model](#the-exchange-model)
 - [Fitting it into your stack](#fitting-it-into-your-stack) · [Security posture](#security-posture)
-- [Configuration](#configuration) · [Using it as a library](#using-it-as-a-library) · [Development](#development)
+- [Configuration](#configuration) · [Using it as a library](#using-it-as-a-library)
+- [Documentation](#documentation) · [Development](#development)
 
 ## Try it
 
@@ -91,7 +92,9 @@ sentence-transformers backend), `cp .env.example .env`, then `make run` for auto
 `.env` and it starts alongside the web app (in the quickstart stack, `OF_QUICKSTART_TELEGRAM_TOKEN`)
 — or run `make run-telegram` for the bot alone, a process that opens no port at all. For a public
 deployment, `docker compose up -d` adds Caddy, which obtains and renews a Let's Encrypt certificate
-for `SITE_DOMAIN` on its own.
+for `SITE_DOMAIN` on its own — the topology and day-2 operations are in
+[docs/guides/deployment.md](docs/guides/deployment.md), and the longer walkthrough of this section is
+[docs/guides/quickstart.md](docs/guides/quickstart.md).
 
 ## What you get
 
@@ -136,6 +139,8 @@ operator can publish a private record to everyone from the console. Adding an in
 CRM means storing an endpoint record — not shipping code, not restarting a plugin host, not editing
 a prompt file. Deployment-specific wording (trigger phrases in another language, a house style) goes
 into a JSON overlay applied at startup, so the same image serves every installation.
+Details: [docs/reference/instructions.md](docs/reference/instructions.md) and
+[docs/reference/endpoints-and-net.md](docs/reference/endpoints-and-net.md).
 
 ### 2. A dialog is an actor, not a request handler
 
@@ -145,6 +150,8 @@ router decides whose each incoming message is (a clarification of one answer, a 
 command), a transport-level reply skips the router entirely, and `ask_user` parks an exchange until
 the person answers, with a nudge if they go quiet. A second question never has to wait for the first
 answer to finish, and a background task or a cron firing is the same machinery.
+Details: [docs/reference/exchanges.md](docs/reference/exchanges.md) and
+[docs/reference/conversation-actor.md](docs/reference/conversation-actor.md).
 
 ### 3. Secrets are structurally out of reach of the model
 
@@ -152,6 +159,7 @@ API keys and tokens live in an encrypted store (Fernet), entered through a one-t
 than in chat. The agent only ever sees a secret's *code*: substitution happens inside the outbound
 call, bound to one host, and values are scrubbed from anything flowing back into the context or the
 logs. Nothing in the prompt path can leak a credential the prompt path never held.
+Details: [docs/reference/secrets.md](docs/reference/secrets.md).
 
 ### 4. Multi-user is the schema, not a wrapper
 
@@ -178,6 +186,8 @@ persisted narrative, LLM router, agent loop) against a scripted in-process LLM w
 | two questions asked back to back, 400 ms of answer each | **458 ms** | 464 ms | 800 ms if the second waited for the first |
 
 *(15 runs each on a 2-vCPU host over SQLite; `make bench` reproduces them, `--json` for raw numbers.
+The method, the mechanisms and the rules that keep one event loop responsive are in
+[docs/guides/performance.md](docs/guides/performance.md).
 For scale, the reasoning model this project is developed against takes ~2.4 s to produce its own
 first token — the framework is about 1% of what a user waits for.)*
 
@@ -187,7 +197,7 @@ The structural reasons behind those numbers:
   for the assistant message to end before executing, so a three-call round costs one call's latency.
   Waiting for the whole message first — what some agents do to protect themselves from truncated
   streams — is what turns those 151 ms into 449 ms. Broken arguments become a tool error the model
-  can read, not a lost run.
+  can read, not a lost run ([docs/reference/agent-loop.md](docs/reference/agent-loop.md)).
 - **Nothing queues behind anything.** No single active run per session: exchanges stream in
   parallel, and cancel does not go through the actor's inbox, so a stop button lands immediately even
   while the router is mid-call.
@@ -197,7 +207,7 @@ The structural reasons behind those numbers:
   requires.
 - **The prompt stays small as the dialog grows.** Skills and knowledge are fetched by `recall` when
   needed instead of being pasted into every request, and a rolling summary plus a verbatim hot tail
-  keeps history bounded.
+  keeps history bounded ([docs/reference/context-compaction.md](docs/reference/context-compaction.md)).
 - **The router is cheap and often skipped.** It is one short tool call over the live exchanges, with
   a deterministic fallback — and a transport-level reply or a dialog with nothing in flight costs no
   router call at all.
@@ -230,7 +240,10 @@ flowchart TB
 An exchange goes `OPEN → IN_PROGRESS → ANSWERED | AWAITING_USER | CANCELLED | FAILED`, and is not
 the same thing as a task: a run can finish while its exchange stays open because it asked the user
 something. Forwarded messages are *material*, not questions — they accumulate in one collection and
-get a single reaction once the burst settles, instead of one answer per forward.
+get a single reaction once the burst settles, instead of one answer per forward. The full model,
+including how routing decides whose a message is, is in
+[docs/reference/exchanges.md](docs/reference/exchanges.md) and
+[docs/reference/routing.md](docs/reference/routing.md).
 
 ## Fitting it into your stack
 
@@ -255,6 +268,11 @@ Module boundaries are test-enforced, not aspirational: modules talk to neighbour
 only, `db/` and `tools/` import no domain module, and the core never imports FastAPI
 (`core/tests/test_boundaries.py`).
 
+The port table and the layer map are in [docs/architecture.md](docs/architecture.md); the recipes for
+each seam are [docs/guides/embed-the-core.md](docs/guides/embed-the-core.md),
+[docs/guides/add-a-tool.md](docs/guides/add-a-tool.md) and
+[docs/guides/add-a-surface.md](docs/guides/add-a-surface.md).
+
 ## Security posture
 
 - **No shell, no filesystem tools.** Not missing — declined. The agent acts through declared,
@@ -274,9 +292,14 @@ only, `db/` and `tools/` import no domain module, and the core never imports Fas
   not your employees — `X-User-Id` selects the dialog and is a trusted string. Front it with your SSO
   proxy or gateway and pass the identity in; per-user web authentication is not built in yet.
 
+The full posture is [docs/security.md](docs/security.md), and everything absent — split into
+deliberate decisions and open gaps — is [docs/limitations.md](docs/limitations.md).
+
 ## Configuration
 
-Everything is `OF_`-prefixed; the annotated list is [.env.example](.env.example). The essentials:
+Everything is `OF_`-prefixed; the annotated list is [.env.example](.env.example) and every variable
+with its default and failure mode is [docs/reference/configuration.md](docs/reference/configuration.md).
+The essentials:
 
 | Variable | Purpose |
 |---|---|
@@ -401,6 +424,23 @@ Notes on the example:
   `CronWaker` port, which `ConversationManager` satisfies structurally — in-process you just pass the
   manager.
 
+## Documentation
+
+Everything below is written from the code and checked against it — `make check` fails when a
+documented path or link stops resolving. Start at [docs/README.md](docs/README.md), which maps every
+page; the entry points:
+
+| Read | For |
+|---|---|
+| [docs/concept.md](docs/concept.md) | Why it is shaped this way, and what it refuses to be |
+| [docs/glossary.md](docs/glossary.md) | The vocabulary — exchange, narrative, material, process |
+| [docs/architecture.md](docs/architecture.md) | Layers, ports, the composition root, concurrency |
+| [docs/reference/](docs/reference/) | One page per aspect: purpose, invariants, configuration, failure modes, code anchors |
+| [docs/guides/](docs/guides/) | Running it, deploying it, embedding it, extending it |
+| [docs/security.md](docs/security.md) | Trust boundaries, secrets, egress, prompt injection |
+| [docs/limitations.md](docs/limitations.md) | What is absent by decision, and what is simply a gap |
+| [docs/comparisons/](docs/comparisons/) | Code-level studies of openclaw, opencode and hermes-agent |
+
 ## Development
 
 ```bash
@@ -409,8 +449,10 @@ make test-pg # the Postgres-specific store tests (needs `make db-up`)
 make bench   # the latency harness behind the table above
 ```
 
-Individually: `make lint`, `make typecheck`, `make test`, `make format`. Contributions are welcome —
-see [CONTRIBUTING.md](CONTRIBUTING.md).
+Individually: `make lint`, `make typecheck`, `make test`, `make format`. Conventions for writing code
+here — including the rules that keep one event loop responsive — are [AGENTS.md](AGENTS.md), and the
+rules for writing documentation are [docs/CONVENTIONS.md](docs/CONVENTIONS.md). Contributions are
+welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
