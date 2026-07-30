@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # Same credentials the manual Postgres container below is started with.
+  PG_USER: octoforge
+  PG_PASSWORD: octoforge
+  PG_TEST_DB: octoforge_test
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -15,23 +21,12 @@ jobs:
     # stacks but does not abort, so the bound has to live here.
     timeout-minutes: 20
 
-    services:
-      # The Postgres store tests (core/tests/test_postgres_stores.py) need a
-      # real server; without OF_TEST_DATABASE_URL they skip, which would hide
-      # every dialect regression they exist to catch.
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_USER: octoforge
-          POSTGRES_PASSWORD: octoforge
-          POSTGRES_DB: octoforge_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U octoforge -d octoforge_test"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
+    # No `services:` block on purpose. The Postgres store tests need pgvector
+    # and pg_textsearch, which only the image built from docker/postgres has,
+    # and a service container can only pull an image that already exists in a
+    # registry — it is started before any step runs, so it cannot use one this
+    # job builds. Starting the container by hand is the way to test against the
+    # database the deployment actually uses instead of a lookalike.
 
     steps:
       - uses: actions/checkout@v4
@@ -47,10 +42,35 @@ jobs:
       - name: Check (ruff + mypy + pytest, both projects)
         run: make check
 
+      - name: Start Postgres with the search extensions
+        run: |
+          docker build -t octoforge-postgres:ci ./docker/postgres
+          docker run -d --name octoforge-ci-postgres \
+            -e POSTGRES_USER="${PG_USER}" \
+            -e POSTGRES_PASSWORD="${PG_PASSWORD}" \
+            -e POSTGRES_DB="${PG_TEST_DB}" \
+            -p 5432:5432 \
+            octoforge-postgres:ci \
+            -c shared_preload_libraries=pg_textsearch
+          for _ in $(seq 1 30); do
+            docker exec octoforge-ci-postgres \
+              pg_isready -U "${PG_USER}" -d "${PG_TEST_DB}" && break
+            sleep 2
+          done
+          # Fail loudly here rather than as thirty confusing test errors later:
+          # without the extensions every Postgres test dies on CREATE EXTENSION.
+          found=$(docker exec octoforge-ci-postgres psql -U "${PG_USER}" -d "${PG_TEST_DB}" -tAc \
+            "SELECT count(*) FROM pg_available_extensions WHERE name IN ('vector', 'pg_textsearch')")
+          test "${found}" = "2" || { echo "search extensions missing from the image (found ${found}/2)"; exit 1; }
+
       - name: Postgres store tests
         env:
           OF_TEST_DATABASE_URL: postgresql+asyncpg://octoforge:octoforge@127.0.0.1:5432/octoforge_test
         run: cd core && ../.venv/bin/pytest tests/test_postgres_stores.py
+
+      - name: Stop Postgres
+        if: always()
+        run: docker rm -f octoforge-ci-postgres || true
 
       # Advisories appear without the code changing, so this is its own step
       # rather than part of `make check`: a red build here means "a dependency

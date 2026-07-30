@@ -15,6 +15,10 @@ LOCAL_URL := http://127.0.0.1:8000
 
 install:
 	python3 -m venv $(VENV)
+	# `venv` seeds whatever pip/setuptools the interpreter shipped with, which on
+	# a stock 3.11 is old enough that `make audit` reports advisories against the
+	# bootstrap tooling rather than against anything this project depends on.
+	$(BIN)/pip install --upgrade pip setuptools
 	$(BIN)/pip install -e "core[dev,local-embeddings]" -e "web[dev]"
 
 # Bring an existing .venv up to what CI installs. `install` leaves any
