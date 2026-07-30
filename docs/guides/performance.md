@@ -9,15 +9,23 @@ users without freezing.
 persisted narrative, LLM router, agent loop — against a scripted in-process LLM with known timing. What
 remains is ours.
 
-Measured with 15 runs each on a 2-vCPU host over SQLite:
+Measured with 15 runs each on an idle 2-vCPU host over SQLite; the medians below are the median of
+three separate sessions and the p90 the worst of the three, so a lucky run cannot flatter the table:
 
 | Scenario | Median | p90 | Baseline |
 |---|---|---|---|
-| `submit()` → the provider is asked | 33 ms | 38 ms | Includes the durable write of the message and its exchange |
-| Same, for a message arriving while another answer streams | 26 ms | 31 ms | Includes the routing decision and spawning a second run |
-| A token leaving the LLM → the same token at a subscriber | 0.03 ms | 0.06 ms | Deltas are never persisted |
+| `submit()` → the provider is asked | 17 ms | 22 ms | Includes the durable write of the message and its exchange |
+| Same, for a message arriving while another answer streams | 13 ms | 17 ms | Includes the routing decision and spawning a second run |
+| A token leaving the LLM → the same token at a subscriber | 0.02 ms | 0.07 ms | Deltas are never persisted |
 | Three 150 ms tool calls in one assistant message | 151 ms | 151 ms | 449 ms if executed one after another |
-| Two questions back to back, 400 ms of answer each | 458 ms | 464 ms | 800 ms if the second waited |
+| Two questions back to back, 400 ms of answer each | 434 ms | 442 ms | 800 ms if the second waited |
+
+The two write-bound rows roughly halved when SQLite moved to WAL (33 → 17 ms and 26 → 13 ms). That is
+attributable rather than assumed: re-running the same harness with the WAL pragma neutralised, on the
+same idle host, gives 28 ms and 23 ms. The rest of the gap between those and the older figures is the
+host being idle, which the earlier numbers were not measured on. `submit()` is dominated by the
+durable write of the message and its exchange, so removing an fsync per commit is exactly where it
+shows up; the tool and delivery rows, which write nothing on the measured path, did not move.
 
 For scale: the reasoning model this project is developed against takes ~2.4 s to produce its own first token.
 The framework is about 1% of what a user waits for, which is the point — the wins that matter are structural,

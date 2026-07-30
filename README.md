@@ -179,13 +179,14 @@ persisted narrative, LLM router, agent loop) against a scripted in-process LLM w
 
 | Scenario | Median | p90 | Baseline |
 |---|---|---|---|
-| framework overhead, `submit()` → the provider is asked | **33 ms** | 38 ms | includes the durable write of the message and its exchange |
-| same, for a message arriving while another answer streams | **26 ms** | 31 ms | includes the router decision and spawning a second run |
-| a token leaving the LLM → the same token at a subscriber | **0.03 ms** | 0.06 ms | transient deltas are never persisted |
+| framework overhead, `submit()` → the provider is asked | **17 ms** | 22 ms | includes the durable write of the message and its exchange |
+| same, for a message arriving while another answer streams | **13 ms** | 17 ms | includes the router decision and spawning a second run |
+| a token leaving the LLM → the same token at a subscriber | **0.02 ms** | 0.07 ms | transient deltas are never persisted |
 | three 150 ms tool calls in one assistant message | **151 ms** | 151 ms | 449 ms if they ran one after another |
-| two questions asked back to back, 400 ms of answer each | **458 ms** | 464 ms | 800 ms if the second waited for the first |
+| two questions asked back to back, 400 ms of answer each | **434 ms** | 442 ms | 800 ms if the second waited for the first |
 
-*(15 runs each on a 2-vCPU host over SQLite; `make bench` reproduces them, `--json` for raw numbers.
+*(15 runs each on a 2-vCPU host over SQLite, median of three sessions and the worst p90 of them;
+`make bench` reproduces them, `--json` for raw numbers.
 The method, the mechanisms and the rules that keep one event loop responsive are in
 [docs/guides/performance.md](docs/guides/performance.md).
 For scale, the reasoning model this project is developed against takes ~2.4 s to produce its own
