@@ -74,6 +74,7 @@ from octoforge_core.instructions.registry import (
     SystemSkill,
     sync_system_registry,
 )
+from octoforge_core.llm.embedding_cache import CachingEmbeddingClient
 from octoforge_core.llm.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from octoforge_core.llm.errors import LLMError
 from octoforge_core.llm.http_reranker import HttpRerankerClient
@@ -569,16 +570,25 @@ def _build_secret_store(
 
 
 def _build_embedder(settings: Settings, http_client: httpx.AsyncClient) -> EmbeddingClient:
-    """Choose the embeddings backend: local sentence-transformers or HTTP."""
+    """Choose the embeddings backend: local sentence-transformers or HTTP.
+
+    Wrapped in a small cache because `recall` searches instructions and datasets
+    with the same query string and each service embeds it independently — two
+    identical computations on nearly every user message. The decorator keeps
+    that fix out of both services' ports.
+    """
+    backend: EmbeddingClient
     if settings.embedding_backend == EmbeddingBackend.LOCAL:
-        return SentenceTransformerEmbedder(
+        backend = SentenceTransformerEmbedder(
             model_name=settings.embedding_model,
             batch_size=settings.embedding_batch_size,
         )
-    return OpenAIEmbeddingClient(
-        http_client=http_client,
-        config=settings.to_embedding_config(),
-    )
+    else:
+        backend = OpenAIEmbeddingClient(
+            http_client=http_client,
+            config=settings.to_embedding_config(),
+        )
+    return CachingEmbeddingClient(backend)
 
 
 def _build_vision_client(settings: Settings, http_client: httpx.AsyncClient) -> VisionClient | None:
