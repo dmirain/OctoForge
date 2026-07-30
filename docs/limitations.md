@@ -79,8 +79,14 @@ delivered. Scrollback comes from stored messages, not from replaying the stream.
   not exist for that request. Ranking is vector search fused with BM25, plus an exact-title boost and an
   optional rerank — there is still no MMR diversification and no recency decay.
 - **The lexical half needs an extension managed Postgres cannot install.** `pg_textsearch` requires
-  `shared_preload_libraries`, which RDS, Cloud SQL, Supabase and Neon do not expose. Those deployments — and
-  SQLite ones — get embeddings-only recall and a substring `history_search`. The startup report says which.
+  `shared_preload_libraries`, which RDS, Cloud SQL, Supabase and Neon do not expose. Those deployments get
+  embeddings-only recall and a substring `history_search`. The startup report says which engine is live.
+- **SQLite keyword search does not stem Russian.** The embedded deployment gets FTS5, but SQLite ships no
+  Russian stemmer, so the tokenizer is `trigram` and matching is by substring: "задач" finds "задачи" and
+  "договор" finds "договора", while "задача" finds neither. Latin technical terms — the highest-value case
+  for keyword search — behave the same on both dialects. Closing this would mean shipping a custom
+  tokenizer as a compiled SQLite extension, which would give up the "just a file" property that makes the
+  embedded mode worth having.
 - **No approximate-nearest-neighbour index.** The vector column is declared without a dimension so that the
   embedding model can be changed without a migration, and pgvector cannot build an HNSW index on such a
   column. Searches are exact scans; that is comfortable well past this scale, but it is a ceiling.

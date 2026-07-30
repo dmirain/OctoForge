@@ -15,10 +15,20 @@ import logging
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from octoforge_core.composition import LexicalBackend
 from octoforge_core.config import EmbeddingBackend
-from octoforge_core.db.search_extensions import PG_TEXTSEARCH, VECTOR
+from octoforge_core.db.search_extensions import VECTOR
 
 from octoforge_web.config import Settings
+
+# Which engine answers a keyword query, and what that costs the user. Naming the
+# engine matters: the two are not equivalent — Postgres stems Russian, SQLite
+# matches substrings, so "задача" finds "задачи" on one and not the other.
+LEXICAL_DETAIL = {
+    LexicalBackend.POSTGRES: "pg_textsearch, BM25 over the russian_unaccent config",
+    LexicalBackend.SQLITE: "SQLite FTS5, BM25 over trigrams (no russian stemming)",
+    LexicalBackend.NONE: "unavailable here — recall is embeddings only",
+}
 
 REPORT_HEADER = "capabilities of this installation:"
 ON = "on"
@@ -45,6 +55,7 @@ class Capability:
 def describe_capabilities(
     settings: Settings,
     search_extensions: frozenset[str] = frozenset(),
+    lexical_backend: LexicalBackend = LexicalBackend.NONE,
 ) -> tuple[Capability, ...]:
     """Describe every optional capability, in report order.
 
@@ -58,7 +69,7 @@ def describe_capabilities(
         *_multimodal_capabilities(settings),
         *_tool_capabilities(settings),
         *_surface_capabilities(settings),
-        *_search_capabilities(search_extensions),
+        *_search_capabilities(search_extensions, lexical_backend),
     )
 
 
@@ -66,9 +77,10 @@ def log_capabilities(
     settings: Settings,
     logger: logging.Logger,
     search_extensions: frozenset[str] = frozenset(),
+    lexical_backend: LexicalBackend = LexicalBackend.NONE,
 ) -> None:
     """Log the capability report; critical gaps also get their own warning."""
-    capabilities = describe_capabilities(settings, search_extensions)
+    capabilities = describe_capabilities(settings, search_extensions, lexical_backend)
     logger.info("%s\n%s", REPORT_HEADER, "\n".join(cap.line() for cap in capabilities))
     for cap in capabilities:
         if not cap.enabled and cap.name in CRITICAL:
@@ -219,7 +231,10 @@ def _host(url: str) -> str:
     return urlsplit(url).netloc or url
 
 
-def _search_capabilities(search_extensions: frozenset[str]) -> tuple[Capability, ...]:
+def _search_capabilities(
+    search_extensions: frozenset[str],
+    lexical_backend: LexicalBackend,
+) -> tuple[Capability, ...]:
     """Report what the database itself can contribute to retrieval.
 
     Neither is required. Without pgvector the whole visible table is pulled
@@ -229,7 +244,6 @@ def _search_capabilities(search_extensions: frozenset[str]) -> tuple[Capability,
     state worth stating plainly rather than a misconfiguration.
     """
     vector = VECTOR in search_extensions
-    lexical = PG_TEXTSEARCH in search_extensions
     return (
         Capability(
             name="vector search",
@@ -242,11 +256,7 @@ def _search_capabilities(search_extensions: frozenset[str]) -> tuple[Capability,
         ),
         Capability(
             name="lexical search",
-            enabled=lexical,
-            detail=(
-                "pg_textsearch, BM25 over the russian_unaccent config"
-                if lexical
-                else "no pg_textsearch — recall is embeddings only"
-            ),
+            enabled=lexical_backend is not LexicalBackend.NONE,
+            detail=LEXICAL_DETAIL[lexical_backend],
         ),
     )

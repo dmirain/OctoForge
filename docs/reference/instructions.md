@@ -35,8 +35,15 @@ Retrieval runs **two retrievers**, because they fail in opposite ways.
   chunked as well, because one long C call holds the GIL even from a thread.
 - **Lexical search (BM25)** finds records that literally *say* it. This is the half embeddings are
   bad at: a product name, an error code, an API field, a rare acronym — cases where nearest-neighbour
-  search cheerfully returns four documents on the topic that never mention the term. It needs
-  `pg_textsearch`; without it, recall is embeddings only.
+  search cheerfully returns four documents on the topic that never mention the term. Postgres
+  provides it through `pg_textsearch`, SQLite through FTS5; without either, recall is embeddings only.
+
+**The two lexical engines are not equivalent, and the difference is visible to users.** Postgres stems
+through `russian_unaccent`, so "задача" finds "задачи". SQLite has no Russian stemmer; the closest
+available tokenizer is `trigram`, which matches substrings — it finds "задачи" from "задач" and
+"договора" from "договор", but not from "задача", which is not a substring of anything there. Latin
+technical terms behave identically on both. The startup report names which engine is live rather than
+just saying "on".
 
 Two BM25 indexes cover a record, title and content, not one over their concatenation: BM25 normalizes
 relevance by document length, so a two-token title folded into a two-hundred-token body would carry

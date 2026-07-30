@@ -16,6 +16,7 @@ from octoforge_core.db.engine import (
     create_engine,
     init_db,
 )
+from octoforge_core.db.sqlite_fts import include_object
 
 EXPECTED_TABLES = frozenset(
     {
@@ -40,7 +41,9 @@ def _table_names(connection: Connection) -> set[str]:
 
 
 def _metadata_diffs(connection: Connection) -> list[object]:
-    context = MigrationContext.configure(connection)
+    # same filter env.py uses: the FTS5 mirrors are raw SQL and never appear in
+    # Base.metadata, so autogenerate would propose dropping all of them
+    context = MigrationContext.configure(connection, opts={"include_object": include_object})
     return list(compare_metadata(context, Base.metadata))
 
 

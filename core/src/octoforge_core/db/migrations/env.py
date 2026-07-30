@@ -14,6 +14,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from octoforge_core.db.base import Base
+from octoforge_core.db.sqlite_fts import include_object
 
 # Import every model module so all tables register on Base.metadata. A module
 # missing here is invisible to autogenerate, which would then propose dropping
@@ -33,6 +34,8 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+
+
 def run_migrations_offline() -> None:
     """Render migrations as SQL without a DBAPI connection."""
     url = config.get_main_option("sqlalchemy.url")
@@ -42,6 +45,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         compare_type=True,
         render_as_batch=True,
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -53,6 +57,7 @@ def do_run_migrations(connection) -> None:
         target_metadata=target_metadata,
         compare_type=True,
         render_as_batch=True,  # SQLite needs batch mode for ALTERs
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()

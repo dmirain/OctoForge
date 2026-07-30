@@ -56,8 +56,9 @@ summary carries topic tags rather than being free prose.
 
 How the query matches depends on the database. With `pg_textsearch` it is a **BM25 search**: the query
 is stemmed through the same `russian_unaccent` configuration the rest of retrieval uses, and hits come
-back by relevance. Without it, the fallback is a **substring match** (`content ILIKE '%query%'`)
-ordered by position in the dialog. The difference is not cosmetic in an inflected language — a
+back by relevance. On SQLite it is **FTS5**, also BM25-ranked but tokenized by trigram, so it matches
+substrings instead of stems. With neither, the fallback is a **substring match**
+(`content ILIKE '%query%'`) ordered by position in the dialog. The difference is not cosmetic in an inflected language — a
 substring search for "задача" does not find "задачи", so the tool only works when the user happens to
 type the exact form somebody wrote months earlier.
 
@@ -99,7 +100,7 @@ that point. It happens rarely and in the background, so the amortized effect is 
 | Provider context overflow | `compact_now()`, branch rebuilt, run retried once; a second overflow fails the run |
 | Compaction disabled (`NoopContextCompactor`) | Prompts grow with the dialog; the provider's window becomes the limit |
 | `history_search` with a topic that matches no summary | Returns "no hits" rather than searching everything |
-| `pg_textsearch` absent | `history_search` falls back to a substring match with no stemming and no relevance ordering |
+| No lexical engine at all | `history_search` falls back to a substring match with no stemming and no relevance ordering |
 | Long-uncompacted backlog | Compaction advances in bounded windows instead of reading everything at once |
 
 ## Code anchors
@@ -111,4 +112,6 @@ that point. It happens rarely and in the background, so the amortized effect is 
 - `core/src/octoforge_core/context/store.py` — summaries and archive search
 - `core/src/octoforge_core/context/tools.py` — the `history_search` tool
 - `core/src/octoforge_core/context/pg_store.py` — the BM25-ranked archive search
+- `core/src/octoforge_core/context/sqlite_store.py` — the FTS5 equivalent
+- `core/src/octoforge_core/db/sqlite_fts.py` — the FTS5 mirrors, triggers and query escaping
 - `core/tests/test_context_compactor.py`, `core/tests/test_context_integration.py` — behavior

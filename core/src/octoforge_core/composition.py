@@ -8,6 +8,7 @@ application settings, no surface adapters (those stay in the web layer).
 """
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -25,6 +26,7 @@ from octoforge_core.config import LLMConfig
 from octoforge_core.context.api import ContextCompactor, MessageArchive, SummaryStore
 from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
 from octoforge_core.context.pg_store import PostgresSummaryStore
+from octoforge_core.context.sqlite_store import SqliteSummaryStore
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.context.tools import HistorySearchTool
 from octoforge_core.cron.api import CronStore, CronWaker, Scheduler
@@ -34,6 +36,7 @@ from octoforge_core.cron.tools import CronPauseTool, CronResumeTool
 from octoforge_core.datasets.api import DatasetService, DatasetStore
 from octoforge_core.datasets.pg_store import PostgresDatasetStore
 from octoforge_core.datasets.service import LocalDatasetService
+from octoforge_core.datasets.sqlite_store import SqliteDatasetStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.datasets.tools import DataForgetTool, DataPutTool, DataQueryTool
 from octoforge_core.dialogs.api import (
@@ -50,6 +53,7 @@ from octoforge_core.instructions.local import (
     LocalInstructionService,
 )
 from octoforge_core.instructions.pg_store import PostgresInstructionStore
+from octoforge_core.instructions.sqlite_store import SqliteInstructionStore
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.instructions.tools import (
     InstructionDeleteTool,
@@ -72,6 +76,20 @@ from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool, TaskListT
 from octoforge_core.tools.registry import ToolRegistry
 from octoforge_core.vision.api import ImageResolver, VisionClient
 from octoforge_core.vision.tools import ImageLookTool
+
+
+class LexicalBackend(StrEnum):
+    """Which engine, if any, can answer the lexical half of a search.
+
+    An enum rather than a bool because the two engines are not
+    interchangeable: BM25 through pg_textsearch stems Russian, FTS5 through
+    trigram matches substrings, and the composition root has to name which one
+    it found rather than merely whether it found something.
+    """
+
+    NONE = "none"
+    POSTGRES = "postgres"
+    SQLITE = "sqlite"
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +159,7 @@ def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMCl
 def build_summary_store(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    lexical_search: bool,
+    lexical_search: LexicalBackend,
 ) -> SqlAlchemySummaryStore:
     """Pick the summary/archive store: BM25-ranked history search where possible.
 
@@ -154,19 +172,23 @@ def build_summary_store(
     position in the dialog, which is what it always was; with it, the query is
     stemmed and results come back by relevance.
     """
-    if lexical_search:
+    if lexical_search is LexicalBackend.POSTGRES:
         return PostgresSummaryStore(session_factory)
+    if lexical_search is LexicalBackend.SQLITE:
+        return SqliteSummaryStore(session_factory)
     return SqlAlchemySummaryStore(session_factory)
 
 
 def build_dataset_store(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    lexical_search: bool,
+    lexical_search: LexicalBackend,
 ) -> DatasetStore:
     """Pick the dataset store: BM25 over descriptions where the database can."""
-    if lexical_search:
+    if lexical_search is LexicalBackend.POSTGRES:
         return PostgresDatasetStore(session_factory)
+    if lexical_search is LexicalBackend.SQLITE:
+        return SqliteDatasetStore(session_factory)
     return SqlAlchemyDatasetStore(session_factory)
 
 
@@ -174,7 +196,7 @@ def build_instruction_store(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     vector_search: bool,
-    lexical_search: bool = False,
+    lexical_search: LexicalBackend = LexicalBackend.NONE,
 ) -> InstructionStore:
     """Pick the instruction store: pgvector-backed when the database can, else portable.
 
@@ -186,8 +208,10 @@ def build_instruction_store(
     `pg_extension`, which is what makes a database without the extension a
     supported configuration rather than a crash.
     """
-    if vector_search or lexical_search:
+    if vector_search or lexical_search is LexicalBackend.POSTGRES:
         return PostgresInstructionStore(session_factory)
+    if lexical_search is LexicalBackend.SQLITE:
+        return SqliteInstructionStore(session_factory)
     return SqlAlchemyInstructionStore(session_factory)
 
 

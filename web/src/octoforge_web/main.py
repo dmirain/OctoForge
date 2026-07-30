@@ -43,7 +43,13 @@ from octoforge_core import (
 from octoforge_core.admin.api import AdminReadModel
 from octoforge_core.admin.store import SqlAlchemyAdminStore
 from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
-from octoforge_core.composition import RunnerOptions, ToolLimits, ToolServices, ToolStores
+from octoforge_core.composition import (
+    LexicalBackend,
+    RunnerOptions,
+    ToolLimits,
+    ToolServices,
+    ToolStores,
+)
 from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
 from octoforge_core.context.api import SummaryStore
 from octoforge_core.context.compactor import CompactorConfig
@@ -55,6 +61,7 @@ from octoforge_core.db.search_extensions import (
     VECTOR,
     installed_search_extensions,
 )
+from octoforge_core.db.sqlite_fts import has_sqlite_fts
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
@@ -166,7 +173,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     # after the bootstrap: the schema step is what creates the extensions, so
     # probing earlier would report a gap the next line has already filled
     search_extensions = await _probe_search_extensions(engine)
-    log_capabilities(settings, logger, search_extensions)
+    lexical_backend = await _probe_lexical_backend(engine, search_extensions)
+    log_capabilities(settings, logger, search_extensions, lexical_backend)
     session_factory = create_session_factory(engine)
     dialogs = SqlAlchemyDialogRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
@@ -198,18 +206,14 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 embedding_model=settings.embedding_model,
             )
             datasets = build_dataset_service(
-                build_dataset_store(
-                    session_factory, lexical_search=PG_TEXTSEARCH in search_extensions
-                ),
+                build_dataset_store(session_factory, lexical_search=lexical_backend),
                 embedder,
             )
             await _sync_system_skills(instructions, settings)
             # The app's own base URL is allowlisted so tool records can
             # target our loopback HTTP API (cron jobs) past the SSRF guard.
             guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
-            summary_store = build_summary_store(
-                session_factory, lexical_search=PG_TEXTSEARCH in search_extensions
-            )
+            summary_store = build_summary_store(session_factory, lexical_search=lexical_backend)
             registry = build_tool_registry(
                 outbound_http,
                 guard,
@@ -467,6 +471,27 @@ async def _probe_search_extensions(engine: AsyncEngine) -> frozenset[str]:
     except SQLAlchemyError:
         logger.warning("could not probe search extensions; assuming none", exc_info=True)
         return frozenset()
+
+
+async def _probe_lexical_backend(
+    engine: AsyncEngine,
+    search_extensions: frozenset[str],
+) -> LexicalBackend:
+    """Decide which engine answers the lexical half of a search, if any.
+
+    Postgres wins where pg_textsearch exists; otherwise a SQLite database whose
+    FTS5 mirrors were built by the migration answers instead. Never fatal: a
+    database that cannot do either reports NONE and recall stays on embeddings.
+    """
+    if PG_TEXTSEARCH in search_extensions:
+        return LexicalBackend.POSTGRES
+    try:
+        async with engine.connect() as connection:
+            if await connection.run_sync(has_sqlite_fts):
+                return LexicalBackend.SQLITE
+    except SQLAlchemyError:
+        logger.warning("could not probe SQLite full-text search; assuming none", exc_info=True)
+    return LexicalBackend.NONE
 
 
 async def _bootstrap_schema(engine: AsyncEngine) -> None:

@@ -3,6 +3,7 @@
 import logging
 
 import pytest
+from octoforge_core.composition import LexicalBackend
 from octoforge_core.db.search_extensions import PG_TEXTSEARCH, VECTOR
 
 from octoforge_web.capabilities import (
@@ -168,13 +169,29 @@ def test_search_extensions_are_reported_from_the_database_not_from_settings() ->
     absent = {cap.name: cap for cap in describe_capabilities(Settings())}
     present = {
         cap.name: cap
-        for cap in describe_capabilities(Settings(), frozenset({VECTOR, PG_TEXTSEARCH}))
+        for cap in describe_capabilities(
+            Settings(), frozenset({VECTOR, PG_TEXTSEARCH}), LexicalBackend.POSTGRES
+        )
     }
 
     assert absent["vector search"].enabled is False
     assert absent["lexical search"].enabled is False
     assert present["vector search"].enabled is True
     assert present["lexical search"].enabled is True
+
+
+def test_the_report_names_which_lexical_engine_is_live() -> None:
+    """The two engines are not equivalent — Postgres stems Russian and SQLite
+    matches substrings — so "on" alone would be misleading."""
+    by_backend = {
+        backend: {cap.name: cap for cap in describe_capabilities(Settings(), frozenset(), backend)}
+        for backend in LexicalBackend
+    }
+
+    assert "pg_textsearch" in by_backend[LexicalBackend.POSTGRES]["lexical search"].detail
+    assert "FTS5" in by_backend[LexicalBackend.SQLITE]["lexical search"].detail
+    assert by_backend[LexicalBackend.SQLITE]["lexical search"].enabled is True
+    assert by_backend[LexicalBackend.NONE]["lexical search"].enabled is False
 
 
 def test_a_database_without_the_extensions_is_not_a_critical_gap(
