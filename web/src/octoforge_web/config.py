@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Annotated
 
 from octoforge_core import EmbeddingConfig, LLMConfig
+from octoforge_core.agent.loop import DEFAULT_TOOL_TIMEOUT_SECONDS
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, SYSTEM_PROMPT_NAME
 from octoforge_core.config import (
     DEFAULT_EMBEDDING_BATCH_SIZE,
@@ -116,6 +117,9 @@ class Settings(BaseSettings):
     max_processes: int = DEFAULT_MAX_PROCESSES
     router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
     llm_stream_idle_timeout_seconds: float = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS
+    # Wall-clock ceiling on one tool call. A tool that never returns holds its
+    # iteration open forever and freezes that dialog until the process restarts.
+    agent_tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS
     llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
     llm_retry_base_seconds: float = DEFAULT_LLM_RETRY_BASE_SECONDS
     llm_retry_max_seconds: float = DEFAULT_LLM_RETRY_MAX_SECONDS

@@ -35,6 +35,10 @@ from octoforge_core.db.search_extensions import ensure_bm25_indexes, ensure_sear
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _BASELINE_REVISION = "675056c8fffd"
 SQLITE_DIALECT = "sqlite"
+# How long a blocked SQLite writer waits for the lock before giving up. Long
+# enough to ride out an ordinary concurrent commit, short enough that a genuine
+# deadlock still surfaces rather than hanging a dialog forever.
+SQLITE_BUSY_TIMEOUT_MS = 5000
 
 
 def create_engine(database_url: str) -> AsyncEngine:
@@ -95,7 +99,37 @@ def create_engine(database_url: str) -> AsyncEngine:
         )
         event.listen(engine.sync_engine, "connect", _enable_read_uncommitted)
         return engine
-    return create_async_engine(database_url)
+    engine = create_async_engine(database_url)
+    if engine.dialect.name == SQLITE_DIALECT:
+        event.listen(engine.sync_engine, "connect", _enable_wal)
+    return engine
+
+
+def _enable_wal(dbapi_connection: DBAPIConnection, _record: ConnectionPoolEntry) -> None:
+    """Put a SQLite FILE database into WAL mode with a write timeout.
+
+    The default rollback journal takes an exclusive lock for the whole of every
+    write, so a reader arriving mid-write gets `database is locked` immediately
+    rather than waiting. One process serves every dialog here, and the actor,
+    the cron scheduler and the recovery sweeps all touch the database at once,
+    so that is not a rare interleaving.
+
+    WAL lets readers proceed against the last committed state while a write is
+    in flight, and `busy_timeout` makes the remaining writer/writer overlap wait
+    instead of failing. `synchronous=NORMAL` is the standard WAL pairing: a
+    crash can lose the last transactions but never corrupts the database, and
+    the alternative costs an fsync per commit.
+
+    In-memory databases are excluded (they take the shared-cache branch above,
+    where WAL does not apply).
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+    finally:
+        cursor.close()
 
 
 def _enable_read_uncommitted(

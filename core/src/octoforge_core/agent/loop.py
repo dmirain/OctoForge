@@ -1,6 +1,7 @@
 """Agent loop: streams events while iterating LLM calls and tool executions."""
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -38,6 +39,15 @@ EMPTY_STREAM_MESSAGE = "LLM stream ended without a final message"
 STREAM_IDLE_TIMEOUT_MESSAGE = "LLM stream idle timeout"
 ERROR_OUTPUT_PREFIX = "error: "
 CANCELLED_OUTPUT = "cancelled"
+
+logger = logging.getLogger(__name__)
+# A tool that never returns holds its iteration open forever: the loop awaits
+# every eager run before it can finish the turn, so one wedged call freezes that
+# dialog until the process restarts. The stream has an idle timeout for the same
+# reason; tools had none. Generous on purpose — a slow endpoint is normal, an
+# infinite one is not.
+DEFAULT_TOOL_TIMEOUT_SECONDS = 180.0
+TOOL_TIMEOUT_MESSAGE = "tool {name!r} exceeded its {seconds:.0f}s time limit"
 
 
 class _RunCancelled(Exception):
@@ -90,9 +100,15 @@ class _ToolRunTracker:
     deterministic under concurrent execution.
     """
 
-    def __init__(self, registry: ToolRegistry, context: ToolContext) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        context: ToolContext,
+        timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+    ) -> None:
         self._registry = registry
         self._context = context
+        self._timeout = timeout_seconds
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._results: dict[str, _ToolRunResult] = {}
         self._queue: asyncio.Queue[_ToolRunResult] = asyncio.Queue()
@@ -189,10 +205,38 @@ class _ToolRunTracker:
         self._queue.put_nowait(_ToolRunResult(call=call, content=content, error=error))
 
     async def _execute_one(self, call: ToolCall) -> tuple[str, str | None]:
-        """Execute one call; failures become error output for the LLM."""
+        """Execute one call under a time limit; failures become output for the LLM.
+
+        A timeout is reported the same way any other tool failure is — as error
+        output the model can react to — rather than raised. The model can then
+        try something else, which is strictly better than the alternative of an
+        iteration that never completes.
+        """
         try:
             tool = self._registry.get(call.name)
-            return await tool.execute(call.arguments, self._context), None
+            # Not `asyncio.wait_for`: it signals our own expiry with the same
+            # TimeoutError a tool may raise for its own reasons (an httpx read
+            # timeout is one), and the two deserve different messages. Waiting
+            # on the task instead makes the distinction structural — an empty
+            # `done` set is our limit, anything else is the tool's own outcome.
+            task = asyncio.create_task(tool.execute(call.arguments, self._context))
+            try:
+                done, _pending = await asyncio.wait({task}, timeout=self._timeout)
+            except asyncio.CancelledError:
+                # A run cancelled from outside (user stop, stream failure, idle
+                # timeout) must take the tool with it: `asyncio.wait` does not
+                # cancel what it was waiting on, so without this the tool keeps
+                # running against a dialog that has already moved on.
+                task.cancel()
+                raise
+            if not done:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                error = TOOL_TIMEOUT_MESSAGE.format(name=call.name, seconds=self._timeout)
+                logger.warning("%s", error)
+                return f"{ERROR_OUTPUT_PREFIX}{error}", error
+            return await task, None
         except Exception as exc:  # tool failures are reported back to the LLM
             error = format_error(exc)
             return f"{ERROR_OUTPUT_PREFIX}{error}", error
@@ -207,11 +251,13 @@ class AgentLoop:
         registry: ToolRegistry,
         max_iterations: int,
         stream_idle_timeout: float | None = None,
+        tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> None:
         self._llm = llm_client
         self._registry = registry
         self._max_iterations = max_iterations
         self._stream_idle_timeout = stream_idle_timeout
+        self._tool_timeout = tool_timeout
 
     def stream(
         self,
@@ -237,7 +283,7 @@ class AgentLoop:
                 yield Cancelled()
                 return
             outcome = _IterationOutcome()
-            tracker = _ToolRunTracker(self._registry, context)
+            tracker = _ToolRunTracker(self._registry, context, self._tool_timeout)
             async for event in self._stream_assistant(history, control, tracker, specs):
                 outcome.observe(event)
                 yield event

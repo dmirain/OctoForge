@@ -270,6 +270,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         registry,
                         max_iterations=settings.agent_max_iterations,
                         stream_idle_timeout=settings.llm_stream_idle_timeout_seconds or None,
+                        tool_timeout=settings.agent_tool_timeout_seconds,
                     ),
                     prompt_provider,
                     build_router(

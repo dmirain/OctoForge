@@ -14,7 +14,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.collecting import CollectingSweeper, CollectionPromoter
-from octoforge_core.agent.loop import AgentLoop
+from octoforge_core.agent.loop import DEFAULT_TOOL_TIMEOUT_SECONDS, AgentLoop
 from octoforge_core.agent.prompts import PromptProvider
 from octoforge_core.agent.router import LLMRouter, MessageRouter
 from octoforge_core.agent.runner import (
@@ -295,6 +295,7 @@ def build_agent_loop(
     *,
     max_iterations: int,
     stream_idle_timeout: float | None = None,
+    tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
 ) -> AgentLoop:
     """Build the agent loop over the given LLM client and tool registry."""
     return AgentLoop(
@@ -302,6 +303,7 @@ def build_agent_loop(
         registry=registry,
         max_iterations=max_iterations,
         stream_idle_timeout=stream_idle_timeout,
+        tool_timeout=tool_timeout,
     )
 
 
