@@ -136,28 +136,37 @@ class SqlAlchemyMessageRepository:
                     .where(MessageRow.dialog_id == dialog_id)
                     .scalar_subquery()
                 )
-                await session.execute(
-                    insert(MessageRow).values(
-                        id=row_id,
-                        dialog_id=dialog_id,
-                        seq=next_seq,
-                        role=message.role.value,
-                        content=message.content,
-                        tool_calls=_tool_calls_to_json(message.tool_calls),
-                        tool_call_id=message.tool_call_id,
-                        client_message_id=client_message_id,
-                        prompt_tokens=usage.prompt_tokens if usage is not None else None,
-                        completion_tokens=usage.completion_tokens if usage is not None else None,
-                        task_id=message.task_id,
-                        exchange_id=message.exchange_id,
-                        kind=_kind_to_column(message.kind),
-                        attachments=_attachments_to_json(message.attachments),
-                    )
-                )
-                dialog = await session.get(DialogRow, dialog_id)
-                if dialog is not None:
-                    dialog.updated_at = utc_now()
+                # The INSERT is inside the try, not just the commit: a Core
+                # insert goes to the server immediately, so when the winning row
+                # is ALREADY committed the unique violation surfaces here rather
+                # than at commit time. Guarding only the commit made the retry
+                # work or not depending on which writer got there first — a
+                # one-in-ten lost message under concurrent appends to one
+                # dialog, which the exchange model makes routine.
                 try:
+                    await session.execute(
+                        insert(MessageRow).values(
+                            id=row_id,
+                            dialog_id=dialog_id,
+                            seq=next_seq,
+                            role=message.role.value,
+                            content=message.content,
+                            tool_calls=_tool_calls_to_json(message.tool_calls),
+                            tool_call_id=message.tool_call_id,
+                            client_message_id=client_message_id,
+                            prompt_tokens=usage.prompt_tokens if usage is not None else None,
+                            completion_tokens=(
+                                usage.completion_tokens if usage is not None else None
+                            ),
+                            task_id=message.task_id,
+                            exchange_id=message.exchange_id,
+                            kind=_kind_to_column(message.kind),
+                            attachments=_attachments_to_json(message.attachments),
+                        )
+                    )
+                    dialog = await session.get(DialogRow, dialog_id)
+                    if dialog is not None:
+                        dialog.updated_at = utc_now()
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
@@ -191,26 +200,28 @@ class SqlAlchemyMessageRepository:
                     .where(MessageRow.dialog_id == dialog_id)
                     .scalar_subquery()
                 )
-                for message in (first, second):
-                    await session.execute(
-                        insert(MessageRow).values(
-                            id=uuid.uuid4().hex,
-                            dialog_id=dialog_id,
-                            seq=next_seq,
-                            role=message.role.value,
-                            content=message.content,
-                            tool_calls=_tool_calls_to_json(message.tool_calls),
-                            tool_call_id=message.tool_call_id,
-                            task_id=message.task_id,
-                            exchange_id=message.exchange_id,
-                            kind=_kind_to_column(message.kind),
-                            attachments=_attachments_to_json(message.attachments),
-                        )
-                    )
-                dialog = await session.get(DialogRow, dialog_id)
-                if dialog is not None:
-                    dialog.updated_at = utc_now()
+                # Same reason as in `append`: the violation can surface on the
+                # INSERT itself, so the retry has to cover it.
                 try:
+                    for message in (first, second):
+                        await session.execute(
+                            insert(MessageRow).values(
+                                id=uuid.uuid4().hex,
+                                dialog_id=dialog_id,
+                                seq=next_seq,
+                                role=message.role.value,
+                                content=message.content,
+                                tool_calls=_tool_calls_to_json(message.tool_calls),
+                                tool_call_id=message.tool_call_id,
+                                task_id=message.task_id,
+                                exchange_id=message.exchange_id,
+                                kind=_kind_to_column(message.kind),
+                                attachments=_attachments_to_json(message.attachments),
+                            )
+                        )
+                    dialog = await session.get(DialogRow, dialog_id)
+                    if dialog is not None:
+                        dialog.updated_at = utc_now()
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
