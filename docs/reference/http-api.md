@@ -14,7 +14,7 @@ therefore contain no wiring: they take ports and call them.
 
 | Method and path | Purpose |
 |---|---|
-| `POST /api/dialog/messages` | Submit a user message. Body: `content`, optional `client_message_id` (idempotency key), optional `reply_to_exchange_id` (skips the router). Answers `202 Accepted` |
+| `POST /api/dialog/messages` | Submit a user message. Body: `content`, optional `client_message_id` (idempotency key), optional `reply_to_exchange_id` (skips the router), plus what only a surface knows: `kind` (`own` or `material`), `origin`, `attachments` (`[{kind, ref}]`). Answers `202 Accepted` |
 | `POST /api/dialog/cancel` | Stop the dialog's live answer runs |
 | `GET /api/dialog/events` | Subscribe to the dialog's event stream over SSE |
 

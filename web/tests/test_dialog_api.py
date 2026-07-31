@@ -33,6 +33,7 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
 )
+from octoforge_core.domain import Attachment, AttachmentKind, MessageKind, MessageSource
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
@@ -44,7 +45,7 @@ from octoforge_web.api.dialog import SSE_MEDIA_TYPE, STATUS_ACCEPTED
 from octoforge_web.api.dialog import cancel as cancel_endpoint
 from octoforge_web.api.dialog import events as events_endpoint
 from octoforge_web.api.dialog import post_message as post_message_endpoint
-from octoforge_web.api.schemas import PostMessageRequest
+from octoforge_web.api.schemas import AttachmentSpec, PostMessageRequest
 from octoforge_web.auth import hash_password
 from octoforge_web.config import Settings
 from octoforge_web.deps import CHANNEL_HEADER, get_channel
@@ -335,6 +336,7 @@ async def test_post_message_forwards_reply_to_exchange_id(
         content: str,
         client_message_id: str | None = None,
         reply_to_exchange_id: str | None = None,
+        source: MessageSource | None = None,
     ) -> None:
         submitted.append((content, client_message_id, reply_to_exchange_id))
 
@@ -485,3 +487,53 @@ def test_an_unknown_channel_is_refused_over_http(client: TestClient) -> None:
     )
 
     assert response.status_code == HTTPStatus.BAD_REQUEST
+
+
+async def test_a_submit_carries_what_only_the_surface_knows(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A surface in its own process must be able to submit everything an
+    in-process one could: forwarded material, whom it came from, and the
+    files that arrived with it."""
+    manager = await make_manager([reply()], session_factory)
+    runner = await manager.get_or_create_runner(USER_A, CHANNEL)
+    submitted: list[MessageSource | None] = []
+
+    async def record(
+        content: str,
+        client_message_id: str | None = None,
+        reply_to_exchange_id: str | None = None,
+        source: MessageSource | None = None,
+    ) -> None:
+        submitted.append(source)
+
+    runner.submit = record  # type: ignore[method-assign]
+    await post_message_endpoint(
+        PostMessageRequest(
+            content="[переслано от Иван] смотри",
+            kind=MessageKind.MATERIAL,
+            origin="Иван",
+            attachments=(AttachmentSpec(kind=AttachmentKind.IMAGE, ref="tgfile:abc"),),
+        ),
+        USER_A,
+        CHANNEL,
+        manager,
+    )
+
+    assert submitted == [
+        MessageSource(
+            kind=MessageKind.MATERIAL,
+            origin="Иван",
+            attachments=(Attachment(kind=AttachmentKind.IMAGE, ref="tgfile:abc"),),
+        )
+    ]
+    await manager.stop_all()
+
+
+async def test_a_plain_submit_is_still_the_user_speaking(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every existing client sends none of this and must keep meaning `own`."""
+    assert PostMessageRequest(content="hi").to_source() == MessageSource(
+        kind=MessageKind.OWN, origin=None, attachments=()
+    )
