@@ -14,10 +14,13 @@ from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
 
 from octoforge_web.auth import AuthGate
+from octoforge_web.channels import KNOWN_CHANNELS
 from octoforge_web.config import Settings
 from octoforge_web.secret_links import SecretLinkService
 from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 
+CHANNEL_HEADER = "X-Channel"
+UNKNOWN_CHANNEL_MESSAGE = "unknown channel: {channel}"
 MISSING_USER_ID_MESSAGE = "X-User-Id header is required"
 
 
@@ -82,8 +85,27 @@ def get_summary_store(request: Request) -> SummaryStore:
 
 
 def get_channel(request: Request) -> str:
-    """Return the surface channel declared by the composition root."""
-    return cast(str, request.app.state.channel)
+    """Return the channel this request addresses.
+
+    The header wins, the composition root's own channel is the default. That
+    default is what keeps the chat UI (and every existing client) working
+    without knowing the concept exists.
+
+    A per-request channel is what lets one process serve several surfaces:
+    without it a deployment needs a separate fleet per channel, which defeats
+    balancing users across a single one. Unknown values are refused — an
+    accepted typo would silently open a dialog nobody ever reads.
+    """
+    declared = cast(str, request.app.state.channel)
+    channel = request.headers.get(CHANNEL_HEADER)
+    if channel is None:
+        return declared
+    if channel not in KNOWN_CHANNELS:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=UNKNOWN_CHANNEL_MESSAGE.format(channel=channel),
+        )
+    return channel
 
 
 def get_secret_store(request: Request) -> SecretStore | None:

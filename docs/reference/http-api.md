@@ -18,7 +18,11 @@ therefore contain no wiring: they take ports and call them.
 | `POST /api/dialog/cancel` | Stop the dialog's live answer runs |
 | `GET /api/dialog/events` | Subscribe to the dialog's event stream over SSE |
 
-The dialog is selected by the `X-User-Id` header and the channel (`web` by default) — a dialog is created
+The dialog is selected by the `X-User-Id` header and the `X-Channel` one. `X-Channel` defaults to the
+channel the process declares (`web` for the HTTP app), which is why existing clients need not know it
+exists; a value outside the surfaces this deployment serves is refused with 400 rather than quietly
+given a dialog of its own. A per-request channel is what lets one process serve several surfaces
+instead of needing a separate fleet for each. A dialog is created
 on first contact.
 
 Submitting is deliberately asynchronous: the message is accepted, and the answer arrives on the event
@@ -126,6 +130,7 @@ string: front the deployment with a proxy that authenticates people and sets tha
 | Repeated wrong credentials | 429 after five failures, for a cooldown, without hashing anything |
 | Cross-site POST/DELETE from a browser | 403, before authentication |
 | Missing `X-User-Id` | 400 |
+| Unknown `X-Channel` | 400 |
 | Client disconnects mid-stream | Subscription removed; the run keeps going and its result is delivered through the outbox on the next subscribe |
 | Slow client | Stream events dropped for that subscriber; terminals still delivered |
 | Database unavailable | `/health/ready` fails (logged), `/health` still answers |

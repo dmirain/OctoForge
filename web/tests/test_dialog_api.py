@@ -6,8 +6,10 @@ import json
 from collections.abc import AsyncIterator, Iterator
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from octoforge_core import (
     AgentLoop,
@@ -45,7 +47,9 @@ from octoforge_web.api.dialog import post_message as post_message_endpoint
 from octoforge_web.api.schemas import PostMessageRequest
 from octoforge_web.auth import hash_password
 from octoforge_web.config import Settings
+from octoforge_web.deps import CHANNEL_HEADER, get_channel
 from octoforge_web.main import create_app
+from octoforge_web.telegram.client import TELEGRAM_CHANNEL
 
 REPLY_CONTENT = "final answer"
 SSE_DATA_PREFIX = "data:"
@@ -439,3 +443,45 @@ async def test_events_endpoint_ends_the_stream_when_the_dialog_moves(
     # left to say, and the client's own reconnect is the recovery
     assert not [frame for frame in frames if frame.startswith(SSE_DATA_PREFIX)]
     await manager.stop_all()
+
+
+def channel_request(headers: dict[str, str], declared: str = CHANNEL) -> Request:
+    """A request carrying only what `get_channel` looks at."""
+    app = SimpleNamespace(state=SimpleNamespace(channel=declared))
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        }
+    )
+
+
+def test_a_request_without_a_channel_addresses_the_one_the_process_serves() -> None:
+    """Every existing client sends no channel at all and must keep working."""
+    assert get_channel(channel_request({})) == CHANNEL
+
+
+def test_a_named_channel_addresses_that_surface() -> None:
+    """One process serving several surfaces is the point: without it a
+    deployment needs a fleet per channel, and balancing users across a single
+    fleet has nothing to balance."""
+    assert get_channel(channel_request({CHANNEL_HEADER: TELEGRAM_CHANNEL})) == TELEGRAM_CHANNEL
+
+
+def test_an_unknown_channel_is_refused() -> None:
+    """An accepted typo would strand the user's messages in a dialog nobody reads."""
+    with pytest.raises(HTTPException) as raised:
+        get_channel(channel_request({CHANNEL_HEADER: "telgram"}))
+
+    assert raised.value.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_an_unknown_channel_is_refused_over_http(client: TestClient) -> None:
+    response = client.post(
+        "/api/dialog/messages",
+        json={"content": "hi"},
+        headers={USER_ID_HEADER: USER_A, CHANNEL_HEADER: "telgram"},
+    )
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST

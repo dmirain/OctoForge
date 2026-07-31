@@ -106,6 +106,7 @@ from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.api.secrets import router as secrets_router
 from octoforge_web.auth import CROSS_SITE_MESSAGE, AuthGate, is_cross_site_mutation, is_open_path
 from octoforge_web.capabilities import log_capabilities
+from octoforge_web.channels import WEB_CHANNEL
 from octoforge_web.config import Settings
 from octoforge_web.prompts import FilePromptProvider
 from octoforge_web.secret_links import SecretLinkService
@@ -132,7 +133,6 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 HEALTH_STATUS = "ok"
 READY_STATUS = "ready"
 NOT_READY_STATUS = "not-ready"
-WEB_CHANNEL = "web"
 HTTPX_LOGGER = "httpx"
 USER_ID_HEADER = "X-User-Id"
 USER_ID_HEADER_VALUE_TEMPLATE = "{user_id}"
