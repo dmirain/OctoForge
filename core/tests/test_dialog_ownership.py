@@ -398,3 +398,30 @@ async def _wait_for(predicate: Callable[[], Awaitable[bool]]) -> None:
             await asyncio.sleep(POLL_SECONDS)
 
     await asyncio.wait_for(_poll(), timeout=TIMEOUT_SECONDS)
+
+
+async def test_taking_a_dialog_over_recovers_its_stranded_answer(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A handover strands whatever the previous owner was answering, and the
+    startup sweep will never come back for it: this process now holds a fresh
+    claim, so every peer's recovery skips the dialog. Claiming has to recover
+    what it claims, or a mid-answer deploy loses the answer for good.
+    """
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    dialog_id = await make_dialog(session_factory)
+    stranded = await exchanges.create(dialog_id, "answered by the old owner", owner_task_id="t-1")
+    await SqlAlchemyClaimRepository(session_factory).claim(dialog_id, PEER_NODE)
+
+    manager = make_manager(session_factory)
+    try:
+        await manager.get_or_create_runner(USER_ID, CHANNEL)
+        await _wait_for(lambda: _left_in_progress(exchanges, stranded.id))
+    finally:
+        await manager.stop_all()
+
+    assert (await exchanges.get(stranded.id)).status is not ExchangeStatus.IN_PROGRESS
+
+
+async def _left_in_progress(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
+    return (await exchanges.get(exchange_id)).status is not ExchangeStatus.IN_PROGRESS

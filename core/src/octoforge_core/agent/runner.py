@@ -70,7 +70,7 @@ from octoforge_core.domain import (
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
-from octoforge_core.tasks.store import TaskStore
+from octoforge_core.tasks.store import TaskList, TaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import TaskDeleteOutcome, TaskDeleter, TaskSpawner, ToolContext
 from octoforge_core.vision.api import ImageResolver, VisionClient, VisionUnavailableError
@@ -2488,7 +2488,41 @@ class ConversationManager:
         )
         runner.start()
         self._runners[dialog.id] = runner
+        # Claiming a dialog means inheriting whatever its previous owner left
+        # behind — a handover strands work exactly as a crash does, and no
+        # startup sweep will come back for it: this process now holds a fresh
+        # claim, so every peer's recovery skips the dialog. Done before the
+        # runner is handed out, so the caller's message meets a consistent
+        # dialog.
+        await self._recover_dialog(runner)
         return runner
+
+    async def _recover_dialog(self, runner: ConversationRunner) -> None:
+        """Pick up the work this dialog's previous owner could not finish.
+
+        The whole of recovery for one dialog, used both when a process starts
+        and when it takes a dialog over — the two are the same situation seen
+        from different sides. Never raises: a dialog that cannot be recovered
+        must still be usable, and every step is idempotent, so the next claim
+        tries again.
+        """
+        dialog_id = runner.dialog_id
+        reopened = await self._reopen_stranded_exchanges(dialog_id)
+        for task in await self._orphaned(dialog_id):
+            try:
+                await runner.restart_task(task)
+            except Exception:
+                logger.exception("orphaned task restart failed: task=%s", task.id)
+        revived = await self._revive_unowned_open(runner)
+        for task in await self._undelivered(dialog_id):
+            runner.request_result_delivery(task.id)
+        if reopened or revived:
+            logger.info(
+                "recovered on claim: dialog=%s reopened=%s revived=%s",
+                dialog_id,
+                reopened,
+                revived,
+            )
 
     async def promote_collection(self, user_id: str, channel: str, exchange_id: str) -> None:
         """Hand a settled material collection to its dialog (sweep entry point)."""
@@ -2557,50 +2591,49 @@ class ConversationManager:
             logger.exception("stand-down failed: dialog=%s", runner.dialog_id)
 
     async def recover_interrupted(self) -> None:
-        """Restart orphaned tasks and redeliver undelivered results after a restart.
+        """Pick up work stranded by whatever ran before this process started.
 
         Processes live in memory, so a restart strands PENDING/RUNNING tasks
-        forever and loses results persisted but not yet delivered. The sweep
-        runs once at startup (before the scheduler and the surfaces start) and
-        never raises: a recovery failure must not take the app down — every
-        operation is idempotent and simply retried on the next restart.
+        forever and loses results persisted but not yet delivered. Runs once
+        at startup, before the scheduler and the surfaces come up.
 
         **Only dialogs no live process owns are touched.** This used to sweep
         the whole database on the reasoning that a restart kills every
         process — true while there was one, and destructive with two: a
         starting instance would reopen exchanges its peers are answering
         right now and restart their tasks as its own. Candidates come from
-        the work itself rather than from the claim table, so stranded rows
-        that predate claims entirely are still recovered.
+        the work itself rather than from the claim table, so rows stranded
+        before claims existed at all are still recovered.
+
+        The recovery itself is not here: building a dialog's runner is what
+        recovers it (`_recover_dialog`), because taking a dialog over and
+        starting up are the same situation seen from two sides. This method
+        only decides *which* dialogs this process may take.
         """
-        orphaned = await self._list_orphaned()
-        undelivered = await self._list_undelivered()
         candidates = frozenset(await self._list_stranded_dialog_ids()).union(
-            task.dialog_id for task in (*orphaned, *undelivered)
+            task.dialog_id for task in (*await self._orphaned(None), *await self._undelivered(None))
         )
         mine = candidates - await self._held_elsewhere(candidates)
-        reopened = 0
+        recovered = 0
         for dialog_id in mine:
-            reopened += await self._reopen_stranded_exchanges(dialog_id)
-        for task in orphaned:
-            if task.dialog_id in mine:
-                await self._restart_orphaned(task)
-        revived = 0
-        for dialog_id in mine:
-            revived += await self._revive_unowned_open(dialog_id)
-        for task in undelivered:
-            if task.dialog_id in mine:
-                await self._redeliver_undelivered(task)
+            if await self._adopt(dialog_id):
+                recovered += 1
         logger.info(
-            "startup recovery: dialogs=%s skipped=%s reopened=%s restarted=%s "
-            "revived=%s redelivered=%s",
-            len(mine),
+            "startup recovery: dialogs=%s skipped=%s failed=%s",
+            recovered,
             len(candidates) - len(mine),
-            reopened,
-            sum(1 for task in orphaned if task.dialog_id in mine),
-            revived,
-            sum(1 for task in undelivered if task.dialog_id in mine),
+            len(mine) - recovered,
         )
+
+    async def _adopt(self, dialog_id: str) -> bool:
+        """Build the dialog's runner, which recovers it; False if that failed."""
+        try:
+            dialog = await self._dialogs.get(dialog_id)
+            await self.get_or_create_runner(dialog.user_id, dialog.channel)
+        except Exception:  # recovery must never take the app down
+            logger.exception("dialog recovery failed: dialog=%s", dialog_id)
+            return False
+        return True
 
     async def _held_elsewhere(self, dialog_ids: frozenset[str]) -> frozenset[str]:
         """Dialogs another live process owns; recovery must not touch these.
@@ -2626,25 +2659,31 @@ class ConversationManager:
             logger.exception("stranded dialog sweep failed")
             return []
 
-    async def _revive_unowned_open(self, dialog_id: str) -> int:
-        """Give the dialog's unowned OPEN exchanges back to its sweep.
+    async def _orphaned(self, dialog_id: str | None) -> TaskList:
+        try:
+            return await self._tasks.list_orphaned(dialog_id)
+        except Exception:
+            logger.exception("orphaned task sweep failed: dialog=%s", dialog_id)
+            return []
+
+    async def _undelivered(self, dialog_id: str | None) -> TaskList:
+        try:
+            return await self._tasks.list_undelivered(dialog_id)
+        except Exception:
+            logger.exception("undelivered task sweep failed: dialog=%s", dialog_id)
+            return []
+
+    async def _revive_unowned_open(self, runner: ConversationRunner) -> int:
+        """Give the dialog's unowned OPEN exchanges back to its own sweep.
 
         Runs after the orphan restarts (which re-own their exchanges), so
-        whatever is still unowned here is a genuine crash leftover: an
-        exchange created whose run never came to exist.
+        whatever is still unowned here is a genuine leftover: an exchange
+        created whose run never came to exist, or one its owner abandoned.
         """
         try:
-            stranded = await self._exchanges.list_unowned_open(dialog_id)
+            stranded = await self._exchanges.list_unowned_open(runner.dialog_id)
         except Exception:
-            logger.exception("unowned-open startup sweep failed: dialog=%s", dialog_id)
-            return 0
-        if not stranded:
-            return 0
-        try:
-            dialog = await self._dialogs.get(dialog_id)
-            runner = await self.get_or_create_runner(dialog.user_id, dialog.channel)
-        except Exception:
-            logger.exception("stranded exchange revive failed: dialog=%s", dialog_id)
+            logger.exception("unowned-open sweep failed: dialog=%s", runner.dialog_id)
             return 0
         revived = 0
         for exchange in stranded:
@@ -2669,36 +2708,6 @@ class ConversationManager:
         except Exception:  # recovery must never take the app down
             logger.exception("stranded exchange sweep failed: dialog=%s", dialog_id)
             return 0
-
-    async def _list_orphaned(self) -> list[Task]:
-        try:
-            return await self._tasks.list_orphaned()
-        except Exception:
-            logger.exception("orphaned task sweep failed")
-            return []
-
-    async def _list_undelivered(self) -> list[Task]:
-        try:
-            return await self._tasks.list_undelivered()
-        except Exception:
-            logger.exception("undelivered task sweep failed")
-            return []
-
-    async def _restart_orphaned(self, task: Task) -> None:
-        """Restart one orphaned task as a background process of its dialog."""
-        try:
-            runner = await self.get_or_create_runner(task.user_id, task.channel)
-            await runner.restart_task(task)
-        except Exception:
-            logger.exception("orphaned task restart failed: task=%s", task.id)
-
-    async def _redeliver_undelivered(self, task: Task) -> None:
-        """Redeliver a persisted-but-undelivered result via the standard path."""
-        try:
-            runner = await self.get_or_create_runner(task.user_id, task.channel)
-            runner.request_result_delivery(task.id)
-        except Exception:
-            logger.exception("undelivered task redelivery failed: task=%s", task.id)
 
     async def evict(self, user_id: str, channel: str) -> None:
         """Stop and deregister the dialog's runner, if any (admin dialog deletion).

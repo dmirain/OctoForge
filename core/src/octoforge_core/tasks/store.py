@@ -56,16 +56,18 @@ class TaskStore(Protocol):
         """Delete every task row of the dialog; return the count (admin dialog deletion)."""
         ...
 
-    async def list_orphaned(self) -> TaskList:
-        """Return every PENDING/RUNNING task (read-only, no mutation).
+    async def list_orphaned(self, dialog_id: str | None = None) -> TaskList:
+        """PENDING/RUNNING tasks (read-only, no mutation); None: every dialog.
 
-        Their in-memory executors (actor pump processes) died with the
-        previous service instance, so they can never finish on their own.
+        Their in-memory executor died with whoever was running them — a
+        restarted process, or a peer that handed the dialog over. Scoped to a
+        dialog when recovery is for that dialog alone: with more than one
+        process alive, restarting a peer's live task would run it twice.
         """
         ...
 
-    async def list_undelivered(self) -> TaskList:
-        """Return terminal (DONE/FAILED) tasks whose result was not delivered."""
+    async def list_undelivered(self, dialog_id: str | None = None) -> TaskList:
+        """Terminal (DONE/FAILED) tasks whose result never reached the user."""
         ...
 
     async def mark_delivered(self, task_id: str) -> None:
@@ -115,16 +117,22 @@ class InMemoryTaskStore:
             del self._tasks[task_id]
         return len(matched)
 
-    async def list_orphaned(self) -> TaskList:
+    async def list_orphaned(self, dialog_id: str | None = None) -> TaskList:
         active = (TaskStatus.PENDING, TaskStatus.RUNNING)
-        return [task for task in self._tasks.values() if task.status in active]
+        return [
+            task
+            for task in self._tasks.values()
+            if task.status in active and (dialog_id is None or task.dialog_id == dialog_id)
+        ]
 
-    async def list_undelivered(self) -> TaskList:
+    async def list_undelivered(self, dialog_id: str | None = None) -> TaskList:
         finished = (TaskStatus.DONE, TaskStatus.FAILED)
         return [
             task
             for task in self._tasks.values()
-            if task.status in finished and task.delivered_at is None
+            if task.status in finished
+            and task.delivered_at is None
+            and (dialog_id is None or task.dialog_id == dialog_id)
         ]
 
     async def mark_delivered(self, task_id: str) -> None:
@@ -192,26 +200,30 @@ class SqlAlchemyTaskStore:
             await session.commit()
             return result.rowcount or 0
 
-    async def list_orphaned(self) -> TaskList:
+    async def list_orphaned(self, dialog_id: str | None = None) -> TaskList:
+        query = (
+            select(TaskRow)
+            .where(TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value)))
+            .order_by(TaskRow.created_at)
+        )
+        if dialog_id is not None:
+            query = query.where(TaskRow.dialog_id == dialog_id)
         async with self._session_factory() as session:
-            result = await session.scalars(
-                select(TaskRow)
-                .where(TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value)))
-                .order_by(TaskRow.created_at)
-            )
-            return [_to_task(row) for row in result.all()]
+            return [_to_task(row) for row in (await session.scalars(query)).all()]
 
-    async def list_undelivered(self) -> TaskList:
-        async with self._session_factory() as session:
-            result = await session.scalars(
-                select(TaskRow)
-                .where(
-                    TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)),
-                    TaskRow.delivered_at.is_(None),
-                )
-                .order_by(TaskRow.created_at)
+    async def list_undelivered(self, dialog_id: str | None = None) -> TaskList:
+        query = (
+            select(TaskRow)
+            .where(
+                TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)),
+                TaskRow.delivered_at.is_(None),
             )
-            return [_to_task(row) for row in result.all()]
+            .order_by(TaskRow.created_at)
+        )
+        if dialog_id is not None:
+            query = query.where(TaskRow.dialog_id == dialog_id)
+        async with self._session_factory() as session:
+            return [_to_task(row) for row in (await session.scalars(query)).all()]
 
     async def mark_delivered(self, task_id: str) -> None:
         async with self._session_factory() as session:

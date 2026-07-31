@@ -104,7 +104,9 @@ the dialogs **no live process owns** — see [dialog-ownership.md](dialog-owners
    the normal terminal path, which is idempotent.
 
 Every step is scoped to one dialog, and a dialog whose claim is fresh and held by a different owner
-is skipped entirely.
+is skipped entirely. The steps themselves run when the dialog's runner is built, so a process that
+*takes a dialog over* recovers it exactly as a restarting one does — see
+[dialog-ownership.md](dialog-ownership.md).
 
 ## Invariants
 

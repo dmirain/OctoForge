@@ -49,9 +49,24 @@ database round trip on the hot loop.
 The check fails **open**. A database hiccup must not stop the single-process installation from
 answering, and the heartbeat is what ultimately notices a lost dialog.
 
+### Recovery happens on claim
+
+Building a dialog's runner is what recovers that dialog: its `IN_PROGRESS`
+exchanges are reopened, its orphaned tasks restarted, its unowned `OPEN`
+exchanges resumed, its undelivered results re-sent. Starting up and taking a
+dialog over are the same situation seen from two sides, so they run the same
+code.
+
+That matters most for the handover. A dialog moving mid-answer strands the
+exchange its previous owner was working on, and no startup sweep will come
+back for it — this process now holds a fresh claim, so every peer's recovery
+skips the dialog. Recovering what you claim is the only thing that closes it.
+
 ### Recovery scope
 
-`recover_interrupted()` only touches dialogs no live process owns.
+`recover_interrupted()` only decides *which* dialogs this process may take;
+the recovery itself is the claim path above. It touches dialogs no live
+process owns.
 
 Candidates come from the *work*, not from the claim table: dialogs holding an `IN_PROGRESS` or
 `OPEN`-and-unowned exchange, plus the dialogs of orphaned and undelivered tasks. Rows stranded
@@ -73,6 +88,9 @@ A clean shutdown releases its claims, so its dialogs are free at once rather tha
 - **Claiming never fails.** The database records placement, it does not decide it.
 - **A claim's identity is `(owner, generation)`.** Owner equality alone is not enough — the same
   process rebuilding a runner must retire the one it replaced.
+- **Claiming a dialog recovers it.** Otherwise a handover mid-answer strands
+  the exchange for good, because the fresh claim hides it from every peer's
+  startup sweep.
 - **Recovery never touches a dialog a live peer holds.** This is the rule that makes a second
   process safe; without it a starting instance resets exchanges its peers are answering.
 - **`reopen_in_progress` is scoped to one dialog.** There is no way to express the global reset that
@@ -100,6 +118,7 @@ a dead process.
 |---|---|
 | Another process claims a dialog mid-answer | The old actor stands down within one heartbeat; its streams close, clients reconnect, the exchange is left for the new owner's recovery |
 | A message is submitted just after a handover | The run is refused before it starts; the exchange stays `OPEN`, which is work the new owner picks up |
+| A dialog moves mid-answer | The new owner reopens the exchange and answers it. The old owner may still be streaming until its next heartbeat, so the text can visibly restart |
 | A process dies without releasing | Its claims go stale after `CLAIM_STALE_AFTER_SECONDS`, then recovery may take them |
 | Two instances share an `OF_NODE_ID` | They treat each other's live dialogs as abandoned, and recovery corrupts running conversations |
 | An instance's `OF_NODE_ID` changes on restart | Correct but slower: its own stranded work waits out the staleness window instead of being recovered at once |
