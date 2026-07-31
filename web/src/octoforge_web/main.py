@@ -104,7 +104,13 @@ from octoforge_web.api.admin import router as admin_router
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.api.secrets import router as secrets_router
-from octoforge_web.auth import CROSS_SITE_MESSAGE, AuthGate, is_cross_site_mutation, is_open_path
+from octoforge_web.auth import (
+    CROSS_SITE_MESSAGE,
+    AuthGate,
+    allows_service_credential,
+    is_cross_site_mutation,
+    is_open_path,
+)
 from octoforge_web.capabilities import log_capabilities
 from octoforge_web.channels import WEB_CHANNEL
 from octoforge_web.config import Settings
@@ -422,6 +428,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     gate = AuthGate(
         username=resolved_settings.admin_username,
         password_hash=resolved_settings.admin_password_hash,
+        service_username=resolved_settings.service_username,
+        service_password_hash=resolved_settings.service_password_hash,
     )
     # the admin router's own dependency resolves the same object, so a request
     # verified by the middleware does not hash again
@@ -449,7 +457,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         if not is_open_path(request.url.path):
             try:
-                await gate.authenticate(request)
+                await gate.authenticate(
+                    request, service_allowed=allows_service_credential(request.url.path)
+                )
             except HTTPException as denied:
                 return JSONResponse(
                     status_code=denied.status_code,

@@ -13,6 +13,7 @@ from octoforge_web.auth import (
     AttemptLimiter,
     AuthGate,
     CredentialCache,
+    allows_service_credential,
     hash_password,
     is_cross_site_mutation,
     is_open_path,
@@ -208,3 +209,96 @@ def test_client_helper_survives_a_missing_peer() -> None:
     )
 
     assert auth._client(scope_without_client) == auth.UNKNOWN_CLIENT
+
+
+SERVICE_USER = "telegram-ingest"
+SERVICE_PASSWORD = "another-long-generated-secret"
+
+
+@pytest.fixture
+def two_credential_gate() -> AuthGate:
+    return AuthGate(
+        username=USERNAME,
+        password_hash=hash_password(PASSWORD),
+        service_username=SERVICE_USER,
+        service_password_hash=hash_password(SERVICE_PASSWORD),
+    )
+
+
+async def test_the_service_credential_opens_a_dialog_endpoint(
+    two_credential_gate: AuthGate,
+) -> None:
+    request = make_request(
+        {"authorization": basic(SERVICE_USER, SERVICE_PASSWORD)}, path="/api/dialog/messages"
+    )
+
+    await two_credential_gate.authenticate(request, service_allowed=True)
+
+
+async def test_the_service_credential_opens_nothing_else(two_credential_gate: AuthGate) -> None:
+    """The point of a second credential: a relay that is compromised must not
+    become the operator."""
+    request = make_request(
+        {"authorization": basic(SERVICE_USER, SERVICE_PASSWORD)}, path="/api/admin/dialogs"
+    )
+
+    with pytest.raises(HTTPException) as denied:
+        await two_credential_gate.authenticate(request, service_allowed=False)
+
+    assert denied.value.status_code == HTTPStatus.UNAUTHORIZED
+
+
+async def test_a_verified_service_credential_does_not_unlock_the_console(
+    two_credential_gate: AuthGate,
+) -> None:
+    """The caches are separate for exactly this: one shared cache would let a
+    credential verified on a dialog request sail through an admin one."""
+    header = basic(SERVICE_USER, SERVICE_PASSWORD)
+    await two_credential_gate.authenticate(
+        make_request({"authorization": header}, path="/api/dialog/messages"), service_allowed=True
+    )
+
+    with pytest.raises(HTTPException):
+        await two_credential_gate.authenticate(
+            make_request({"authorization": header}, path="/api/admin/dialogs"),
+            service_allowed=False,
+        )
+
+
+async def test_the_operator_credential_still_opens_everything(
+    two_credential_gate: AuthGate,
+) -> None:
+    for path, allowed in (("/api/admin/dialogs", False), ("/api/dialog/messages", True)):
+        await two_credential_gate.authenticate(
+            make_request({"authorization": basic(USERNAME, PASSWORD)}, path=path),
+            service_allowed=allowed,
+        )
+
+
+async def test_without_a_service_credential_only_the_operator_is_accepted(
+    gate: AuthGate,
+) -> None:
+    """Empty configuration means the feature does not exist, not that anything goes."""
+    request = make_request(
+        {"authorization": basic(SERVICE_USER, SERVICE_PASSWORD)}, path="/api/dialog/messages"
+    )
+
+    with pytest.raises(HTTPException):
+        await gate.authenticate(request, service_allowed=True)
+
+
+def test_only_the_dialog_endpoints_admit_a_service_credential() -> None:
+    assert allows_service_credential("/api/dialog/messages")
+    assert allows_service_credential("/api/dialog/events")
+    assert not allows_service_credential("/api/admin/dialogs")
+    assert not allows_service_credential("/api/cron/jobs")
+    assert not allows_service_credential("/admin.html")
+
+
+async def test_empty_credentials_never_authenticate_as_the_service(gate: AuthGate) -> None:
+    """An unset service credential is two empty strings. Nothing may match
+    them — least of all a caller presenting empty strings back."""
+    request = make_request({"authorization": basic("", "")}, path="/api/dialog/messages")
+
+    with pytest.raises(HTTPException):
+        await gate.authenticate(request, service_allowed=True)

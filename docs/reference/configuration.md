@@ -96,6 +96,8 @@ and dataset search are unavailable — the system-record sync is skipped too.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OF_MAX_PROCESSES` | `5` | Concurrent processes (and therefore live exchanges) per dialog |
+| `OF_SERVICE_USERNAME` | *(empty)* | A second credential opening only `/api/dialog/*`, for a process that relays a surface's traffic. Empty means no such credential exists |
+| `OF_SERVICE_PASSWORD_HASH` | *(empty)* | Its PBKDF2 hash, same format as the operator one (`tools/hash_password.py`) |
 | `OF_NODE_ID` | hostname | Names this process as a dialog owner. Must be stable across this instance's own restarts and unique against every other instance sharing the database — see [dialog-ownership.md](dialog-ownership.md) |
 | `OF_ROUTER_TIMEOUT_SECONDS` | `10.0` | Router LLM call timeout; on timeout the message opens a new exchange |
 | `OF_MATERIAL_QUIET_SECONDS` | `30.0` | How long forwarded material may stay quiet before the agent reacts on its own |

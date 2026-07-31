@@ -122,6 +122,12 @@ class Settings(BaseSettings):
     # The hostname satisfies both under docker compose and Kubernetes, which
     # is why it is the default.
     node_id: str = Field(default_factory=socket.gethostname)
+    # A second credential opening only the dialog endpoints, for a process
+    # that merely relays a surface's traffic (the Telegram ingestion node).
+    # Both empty means no such credential exists. Hash with
+    # `tools/hash_password.py`, same format as the operator one.
+    service_username: str = ""
+    service_password_hash: str = ""
     router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
     llm_stream_idle_timeout_seconds: float = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS
     # Wall-clock ceiling on one tool call. A tool that never returns holds its

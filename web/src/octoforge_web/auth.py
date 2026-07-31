@@ -64,6 +64,10 @@ OPEN_PATHS = frozenset({"/health", "/health/ready", "/secrets.html"})
 # endpoints must be reachable without Basic auth.
 OPEN_PREFIXES = ("/api/secrets/",)
 
+#: Paths the service credential may open — submitting, cancelling and
+#: watching a dialog. Everything else stays operator-only.
+SERVICE_PREFIXES = ("/api/dialog/",)
+
 # Cross-site request forgery, in the shape Basic auth allows: a browser holding
 # the operator credential attaches it to every request to this origin, including
 # one an attacker's page submits — so a form on any site could publish a record
@@ -135,6 +139,15 @@ def is_open_path(path: str) -> bool:
     Health probes plus the token-authenticated self-service secrets surface.
     """
     return path in OPEN_PATHS or path.startswith(OPEN_PREFIXES)
+
+
+def allows_service_credential(path: str) -> bool:
+    """Whether the service credential may authenticate this path.
+
+    The dialog endpoints and nothing else: relaying a surface's traffic is
+    all the ingestion node does, so that is all its credential opens.
+    """
+    return path.startswith(SERVICE_PREFIXES)
 
 
 def is_cross_site_mutation(request: Request) -> bool:
@@ -239,15 +252,37 @@ class CredentialCache:
 
 @dataclass(frozen=True, slots=True)
 class AuthGate:
-    """The operator gate: a limiter, a cache and the credential to check against."""
+    """The gate: a limiter, caches, and the credentials to check against.
+
+    Two credentials, deliberately unequal. The **operator** one opens
+    everything. The **service** one opens only the dialog endpoints, and
+    exists so a machine that merely relays a surface's traffic — the Telegram
+    ingestion node — does not have to carry operator power to do it: a
+    compromise there must not become a compromise of the console, the
+    instructions and the secret store. Leaving it unset turns it off.
+
+    Each credential has its own cache. Sharing one would be a hole rather
+    than an optimization: a service credential verified on a dialog request
+    would then satisfy the cache check on an admin one.
+    """
 
     username: str
     password_hash: str
+    service_username: str = ""
+    service_password_hash: str = ""
     limiter: AttemptLimiter = field(default_factory=AttemptLimiter)
     cache: CredentialCache = field(default_factory=CredentialCache)
+    service_cache: CredentialCache = field(default_factory=CredentialCache)
 
-    async def authenticate(self, request: Request) -> None:
+    def _service_configured(self) -> bool:
+        return bool(self.service_username and self.service_password_hash)
+
+    async def authenticate(self, request: Request, service_allowed: bool = False) -> None:
         """Authenticate the request or raise; hashing happens off the event loop.
+
+        `service_allowed` says whether the service credential is acceptable
+        here — decided by the path, never by the caller's own claim about
+        itself.
 
         A missing configuration fails closed with 503: an operator console with
         an empty password would otherwise be reachable from the internet.
@@ -260,6 +295,8 @@ class AuthGate:
         if not header.lower().startswith(BASIC_PREFIX):
             raise _unauthorized()
         if self.cache.valid(header):
+            return
+        if service_allowed and self._service_configured() and self.service_cache.valid(header):
             return
         client = _client(request)
         if self.limiter.blocked(client):
@@ -274,19 +311,28 @@ class AuthGate:
             self.limiter.record_failure(client)
             raise _unauthorized()
         candidate_user, candidate_password = candidate
-        user_ok = hmac.compare_digest(candidate_user, self.username)
+        # Exactly ONE hash per attempt, whichever credential was named: two
+        # would double the cost of every wrong guess, which is the thing the
+        # limiter exists to bound. Which username exists is not treated as a
+        # secret — the operator's is configured by the same person who reads
+        # this — but the password check is uniform either way.
+        as_service = (
+            service_allowed
+            and self._service_configured()
+            and hmac.compare_digest(candidate_user, self.service_username)
+        )
+        expected = self.service_password_hash if as_service else self.password_hash
+        user_ok = as_service or hmac.compare_digest(candidate_user, self.username)
         # PBKDF2 is ~60 ms of CPU: on the loop it would stall every dialog in
         # the process, so it runs in a worker thread. Both checks always run —
         # skipping the hash on a wrong user would leak which half failed.
-        password_ok = await asyncio.to_thread(
-            verify_password, candidate_password, self.password_hash
-        )
+        password_ok = await asyncio.to_thread(verify_password, candidate_password, expected)
         if not (user_ok and password_ok):
             self.limiter.record_failure(client)
-            logger.warning("failed admin login for %r from %s", candidate_user, client)
+            logger.warning("failed login for %r from %s", candidate_user, client)
             raise _unauthorized()
         self.limiter.record_success(client)
-        self.cache.remember(header)
+        (self.service_cache if as_service else self.cache).remember(header)
 
 
 def _decode_basic(header: str) -> tuple[str, str] | None:

@@ -97,6 +97,12 @@ The password is stored as a PBKDF2-HMAC-SHA256 hash in the format `pbkdf2_sha256
 (`:` rather than `$` because docker compose interpolates `$` in `.env`), verified in constant time. An
 empty hash answers **503** — it fails closed, never open.
 
+A second credential (`OF_SERVICE_USERNAME` / `OF_SERVICE_PASSWORD_HASH`) opens `/api/dialog/*` and
+nothing else. It exists so a process that merely relays a surface's traffic — the Telegram ingestion
+node — need not carry operator power: a compromise there must not become a compromise of the console,
+the instructions and the secret store. Each credential has its own verification cache, so one verified
+on a dialog request cannot satisfy an admin one. Leaving it unset turns it off.
+
 This authenticates the **operator**, not the agent's users. `X-User-Id` selects the dialog and is a trusted
 string: front the deployment with a proxy that authenticates people and sets that header. See
 [../security.md](../security.md).
