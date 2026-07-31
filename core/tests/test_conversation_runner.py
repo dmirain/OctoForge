@@ -51,6 +51,8 @@ from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
     ConversationRunner,
+    ManagerStores,
+    OwnershipConfig,
     RunnerConfig,
     TaskOutcomeListener,
     _Flush,
@@ -65,6 +67,7 @@ from octoforge_core.db.engine import create_engine, create_session_factory, init
 from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.dialogs.models import ExchangeRow, MessageRow
 from octoforge_core.dialogs.store import (
+    SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
@@ -120,6 +123,7 @@ MAX_ITERATIONS = 3
 MAX_PROCESSES = 5
 ONE_PROCESS = 1
 TWO_PROCESSES = 2
+NODE_ID = "test-node"
 USER_ID = "user-1"
 CHANNEL = "web"
 OLD_IMAGE = Attachment(kind=AttachmentKind.IMAGE, ref="tg:file-1")
@@ -589,10 +593,14 @@ def make_manager(
     )
     return ConversationManager(
         config=config,
-        dialogs=SqlAlchemyDialogRepository(session_factory),
-        messages=SqlAlchemyMessageRepository(session_factory),
-        tasks=resolved.store if resolved.store is not None else InMemoryTaskStore(),
-        exchanges=SqlAlchemyExchangeRepository(session_factory),
+        stores=ManagerStores(
+            dialogs=SqlAlchemyDialogRepository(session_factory),
+            messages=SqlAlchemyMessageRepository(session_factory),
+            tasks=resolved.store if resolved.store is not None else InMemoryTaskStore(),
+            exchanges=SqlAlchemyExchangeRepository(session_factory),
+            claims=SqlAlchemyClaimRepository(session_factory),
+        ),
+        ownership=OwnershipConfig(node_id=NODE_ID),
     )
 
 

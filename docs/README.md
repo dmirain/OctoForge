@@ -33,6 +33,8 @@ failure modes, code anchors.
   narrative, processes, branches, event broadcast, delivery, restart recovery
 - [reference/exchanges.md](reference/exchanges.md) — obligations to the user: lifecycle, material
   collections, `ask_user`, nudges
+- [reference/dialog-ownership.md](reference/dialog-ownership.md) — which process runs a dialog:
+  claims, the heartbeat, stand-down, and what restart recovery may touch
 - [reference/routing.md](reference/routing.md) — deciding which exchange an incoming message belongs
   to
 - [reference/context-compaction.md](reference/context-compaction.md) — rolling summaries, the hot

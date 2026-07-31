@@ -96,6 +96,7 @@ and dataset search are unavailable — the system-record sync is skipped too.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OF_MAX_PROCESSES` | `5` | Concurrent processes (and therefore live exchanges) per dialog |
+| `OF_NODE_ID` | hostname | Names this process as a dialog owner. Must be stable across this instance's own restarts and unique against every other instance sharing the database — see [dialog-ownership.md](dialog-ownership.md) |
 | `OF_ROUTER_TIMEOUT_SECONDS` | `10.0` | Router LLM call timeout; on timeout the message opens a new exchange |
 | `OF_MATERIAL_QUIET_SECONDS` | `30.0` | How long forwarded material may stay quiet before the agent reacts on its own |
 | `OF_MATERIAL_SWEEP_INTERVAL_SECONDS` | `10.0` | How often the sweep looks for settled collections |

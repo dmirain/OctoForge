@@ -10,6 +10,7 @@ and no ORM object ever crosses a module boundary — stores map rows to their mo
 | `dialogs` | `dialogs/` | One row per `(user_id, channel)` |
 | `messages` | `dialogs/` | The narrative and archive: role, content, kind, per-dialog `seq`, `exchange_id`, `task_id`, attachments |
 | `exchanges` | `dialogs/` | Obligations: status, title, owning task, pending question |
+| `dialog_claims` | `dialogs/` | Which process runs a dialog's actor: owner, generation, heartbeat |
 | `tasks` | `tasks/` | Units of work: kind, status, input, result/error, delivery timestamps |
 | `instructions` | `instructions/` | Skills, knowledge, endpoints and memories with their embeddings, ownership and authorship |
 | `datasets`, `dataset_records` | `datasets/` | User datasets, their schemas and validated records |

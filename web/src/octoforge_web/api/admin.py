@@ -28,6 +28,7 @@ from octoforge_core.context.api import DialogueSummary, SummaryStore
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError, CronStore
 from octoforge_core.datasets.api import Dataset, DatasetRecord
 from octoforge_core.dialogs.api import (
+    ClaimRepository,
     DialogNotFoundError,
     DialogRepository,
     ExchangeRepository,
@@ -46,6 +47,7 @@ from octoforge_core.tasks.store import TaskStore
 from octoforge_web import audit
 from octoforge_web.deps import (
     get_admin_read_model,
+    get_claim_repository,
     get_conversation_manager,
     get_cron_store,
     get_dialog_repository,
@@ -70,6 +72,7 @@ ManagerDep = Annotated[ConversationManager, Depends(get_conversation_manager)]
 DialogsDep = Annotated[DialogRepository, Depends(get_dialog_repository)]
 OperatorDep = Annotated[str, Depends(get_operator)]
 ExchangesDep = Annotated[ExchangeRepository, Depends(get_exchange_repository)]
+ClaimsDep = Annotated[ClaimRepository, Depends(get_claim_repository)]
 SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
 MembersDep = Annotated["MemberDirectory | None", Depends(get_telegram_members)]
 InvitesDep = Annotated["InviteStore | None", Depends(get_telegram_invites)]
@@ -86,14 +89,16 @@ class _DialogCascade:
     tasks: TaskStore
     summaries: SummaryStore
     exchanges: ExchangeRepository
+    claims: ClaimRepository
 
 
 def _dialog_cascade(
     tasks: TaskStoreDep,
     summaries: SummariesDep,
     exchanges: ExchangesDep,
+    claims: ClaimsDep,
 ) -> _DialogCascade:
-    return _DialogCascade(tasks=tasks, summaries=summaries, exchanges=exchanges)
+    return _DialogCascade(tasks=tasks, summaries=summaries, exchanges=exchanges, claims=claims)
 
 
 T = TypeVar("T")
@@ -161,6 +166,9 @@ async def delete_dialog(
         await stores.summaries.delete_for_dialog(dialog_id)
         await stores.tasks.delete_for_dialog(dialog_id)
         await stores.exchanges.delete_for_dialog(dialog_id)
+        # last of the module deletes: the claim row references the dialog, so
+        # a stale one left by a dead process would block the delete itself
+        await stores.claims.delete_for_dialog(dialog_id)
         await dialogs.delete(dialog_id)
     except DialogNotFoundError as exc:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc

@@ -20,10 +20,16 @@ from octoforge_core import (
 )
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
-from octoforge_core.agent.runner import ConversationRunner, RunnerConfig
+from octoforge_core.agent.runner import (
+    ConversationRunner,
+    ManagerStores,
+    OwnershipConfig,
+    RunnerConfig,
+)
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.store import (
+    SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
@@ -340,10 +346,14 @@ async def make_manager(
             max_processes=MAX_PROCESSES,
             compactor=NoopContextCompactor(),
         ),
-        dialogs=SqlAlchemyDialogRepository(session_factory),
-        messages=SqlAlchemyMessageRepository(session_factory),
-        tasks=InMemoryTaskStore(),
-        exchanges=SqlAlchemyExchangeRepository(session_factory),
+        stores=ManagerStores(
+            dialogs=SqlAlchemyDialogRepository(session_factory),
+            messages=SqlAlchemyMessageRepository(session_factory),
+            tasks=InMemoryTaskStore(),
+            exchanges=SqlAlchemyExchangeRepository(session_factory),
+            claims=SqlAlchemyClaimRepository(session_factory),
+        ),
+        ownership=OwnershipConfig(node_id="test-node"),
     )
 
 

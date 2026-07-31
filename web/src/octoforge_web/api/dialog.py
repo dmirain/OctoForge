@@ -8,6 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from octoforge_core import ConversationManager
+from octoforge_core.agent.runner import STREAM_CLOSED
 
 from octoforge_web.api.schemas import AckResponse, PostMessageRequest
 from octoforge_web.api.sse import encode_frame, encode_heartbeat, event_to_payload
@@ -61,7 +62,13 @@ async def events(
     channel: ChannelDep,
     manager: ManagerDep,
 ) -> StreamingResponse:
-    """Subscribe to dialog events over SSE; the dialog is created on first contact."""
+    """Subscribe to dialog events over SSE; the dialog is created on first contact.
+
+    The stream ends when the runner stands down — another process owns this
+    dialog now. Clients reconnect on a closed SSE stream by themselves, and
+    reconnecting is what routes them to the new owner; holding the connection
+    open would leave the user watching a process that will never speak again.
+    """
     runner = await manager.get_or_create_runner(user_id, channel)
     queue = runner.subscribe()
 
@@ -73,6 +80,8 @@ async def events(
                 except TimeoutError:
                     yield encode_heartbeat()
                     continue
+                if event is STREAM_CLOSED:
+                    return
                 yield encode_frame(event_to_payload(event))
         finally:
             runner.unsubscribe(queue)

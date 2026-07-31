@@ -20,7 +20,11 @@ from octoforge_core.agent.events import (
     ToolCallFailed,
     ToolCallRequested,
 )
-from octoforge_core.agent.runner import ConversationEvent, ConversationRunner
+from octoforge_core.agent.runner import (
+    STREAM_CLOSED,
+    ConversationRunner,
+    SubscriberQueue,
+)
 from octoforge_core.domain import Attachment, MessageKind, MessageSource
 
 from octoforge_web.telegram.client import (
@@ -173,12 +177,23 @@ class TelegramBridge:
             self._runner = await self._runner_provider(self._user_id, TELEGRAM_CHANNEL)
         return self._runner
 
-    async def _forward(
-        self, runner: ConversationRunner, queue: asyncio.Queue[ConversationEvent]
-    ) -> None:
+    async def _forward(self, runner: ConversationRunner, queue: SubscriberQueue) -> None:
+        """Render the runner's events until it stops or stands down.
+
+        A stand-down means another process owns this dialog now. The cached
+        runner is dropped rather than resubscribed to: re-resolving here would
+        claim the dialog straight back from whoever just took it, and the two
+        processes would trade it forever. The next incoming message rebuilds
+        the binding through the normal path, which is also the moment the
+        answer has somewhere to go.
+        """
         try:
             while True:
                 event = await queue.get()
+                if event is STREAM_CLOSED:
+                    logger.info("dialog moved to another owner: user=%s", self._user_id)
+                    self._runner = None
+                    return
                 await self._render_safely(event.payload, event.exchange_id)
         finally:
             runner.unsubscribe(queue)

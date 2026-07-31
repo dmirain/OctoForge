@@ -15,9 +15,12 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from octoforge_core import (
+    ClaimRepository,
     ConversationManager,
     DialogRepository,
     ExchangeRepository,
+    ManagerStores,
+    OwnershipConfig,
     SqlAlchemyTaskStore,
     bootstrap_schema,
     build_agent_loop,
@@ -63,6 +66,7 @@ from octoforge_core.db.search_extensions import (
 )
 from octoforge_core.db.sqlite_fts import has_sqlite_fts
 from octoforge_core.dialogs.store import (
+    SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
@@ -155,10 +159,24 @@ class Runtime:
     dialogs: DialogRepository
     summary_store: SummaryStore
     exchanges: ExchangeRepository
+    claims: ClaimRepository
     # Telegram who-is-who (None: bot not configured) — read by the operator
     # console to decorate user ids with names and invite attribution
     telegram_members: MemberDirectory | None = None
     telegram_invites: InviteStore | None = None
+
+
+def _build_manager_stores(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> ManagerStores:
+    """Build the persistence collaborators one conversation manager needs."""
+    return ManagerStores(
+        dialogs=SqlAlchemyDialogRepository(session_factory),
+        messages=SqlAlchemyMessageRepository(session_factory),
+        tasks=SqlAlchemyTaskStore(session_factory),
+        exchanges=SqlAlchemyExchangeRepository(session_factory),
+        claims=SqlAlchemyClaimRepository(session_factory),
+    )
 
 
 @asynccontextmanager
@@ -179,10 +197,9 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     log_capabilities(settings, logger, search_extensions, lexical_backend)
     session_factory = create_session_factory(engine)
     await _sweep_retention(settings, session_factory)
-    dialogs = SqlAlchemyDialogRepository(session_factory)
-    messages = SqlAlchemyMessageRepository(session_factory)
-    exchanges = SqlAlchemyExchangeRepository(session_factory)
-    task_store = SqlAlchemyTaskStore(session_factory)
+    manager_stores = _build_manager_stores(session_factory)
+    dialogs, exchanges = manager_stores.dialogs, manager_stores.exchanges
+    claims, task_store = manager_stores.claims, manager_stores.tasks
     cron_store = SqlAlchemyCronStore(session_factory)
     secret_store = _build_secret_store(settings, session_factory)
     secret_links = SecretLinkService()
@@ -248,8 +265,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         AdminStores(
                             invites=telegram_stores.invites,
                             cron_store=cron_store,
-                            messages=messages,
                             dialogs=dialogs,
+                            messages=manager_stores.messages,
                             instructions=instructions,
                             directory=telegram_stores.directory,
                         ),
@@ -299,15 +316,17 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         image_resolver=image_resolver,
                     ),
                 ),
-                dialogs=dialogs,
-                messages=messages,
-                tasks=task_store,
-                exchanges=exchanges,
+                stores=manager_stores,
+                ownership=OwnershipConfig(node_id=settings.node_id),
             )
             # Sweep before the scheduler and surfaces start: orphaned tasks
             # are restarted as background processes and persisted results
-            # that never reached their dialog are redelivered.
+            # that never reached their dialog are redelivered. Only dialogs
+            # no other live instance owns are touched.
             await manager.recover_interrupted()
+            # the claim heartbeat starts after recovery: until it has run,
+            # this process holds no dialogs worth advertising as live
+            manager.start()
             scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
             sweeper_task = _start_collecting_sweeper(exchanges, dialogs, manager, settings)
             telegram = _start_telegram(
@@ -341,6 +360,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     dialogs=dialogs,
                     summary_store=summary_store,
                     exchanges=exchanges,
+                    claims=claims,
                     telegram_members=(
                         telegram_stores.directory if telegram_stores is not None else None
                     ),
@@ -391,6 +411,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.dialogs = rt.dialogs
             app.state.summary_store = rt.summary_store
             app.state.exchanges = rt.exchanges
+            app.state.claims = rt.claims
             app.state.telegram_members = rt.telegram_members
             app.state.telegram_invites = rt.telegram_invites
             yield

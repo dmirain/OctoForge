@@ -92,7 +92,8 @@ waiting for. RUN tasks are not touched: `task_delete` stops those.
 
 ### Restart recovery
 
-`ConversationManager.recover_interrupted()` runs before the scheduler and the surfaces start:
+`ConversationManager.recover_interrupted()` runs before the scheduler and the surfaces start, over
+the dialogs **no live process owns** — see [dialog-ownership.md](dialog-ownership.md):
 
 1. `PENDING`/`RUNNING` task rows are orphans of the previous process — they are restarted as
    background processes (respecting the per-dialog limit; exceeding it marks the row failed and
@@ -101,6 +102,9 @@ waiting for. RUN tasks are not touched: `task_delete` stops those.
    both at startup and whenever a process slot frees up.
 3. Task rows that finished but were never delivered (`delivered_at IS NULL`) are re-delivered through
    the normal terminal path, which is idempotent.
+
+Every step is scoped to one dialog, and a dialog whose claim is fresh and held by a different owner
+is skipped entirely.
 
 ## Invariants
 
@@ -117,6 +121,9 @@ waiting for. RUN tasks are not touched: `task_delete` stops those.
   to the outbox.
 - **Cancellation bypasses the inbox** and therefore cannot queue behind slow work.
 - **Every process has a task row**, which is what makes restart recovery a query rather than a guess.
+- **An actor answers only while it owns its dialog.** A run checks the claim before it starts, and a
+  preempted actor stands down instead of finishing — see
+  [dialog-ownership.md](dialog-ownership.md).
 
 ## Configuration
 
@@ -135,6 +142,7 @@ waiting for. RUN tasks are not touched: `task_delete` stops those.
 | No subscriber at all when a RUN task finishes | Result waits in the outbox, delivered on the next `subscribe()` |
 | Process slot limit reached | Templated broker notice to the user; nothing is silently dropped |
 | Crash with runs in flight | Task rows restarted, exchanges reopened, undelivered results re-sent |
+| Another process takes the dialog | The actor stands down: streams close so clients reconnect, and the in-flight work is left for the new owner's recovery |
 | A command handler raises (e.g. the router throws) | The actor answers that submit with `Failed`, stays alive, and keeps serving the dialog |
 | Provider context overflow mid-run | Reactive compaction, then the run is retried once (see [context-compaction.md](context-compaction.md)) |
 

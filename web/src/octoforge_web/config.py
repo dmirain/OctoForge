@@ -1,5 +1,6 @@
 """Application settings."""
 
+import socket
 from pathlib import Path
 from typing import Annotated
 
@@ -115,6 +116,12 @@ class Settings(BaseSettings):
     model_context_tokens: int = DEFAULT_MODEL_CONTEXT_TOKENS
     context_buffer_tokens: int = DEFAULT_CONTEXT_BUFFER_TOKENS
     max_processes: int = DEFAULT_MAX_PROCESSES
+    # Names this process for dialog ownership. Must stay the same across this
+    # instance's own restarts (that is what lets it reclaim its own stranded
+    # work at once) and differ from every other instance sharing the database.
+    # The hostname satisfies both under docker compose and Kubernetes, which
+    # is why it is the default.
+    node_id: str = Field(default_factory=socket.gethostname)
     router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
     llm_stream_idle_timeout_seconds: float = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS
     # Wall-clock ceiling on one tool call. A tool that never returns holds its

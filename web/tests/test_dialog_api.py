@@ -21,11 +21,12 @@ from octoforge_core import (
 from octoforge_core.agent.events import Cancelled, Failed, Finished
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
-from octoforge_core.agent.runner import RunnerConfig
+from octoforge_core.agent.runner import ManagerStores, OwnershipConfig, RunnerConfig
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import DialogRow
 from octoforge_core.dialogs.store import (
+    SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
@@ -131,10 +132,14 @@ async def make_manager(
             max_processes=MAX_PROCESSES,
             compactor=NoopContextCompactor(),
         ),
-        dialogs=SqlAlchemyDialogRepository(session_factory),
-        messages=SqlAlchemyMessageRepository(session_factory),
-        tasks=InMemoryTaskStore(),
-        exchanges=SqlAlchemyExchangeRepository(session_factory),
+        stores=ManagerStores(
+            dialogs=SqlAlchemyDialogRepository(session_factory),
+            messages=SqlAlchemyMessageRepository(session_factory),
+            tasks=InMemoryTaskStore(),
+            exchanges=SqlAlchemyExchangeRepository(session_factory),
+            claims=SqlAlchemyClaimRepository(session_factory),
+        ),
+        ownership=OwnershipConfig(node_id="test-node"),
     )
 
 
@@ -406,3 +411,31 @@ def test_index_page_is_served(client: TestClient) -> None:
 
     assert response.status_code == HTTPStatus.OK
     assert "text/html" in response.headers["content-type"]
+
+
+async def test_events_endpoint_ends_the_stream_when_the_dialog_moves(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A client left hanging on the previous owner sees the agent go silent.
+    Ending the stream is what makes it reconnect — and reconnecting is what
+    routes it to whoever runs the dialog now.
+    """
+    manager = await make_manager([reply()], session_factory)
+    response = await events_endpoint(USER_A, CHANNEL, manager)
+    runner = await manager.get_or_create_runner(USER_A, CHANNEL)
+
+    await SqlAlchemyClaimRepository(session_factory).claim(runner.dialog_id, "another-node")
+    await manager._beat_once()
+
+    async def drain_until_closed() -> list[str]:
+        frames: list[str] = []
+        async for frame in response.body_iterator:
+            frames.append(frame if isinstance(frame, str) else frame.decode())
+        return frames
+
+    frames = await asyncio.wait_for(drain_until_closed(), timeout=EVENTS_TIMEOUT_SECONDS)
+
+    # the stream ends rather than emitting a terminal frame: there is nothing
+    # left to say, and the client's own reconnect is the recovery
+    assert not [frame for frame in frames if frame.startswith(SSE_DATA_PREFIX)]
+    await manager.stop_all()

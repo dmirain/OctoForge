@@ -146,11 +146,24 @@ class ExchangeRepository(Protocol):
         """
         ...
 
-    async def reopen_in_progress(self) -> int:
-        """Reset every IN_PROGRESS exchange to OPEN; return how many.
+    async def list_stranded_dialog_ids(self) -> list[str]:
+        """Dialog ids holding an exchange no live run can finish on its own.
 
-        Startup only: processes never survive a restart, so an owner recorded
-        in the database is stale by definition.
+        IN_PROGRESS (its executor lives in some process's memory) or
+        OPEN-and-unowned (nobody picked it up). Recovery starts from this
+        list and then asks who, if anyone, still owns those dialogs.
+        """
+        ...
+
+    async def reopen_in_progress(self, dialog_id: str) -> int:
+        """Reset the dialog's IN_PROGRESS exchanges to OPEN; return how many.
+
+        Scoped to one dialog on purpose. This used to reset every row in the
+        database on the reasoning that a restart kills every process — true
+        of one process, and catastrophic with two: a starting instance would
+        reset exchanges its peers are running right now. The caller must
+        establish that nobody live owns the dialog (`held_elsewhere`) before
+        calling this.
         """
         ...
 
@@ -166,6 +179,80 @@ class ExchangeRepository(Protocol):
 
     async def delete_for_dialog(self, dialog_id: str) -> None:
         """Drop every exchange of the dialog (admin dialog deletion)."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DialogClaim:
+    """A process's claim on running one dialog's actor.
+
+    `generation` is the whole guard: the owner remembers the number it was
+    given and compares it against the stored one. A higher number means
+    somebody else took the dialog, and this owner must stop — no message
+    between the two processes is needed, which is what makes the check work
+    when the previous owner is unreachable or already dead.
+    """
+
+    dialog_id: str
+    owner: str
+    generation: int
+    heartbeat_at: datetime
+
+
+#: `list`-shadowing alias, same reason as the others in this module
+DialogClaimList = list[DialogClaim]
+
+
+class ClaimRepository(Protocol):
+    """Port over dialog ownership: who runs which actor, and since when.
+
+    Exists so a second process is safe. With one process every claim
+    succeeds, nothing is ever preempted, and the recovery filter matches
+    everything — the behavior is exactly what it was before claims existed.
+    """
+
+    async def claim(self, dialog_id: str, owner: str) -> DialogClaim:
+        """Take the dialog for `owner`, bumping its generation; never fails.
+
+        Deliberately unconditional: placement is the router's decision, not
+        the database's. Taking a dialog somebody else holds is a legitimate
+        handover, and the loser finds out through its own generation check.
+        """
+        ...
+
+    async def heartbeat(self, claims: DialogClaimList) -> frozenset[str]:
+        """Refresh the given claims; return the ids still held by their owner.
+
+        A dialog missing from the result was preempted (or its row is gone),
+        which is how a live owner learns it must stand down.
+        """
+        ...
+
+    async def release(self, dialog_id: str, owner: str, generation: int) -> None:
+        """Drop the claim if it is still this exact one; otherwise a no-op.
+
+        The generation check matters on shutdown: a dialog already taken over
+        by another process must keep ITS claim, not lose it to our exit.
+        """
+        ...
+
+    async def held_elsewhere(
+        self, dialog_ids: frozenset[str], owner: str, stale_before: datetime
+    ) -> frozenset[str]:
+        """Of `dialog_ids`, those a DIFFERENT live owner holds.
+
+        The recovery filter. "Live" means a heartbeat at or after
+        `stale_before`; our own claims are never returned, because a process
+        that is only now starting up cannot be running them.
+        """
+        ...
+
+    async def current_generation(self, dialog_id: str) -> int | None:
+        """The stored generation, or None when nobody holds the dialog."""
+        ...
+
+    async def delete_for_dialog(self, dialog_id: str) -> None:
+        """Drop the dialog's claim (admin dialog deletion)."""
         ...
 
 

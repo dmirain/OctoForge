@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_core.agent.events import Cancelled, Failed, Finished
 from octoforge_core.agent.prompts import StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
-from octoforge_core.agent.runner import ConversationEvent
+from octoforge_core.agent.runner import ConversationEvent, ManagerStores, OwnershipConfig
 from octoforge_core.composition import (
     RunnerOptions,
     ToolLimits,
@@ -36,6 +36,7 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.store import (
+    SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
@@ -381,10 +382,14 @@ async def test_build_conversation_manager_runs_a_dialog(
             NoopContextCompactor(),
             options=RunnerOptions(max_processes=MAX_PROCESSES),
         ),
-        dialogs=SqlAlchemyDialogRepository(session_factory),
-        messages=SqlAlchemyMessageRepository(session_factory),
-        tasks=InMemoryTaskStore(),
-        exchanges=SqlAlchemyExchangeRepository(session_factory),
+        stores=ManagerStores(
+            dialogs=SqlAlchemyDialogRepository(session_factory),
+            messages=SqlAlchemyMessageRepository(session_factory),
+            tasks=InMemoryTaskStore(),
+            exchanges=SqlAlchemyExchangeRepository(session_factory),
+            claims=SqlAlchemyClaimRepository(session_factory),
+        ),
+        ownership=OwnershipConfig(node_id="test-node"),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()

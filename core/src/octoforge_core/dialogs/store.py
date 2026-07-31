@@ -7,7 +7,7 @@ objects (`Dialog`, `ChatMessage` from the shared kernel) at the boundary.
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import ColumnElement, case, delete, func, insert, select, update
@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_core.dialogs.api import (
     LIVE_EXCHANGE_STATUSES,
     TITLE_MAX_LENGTH,
+    DialogClaim,
+    DialogClaimList,
     DialogNotFoundError,
     Exchange,
     ExchangeList,
@@ -26,7 +28,7 @@ from octoforge_core.dialogs.api import (
     MessageStats,
     MessageStatsList,
 )
-from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
+from octoforge_core.dialogs.models import DialogClaimRow, DialogRow, ExchangeRow, MessageRow
 from octoforge_core.domain import (
     Attachment,
     AttachmentKind,
@@ -44,6 +46,15 @@ from octoforge_core.time import utc_now
 # freshly recomputed seq rather than propagated. Bounded so a genuine
 # duplicate client_message_id still raises instead of looping forever.
 MESSAGE_SEQ_RETRY_ATTEMPTS = 5
+
+# The first claim on a dialog. Generations start at 1 so that "no row" and
+# "never claimed" stay the same thing, told apart by None rather than by 0.
+FIRST_GENERATION = 1
+
+# Two processes can race to insert the FIRST claim of a dialog; the loser's
+# unique violation is retried once into the UPDATE branch. Bounded so a
+# genuine constraint failure still raises instead of looping.
+CLAIM_INSERT_RETRY_ATTEMPTS = 2
 
 
 class SqlAlchemyDialogRepository:
@@ -427,14 +438,33 @@ class SqlAlchemyExchangeRepository:
             result = await session.scalars(query)
             return [_to_exchange(row) for row in result.all()]
 
-    async def reopen_in_progress(self) -> int:
-        """Reset every IN_PROGRESS exchange to OPEN; return how many (startup)."""
+    async def list_stranded_dialog_ids(self) -> list[str]:
+        """Dialog ids holding an IN_PROGRESS or an OPEN-and-unowned exchange."""
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(ExchangeRow.dialog_id)
+                .where(
+                    (ExchangeRow.status == ExchangeStatus.IN_PROGRESS.value)
+                    | (
+                        (ExchangeRow.status == ExchangeStatus.OPEN.value)
+                        & ExchangeRow.owner_task_id.is_(None)
+                    )
+                )
+                .distinct()
+            )
+            return list(result.all())
+
+    async def reopen_in_progress(self, dialog_id: str) -> int:
+        """Reset the dialog's IN_PROGRESS exchanges to OPEN; return how many."""
         async with self._session_factory() as session:
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
                     update(ExchangeRow)
-                    .where(ExchangeRow.status == ExchangeStatus.IN_PROGRESS.value)
+                    .where(
+                        ExchangeRow.dialog_id == dialog_id,
+                        ExchangeRow.status == ExchangeStatus.IN_PROGRESS.value,
+                    )
                     .values(status=ExchangeStatus.OPEN.value, owner_task_id=None)
                 ),
             )
@@ -460,6 +490,133 @@ class SqlAlchemyExchangeRepository:
     async def delete_for_dialog(self, dialog_id: str) -> None:
         async with self._session_factory() as session:
             await session.execute(delete(ExchangeRow).where(ExchangeRow.dialog_id == dialog_id))
+            await session.commit()
+
+
+class SqlAlchemyClaimRepository:
+    """Dialog ownership: which process runs which actor.
+
+    Claiming is a read-modify-write rather than an atomic increment, and that
+    is safe because the identity of a claim is the PAIR (owner, generation),
+    never the number alone. Two processes racing to take the same dialog may
+    both compute the same next generation, but only one owner survives in the
+    row, so the other fails its next check and stands down — which is exactly
+    the outcome an atomic increment would have produced.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def claim(self, dialog_id: str, owner: str) -> DialogClaim:
+        """Take the dialog for `owner`, bumping its generation."""
+        for attempt in range(CLAIM_INSERT_RETRY_ATTEMPTS):
+            now = utc_now()
+            async with self._session_factory() as session:
+                row = await session.get(DialogClaimRow, dialog_id)
+                if row is None:
+                    try:
+                        await session.execute(
+                            insert(DialogClaimRow).values(
+                                dialog_id=dialog_id,
+                                owner=owner,
+                                generation=FIRST_GENERATION,
+                                heartbeat_at=now,
+                            )
+                        )
+                        await session.commit()
+                    except IntegrityError:
+                        # another process inserted the first claim between our
+                        # read and our write; retry and take the UPDATE branch
+                        await session.rollback()
+                        if attempt == CLAIM_INSERT_RETRY_ATTEMPTS - 1:
+                            raise
+                        continue
+                    return DialogClaim(
+                        dialog_id=dialog_id,
+                        owner=owner,
+                        generation=FIRST_GENERATION,
+                        heartbeat_at=now,
+                    )
+                row.generation += 1
+                row.owner = owner
+                row.heartbeat_at = now
+                generation = row.generation
+                await session.commit()
+                return DialogClaim(
+                    dialog_id=dialog_id, owner=owner, generation=generation, heartbeat_at=now
+                )
+        raise AssertionError("unreachable: the final attempt either returns or raises")
+
+    async def heartbeat(self, claims: DialogClaimList) -> frozenset[str]:
+        """Refresh the given claims; return the ids still held by their owner."""
+        if not claims:
+            return frozenset()
+        held = {claim.dialog_id: claim for claim in claims}
+        now = utc_now()
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        DialogClaimRow.dialog_id, DialogClaimRow.owner, DialogClaimRow.generation
+                    ).where(DialogClaimRow.dialog_id.in_(held))
+                )
+            ).all()
+            kept = frozenset(
+                dialog_id
+                for dialog_id, owner, generation in rows
+                if held[dialog_id].owner == owner and held[dialog_id].generation == generation
+            )
+            if kept:
+                await session.execute(
+                    update(DialogClaimRow)
+                    .where(DialogClaimRow.dialog_id.in_(kept))
+                    .values(heartbeat_at=now)
+                )
+                await session.commit()
+            return kept
+
+    async def release(self, dialog_id: str, owner: str, generation: int) -> None:
+        """Drop the claim if it is still this exact one; otherwise a no-op."""
+        async with self._session_factory() as session:
+            await session.execute(
+                delete(DialogClaimRow).where(
+                    DialogClaimRow.dialog_id == dialog_id,
+                    DialogClaimRow.owner == owner,
+                    DialogClaimRow.generation == generation,
+                )
+            )
+            await session.commit()
+
+    async def held_elsewhere(
+        self, dialog_ids: frozenset[str], owner: str, stale_before: datetime
+    ) -> frozenset[str]:
+        """Of `dialog_ids`, those a different owner holds with a fresh heartbeat."""
+        if not dialog_ids:
+            return frozenset()
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(DialogClaimRow.dialog_id).where(
+                    DialogClaimRow.dialog_id.in_(dialog_ids),
+                    DialogClaimRow.owner != owner,
+                    DialogClaimRow.heartbeat_at >= stale_before,
+                )
+            )
+            return frozenset(result.all())
+
+    async def current_generation(self, dialog_id: str) -> int | None:
+        """The stored generation, or None when nobody holds the dialog."""
+        async with self._session_factory() as session:
+            generation: int | None = await session.scalar(
+                select(DialogClaimRow.generation).where(DialogClaimRow.dialog_id == dialog_id)
+            )
+            return generation
+
+    async def delete_for_dialog(self, dialog_id: str) -> None:
+        """Drop the dialog's claim (admin dialog deletion)."""
+        async with self._session_factory() as session:
+            await session.execute(
+                delete(DialogClaimRow).where(DialogClaimRow.dialog_id == dialog_id)
+            )
             await session.commit()
 
 

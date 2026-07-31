@@ -23,6 +23,8 @@ from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
     ConversationRunner,
+    ManagerStores,
+    OwnershipConfig,
     RunnerConfig,
     TaskOutcomeListener,
 )
@@ -59,6 +61,7 @@ from octoforge_core.db.engine import (
     init_db,
 )
 from octoforge_core.dialogs.api import (
+    ClaimRepository,
     DialogNotFoundError,
     DialogRepository,
     ExchangeRepository,
@@ -124,6 +127,7 @@ __all__ = [
     "AuthError",
     "Cancelled",
     "ChatMessage",
+    "ClaimRepository",
     "ClientError",
     "Completion",
     "ContextCompactor",
@@ -156,6 +160,7 @@ __all__ = [
     "LLMResponseError",
     "LoopControl",
     "LoopEvent",
+    "ManagerStores",
     "Memory",
     "MessageArchive",
     "MessageKind",
@@ -163,6 +168,7 @@ __all__ = [
     "MessageRole",
     "MessageRouter",
     "MessageSource",
+    "OwnershipConfig",
     "ProcessCompleted",
     "ProcessStarted",
     "PromptProvider",

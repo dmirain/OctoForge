@@ -15,6 +15,8 @@ from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
+    ManagerStores,
+    OwnershipConfig,
     RunnerConfig,
 )
 from octoforge_core.context.api import DialogueSummary
@@ -22,6 +24,7 @@ from octoforge_core.context.compactor import CompactorConfig, LlmContextCompacto
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.store import (
+    SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
@@ -119,10 +122,14 @@ def make_manager(
     )
     return ConversationManager(
         config=config,
-        dialogs=SqlAlchemyDialogRepository(session_factory),
-        messages=SqlAlchemyMessageRepository(session_factory),
-        tasks=InMemoryTaskStore(),
-        exchanges=SqlAlchemyExchangeRepository(session_factory),
+        stores=ManagerStores(
+            dialogs=SqlAlchemyDialogRepository(session_factory),
+            messages=SqlAlchemyMessageRepository(session_factory),
+            tasks=InMemoryTaskStore(),
+            exchanges=SqlAlchemyExchangeRepository(session_factory),
+            claims=SqlAlchemyClaimRepository(session_factory),
+        ),
+        ownership=OwnershipConfig(node_id="test-node"),
     )
 
 

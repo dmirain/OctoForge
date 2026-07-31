@@ -824,7 +824,7 @@ async def test_exchange_reopen_in_progress_resets_only_those_rows(
         awaiting.id, ExchangeStatus.AWAITING_USER, pending_question=OTHER_PENDING_QUESTION
     )
 
-    reopened_count = await repo.reopen_in_progress()
+    reopened_count = await repo.reopen_in_progress(DIALOG_ID)
 
     assert reopened_count == EXPECTED_REOPENED_COUNT
     for exchange_id in (stranded_one.id, stranded_two.id):
@@ -836,6 +836,24 @@ async def test_exchange_reopen_in_progress_resets_only_those_rows(
     still_awaiting = await repo.get(awaiting.id)
     assert still_awaiting.status is ExchangeStatus.AWAITING_USER
     assert still_awaiting.pending_question == OTHER_PENDING_QUESTION
+
+
+async def test_exchange_reopen_in_progress_never_reaches_another_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The scope is the whole point: with more than one process alive, a
+    global reset would reopen exchanges a peer is answering right now."""
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    mine = await repo.create(DIALOG_ID, "mine", owner_task_id=OWNER_TASK_ID)
+    theirs = await repo.create(OTHER_DIALOG_ID, "theirs", owner_task_id=OTHER_OWNER_TASK_ID)
+
+    reopened_count = await repo.reopen_in_progress(DIALOG_ID)
+
+    assert reopened_count == 1
+    assert (await repo.get(mine.id)).status is ExchangeStatus.OPEN
+    untouched = await repo.get(theirs.id)
+    assert untouched.status is ExchangeStatus.IN_PROGRESS
+    assert untouched.owner_task_id == OTHER_OWNER_TASK_ID
 
 
 async def test_exchange_delete_for_dialog_scopes_to_one_dialog(

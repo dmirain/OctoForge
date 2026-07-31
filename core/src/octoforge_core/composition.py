@@ -19,6 +19,8 @@ from octoforge_core.agent.prompts import PromptProvider
 from octoforge_core.agent.router import LLMRouter, MessageRouter
 from octoforge_core.agent.runner import (
     ConversationManager,
+    ManagerStores,
+    OwnershipConfig,
     RunnerConfig,
     TaskOutcomeListener,
 )
@@ -42,7 +44,6 @@ from octoforge_core.datasets.tools import DataForgetTool, DataPutTool, DataQuery
 from octoforge_core.dialogs.api import (
     DialogRepository,
     ExchangeRepository,
-    MessageRepository,
 )
 from octoforge_core.dialogs.tools import AskUserTool
 from octoforge_core.instructions.api import InstructionService, InstructionStore
@@ -354,19 +355,11 @@ def build_runner_config(
 
 def build_conversation_manager(
     config: RunnerConfig,
-    dialogs: DialogRepository,
-    messages: MessageRepository,
-    tasks: TaskStore,
-    exchanges: ExchangeRepository,
+    stores: ManagerStores,
+    ownership: OwnershipConfig,
 ) -> ConversationManager:
     """Build the conversation manager owning one runner per dialog."""
-    return ConversationManager(
-        config=config,
-        dialogs=dialogs,
-        messages=messages,
-        tasks=tasks,
-        exchanges=exchanges,
-    )
+    return ConversationManager(config=config, stores=stores, ownership=ownership)
 
 
 def build_cron_scheduler(

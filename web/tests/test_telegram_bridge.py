@@ -19,10 +19,16 @@ from octoforge_core import (
 from octoforge_core.agent.events import Cancelled, Finished, ProcessStarted, TextDelta
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
-from octoforge_core.agent.runner import ConversationRunner, RunnerConfig
+from octoforge_core.agent.runner import (
+    ConversationRunner,
+    ManagerStores,
+    OwnershipConfig,
+    RunnerConfig,
+)
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.store import (
+    SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
@@ -321,10 +327,14 @@ async def make_manager(
             max_processes=MAX_PROCESSES,
             compactor=NoopContextCompactor(),
         ),
-        dialogs=SqlAlchemyDialogRepository(session_factory),
-        messages=SqlAlchemyMessageRepository(session_factory),
-        tasks=tasks if tasks is not None else InMemoryTaskStore(),
-        exchanges=SqlAlchemyExchangeRepository(session_factory),
+        stores=ManagerStores(
+            dialogs=SqlAlchemyDialogRepository(session_factory),
+            messages=SqlAlchemyMessageRepository(session_factory),
+            tasks=tasks if tasks is not None else InMemoryTaskStore(),
+            exchanges=SqlAlchemyExchangeRepository(session_factory),
+            claims=SqlAlchemyClaimRepository(session_factory),
+        ),
+        ownership=OwnershipConfig(node_id="test-node"),
     )
 
 
@@ -806,3 +816,27 @@ async def test_material_submits_without_promising_an_answer() -> None:
     assert runner.kinds == [MessageKind.MATERIAL]
     assert client.actions == []
     await bridge.aclose()
+
+
+async def test_the_bridge_drops_a_runner_that_handed_the_dialog_over(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """It must not resubscribe here: re-resolving would claim the dialog
+    straight back from whoever just took it, and the two processes would
+    trade it forever. The next message rebinds through the normal path.
+    """
+    client = FakeTelegramClient()
+    manager = await make_manager([], session_factory)
+    bridge = make_bridge(client, manager)
+    try:
+        await bridge.start()
+        runner = await manager.get_or_create_runner(TELEGRAM_USER_ID, TELEGRAM_CHANNEL)
+
+        await SqlAlchemyClaimRepository(session_factory).claim(runner.dialog_id, "another-node")
+        await manager._beat_once()
+        await asyncio.wait_for(bridge._forwarder, timeout=WAIT_TIMEOUT_SECONDS)
+
+        assert bridge._runner is None
+    finally:
+        await bridge.aclose()
+        await manager.stop_all()

@@ -24,7 +24,12 @@ from octoforge_core.agent.prompts import (
     StaticPromptProvider,
 )
 from octoforge_core.agent.router import ROUTE_TOOL_NAME
-from octoforge_core.agent.runner import ConversationEvent, ConversationManager
+from octoforge_core.agent.runner import (
+    ConversationEvent,
+    ConversationManager,
+    ManagerStores,
+    OwnershipConfig,
+)
 from octoforge_core.composition import (
     RunnerOptions,
     ToolLimits,
@@ -45,6 +50,7 @@ from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.store import (
+    SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
@@ -341,10 +347,14 @@ def build_third_party_root(
             NoopContextCompactor(),
             options=RunnerOptions(max_processes=MAX_PROCESSES),
         ),
-        dialogs=SqlAlchemyDialogRepository(session_factory),
-        messages=SqlAlchemyMessageRepository(session_factory),
-        tasks=InMemoryTaskStore(),
-        exchanges=SqlAlchemyExchangeRepository(session_factory),
+        stores=ManagerStores(
+            dialogs=SqlAlchemyDialogRepository(session_factory),
+            messages=SqlAlchemyMessageRepository(session_factory),
+            tasks=InMemoryTaskStore(),
+            exchanges=SqlAlchemyExchangeRepository(session_factory),
+            claims=SqlAlchemyClaimRepository(session_factory),
+        ),
+        ownership=OwnershipConfig(node_id="test-node"),
     )
     return ThirdPartyRoot(manager=manager, llm=llm, instructions=instructions)
 

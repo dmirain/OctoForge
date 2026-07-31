@@ -64,6 +64,29 @@ class MessageRow(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
 
 
+class DialogClaimRow(Base):
+    """Which process runs a dialog's actor, and since which generation.
+
+    One row per dialog, taken when a process builds the runner. `generation`
+    grows on every claim, so a previous owner can tell that it was preempted
+    without anyone having to reach it: it compares the number it was born
+    with against the stored one. `heartbeat_at` exists for the other
+    question — whether an owner is still alive — which is what recovery needs
+    before it may touch a dialog's stranded work.
+
+    Absent row means nobody has ever run this dialog on a build that recorded
+    claims; it is free to take.
+    """
+
+    __tablename__ = "dialog_claims"
+
+    dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), primary_key=True)
+    owner: Mapped[str] = mapped_column(String)
+    generation: Mapped[int] = mapped_column(Integer, default=1)
+    # indexed: recovery filters by it over every dialog holding stranded work
+    heartbeat_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now, index=True)
+
+
 class ExchangeRow(Base):
     """One obligation to the user: a question, its clarifications and its answer.
 

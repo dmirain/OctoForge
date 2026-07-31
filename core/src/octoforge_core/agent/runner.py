@@ -21,6 +21,7 @@ from collections import deque
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -46,6 +47,9 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
 from octoforge_core.dialogs.api import (
+    ClaimRepository,
+    DialogClaim,
+    DialogClaimList,
     DialogRepository,
     Exchange,
     ExchangeList,
@@ -74,6 +78,28 @@ from octoforge_core.vision.api import ImageResolver, VisionClient, VisionUnavail
 logger = logging.getLogger(__name__)
 
 SUBSCRIBER_QUEUE_SIZE = 100
+
+#: End-of-stream marker put on every subscriber queue when the actor stands
+#: down. A transport that sees it must close its stream and reconnect rather
+#: than keep waiting: this runner no longer owns the dialog, so nothing more
+#: will ever arrive on this queue. Reconnecting is what lands the client on
+#: whichever process took over.
+STREAM_CLOSED = None
+
+#: What a subscriber receives: events, then `STREAM_CLOSED` at most once.
+SubscriberQueue = asyncio.Queue["ConversationEvent | None"]
+
+#: How often a process refreshes the claims of its live dialogs. Also the
+#: worst-case delay before an actor whose dialog moved stops streaming to a
+#: transport — the per-run check in `_start_answer` covers new work sooner.
+CLAIM_HEARTBEAT_SECONDS = 5.0
+
+#: A claim unrefreshed for this long is treated as abandoned, so recovery may
+#: take the dialog's stranded work. Several heartbeats of slack on purpose:
+#: mistaking a slow query or a paused process for a dead one would hand a
+#: live conversation to a second actor.
+CLAIM_STALE_AFTER_SECONDS = 30.0
+
 # events a transport must never miss: terminals close a streamed message and
 # gate `delivered_at`, process markers drive the surface's UI state. Stream
 # chatter (TextDelta, tool events) may drop on a lagging subscriber instead.
@@ -321,6 +347,7 @@ class _RunnerStores:
     messages: MessageRepository
     tasks: TaskStore
     exchanges: ExchangeRepository
+    claims: ClaimRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,9 +504,19 @@ class ConversationRunner:
         config: RunnerConfig,
         stores: _RunnerStores,
         history: list[ChatMessage],
+        claim: DialogClaim,
     ) -> None:
         messages, tasks, exchanges = stores.messages, stores.tasks, stores.exchanges
         self._dialog = dialog
+        self._claims = stores.claims
+        # the claim this actor was born with: everything user-visible is
+        # gated on it still being the current one
+        self._claim = claim
+        self._stood_down = False
+        # set when the actor itself discovers the dialog moved: it stops
+        # taking work and exits, and the manager's heartbeat finishes the
+        # stand-down (closing subscribers) a moment later
+        self._preempted = False
         self._loop = config.loop
         self._prompts = config.prompts
         self._router = config.router
@@ -512,7 +549,7 @@ class ConversationRunner:
         self._spawner: TaskSpawner = _DialogTaskSpawner(self)
         self._deleter: TaskDeleter = _DialogTaskDeleter(self)
         self._inbox: asyncio.Queue[_Command] = asyncio.Queue()
-        self._subscribers: set[asyncio.Queue[ConversationEvent]] = set()
+        self._subscribers: set[SubscriberQueue] = set()
         self._seq = 0
         self._dropped_events = 0
         self._actor_task: asyncio.Task[None] | None = None
@@ -790,7 +827,7 @@ class ConversationRunner:
             narrative_built=False,
         )
 
-    def subscribe(self) -> asyncio.Queue[ConversationEvent]:
+    def subscribe(self) -> SubscriberQueue:
         """Attach a subscriber queue receiving broadcast events.
 
         Attaching also asks the actor to drain the outbox: results that
@@ -798,13 +835,20 @@ class ConversationRunner:
         into a dialog nobody watches, the startup redelivery sweep, which runs
         before the surfaces come up). Live stream events are never replayed —
         only the outbox is.
+
+        A runner that has already stood down hands back an
+        already-closed queue instead of a silent one: the transport learns
+        immediately that it must go and find the current owner.
         """
-        queue: asyncio.Queue[ConversationEvent] = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_SIZE)
+        queue: SubscriberQueue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_SIZE)
+        if self._stood_down:
+            queue.put_nowait(STREAM_CLOSED)
+            return queue
         self._subscribers.add(queue)
         self._inbox.put_nowait(_Flush())
         return queue
 
-    def unsubscribe(self, queue: asyncio.Queue[ConversationEvent]) -> None:
+    def unsubscribe(self, queue: SubscriberQueue) -> None:
         """Detach a subscriber queue."""
         self._subscribers.discard(queue)
 
@@ -820,6 +864,75 @@ class ConversationRunner:
     def dialog_id(self) -> str:
         """Return the id of the owned dialog."""
         return self._dialog.id
+
+    @property
+    def claim(self) -> DialogClaim:
+        """The claim this actor holds on its dialog."""
+        return self._claim
+
+    async def stand_down(self) -> None:
+        """Stop for good: another process owns this dialog now.
+
+        Not a failure and not a cancellation by the user — the work simply
+        moved. Every subscriber is told the stream is over so it reconnects
+        and finds the new owner; whatever this actor had in flight is left
+        for that owner's recovery, which is the same path a crash takes.
+
+        Called by the manager (which owns the claim lifecycle), never from
+        inside the actor: `stop()` awaits the actor task, and a task cannot
+        await itself. An actor that notices the loss on its own instead
+        refuses the work and exits — see `_start_answer`.
+
+        Idempotent: preemption can be noticed by the heartbeat and by a run
+        starting at the same time.
+        """
+        if self._stood_down:
+            return
+        self._stood_down = True
+        logger.info(
+            "standing down: dialog=%s owner=%s generation=%s",
+            self._dialog.id,
+            self._claim.owner,
+            self._claim.generation,
+        )
+        for queue in tuple(self._subscribers):
+            self._close_stream(queue)
+        self._subscribers.clear()
+        await self.stop()
+
+    @staticmethod
+    def _close_stream(queue: SubscriberQueue) -> None:
+        """Put the end-of-stream marker, evicting a queued event if need be.
+
+        A full queue must not swallow the marker: a transport that never
+        learns the stream is over waits on a runner that will never speak
+        again, which looks exactly like the agent ignoring the user.
+        """
+        while True:
+            try:
+                queue.put_nowait(STREAM_CLOSED)
+                return
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:  # drained concurrently; try the put again
+                    continue
+
+    async def _still_owns_dialog(self) -> bool:
+        """Whether this actor's claim is still the current one.
+
+        Deliberately fails OPEN. A database hiccup must not stop the single
+        process installation — the overwhelmingly common one — from
+        answering, and the heartbeat is the mechanism that ultimately
+        notices a lost dialog. This check only narrows the window between a
+        handover and the next heartbeat.
+        """
+        try:
+            generation = await self._claims.current_generation(self._dialog.id)
+        except Exception:
+            logger.exception("ownership check failed: dialog=%s", self._dialog.id)
+            return True
+        return generation is None or generation == self._claim.generation
 
     async def _run_actor(self) -> None:
         while True:
@@ -844,6 +957,11 @@ class ConversationRunner:
                     # silence); the unowned-open sweep revives an exchange
                     # stranded mid-apply.
                     self._broadcast(Failed(error=SUBMIT_FAILED_ERROR))
+            if self._preempted:
+                # another process owns this dialog now: take no further
+                # commands. The manager's heartbeat completes the stand-down
+                # (subscribers get the end-of-stream marker) right after.
+                raise asyncio.CancelledError from None
             if self._cancellation_pending():
                 # A cancel can also be absorbed WITHOUT surfacing as an error:
                 # SQLAlchemy's greenlet bridge swallows the CancelledError of
@@ -1713,7 +1831,22 @@ class ConversationRunner:
         the last user cancel starts already-cancelled: the stop button was
         pressed while the message was still being routed, and "I pressed
         stop and it answered anyway" is a broken stop.
+
+        Ownership is checked here, once per run, and nowhere on the streaming
+        path: one query is nothing beside a model call, while a per-event
+        check would put a database round trip on the hot loop. Losing the
+        dialog here leaves the exchange OPEN and untouched — exactly the
+        state the new owner's recovery picks up, the same shape a crash
+        leaves behind.
         """
+        if not await self._still_owns_dialog():
+            self._preempted = True
+            logger.info(
+                "refusing to answer, dialog moved: dialog=%s exchange=%s",
+                self._dialog.id,
+                exchange.id,
+            )
+            return
         task = await self._prepare_process_task(
             exchange.title,
             message.content,
@@ -2180,9 +2313,7 @@ class ConversationRunner:
         return accepted
 
     @staticmethod
-    def _evict_and_put(
-        queue: asyncio.Queue[ConversationEvent], envelope: ConversationEvent
-    ) -> bool:
+    def _evict_and_put(queue: SubscriberQueue, envelope: ConversationEvent) -> bool:
         """Make room for a critical event by evicting the oldest DROPPABLE one.
 
         Blind head-eviction could evict an earlier critical event (a terminal
@@ -2192,14 +2323,20 @@ class ConversationRunner:
         counts the event as not accepted, so the outbox keeps the delivery
         queued instead of stamping it delivered.
         """
-        drained: list[ConversationEvent] = []
+        drained: list[ConversationEvent | None] = []
         while True:
             try:
                 drained.append(queue.get_nowait())
             except asyncio.QueueEmpty:
                 break
         victim = next(
-            (i for i, item in enumerate(drained) if not isinstance(item.payload, _CRITICAL_EVENTS)),
+            (
+                i
+                for i, item in enumerate(drained)
+                # the end-of-stream marker is never a victim: a transport that
+                # loses it waits forever on a runner that has already gone
+                if item is not None and not isinstance(item.payload, _CRITICAL_EVENTS)
+            ),
             None,
         )
         if victim is not None:
@@ -2231,22 +2368,65 @@ class _DialogTaskDeleter:
         return await self._runner.delete_task(task_id)
 
 
+def _finished_build(build: "asyncio.Task[ConversationRunner]") -> "ConversationRunner | None":
+    """The runner a build produced, or None if it is unfinished or failed."""
+    if not build.done() or build.cancelled() or build.exception() is not None:
+        return None
+    return build.result()
+
+
+@dataclass(frozen=True, slots=True)
+class ManagerStores:
+    """Persistence collaborators of one conversation manager."""
+
+    dialogs: DialogRepository
+    messages: MessageRepository
+    tasks: TaskStore
+    exchanges: ExchangeRepository
+    claims: ClaimRepository
+
+
+@dataclass(frozen=True, slots=True)
+class OwnershipConfig:
+    """How this process names itself as a dialog owner, and how it paces that.
+
+    `node_id` must be stable across this instance's own restarts — seeing its
+    own claim after a restart is what lets it reclaim its own stranded work
+    immediately instead of waiting out `stale_after_seconds` — and unique
+    against every other instance sharing the database, or two of them will
+    treat each other's live dialogs as abandoned.
+    """
+
+    node_id: str
+    heartbeat_seconds: float = CLAIM_HEARTBEAT_SECONDS
+    stale_after_seconds: float = CLAIM_STALE_AFTER_SECONDS
+
+
 class ConversationManager:
-    """Owns one runner per dialog, keyed by (user_id, channel)."""
+    """Owns one runner per dialog, keyed by (user_id, channel).
+
+    Also owns dialog ownership itself: it claims a dialog when it builds the
+    actor, keeps the claim warm with a heartbeat, and stands the actor down
+    when the heartbeat reports that somebody else took over. The actor knows
+    only its own claim — the lifecycle lives here.
+    """
 
     def __init__(
         self,
         config: RunnerConfig,
-        dialogs: DialogRepository,
-        messages: MessageRepository,
-        tasks: TaskStore,
-        exchanges: ExchangeRepository,
+        stores: ManagerStores,
+        ownership: OwnershipConfig,
     ) -> None:
         self._config = config
-        self._dialogs = dialogs
-        self._messages = messages
-        self._tasks = tasks
-        self._exchanges = exchanges
+        self._dialogs = stores.dialogs
+        self._messages = stores.messages
+        self._tasks = stores.tasks
+        self._exchanges = stores.exchanges
+        self._claims = stores.claims
+        self._node_id = ownership.node_id
+        self._heartbeat_seconds = ownership.heartbeat_seconds
+        self._stale_after_seconds = ownership.stale_after_seconds
+        self._heartbeat_task: asyncio.Task[None] | None = None
         self._runners: dict[str, ConversationRunner] = {}
         # (user_id, channel) -> the build task, memoized: concurrent callers
         # await one build, later callers get the finished runner from it
@@ -2283,6 +2463,10 @@ class ConversationManager:
 
     async def _build_runner(self, user_id: str, channel: str) -> ConversationRunner:
         dialog = await self._dialogs.get_or_create(user_id, channel)
+        # claimed before the actor exists: building one is what makes this
+        # process the dialog's owner, and a previous owner elsewhere learns
+        # it was replaced from the bumped generation
+        claim = await self._claims.claim(dialog.id, self._node_id)
         # only the hot slice lives in memory: everything up to the compaction
         # boundary is reachable through summaries and history_search
         boundary = await self._config.compactor.compacted_boundary(dialog.id)
@@ -2294,9 +2478,13 @@ class ConversationManager:
             dialog=dialog,
             config=self._config,
             stores=_RunnerStores(
-                messages=self._messages, tasks=self._tasks, exchanges=self._exchanges
+                messages=self._messages,
+                tasks=self._tasks,
+                exchanges=self._exchanges,
+                claims=self._claims,
             ),
             history=history,
+            claim=claim,
         )
         runner.start()
         self._runners[dialog.id] = runner
@@ -2322,6 +2510,52 @@ class ConversationManager:
         runner = await self.get_or_create_runner(user_id, channel)
         return await runner.wake(title, prompt, cron_job_id)
 
+    def start(self) -> None:
+        """Start the claim heartbeat; call once, after `recover_interrupted`."""
+        if self._heartbeat_task is None:
+            self._heartbeat_task = asyncio.create_task(self._run_heartbeat())
+
+    async def _run_heartbeat(self) -> None:
+        """Keep this process's claims warm and stand down whatever it lost.
+
+        The heartbeat carries both halves of ownership: refreshing a claim
+        tells recovery elsewhere that this dialog is alive, and failing to
+        refresh one is how this process learns the dialog moved. Failures are
+        swallowed — a database blip must not stand down healthy actors, and
+        the next tick retries.
+        """
+        while True:
+            await asyncio.sleep(self._heartbeat_seconds)
+            try:
+                await self._beat_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("claim heartbeat failed")
+
+    async def _beat_once(self) -> None:
+        """Refresh every live runner's claim; stand down the preempted ones."""
+        runners = tuple(self._runners.values())
+        if not runners:
+            return
+        claims: DialogClaimList = [runner.claim for runner in runners]
+        kept = await self._claims.heartbeat(claims)
+        for runner in runners:
+            if runner.dialog_id not in kept:
+                await self._drop_preempted(runner)
+
+    async def _drop_preempted(self, runner: ConversationRunner) -> None:
+        """Deregister and stand down a runner whose dialog moved elsewhere."""
+        async with self._lock:
+            for key, build in tuple(self._builds.items()):
+                if _finished_build(build) is runner:
+                    del self._builds[key]
+            self._runners.pop(runner.dialog_id, None)
+        try:
+            await runner.stand_down()
+        except Exception:  # a failing runner must not stall the heartbeat
+            logger.exception("stand-down failed: dialog=%s", runner.dialog_id)
+
     async def recover_interrupted(self) -> None:
         """Restart orphaned tasks and redeliver undelivered results after a restart.
 
@@ -2330,58 +2564,110 @@ class ConversationManager:
         runs once at startup (before the scheduler and the surfaces start) and
         never raises: a recovery failure must not take the app down — every
         operation is idempotent and simply retried on the next restart.
+
+        **Only dialogs no live process owns are touched.** This used to sweep
+        the whole database on the reasoning that a restart kills every
+        process — true while there was one, and destructive with two: a
+        starting instance would reopen exchanges its peers are answering
+        right now and restart their tasks as its own. Candidates come from
+        the work itself rather than from the claim table, so stranded rows
+        that predate claims entirely are still recovered.
         """
-        stranded = await self._reopen_stranded_exchanges()
         orphaned = await self._list_orphaned()
-        for task in orphaned:
-            await self._restart_orphaned(task)
-        revived = await self._revive_unowned_open()
         undelivered = await self._list_undelivered()
+        candidates = frozenset(await self._list_stranded_dialog_ids()).union(
+            task.dialog_id for task in (*orphaned, *undelivered)
+        )
+        mine = candidates - await self._held_elsewhere(candidates)
+        reopened = 0
+        for dialog_id in mine:
+            reopened += await self._reopen_stranded_exchanges(dialog_id)
+        for task in orphaned:
+            if task.dialog_id in mine:
+                await self._restart_orphaned(task)
+        revived = 0
+        for dialog_id in mine:
+            revived += await self._revive_unowned_open(dialog_id)
         for task in undelivered:
-            await self._redeliver_undelivered(task)
+            if task.dialog_id in mine:
+                await self._redeliver_undelivered(task)
         logger.info(
-            "startup recovery: reopened=%s restarted=%s revived=%s redelivered=%s",
-            stranded,
-            len(orphaned),
+            "startup recovery: dialogs=%s skipped=%s reopened=%s restarted=%s "
+            "revived=%s redelivered=%s",
+            len(mine),
+            len(candidates) - len(mine),
+            reopened,
+            sum(1 for task in orphaned if task.dialog_id in mine),
             revived,
-            len(undelivered),
+            sum(1 for task in undelivered if task.dialog_id in mine),
         )
 
-    async def _revive_unowned_open(self) -> int:
-        """Give every unowned OPEN exchange back to its dialog's sweep.
+    async def _held_elsewhere(self, dialog_ids: frozenset[str]) -> frozenset[str]:
+        """Dialogs another live process owns; recovery must not touch these.
+
+        On failure every candidate is treated as somebody else's. Skipping
+        recovery costs a delay — the next restart or the owning process picks
+        the work up — while recovering a dialog another instance is actively
+        running corrupts a live conversation.
+        """
+        if not dialog_ids:
+            return frozenset()
+        stale_before = utc_now() - timedelta(seconds=self._stale_after_seconds)
+        try:
+            return await self._claims.held_elsewhere(dialog_ids, self._node_id, stale_before)
+        except Exception:
+            logger.exception("claim lookup failed; skipping recovery this start")
+            return dialog_ids
+
+    async def _list_stranded_dialog_ids(self) -> list[str]:
+        try:
+            return await self._exchanges.list_stranded_dialog_ids()
+        except Exception:
+            logger.exception("stranded dialog sweep failed")
+            return []
+
+    async def _revive_unowned_open(self, dialog_id: str) -> int:
+        """Give the dialog's unowned OPEN exchanges back to its sweep.
 
         Runs after the orphan restarts (which re-own their exchanges), so
         whatever is still unowned here is a genuine crash leftover: an
         exchange created whose run never came to exist.
         """
         try:
-            stranded = await self._exchanges.list_unowned_open()
+            stranded = await self._exchanges.list_unowned_open(dialog_id)
         except Exception:
-            logger.exception("unowned-open startup sweep failed")
+            logger.exception("unowned-open startup sweep failed: dialog=%s", dialog_id)
+            return 0
+        if not stranded:
+            return 0
+        try:
+            dialog = await self._dialogs.get(dialog_id)
+            runner = await self.get_or_create_runner(dialog.user_id, dialog.channel)
+        except Exception:
+            logger.exception("stranded exchange revive failed: dialog=%s", dialog_id)
             return 0
         revived = 0
         for exchange in stranded:
             try:
-                dialog = await self._dialogs.get(exchange.dialog_id)
-                runner = await self.get_or_create_runner(dialog.user_id, dialog.channel)
                 await runner.resume_stranded()
                 revived += 1
             except Exception:
                 logger.exception("stranded exchange revive failed: exchange=%s", exchange.id)
         return revived
 
-    async def _reopen_stranded_exchanges(self) -> int:
-        """Reset obligations whose owner died; return how many.
+    async def _reopen_stranded_exchanges(self, dialog_id: str) -> int:
+        """Reset the dialog's obligations whose owner died; return how many.
 
-        Processes never survive a restart, so an IN_PROGRESS exchange at
-        startup is stale by definition — and a settle that failed mid-write
-        would otherwise strand it forever, invisible to the OPEN-based
-        predicate. AWAITING_USER is left alone: that one waits for a human.
+        An IN_PROGRESS exchange of a dialog nobody live owns is stale: its
+        executor lived in a process that is gone. A settle that failed
+        mid-write would otherwise strand it forever, invisible to the
+        OPEN-based predicate. AWAITING_USER is left alone: that one waits for
+        a human.
         """
         try:
-            return await self._exchanges.reopen_in_progress()
+            return await self._exchanges.reopen_in_progress(dialog_id)
         except Exception:  # recovery must never take the app down
-            logger.exception("stranded exchange sweep failed")
+            logger.exception("stranded exchange sweep failed: dialog=%s", dialog_id)
             return 0
 
     async def _list_orphaned(self) -> list[Task]:
@@ -2438,9 +2724,20 @@ class ConversationManager:
             await runner.stop()
         except Exception:  # a failing runner must not block the deletion
             logger.exception("runner stop failed: dialog=%s", runner.dialog_id)
+        await self._release(runner)
 
     async def stop_all(self) -> None:
-        """Stop and deregister every live runner (the app is shutting down)."""
+        """Stop and deregister every live runner (the app is shutting down).
+
+        Claims are released on the way out, so the dialogs this process was
+        running are immediately free for another one — a clean shutdown must
+        not make its dialogs wait out the staleness window.
+        """
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._heartbeat_task
+            self._heartbeat_task = None
         async with self._lock:
             builds = tuple(self._builds.values())
             self._builds.clear()
@@ -2456,3 +2753,12 @@ class ConversationManager:
                 await runner.stop()
             except Exception:  # one failing runner must not block the shutdown
                 logger.exception("runner stop failed: dialog=%s", runner.dialog_id)
+            await self._release(runner)
+
+    async def _release(self, runner: ConversationRunner) -> None:
+        """Drop the runner's claim; a claim already taken over is left alone."""
+        claim = runner.claim
+        try:
+            await self._claims.release(claim.dialog_id, claim.owner, claim.generation)
+        except Exception:  # shutdown must not fail on a lost database
+            logger.exception("claim release failed: dialog=%s", claim.dialog_id)
