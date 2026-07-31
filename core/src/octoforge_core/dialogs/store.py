@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.dialogs.api import (
     LIVE_EXCHANGE_STATUSES,
+    TITLE_MAX_LENGTH,
     DialogNotFoundError,
     Exchange,
     ExchangeList,
@@ -43,8 +44,6 @@ from octoforge_core.time import utc_now
 # freshly recomputed seq rather than propagated. Bounded so a genuine
 # duplicate client_message_id still raises instead of looping forever.
 MESSAGE_SEQ_RETRY_ATTEMPTS = 5
-# exchange titles quote the question; the full text lives in the message
-TITLE_MAX_LENGTH = 60
 
 
 class SqlAlchemyDialogRepository:
@@ -381,6 +380,15 @@ class SqlAlchemyExchangeRepository:
             if row is None:
                 return
             row.updated_at = utc_now()
+            await session.commit()
+
+    async def set_title(self, exchange_id: str, title: str) -> None:
+        """Rename the exchange; a missing row is a no-op (it may have been deleted)."""
+        async with self._session_factory() as session:
+            row = await session.get(ExchangeRow, exchange_id)
+            if row is None:
+                return
+            row.title = title[:TITLE_MAX_LENGTH]
             await session.commit()
 
     async def get(self, exchange_id: str) -> Exchange:

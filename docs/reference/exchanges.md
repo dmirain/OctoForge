@@ -81,6 +81,15 @@ briefly `OPEN`, so the recovery sweep cannot mistake it for work to do). From th
 - otherwise the sweep (`CollectingSweeper`) notices the collection has been quiet for
   `OF_MATERIAL_QUIET_SECONDS` and asks the actor to promote it — one reaction for the whole batch.
 
+Adoption is deterministic while the collection is the dialog's only live exchange and still inside its
+quiet window: "forward, then ask" is the mirror of "comment, then forward", and both are resolved
+without a model call. Past the window the collection belongs to the promotion path, and with another
+obligation in flight the message may be a reply to that one — both cases go to the router, which is
+shown what the collection holds rather than only its title. A collection is titled after the forward's
+source, so the title alone cannot say whether a question is about it; that gap cost an adoption in
+production (31.07) and produced a second, redundant reaction asking the user what to do with a post they
+had already asked about. See [routing.md](routing.md).
+
 The sweep is a nominator, not a writer: it finds candidates and the actor re-checks the quiet window
 and the status under its own serialization, so promotion cannot race a question that is already
 starting a run on the same exchange.

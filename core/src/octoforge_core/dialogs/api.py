@@ -52,6 +52,12 @@ LIVE_EXCHANGE_STATUSES = (
     ExchangeStatus.AWAITING_USER,
 )
 
+#: how long an exchange title may be — it is a label (operator console, the
+#: nudge text, the router's candidate lines), not the question itself, which
+#: stays whole in the message. The store clamps to it; whoever writes a title
+#: should aim under it rather than rely on the cut.
+TITLE_MAX_LENGTH = 60
+
 
 @dataclass(slots=True)
 class Exchange:
@@ -119,6 +125,16 @@ class ExchangeRepository(Protocol):
 
     async def touch(self, exchange_id: str) -> None:
         """Bump `updated_at` — the clock the quiet window is measured against."""
+        ...
+
+    async def set_title(self, exchange_id: str, title: str) -> None:
+        """Rename the exchange; a missing row is a no-op.
+
+        An exchange is named when it opens, from the message that opened it —
+        after a few turns that name describes its first sentence rather than
+        the obligation. Routing renames it whenever a message joins, so the
+        name keeps up with what the exchange became.
+        """
         ...
 
     async def list_unowned_open(self, dialog_id: str | None = None) -> ExchangeList:

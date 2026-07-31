@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_core.context.api import INTERRUPTED_NOTE
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.api import (
+    TITLE_MAX_LENGTH,
     DialogNotFoundError,
     DialogRepository,
     ExchangeNotFoundError,
@@ -849,6 +850,40 @@ async def test_exchange_delete_for_dialog_scopes_to_one_dialog(
     with pytest.raises(ExchangeNotFoundError):
         await repo.get(own.id)
     assert (await repo.get(other.id)).id == other.id
+
+
+async def test_exchange_set_title_renames_the_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    created = await repo.create(DIALOG_ID, EXCHANGE_TITLE)
+
+    await repo.set_title(created.id, "what it is about now")
+
+    assert (await repo.get(created.id)).title == "what it is about now"
+
+
+async def test_exchange_set_title_clamps_to_the_stored_length(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The title is a label — the console, the nudge and the router's
+    candidate lines all render it, and the full text lives in the message."""
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    created = await repo.create(DIALOG_ID, EXCHANGE_TITLE)
+
+    await repo.set_title(created.id, "y" * (TITLE_MAX_LENGTH * 3))
+
+    assert (await repo.get(created.id)).title == "y" * TITLE_MAX_LENGTH
+
+
+async def test_exchange_set_title_on_a_missing_row_is_a_noop(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Renaming is cosmetic: an exchange deleted under it must not raise the
+    way `set_status` does, or a name would cost the answer."""
+    repo = SqlAlchemyExchangeRepository(session_factory)
+
+    await repo.set_title("no-such-exchange", "a name")
 
 
 async def test_exchange_create_with_collecting_status_has_no_owner(

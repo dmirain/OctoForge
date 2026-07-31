@@ -39,6 +39,7 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
+    MATERIAL_DIGEST_CHARS,
     MATERIAL_QUIET_SECONDS,
     MATERIAL_TITLE_ANONYMOUS,
     MATERIAL_TITLE_TEMPLATE,
@@ -140,6 +141,7 @@ MATERIAL_TWO = "forwarded two"
 MATERIAL_THREE = "forwarded three"
 THREE_MATERIAL_MESSAGES = 3
 TWO_MESSAGES = 2
+FOUR_MESSAGES = 4
 MATERIAL_REACTION = "reacted to the batch"
 ADOPTING_TASK_ID = "adopting-task"
 TARGET_QUESTION = "target question"
@@ -160,6 +162,7 @@ class FakeRouter:
         self.action = RouteAction.NEW
         self.cancel_all = False
         self.cancel_one: str | None = None
+        self.title: str | None = None
         self.calls: list[tuple[tuple[ExchangeInfo, ...], str]] = []
 
     async def route(
@@ -176,13 +179,17 @@ class FakeRouter:
             cancel_ids = (self.cancel_one,)
         if self.action is RouteAction.CONTINUE and exchanges:
             return RouteDecision(
-                action=RouteAction.CONTINUE, exchange_id=exchanges[0].id, cancel_ids=cancel_ids
+                action=RouteAction.CONTINUE,
+                exchange_id=exchanges[0].id,
+                cancel_ids=cancel_ids,
+                title=self.title,
             )
         return RouteDecision(action=self.action, cancel_ids=cancel_ids)
 
-    def decide_continue(self) -> None:
+    def decide_continue(self, title: str | None = None) -> None:
         """Route the next message into the oldest live exchange (the old INJECT)."""
         self.action = RouteAction.CONTINUE
+        self.title = title
 
     def decide_cancel_all(self) -> None:
         self.cancel_all = True
@@ -1097,6 +1104,14 @@ async def _is_failed(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) 
 
 async def _is_collecting(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
     return (await exchanges.get(exchange_id)).status is ExchangeStatus.COLLECTING
+
+
+async def _collection_exists(exchanges: SqlAlchemyExchangeRepository, dialog_id: str) -> bool:
+    return await exchanges.find_collecting(dialog_id) is not None
+
+
+async def _has_title(exchanges: SqlAlchemyExchangeRepository, exchange_id: str, title: str) -> bool:
+    return (await exchanges.get(exchange_id)).title == title
 
 
 async def _backdate_exchange(
@@ -4025,11 +4040,15 @@ async def test_promote_collected_is_a_noop_when_material_just_touched_it(
     assert llm.requests == []
 
 
-async def test_own_message_routed_into_the_collection_starts_a_run_and_leaves_collecting(
+async def test_own_message_adopts_the_sole_fresh_collection_without_asking_the_router(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    router = FakeRouter()
-    router.decide_continue()  # the only live exchange is the collection
+    """ "Forward, then ask" is decided deterministically: the collection is the
+    only live exchange and it is still fresh, so the message belongs to it.
+    Asking an LLM here answered the question without the material (live,
+    31.07) — the candidate line carries the forward's source, which says
+    nothing about its subject."""
+    router = FakeRouter()  # deliberately unprogrammed: it must not be consulted
     llm = ScriptedLLM([reply(MATERIAL_REACTION)])
     manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -4046,11 +4065,184 @@ async def test_own_message_routed_into_the_collection_starts_a_run_and_leaves_co
     await runner.submit("please summarize this")
     events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
 
-    assert router.calls != []  # the OWN message was actually routed
+    assert router.calls == []  # no LLM stood between the forward and its question
     left_collecting = await exchanges.get(exchange.id)
     assert left_collecting.status is not ExchangeStatus.COLLECTING
     assert any(isinstance(e.payload, Finished) for e in events)
     await wait_for_async_condition(lambda: _is_answered(exchanges, exchange.id))
+
+
+async def test_a_stale_collection_is_left_to_the_sweep_and_goes_to_the_router(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Past the quiet window the collection belongs to the promotion path.
+    Adopting it here would race the sweep the actor serializes with, so the
+    shortcut steps aside and the router decides — with the content in hand."""
+    router = FakeRouter()
+    llm = ScriptedLLM([reply(MATERIAL_REACTION)])
+    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit(
+        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
+    await wait_for_condition(lambda: len(runner.history()) == 1)
+    exchange = await exchanges.find_collecting(runner.dialog_id)
+    assert exchange is not None
+    await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+
+    await runner.submit("unrelated question")
+    await wait_for_condition(lambda: router.calls != [])
+
+
+async def test_another_live_exchange_sends_the_message_to_the_router_with_the_preview(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """With a second obligation in flight the message may be a reply to that
+    one, so the shortcut does not fire. The router then needs what the
+    collection holds: its title names the forward's source, never its
+    subject."""
+    tool = AskingTool()
+    router = FakeRouter()
+    llm = ScriptedLLM([blocking_call(), reply("")])
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(router=router, store=InMemoryTaskStore()),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    # one obligation parked on the user, so the collection is not alone
+    await runner.submit("what is the weather?")
+    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    await collect_until(queue, is_delivered(tool.question))
+    await runner.submit(
+        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    )
+    await wait_for_async_condition(lambda: _collection_exists(exchanges, runner.dialog_id))
+    router.calls.clear()
+
+    await runner.submit("what about the thing above?")
+    await wait_for_condition(lambda: router.calls != [])
+
+    candidates, _ = router.calls[0]
+    collecting = [item for item in candidates if item.status is ExchangeStatus.COLLECTING]
+    assert len(collecting) == 1
+    assert collecting[0].preview is not None
+    assert MATERIAL_ONE in collecting[0].preview
+    # an ordinary exchange is described by its title; only material needs this
+    others = [item for item in candidates if item.status is not ExchangeStatus.COLLECTING]
+    assert [item.preview for item in others] == [None]
+
+
+async def test_a_long_forward_keeps_its_tail_in_the_preview(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A forwarded picture leads with its attribution and the description of
+    the image; the text the user forwarded trails it. Cutting the tail drops
+    exactly what says what the post is about (live, 31.07: the router saw
+    "a poster with a minimalist design" and nothing else), so an over-budget
+    piece loses its middle instead."""
+    tool = AskingTool()
+    router = FakeRouter()
+    llm = ScriptedLLM([blocking_call(), reply("")])
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(router=router, store=InMemoryTaskStore()),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("what is the weather?")
+    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    await collect_until(queue, is_delivered(tool.question))
+    head = "[image] a poster with a minimalist design "
+    tail = "the first travel MCP hackathon"
+    await runner.submit(
+        head + "x" * (MATERIAL_DIGEST_CHARS * 2) + tail,
+        source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN),
+    )
+    await wait_for_async_condition(lambda: _collection_exists(exchanges, runner.dialog_id))
+    router.calls.clear()
+
+    await runner.submit("what about the thing above?")
+    await wait_for_condition(lambda: router.calls != [])
+
+    candidates, _ = router.calls[0]
+    preview = next(item.preview for item in candidates if item.status is ExchangeStatus.COLLECTING)
+    assert preview is not None
+    assert len(preview) <= MATERIAL_DIGEST_CHARS
+    assert preview.startswith(head)
+    assert preview.endswith(tail)
+
+
+async def test_continue_renames_the_exchange_to_what_it_is_now_about(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An exchange is named after the message that opened it, which stops
+    describing it a few turns in. Routing renames it as it attaches, so the
+    console, the nudge and the next routing decision see the current topic."""
+    tool = AskingTool()
+    router = FakeRouter()
+    llm = ScriptedLLM([blocking_call(), reply(""), reply("+21 in Moscow")])
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(router=router, store=InMemoryTaskStore()),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("what is the weather?")
+    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    await collect_until(queue, is_delivered(tool.question))
+    live = await exchanges.list_live(runner.dialog_id)
+    assert live[0].title == "what is the weather?"
+
+    router.decide_continue(title="Погода в Москве")
+    await runner.submit("Moscow")
+    await collect_until(queue, is_delivered("+21 in Moscow"))
+
+    await wait_for_async_condition(lambda: _has_title(exchanges, live[0].id, "Погода в Москве"))
+
+
+async def test_continue_without_a_new_title_keeps_the_name_it_had(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`title=None` means "the name still fits" — never "clear it"."""
+    tool = AskingTool()
+    router = FakeRouter()
+    llm = ScriptedLLM([blocking_call(), reply(""), reply("+21 in Moscow")])
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(router=router, store=InMemoryTaskStore()),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+
+    await runner.submit("what is the weather?")
+    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    await collect_until(queue, is_delivered(tool.question))
+    live = await exchanges.list_live(runner.dialog_id)
+
+    router.decide_continue()  # no title offered
+    await runner.submit("Moscow")
+    await collect_until(queue, is_delivered("+21 in Moscow"))
+
+    unchanged = await exchanges.get(live[0].id)
+    assert unchanged.title == "what is the weather?"
 
 
 async def test_cancel_cancels_a_collecting_exchange_and_blocks_later_promotion(

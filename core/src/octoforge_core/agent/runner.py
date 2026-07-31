@@ -18,6 +18,7 @@ delivery never involves an LLM call.
 import asyncio
 import logging
 from collections import deque
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -47,6 +48,7 @@ from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
 from octoforge_core.dialogs.api import (
     DialogRepository,
     Exchange,
+    ExchangeList,
     ExchangeNotFoundError,
     ExchangeRepository,
     ExchangeStatus,
@@ -116,7 +118,15 @@ MATERIAL_TITLE_IMAGES = "Присланные изображения"
 # the routing decision sees a preview, not the whole batch: the narrative
 # keeps everything, the prompt stays bounded
 MATERIAL_DIGEST_MESSAGES = 20
-MATERIAL_DIGEST_CHARS = 200
+# The budget is the batch's, not each message's. Splitting it per message
+# instead cost a routing decision in production (31.07): one forwarded post
+# got the same 200 characters as one of twenty, and 200 characters of a
+# forwarded picture are the image description, never the text under it.
+MATERIAL_DIGEST_CHARS = 4000
+# an over-budget piece is cut in the middle: a forwarded post carries its
+# attribution and any picture description at the front and its own text at
+# the end, so cutting only the tail drops exactly what identifies the topic
+MATERIAL_DIGEST_ELLIPSIS = "\n[…]\n"
 MATERIAL_DIGEST_TEMPLATE = (
     "The user forwarded {count} message(s) — third-party content, not their "
     "own words. Which exchange does this material belong to?\n{lines}"
@@ -180,6 +190,29 @@ def _untitled(message: ChatMessage) -> str:
     if any(item.kind is AttachmentKind.IMAGE for item in message.attachments):
         return MATERIAL_TITLE_IMAGES
     return MATERIAL_TITLE_ANONYMOUS
+
+
+def _bounded_preview(pieces: Sequence[str], budget: int) -> str:
+    """Join `pieces` into at most `budget` characters, sharing it equally.
+
+    The budget belongs to the batch: one forward may spend all of it, twenty
+    get a slice each. A piece over its share keeps both ends — the front
+    carries attribution and any picture description, the back carries the
+    text the user actually forwarded.
+    """
+    if not pieces:
+        return ""
+    share = max(budget // len(pieces), len(MATERIAL_DIGEST_ELLIPSIS) + 2)
+    return "\n".join(_middle_out(piece, share) for piece in pieces)
+
+
+def _middle_out(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, dropping the middle rather than the tail."""
+    if len(text) <= limit:
+        return text
+    keep = limit - len(MATERIAL_DIGEST_ELLIPSIS)
+    head = keep // 2
+    return text[:head] + MATERIAL_DIGEST_ELLIPSIS + text[len(text) - (keep - head) :]
 
 
 def _silent_done(task: Task) -> bool:
@@ -993,14 +1026,30 @@ class ConversationRunner:
         return next((item for item in live if item.id == decision.exchange_id), None)
 
     def _material_digest(self, exchange_id: str) -> str:
-        """A compact preview of the batch for the routing decision."""
-        pieces = [
+        """The batch as the question a promotion asks the router."""
+        pieces = self._material_pieces(exchange_id)
+        return MATERIAL_DIGEST_TEMPLATE.format(
+            count=len(pieces), lines=_bounded_preview(pieces, MATERIAL_DIGEST_CHARS)
+        )
+
+    def _material_preview(self, exchange_id: str) -> str | None:
+        """What a collection holds, for the router's candidate line.
+
+        A collection is named after where the forward came from, so its title
+        cannot answer "is this message about it?" — the content has to. None
+        when there is nothing collected (the caller then shows the title
+        alone).
+        """
+        pieces = self._material_pieces(exchange_id)
+        return _bounded_preview(pieces, MATERIAL_DIGEST_CHARS) if pieces else None
+
+    def _material_pieces(self, exchange_id: str) -> list[str]:
+        """The collected material of one exchange, oldest first, capped in count."""
+        return [
             message.content
             for message in self._narrative
             if message.exchange_id == exchange_id and message.kind is MessageKind.MATERIAL
         ][:MATERIAL_DIGEST_MESSAGES]
-        lines = [piece[:MATERIAL_DIGEST_CHARS] for piece in pieces]
-        return MATERIAL_DIGEST_TEMPLATE.format(count=len(pieces), lines="\n".join(lines))
 
     async def _reparent_material(self, collection: Exchange, target: Exchange) -> None:
         """Move the batch into the exchange it belongs to and drop the shell.
@@ -1031,10 +1080,12 @@ class ConversationRunner:
     async def _route(self, message: ChatMessage, command: _Submit) -> RouteDecision:
         """Decide which exchange the message belongs to (deterministic first).
 
-        Two shortcuts skip the LLM entirely: an explicit transport-level reply
-        names its exchange outright, and with no live exchange there is
-        nothing to belong to. Everything else goes to the router, which sees
-        exchanges (user-visible obligations), not process ids.
+        Three shortcuts skip the LLM entirely: an explicit transport-level
+        reply names its exchange outright, with no live exchange there is
+        nothing to belong to, and a message arriving on the heels of a
+        forward is that forward's ("forward, then ask" — see
+        `_sole_fresh_collection`). Everything else goes to the router, which
+        sees exchanges (user-visible obligations), not process ids.
         """
         live = await self._exchanges.list_live(self._dialog.id)
         live_ids = {item.id for item in live}
@@ -1049,6 +1100,14 @@ class ConversationRunner:
             )
         if not live:
             return RouteDecision()
+        collection = self._sole_fresh_collection(live)
+        if collection is not None:
+            logger.info(
+                "routed by collection: dialog=%s exchange=%s",
+                self._dialog.id,
+                collection.id,
+            )
+            return RouteDecision(action=RouteAction.CONTINUE, exchange_id=collection.id)
         infos = tuple(
             ExchangeInfo(
                 id=item.id,
@@ -1058,10 +1117,47 @@ class ConversationRunner:
                 # staleness, not lifetime: "how long since we last touched
                 # it" is what a routing decision needs (matches the nudge)
                 age_seconds=(utc_now() - item.updated_at).total_seconds(),
+                # a collection's title names the forward's source, not its
+                # subject: without the content the router cannot tell whether
+                # the message is about it (measured live, 31.07)
+                preview=(
+                    self._material_preview(item.id)
+                    if item.status is ExchangeStatus.COLLECTING
+                    else None
+                ),
             )
             for item in live
         )
         return await self._router.route(infos, message.content, self._max_processes)
+
+    def _sole_fresh_collection(self, live: ExchangeList) -> Exchange | None:
+        """The collection a message arriving right now simply belongs to.
+
+        "Forward, then ask" is the mirror of the shape `_material_home`
+        already handles without a router: there the comment comes first and
+        the material joins its run, here the material comes first and the
+        message adopts it. Waiting for an LLM to notice that costs the answer
+        — the router sees titles, and a collection is titled after the
+        forward's source (measured live, 31.07: the question opened its own
+        exchange and the batch was promoted separately, so the user got asked
+        what to do with a post they had already asked about).
+
+        Narrow on purpose. Only when the collection is the *only* live
+        exchange is "this belongs to the forward" the sole reading; with
+        another obligation in flight the message may be a reply to that one,
+        and the router decides — now with the collection's content in hand.
+        Only while the batch is still fresh: past the quiet window the sweep
+        owns it, and jumping in would race the promotion this serializes with.
+        Being wrong here costs a forward as extra context, not a lost answer.
+        """
+        if len(live) != 1:
+            return None
+        collection = live[0]
+        if collection.status is not ExchangeStatus.COLLECTING:
+            return None
+        if (utc_now() - collection.updated_at).total_seconds() >= self._material_quiet_seconds:
+            return None
+        return collection
 
     async def ask_user(self, process_id: str, question: str) -> bool:
         """Deliver a run's clarifying question and park its exchange.
@@ -1461,6 +1557,9 @@ class ConversationRunner:
         refused = False
         if decision.action is RouteAction.CONTINUE and decision.exchange_id is not None:
             exchange_id = decision.exchange_id
+            # before the owner: the run about to start titles its task from
+            # the exchange, and it should carry the name that now describes it
+            await self._retitle(exchange_id, decision.title)
         elif decision.action is not RouteAction.COMMAND:
             if self._exceeds_limit(self._cancelled_tasks(cancelled)):
                 refused = True
@@ -1487,6 +1586,29 @@ class ConversationRunner:
                 cancel_epoch=command.cancel_epoch,
             )
         await self._nudge_stale_exchanges(exchange_id)
+
+    async def _retitle(self, exchange_id: str, title: str | None) -> None:
+        """Rename an exchange a message just joined; never fatal.
+
+        An exchange is named when it opens, after the message that opened it,
+        and a few turns later that name describes a sentence rather than the
+        obligation — a collection's name is its source, which never described
+        the subject at all. Routing renames it as it attaches, so the operator
+        console, the nudge and the next routing decision all see what the
+        exchange is actually about.
+
+        The name is cosmetic and the answer is not: a store failure here must
+        not strand the message the way it would if it propagated (the same
+        reason the nudge sits after owner assignment).
+        """
+        if title is None:
+            return
+        try:
+            await self._exchanges.set_title(exchange_id, title)
+        except Exception:  # a name is never worth losing the answer over
+            logger.warning(
+                "retitle failed: dialog=%s exchange=%s", self._dialog.id, exchange_id, exc_info=True
+            )
 
     async def _cancel_exchanges(self, exchange_ids: tuple[str, ...]) -> set[str]:
         """Cancel the named exchanges and their live runs; return what was cancelled."""
