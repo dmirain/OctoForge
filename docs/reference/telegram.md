@@ -35,13 +35,22 @@ See [vision-and-speech.md](vision-and-speech.md) for the modality details and
 
 ### Outgoing formatting
 
-Agent answers are Markdown; Telegram is not. `telegram/markdown.py` converts to Telegram HTML with a
-plain-text fallback, and chunks long output at the 4096-character limit without splitting a tag.
+Agent answers are Markdown and Telegram renders Markdown natively, so nothing is converted on the way
+out: every answer is a **Rich Message** (Bot API 10.1), sent with `sendRichMessage` and edited in place
+with `editMessageText` as it streams. What the agent wrote is what the chat receives.
 
-A final answer containing a table, a task list, `<details>` or block math is upgraded in place to a native
-**Rich Message** (Bot API 10.1, `telegram/rich.py`) — those constructs degrade badly in the HTML path. The
-streaming draft stays on the HTML path; only the final is upgraded, at most one message, up to 32,768
-characters, and it falls back to the HTML version if the API refuses.
+The limit that applies is therefore the Rich Message one — **32,768 characters**, eight times the
+plain-text budget — plus 500 blocks, 16 levels of nesting, 50 media attachments and 20 table columns. An
+answer past 32,768 characters is sealed and continued in a fresh message, cut on a line boundary so a
+table row or list item is never torn in half.
+
+This replaced a Markdown→HTML conversion that chunked at 4,096 characters and upgraded only qualifying
+finals to Rich Messages. The conversion existed to survive a renderer that could not do tables, and the
+chunking it needed is what broke them: an answer over 4,096 characters was split across messages, and a
+split answer was no longer eligible for the upgrade, so its table arrived as raw pipes and letters.
+
+Plain notices — greetings, refusals, invite texts — still go out as ordinary text messages; they carry
+no formatting to preserve.
 
 ### Access control
 
@@ -103,7 +112,6 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 | `OF_TELEGRAM_DATABASE_URL` | The invite/member database |
 | `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` | Long-poll timeout |
 | `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` | Minimum interval between draft edits |
-| `OF_TELEGRAM_RICH_MESSAGES` | Whether qualifying finals are upgraded to Rich Messages |
 | `OF_VISION_*`, `OF_STT_*`, `OF_VOICE_MAX_SECONDS` | Images and voice |
 
 ## Failure modes
@@ -111,8 +119,8 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 | Situation | Outcome |
 |---|---|
 | Two processes polling one token | Updates are split unpredictably between them — run exactly one |
-| Rich Message rejected by the API | Falls back to the HTML rendering of the same answer |
-| Answer longer than the message limit | Chunked without breaking markup |
+| Rich Message rejected by the API | The client retries transient failures and the bridge retries the final flush once; a persistent refusal is logged loudly and the answer does not land |
+| Answer longer than 32,768 characters | Continued in a fresh message, cut on a line boundary |
 | Edit throttled or rate-limited | The draft catches up on the next allowed edit; the final always lands |
 | Vision or transcription unavailable | The message still arrives, with a placeholder or a "text only" notice |
 | Unknown or expired invite code | Explained to the user; access denied |
@@ -125,7 +133,6 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 - `web/src/octoforge_web/telegram/client.py` — the Bot API client and limits
 - `web/src/octoforge_web/telegram/poller.py` — long polling, per-user queues, commands, gating
 - `web/src/octoforge_web/telegram/bridge.py` — event rendering, drafts, throttling, reply threading
-- `web/src/octoforge_web/telegram/markdown.py`, `telegram/rich.py` — formatting and the Rich Message path
 - `web/src/octoforge_web/telegram/images.py` — image refs and resolution
 - `web/src/octoforge_web/telegram/invites/` — invite store, member directory
 - `web/src/octoforge_web/telegram/admin.py` — the `admin_manage` tool

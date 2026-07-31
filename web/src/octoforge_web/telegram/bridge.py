@@ -25,14 +25,11 @@ from octoforge_core.domain import Attachment, MessageKind, MessageSource
 
 from octoforge_web.telegram.client import (
     CHAT_ACTION_TYPING,
-    MAX_MESSAGE_LENGTH,
     MAX_RICH_MESSAGE_LENGTH,
     TELEGRAM_CHANNEL,
     TelegramApiError,
     TelegramClient,
 )
-from octoforge_web.telegram.markdown import markdown_to_telegram_html, split_html_safe
-from octoforge_web.telegram.rich import needs_rich_message
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +40,6 @@ TOOL_FAIL_LINE_TEMPLATE = "⚠️ {name}: {error}"
 CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
 RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
-PARSE_MODE_HTML = "HTML"
 # how many sent-message-id -> exchange-id mappings the bridge remembers for
 # reply routing; a restart loses the map entirely (routing falls back to the
 # LLM router), so this only bounds in-process memory, not correctness
@@ -60,7 +56,6 @@ class TelegramBridgeOptions:
     """Rendering knobs shared by every bridge of the surface."""
 
     edit_throttle_seconds: float
-    rich_messages_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -103,7 +98,6 @@ class TelegramBridge:
         self._runner_provider = runner_provider
         self._client = client
         self._edit_throttle_seconds = options.edit_throttle_seconds
-        self._rich_messages_enabled = options.rich_messages_enabled
         self._runner: ConversationRunner | None = None
         self._forwarder: asyncio.Task[None] | None = None
         self._drafts: dict[str | None, _Draft] = {}
@@ -234,8 +228,6 @@ class TelegramBridge:
             # left behind by a failed flush would corrupt (or silently eat)
             # the next answer delivered under the same exchange id
             self._drafts.pop(exchange_id, None)
-        if isinstance(event, Finished):
-            await self._upgrade_to_rich(draft)
 
     async def _flush_terminal_with_retry(self, draft: _Draft) -> None:
         """Flush the final draft, retrying once more on a transport/API hiccup.
@@ -260,25 +252,6 @@ class TelegramBridge:
                     exc_info=True,
                 )
 
-    async def _upgrade_to_rich(self, draft: _Draft) -> None:
-        """Re-render the final answer as a native Rich Message when it earns one.
-
-        The draft stays on the legacy HTML path; only a single-message final
-        with constructs the HTML rendering degrades is upgraded in place.
-        A failed upgrade leaves the HTML version on screen (logged upstream).
-        """
-        raw = draft.buffer.rstrip("\n")
-        if (
-            not self._rich_messages_enabled
-            or draft.message_id is None
-            or draft.sealed_chunks > 0
-            or not raw
-            or len(raw) > MAX_RICH_MESSAGE_LENGTH
-            or not needs_rich_message(raw)
-        ):
-            return
-        await self._client.edit_message_rich(self._chat_id, draft.message_id, raw)
-
     def _append_line(self, draft: _Draft, line: str) -> None:
         """Append a status line, keeping the arrival order with the answer text."""
         if draft.buffer and not draft.buffer.endswith("\n"):
@@ -292,40 +265,78 @@ class TelegramBridge:
             await self._flush_draft(draft)
 
     async def _flush_draft(self, draft: _Draft) -> None:
+        """Push the buffer to the chat as the Rich Message(s) it renders into.
+
+        The buffer is the agent's Markdown and Telegram renders it natively,
+        so nothing is converted on the way out — the limit that applies is
+        the Rich Message one, eight times the plain-text budget. An answer
+        that still outgrows it is sealed and continued in a fresh message.
+        """
         raw = draft.buffer.rstrip("\n")
         if not raw:
             return
-        # The buffer holds raw Markdown; the 4096 limit applies to its HTML form.
-        chunks = split_html_safe(markdown_to_telegram_html(raw), MAX_MESSAGE_LENGTH)
+        chunks = _split_markdown(raw, MAX_RICH_MESSAGE_LENGTH)
         while draft.sealed_chunks < len(chunks) - 1:
-            await self._deliver(draft, chunks[draft.sealed_chunks])
+            if chunks[draft.sealed_chunks] != draft.delivered_text:
+                await self._deliver(draft, chunks[draft.sealed_chunks])
             draft.message_id = None  # seal the head, continue in a fresh message
             draft.delivered_text = ""
             draft.sealed_chunks += 1
         if chunks[-1] != draft.delivered_text:
             await self._deliver(draft, chunks[-1])
 
-    async def _deliver(self, draft: _Draft, html: str) -> None:
+    async def _deliver(self, draft: _Draft, markdown: str) -> None:
         if draft.message_id is None:
             # only the head of the answer replies; continuation chunks of a
             # long answer (sealed_chunks > 0) are plain follow-ups
             reply_to = draft.reply_to if draft.sealed_chunks == 0 else None
-            draft.message_id = await self._client.send_message(
-                self._chat_id, html, parse_mode=PARSE_MODE_HTML, reply_to_message_id=reply_to
+            draft.message_id = await self._client.send_rich_message(
+                self._chat_id, markdown, reply_to_message_id=reply_to
             )
             if draft.exchange_id is not None:
                 self._record_reply_target(draft.message_id, draft.exchange_id)
         else:
-            await self._client.edit_message_text(
-                self._chat_id, draft.message_id, html, parse_mode=PARSE_MODE_HTML
-            )
-        draft.delivered_text = html
+            await self._client.edit_message_rich(self._chat_id, draft.message_id, markdown)
+        draft.delivered_text = markdown
 
     def _record_reply_target(self, message_id: int, exchange_id: str) -> None:
         """Remember a sent message as a reply target for its exchange (bounded)."""
         self._reply_targets[message_id] = exchange_id
         if len(self._reply_targets) > REPLY_TARGET_MAP_SIZE:
             self._reply_targets.popitem(last=False)  # evict the oldest mapping
+
+
+def _split_markdown(text: str, limit: int) -> list[str]:
+    """Split Markdown into chunks of at most `limit` characters.
+
+    Cuts land on line boundaries, so a table row, a list item or a fenced
+    line is never torn in half — the coarsest thing a cut can break is a
+    block, and only for an answer past `MAX_RICH_MESSAGE_LENGTH`, which no
+    real one reaches. A single line longer than the limit (a pasted blob
+    with no newline in it) is cut hard: there is nothing better to cut on.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        rest = line
+        while len(rest) > limit:  # a single line past the limit: cut it hard
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(rest[:limit])
+            rest = rest[limit:]
+        if len(current) + len(rest) > limit:
+            chunks.append(current)
+            current = ""
+        current += rest
+    if current:
+        chunks.append(current)
+    # a cut lands on a line break, so the piece after it opens with the
+    # newline it was cut on: trim both ends rather than start a message blank
+    trimmed = [stripped for chunk in chunks if (stripped := chunk.strip("\n"))]
+    return trimmed or [text[:limit]]
 
 
 def _reply_target(source_client_message_id: str | None) -> int | None:

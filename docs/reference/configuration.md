@@ -180,7 +180,6 @@ The hash uses `:` separators rather than `$` because docker compose interpolates
 | `OF_TELEGRAM_INVITE_TTL_SECONDS` | `259200.0` | How long a generated invite code stays claimable (3 days) |
 | `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` | `30.0` | Long-poll timeout |
 | `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` | `1.5` | Minimum interval between edits of a streaming draft message |
-| `OF_TELEGRAM_RICH_MESSAGES` | `true` | Upgrade finals containing tables, checklists, `<details>` or math to native Rich Messages |
 
 In the local quickstart stack the bot is opt-in through `OF_QUICKSTART_TELEGRAM_TOKEN` instead — a
 bot can only be long-polled by one process, and a second poller would steal a live bot's updates.

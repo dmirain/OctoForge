@@ -193,14 +193,10 @@ class TelegramBridgeRegistry:
         runner_provider: RunnerProvider,
         client: TelegramClient,
         edit_throttle_seconds: float,
-        rich_messages_enabled: bool = True,
     ) -> None:
         self._runner_provider = runner_provider
         self._client = client
-        self._options = TelegramBridgeOptions(
-            edit_throttle_seconds=edit_throttle_seconds,
-            rich_messages_enabled=rich_messages_enabled,
-        )
+        self._options = TelegramBridgeOptions(edit_throttle_seconds=edit_throttle_seconds)
         self._bridges: dict[str, TelegramBridge] = {}
 
     def existing(self, user_id: str) -> TelegramBridge | None:

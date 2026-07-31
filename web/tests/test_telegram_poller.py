@@ -36,7 +36,7 @@ from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_web.telegram.bridge import PARSE_MODE_HTML, RunnerProvider
+from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import USER_ID_PREFIX, TelegramApiError
 from octoforge_web.telegram.images import REF_PREFIX
 from octoforge_web.telegram.invites.api import MemberProfile
@@ -97,6 +97,9 @@ WAIT_TIMEOUT_SECONDS = 5.0
 POLL_SECONDS = 0.01
 IDLE_BATCH_SECONDS = 0.05
 REPLY = "pong"
+# marks a recorded call as the Rich Message path (answers) rather than a
+# plain notice; the fake client has no parse_mode to record for those
+RICH = "rich"
 FIRST_UPDATE_ID = 41
 SECOND_UPDATE_ID = 42
 EXPECTED_TWO_REPLIES = 2
@@ -145,6 +148,18 @@ class FakeTelegramClient:
         self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
     ) -> None:
         self.edited.append((chat_id, message_id, text, parse_mode))
+
+    async def send_rich_message(
+        self, chat_id: int, markdown: str, reply_to_message_id: int | None = None
+    ) -> int:
+        # answers go out as Rich Messages; notices stay on plain send_message
+        self._next_message_id += 1
+        self.sent.append((chat_id, markdown, RICH))
+        self.replies.append(reply_to_message_id)
+        return self._next_message_id
+
+    async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
+        self.edited.append((chat_id, message_id, markdown, RICH))
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         pass
@@ -447,7 +462,7 @@ async def test_text_message_reaches_the_dialog_and_renders_the_reply(
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
     await wait_until(lambda: bool(client.sent))
 
-    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
     await manager.stop_all()
 
 
@@ -689,7 +704,7 @@ async def test_admin_passes_the_gate_without_invite(
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
     await wait_until(lambda: bool(client.sent))
 
-    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
     await manager.stop_all()
 
 
@@ -720,7 +735,7 @@ async def test_claimed_invite_passes_the_gate(
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
     await wait_until(lambda: bool(client.sent))
 
-    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
     await manager.stop_all()
 
 
@@ -759,7 +774,7 @@ async def test_start_with_code_claims_and_welcomes(
     await deliver(poller, make_update(SECOND_UPDATE_ID, text="ping"))
     await wait_until(lambda: len(client.sent) == EXPECTED_TWO_REPLIES)
 
-    assert client.sent[1] == (TELEGRAM_USER_ID, REPLY, PARSE_MODE_HTML)
+    assert client.sent[1] == (TELEGRAM_USER_ID, REPLY, RICH)
     await manager.stop_all()
 
 

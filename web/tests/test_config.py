@@ -23,7 +23,6 @@ from octoforge_web.config import (
     DEFAULT_SELF_BASE_URL,
     DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS,
     DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
-    DEFAULT_TELEGRAM_RICH_MESSAGES,
     DEFAULT_VISION_DEEP_MODEL,
     Settings,
 )
@@ -96,7 +95,6 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.telegram_bot_token == ""
     assert settings.telegram_poll_timeout_seconds == DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
     assert settings.telegram_edit_throttle_seconds == DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
-    assert settings.telegram_rich_messages == DEFAULT_TELEGRAM_RICH_MESSAGES
     assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
     assert settings.to_embedding_config().backend == EmbeddingBackend.OPENAI
     assert settings.reranker_model == ""
@@ -157,14 +155,12 @@ def test_telegram_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OF_TELEGRAM_BOT_TOKEN", CUSTOM_TELEGRAM_TOKEN)
     monkeypatch.setenv("OF_TELEGRAM_POLL_TIMEOUT_SECONDS", str(CUSTOM_TELEGRAM_POLL_TIMEOUT))
     monkeypatch.setenv("OF_TELEGRAM_EDIT_THROTTLE_SECONDS", str(CUSTOM_TELEGRAM_EDIT_THROTTLE))
-    monkeypatch.setenv("OF_TELEGRAM_RICH_MESSAGES", "false")
 
     settings = Settings()
 
     assert settings.telegram_bot_token == CUSTOM_TELEGRAM_TOKEN
     assert settings.telegram_poll_timeout_seconds == CUSTOM_TELEGRAM_POLL_TIMEOUT
     assert settings.telegram_edit_throttle_seconds == CUSTOM_TELEGRAM_EDIT_THROTTLE
-    assert settings.telegram_rich_messages is False
 
 
 def test_auth_whitelist_parsed_from_json_env(monkeypatch: pytest.MonkeyPatch) -> None:

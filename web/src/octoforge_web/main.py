@@ -845,7 +845,6 @@ def _start_telegram(
         runner_provider=runner_provider,
         client=client,
         edit_throttle_seconds=settings.telegram_edit_throttle_seconds,
-        rich_messages_enabled=settings.telegram_rich_messages,
     )
     membership = None
     if resolved.stores is not None and settings.telegram_admin_ids:

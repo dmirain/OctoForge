@@ -11,7 +11,11 @@ from octoforge_web.telegram.models import TelegramUpdate
 
 TELEGRAM_CHANNEL = "telegram"
 USER_ID_PREFIX = "tg:"
+# the plain-text `sendMessage` budget, which bounds the poller's notices —
+# answers do not travel this way and are bounded by the Rich Message limit
 MAX_MESSAGE_LENGTH = 4096
+# 32,768 UTF-8 characters, alongside 500 blocks, 16 nesting levels, 50 media
+# attachments and 20 table columns (Bot API 10.1, "Rich Message Limits")
 MAX_RICH_MESSAGE_LENGTH = 32768
 API_BASE_URL = "https://api.telegram.org"
 CHAT_ACTION_TYPING = "typing"
@@ -84,8 +88,14 @@ class TelegramClient(Protocol):
         """Replace the text of an existing message."""
         ...
 
+    async def send_rich_message(
+        self, chat_id: int, markdown: str, reply_to_message_id: int | None = None
+    ) -> int:
+        """Send a Rich Message from raw Markdown, optionally as a reply."""
+        ...
+
     async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
-        """Upgrade an existing message to a Rich Message from raw Markdown."""
+        """Replace an existing message's content with a Rich Message from raw Markdown."""
         ...
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
@@ -212,6 +222,24 @@ class TelegramBotClient:
             raise _RetryableCallError(
                 TRANSIENT_RETRY_DELAY_SECONDS, f"downloadFile: {exc}"
             ) from exc
+
+    async def send_rich_message(
+        self, chat_id: int, markdown: str, reply_to_message_id: int | None = None
+    ) -> int:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "rich_message": {"markdown": markdown},
+        }
+        if reply_to_message_id is not None:
+            # allow_sending_without_reply: a deleted question must not fail the answer
+            payload["reply_parameters"] = {
+                "message_id": reply_to_message_id,
+                "allow_sending_without_reply": True,
+            }
+        result = await self._call("sendRichMessage", payload)
+        if not isinstance(result, dict) or "message_id" not in result:
+            raise TelegramApiError("sendRichMessage: unexpected result shape")
+        return int(result["message_id"])
 
     async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
         payload: dict[str, Any] = {

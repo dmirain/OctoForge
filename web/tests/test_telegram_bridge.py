@@ -41,7 +41,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_web.telegram import bridge as bridge_module
 from octoforge_web.telegram.bridge import (
     CANCELLED_LINE,
-    PARSE_MODE_HTML,
     REPLY_TARGET_MAP_SIZE,
     TOOL_LINE_TEMPLATE,
     RunnerProvider,
@@ -50,6 +49,7 @@ from octoforge_web.telegram.bridge import (
 )
 from octoforge_web.telegram.client import (
     MAX_MESSAGE_LENGTH,
+    MAX_RICH_MESSAGE_LENGTH,
     TELEGRAM_CHANNEL,
     USER_ID_PREFIX,
     TelegramApiError,
@@ -74,20 +74,21 @@ CRON_TITLE = "morning report"
 CRON_RESULT = "the report is ready"
 EXPECTED_MESSAGE_COUNT = 2
 QUESTION_MESSAGE_ID = 777
+# the plain-text send limit answers used to be cut at
+PLAIN_TEXT_LIMIT = MAX_MESSAGE_LENGTH
 
 
 class FakeTelegramClient:
     """TelegramClient stub recording the outbound calls."""
 
     def __init__(self) -> None:
-        self.sent: list[tuple[int, str, str | None]] = []
+        # answers go out as Rich Messages: (chat_id, markdown)
+        self.sent: list[tuple[int, str]] = []
         # reply targets, one per send (None = plain message)
         self.replies: list[int | None] = []
-        self.edited: list[tuple[int, int, str, str | None]] = []
-        self.rich_edited: list[tuple[int, int, str]] = []
+        self.edited: list[tuple[int, int, str]] = []
         self.actions: list[tuple[int, str]] = []
-        self.rich_edit_error: TelegramApiError | None = None
-        # errors popped (in order) and raised by the next edit_message_text calls
+        # errors popped (in order) and raised by the next edit_message_rich calls
         self.edit_failures: list[Exception] = []
         self._next_message_id = 0
 
@@ -101,28 +102,33 @@ class FakeTelegramClient:
         parse_mode: str | None = None,
         reply_to_message_id: int | None = None,
     ) -> int:
+        # plain notices only (the poller's greetings and refusals)
         self._next_message_id += 1
-        self.sent.append((chat_id, text, parse_mode))
-        self.replies.append(reply_to_message_id)
         return self._next_message_id
 
     async def edit_message_text(
         self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
     ) -> None:
-        if self.edit_failures:
-            raise self.edit_failures.pop(0)
-        self.edited.append((chat_id, message_id, text, parse_mode))
+        raise NotImplementedError
+
+    async def send_rich_message(
+        self, chat_id: int, markdown: str, reply_to_message_id: int | None = None
+    ) -> int:
+        self._next_message_id += 1
+        self.sent.append((chat_id, markdown))
+        self.replies.append(reply_to_message_id)
+        return self._next_message_id
 
     async def edit_message_rich(self, chat_id: int, message_id: int, markdown: str) -> None:
-        if self.rich_edit_error is not None:
-            raise self.rich_edit_error
-        self.rich_edited.append((chat_id, message_id, markdown))
+        if self.edit_failures:
+            raise self.edit_failures.pop(0)
+        self.edited.append((chat_id, message_id, markdown))
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
         self.actions.append((chat_id, action))
 
     def current_text(self) -> str:
-        """The text of the single message rendered so far (last edit or first send)."""
+        """The markdown of the single message rendered so far (last edit or first send)."""
         if self.edited:
             return self.edited[-1][2]
         assert self.sent, "no message rendered yet"
@@ -325,17 +331,13 @@ async def make_manager(
 def make_bridge(
     client: FakeTelegramClient,
     manager: ConversationManager,
-    rich_messages_enabled: bool = True,
 ) -> TelegramBridge:
     return TelegramBridge(
         user_id=TELEGRAM_USER_ID,
         chat_id=CHAT_ID,
         runner_provider=manager.get_or_create_runner,
         client=client,
-        options=TelegramBridgeOptions(
-            edit_throttle_seconds=NO_THROTTLE,
-            rich_messages_enabled=rich_messages_enabled,
-        ),
+        options=TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE),
     )
 
 
@@ -386,7 +388,7 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     await bridge.start()  # what TelegramBridgeRegistry.warm() does at startup
 
     await wait_until(lambda: client.sent != [])
-    assert client.sent == [(CHAT_ID, CRON_RESULT, PARSE_MODE_HTML)]
+    assert client.sent == [(CHAT_ID, CRON_RESULT)]
     await wait_until(lambda: task.delivered_at is not None)
     await bridge.aclose()
     await manager.stop_all()
@@ -402,7 +404,7 @@ async def test_single_delta_sends_one_message(
     await bridge.handle_text("hi")
     await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
 
-    assert client.sent == [(CHAT_ID, REPLY, PARSE_MODE_HTML)]
+    assert client.sent == [(CHAT_ID, REPLY)]
     assert client.edited == []
     await bridge.aclose()
     await manager.stop_all()
@@ -489,8 +491,8 @@ async def test_deltas_stream_into_one_edited_message(
     await bridge.handle_text("hi")
     await wait_until(lambda: client.current_text() == "hello" if client.sent else False)
 
-    assert client.sent == [(CHAT_ID, "hel", PARSE_MODE_HTML)]
-    assert client.edited == [(CHAT_ID, 1, "hello", PARSE_MODE_HTML)]
+    assert client.sent == [(CHAT_ID, "hel")]
+    assert client.edited == [(CHAT_ID, 1, "hello")]
     await bridge.aclose()
     await manager.stop_all()
 
@@ -498,8 +500,10 @@ async def test_deltas_stream_into_one_edited_message(
 async def test_long_reply_is_split_into_telegram_sized_messages(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """The budget is the Rich Message one — eight times the plain-text limit.
+    An answer past even that is sealed and continued in a fresh message."""
     client = FakeTelegramClient()
-    long_reply = "x" * MAX_MESSAGE_LENGTH + LONG_REPLY_TAIL
+    long_reply = "x" * MAX_RICH_MESSAGE_LENGTH + "\n" + LONG_REPLY_TAIL
     manager = await make_manager(ScriptedLLM([reply(long_reply)]), session_factory)
     bridge = make_bridge(client, manager)
 
@@ -507,11 +511,31 @@ async def test_long_reply_is_split_into_telegram_sized_messages(
     await wait_until(lambda: len(client.sent) == EXPECTED_MESSAGE_COUNT)
 
     head, tail = client.sent
-    assert head == (CHAT_ID, "x" * MAX_MESSAGE_LENGTH, PARSE_MODE_HTML)
-    assert tail == (CHAT_ID, LONG_REPLY_TAIL, PARSE_MODE_HTML)
-    assert client.edited == []
+    assert head == (CHAT_ID, "x" * MAX_RICH_MESSAGE_LENGTH)
+    assert tail == (CHAT_ID, LONG_REPLY_TAIL)
     # only the head of a split answer replies; continuations are plain
     assert client.replies == [555, None]
+    await bridge.aclose()
+
+
+async def test_an_answer_under_the_rich_limit_is_never_split(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The bug this delivery path exists for: an answer over the 4096-character
+    plain-text limit used to be cut into separate messages, and a table cut
+    that way rendered as raw pipes and letters."""
+    client = FakeTelegramClient()
+    rows = "".join(f"|{i}|https://example.com/{i}|\n" for i in range(200))
+    table = "|#|Ссылка|\n|---|---|\n" + rows
+    manager = await make_manager(ScriptedLLM([reply(table)]), session_factory)
+    bridge = make_bridge(client, manager)
+
+    await bridge.handle_text("hi")
+    await wait_until(lambda: client.current_text().endswith("|") if client.sent else False)
+
+    assert len(table) > PLAIN_TEXT_LIMIT  # would have been split before
+    assert len(client.sent) == 1
+    assert client.current_text() == table.rstrip("\n")
     await bridge.aclose()
     await manager.stop_all()
 
@@ -532,8 +556,8 @@ async def test_tool_call_renders_status_line_before_the_answer(
     expected = f"{tool_line}\n{REPLY}"
     await wait_until(lambda: client.current_text() == expected if client.sent else False)
 
-    assert client.sent == [(CHAT_ID, tool_line, PARSE_MODE_HTML)]
-    assert client.edited == [(CHAT_ID, 1, expected, PARSE_MODE_HTML)]
+    assert client.sent == [(CHAT_ID, tool_line)]
+    assert client.edited == [(CHAT_ID, 1, expected)]
     await bridge.aclose()
     await manager.stop_all()
 
@@ -574,103 +598,39 @@ async def test_llm_failure_appends_the_error_line(
     await manager.stop_all()
 
 
-async def test_markdown_reply_is_delivered_as_html(
+async def test_markdown_reply_is_delivered_verbatim(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """Telegram renders the Markdown natively, so nothing is converted on the
+    way out — what the agent wrote is what is sent."""
     client = FakeTelegramClient()
     content = "**жирный**\n```\ncode\n```"
-    expected_html = "<b>жирный</b>\n<pre>code</pre>"
     manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
     bridge = make_bridge(client, manager)
 
     await bridge.handle_text("hi")
-    await wait_until(lambda: client.current_text() == expected_html if client.sent else False)
+    await wait_until(lambda: client.current_text() == content if client.sent else False)
 
-    assert client.sent == [(CHAT_ID, expected_html, PARSE_MODE_HTML)]
+    assert client.sent == [(CHAT_ID, content)]
     await bridge.aclose()
     await manager.stop_all()
 
 
-async def test_table_reply_is_upgraded_to_a_rich_message(
+async def test_a_table_reply_is_sent_rich_and_still_threads_its_reply(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """`sendRichMessage` takes `reply_parameters`, so per-exchange threading
+    survives the move off the plain-text send."""
     client = FakeTelegramClient()
-    content = "| col | val |\n| --- | --- |\n| a | 1 |"
+    content = "|col|val|\n|---|---|\n|a|1|"
     manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi", client_message_id="777")
-    await wait_until(lambda: bool(client.rich_edited))
+    await bridge.handle_text("hi", client_message_id=str(QUESTION_MESSAGE_ID))
+    await wait_until(lambda: client.current_text() == content if client.sent else False)
 
-    assert client.rich_edited == [(CHAT_ID, 1, content)]
-    assert client.sent[0][2] == PARSE_MODE_HTML  # the draft streamed as HTML first
-    # the in-place rich upgrade edits the same message: threading survives
+    assert client.sent == [(CHAT_ID, content)]
     assert client.replies[0] == QUESTION_MESSAGE_ID
-    await bridge.aclose()
-    await manager.stop_all()
-
-
-async def test_plain_reply_stays_on_the_legacy_path(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    client = FakeTelegramClient()
-    manager = await make_manager(ScriptedLLM([reply()]), session_factory)
-    bridge = make_bridge(client, manager)
-
-    await bridge.handle_text("hi")
-    await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
-
-    assert client.rich_edited == []
-    await bridge.aclose()
-    await manager.stop_all()
-
-
-async def test_split_reply_is_not_upgraded(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    client = FakeTelegramClient()
-    content = "| a |\n| --- |\n" + "x" * MAX_MESSAGE_LENGTH
-    manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
-    bridge = make_bridge(client, manager)
-
-    await bridge.handle_text("hi")
-    await wait_until(lambda: len(client.sent) == EXPECTED_MESSAGE_COUNT)
-
-    assert client.rich_edited == []
-    await bridge.aclose()
-    await manager.stop_all()
-
-
-async def test_rich_upgrade_can_be_disabled(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    client = FakeTelegramClient()
-    content = "| col |\n| --- |\n| a |"
-    manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
-    bridge = make_bridge(client, manager, rich_messages_enabled=False)
-
-    await bridge.handle_text("hi")
-    await wait_until(lambda: bool(client.sent) and content in client.current_text())
-
-    assert client.rich_edited == []
-    await bridge.aclose()
-    await manager.stop_all()
-
-
-async def test_a_failing_rich_upgrade_keeps_the_html_version(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    client = FakeTelegramClient()
-    client.rich_edit_error = TelegramApiError("Bad Request: can't parse rich message")
-    content = "| col |\n| --- |\n| a |"
-    manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
-    bridge = make_bridge(client, manager)
-
-    await bridge.handle_text("hi")
-    await wait_until(lambda: bool(client.sent) and content in client.current_text())
-
-    assert client.rich_edited == []
-    assert client.current_text() == content  # the HTML draft survived
     await bridge.aclose()
     await manager.stop_all()
 
@@ -696,7 +656,7 @@ async def test_reply_target_is_recorded_and_used_for_a_matching_reply() -> None:
 
     await bridge._render(TextDelta(text=REPLY), "x1")
     await bridge._render(Finished(message=reply()), "x1")
-    assert client.sent == [(CHAT_ID, REPLY, PARSE_MODE_HTML)]
+    assert client.sent == [(CHAT_ID, REPLY)]
     assert bridge._reply_targets == {1: "x1"}  # the sent message id maps to its exchange
 
     await bridge.handle_text("thanks", reply_to_message_id=1)
@@ -763,9 +723,9 @@ async def test_concurrent_exchanges_render_into_separate_messages() -> None:
     await bridge._render(Finished(message=reply("beta")), "x2")
 
     assert len(client.sent) == EXPECTED_MESSAGE_COUNT
-    (chat_id_1, text_1, mode_1), (chat_id_2, text_2, mode_2) = client.sent
-    assert (chat_id_1, text_1, mode_1) == (CHAT_ID, "alpha", PARSE_MODE_HTML)
-    assert (chat_id_2, text_2, mode_2) == (CHAT_ID, "beta", PARSE_MODE_HTML)
+    (chat_id_1, text_1), (chat_id_2, text_2) = client.sent
+    assert (chat_id_1, text_1) == (CHAT_ID, "alpha")
+    assert (chat_id_2, text_2) == (CHAT_ID, "beta")
     # distinct message ids, each correctly mapped back to the exchange it answered
     assert bridge._reply_targets == {1: "x1", 2: "x2"}
     assert bridge._drafts == {}  # both terminal events popped their draft
@@ -789,7 +749,7 @@ async def test_terminal_flush_retries_once_before_giving_up(
     await bridge._render(Cancelled(), "x1")
 
     expected = f"{PARTIAL}\n{CANCELLED_LINE}"
-    assert client.edited[-1] == (CHAT_ID, 1, expected, PARSE_MODE_HTML)
+    assert client.edited[-1] == (CHAT_ID, 1, expected)
     assert bridge._drafts == {}  # popped exactly once, on the successful retry
     await bridge.aclose()
 
