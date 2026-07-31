@@ -52,6 +52,13 @@ split answer was no longer eligible for the upgrade, so its table arrived as raw
 Plain notices — greetings, refusals, invite texts — still go out as ordinary text messages; they carry
 no formatting to preserve.
 
+### The bridge follows the actor
+
+A chat bridge is attached when its dialog's actor is built and dropped when the dialog leaves this
+process — the `DialogSurface` port. Rendering therefore does not depend on the user having written
+recently: a cron firing, a background result, or an answer this process has just inherited all have
+somebody to deliver them.
+
 ### Drafts survive a move
 
 A draft is which Telegram message an answer is being written into. It lives in the bridge's memory,

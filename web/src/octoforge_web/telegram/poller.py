@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 import httpx
+from octoforge_core.agent.runner import ConversationRunner
 from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
 from octoforge_core.speech.api import AudioData, TranscriptionClient
 from octoforge_core.vision.api import ImageData, VisionClient
@@ -16,6 +17,7 @@ from octoforge_core.vision.api import ImageData, VisionClient
 from octoforge_web.telegram.bridge import RunnerProvider, TelegramBridge, TelegramBridgeOptions
 from octoforge_web.telegram.client import (
     CHAT_ACTION_TYPING,
+    TELEGRAM_CHANNEL,
     USER_ID_PREFIX,
     TelegramApiError,
     TelegramClient,
@@ -234,6 +236,30 @@ class TelegramBridgeRegistry:
             if chat_id is None:
                 continue
             await self.get_or_create(user_id, chat_id).start()
+
+    async def attach(self, runner: ConversationRunner) -> None:
+        """Render this dialog, if it is one of ours (`DialogSurface`).
+
+        Tied to the actor rather than to a request on purpose: a scheduled run
+        finishing while nobody is looking still has to reach the chat, and
+        after a dialog moves here from another process there is nobody else
+        left to deliver it.
+        """
+        if runner.channel != TELEGRAM_CHANNEL:
+            return
+        chat_id = chat_id_from_user_id(runner.user_id)
+        if chat_id is None:
+            logger.warning("no chat id in telegram user id %r", runner.user_id)
+            return
+        await self.get_or_create(runner.user_id, chat_id).start()
+
+    async def detach(self, runner: ConversationRunner) -> None:
+        """Stop rendering a dialog that is leaving this process (`DialogSurface`)."""
+        if runner.channel != TELEGRAM_CHANNEL:
+            return
+        bridge = self._bridges.pop(runner.user_id, None)
+        if bridge is not None:
+            await bridge.aclose()
 
     async def aclose(self) -> None:
         """Stop all bridges (on app shutdown)."""

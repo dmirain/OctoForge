@@ -352,6 +352,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     speech=speech_client,
                 ),
             )
+            _bind_surface(manager, telegram)
             try:
                 yield Runtime(
                     settings=settings,
@@ -856,6 +857,20 @@ def _secrets_link_builder(
         return f"{settings.resolved_public_base_url()}/secrets.html#token={token}"
 
     return build
+
+
+def _bind_surface(
+    manager: ConversationManager,
+    telegram: tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None,
+) -> None:
+    """Let the Telegram surface render every dialog of its channel.
+
+    Tied to the actor rather than to a request: a scheduled run finishing at
+    four in the morning still has to reach the chat, and a dialog that has
+    just moved to this process has nobody else left to deliver it.
+    """
+    if telegram is not None:
+        manager.use_surface(telegram[0])
 
 
 def _start_telegram(

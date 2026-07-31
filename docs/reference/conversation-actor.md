@@ -108,6 +108,17 @@ is skipped entirely. The steps themselves run when the dialog's runner is built,
 *takes a dialog over* recovers it exactly as a restarting one does — see
 [dialog-ownership.md](dialog-ownership.md).
 
+### Surfaces
+
+A dialog whose channel has a transport gets it when its **actor is built**, not when a request
+arrives: a scheduled run finishing at four in the morning still has to reach the user, and a dialog
+that has just moved here from another process has nobody else left to deliver it. The transport is
+dropped again when the dialog is evicted, shut down, or taken over elsewhere.
+
+Core knows only the `DialogSurface` port — attach and detach, nothing about chats. Which channel gets
+which transport is the composition root's decision, and a surface that fails to attach costs delivery
+through that transport, never the dialog.
+
 ## Invariants
 
 - **One actor per dialog, one task consuming its inbox.** Dialog state is never mutated concurrently.
@@ -123,6 +134,7 @@ is skipped entirely. The steps themselves run when the dialog's runner is built,
   to the outbox.
 - **Cancellation bypasses the inbox** and therefore cannot queue behind slow work.
 - **Every process has a task row**, which is what makes restart recovery a query rather than a guess.
+- **A dialog's transport is bound to its actor**, so delivery does not depend on anyone watching.
 - **An actor answers only while it owns its dialog.** A run checks the claim before it starts, and a
   preempted actor stands down instead of finishing — see
   [dialog-ownership.md](dialog-ownership.md).
@@ -151,7 +163,7 @@ is skipped entirely. The steps themselves run when the dialog's runner is built,
 ## Code anchors
 
 - `core/src/octoforge_core/agent/runner.py` — `ConversationRunner`, `ConversationManager`, `_Process`,
-  the inbox commands and the outbox
+  `DialogSurface`, the inbox commands and the outbox
 - `core/src/octoforge_core/agent/branch.py` — branch rendering and role marks
 - `core/src/octoforge_core/dialogs/api.py`, `core/src/octoforge_core/dialogs/store.py` — dialog,
   message and exchange persistence

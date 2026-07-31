@@ -425,3 +425,75 @@ async def test_taking_a_dialog_over_recovers_its_stranded_answer(
 
 async def _left_in_progress(exchanges: SqlAlchemyExchangeRepository, exchange_id: str) -> bool:
     return (await exchanges.get(exchange_id)).status is not ExchangeStatus.IN_PROGRESS
+
+
+class RecordingSurface:
+    """DialogSurface stub recording which dialogs it was asked to render."""
+
+    def __init__(self) -> None:
+        self.attached: list[str] = []
+        self.detached: list[str] = []
+
+    async def attach(self, runner: object) -> None:
+        self.attached.append(runner.dialog_id)
+
+    async def detach(self, runner: object) -> None:
+        self.detached.append(runner.dialog_id)
+
+
+class FailingSurface:
+    """DialogSurface stub that cannot attach."""
+
+    async def attach(self, runner: object) -> None:
+        raise RuntimeError("transport down")
+
+    async def detach(self, runner: object) -> None:
+        raise RuntimeError("transport down")
+
+
+async def test_a_dialog_gets_its_surface_when_its_actor_is_built(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Rendering is tied to the actor, not to a request: a scheduled run
+    finishing while nobody is looking still has to reach the user."""
+    surface = RecordingSurface()
+    manager = make_manager(session_factory)
+    manager.use_surface(surface)
+    try:
+        runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+        assert surface.attached == [runner.dialog_id]
+    finally:
+        await manager.stop_all()
+
+    assert surface.detached == [runner.dialog_id]
+
+
+async def test_a_dialog_that_moved_away_loses_its_surface(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two processes rendering one chat would answer the user twice."""
+    surface = RecordingSurface()
+    manager = make_manager(session_factory)
+    manager.use_surface(surface)
+    try:
+        runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+        await SqlAlchemyClaimRepository(session_factory).claim(runner.dialog_id, PEER_NODE)
+        await manager._beat_once()
+
+        assert surface.detached == [runner.dialog_id]
+    finally:
+        await manager.stop_all()
+
+
+async def test_a_surface_that_cannot_attach_does_not_break_the_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A transport that is down costs delivery through that transport; the
+    dialog itself, and the API subscription path, keep working."""
+    manager = make_manager(session_factory)
+    manager.use_surface(FailingSurface())
+    try:
+        runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+        assert runner.dialog_id
+    finally:
+        await manager.stop_all()

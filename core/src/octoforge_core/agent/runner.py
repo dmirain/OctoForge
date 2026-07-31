@@ -469,6 +469,27 @@ class _Process:
     asked: bool = False
 
 
+class DialogSurface(Protocol):
+    """A transport that renders one dialog's events wherever its user is.
+
+    The actor broadcasts; somebody has to be listening on the user's behalf,
+    and for a chat that somebody must exist even when the user is not looking
+    — a scheduled run finishing at four in the morning still has to arrive.
+    Attaching is therefore tied to the actor's life, not to a request.
+
+    Core calls this and knows nothing else about the transport. The
+    composition root decides which surface, if any, a given channel gets.
+    """
+
+    async def attach(self, runner: "ConversationRunner") -> None:
+        """Start rendering this dialog; called once its actor exists."""
+        ...
+
+    async def detach(self, runner: "ConversationRunner") -> None:
+        """Stop rendering it; the actor is going away or has moved elsewhere."""
+        ...
+
+
 class TaskOutcomeListener(Protocol):
     """Port reporting the terminal status of a task-backed process (e.g. cron)."""
 
@@ -864,6 +885,16 @@ class ConversationRunner:
     def dialog_id(self) -> str:
         """Return the id of the owned dialog."""
         return self._dialog.id
+
+    @property
+    def user_id(self) -> str:
+        """The user this dialog belongs to."""
+        return self._dialog.user_id
+
+    @property
+    def channel(self) -> str:
+        """The surface this dialog belongs to."""
+        return self._dialog.channel
 
     @property
     def claim(self) -> DialogClaim:
@@ -2427,6 +2458,7 @@ class ConversationManager:
         self._heartbeat_seconds = ownership.heartbeat_seconds
         self._stale_after_seconds = ownership.stale_after_seconds
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._surface: DialogSurface | None = None
         self._runners: dict[str, ConversationRunner] = {}
         # (user_id, channel) -> the build task, memoized: concurrent callers
         # await one build, later callers get the finished runner from it
@@ -2495,7 +2527,31 @@ class ConversationManager:
         # runner is handed out, so the caller's message meets a consistent
         # dialog.
         await self._recover_dialog(runner)
+        await self._attach_surface(runner)
         return runner
+
+    async def _attach_surface(self, runner: ConversationRunner) -> None:
+        """Let the configured surface start rendering this dialog.
+
+        Never fatal: a transport that cannot attach costs delivery through
+        that transport, not the dialog. The API subscription path is
+        untouched either way.
+        """
+        if self._surface is None:
+            return
+        try:
+            await self._surface.attach(runner)
+        except Exception:
+            logger.exception("surface attach failed: dialog=%s", runner.dialog_id)
+
+    async def _detach_surface(self, runner: ConversationRunner) -> None:
+        """Let the surface stop rendering a dialog that is leaving this process."""
+        if self._surface is None:
+            return
+        try:
+            await self._surface.detach(runner)
+        except Exception:
+            logger.exception("surface detach failed: dialog=%s", runner.dialog_id)
 
     async def _recover_dialog(self, runner: ConversationRunner) -> None:
         """Pick up the work this dialog's previous owner could not finish.
@@ -2544,6 +2600,16 @@ class ConversationManager:
         runner = await self.get_or_create_runner(user_id, channel)
         return await runner.wake(title, prompt, cron_job_id)
 
+    def use_surface(self, surface: DialogSurface) -> None:
+        """Bind the transport that renders dialogs of its channel.
+
+        Set after construction rather than through `RunnerConfig` because the
+        two need each other: a surface resolves runners through this manager,
+        and this manager attaches that surface to every runner it builds.
+        Safe because no runner exists before the composition root finishes.
+        """
+        self._surface = surface
+
     def start(self) -> None:
         """Start the claim heartbeat; call once, after `recover_interrupted`."""
         if self._heartbeat_task is None:
@@ -2585,6 +2651,7 @@ class ConversationManager:
                 if _finished_build(build) is runner:
                     del self._builds[key]
             self._runners.pop(runner.dialog_id, None)
+        await self._detach_surface(runner)
         try:
             await runner.stand_down()
         except Exception:  # a failing runner must not stall the heartbeat
@@ -2729,6 +2796,7 @@ class ConversationManager:
         if runner is None:
             return
         self._runners.pop(runner.dialog_id, None)
+        await self._detach_surface(runner)
         try:
             await runner.stop()
         except Exception:  # a failing runner must not block the deletion
@@ -2758,6 +2826,7 @@ class ConversationManager:
             with suppress(asyncio.CancelledError, Exception):
                 await build
         for runner in runners:
+            await self._detach_surface(runner)
             try:
                 await runner.stop()
             except Exception:  # one failing runner must not block the shutdown
