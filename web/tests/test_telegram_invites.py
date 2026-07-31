@@ -14,8 +14,8 @@ from octoforge_web.telegram.invites.api import (
     InviteNotFoundError,
     InviteStatus,
 )
-from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
+from octoforge_web.telegram.schema import TelegramSurfaceBase
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 USER_ID = "tg:111"
@@ -28,7 +28,7 @@ CRON_JOB_IDS = ("job-1", "job-2")
 async def store() -> AsyncIterator[SqlAlchemyInviteStore]:
     engine = create_engine(MEMORY_DATABASE_URL)
     async with engine.begin() as connection:
-        await connection.run_sync(InviteBase.metadata.create_all)
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
     session_factory: async_sessionmaker[AsyncSession] = create_session_factory(engine)
     yield SqlAlchemyInviteStore(session_factory)
     await engine.dispose()
@@ -39,7 +39,7 @@ async def expiring_store() -> AsyncIterator[SqlAlchemyInviteStore]:
     """Store with a zero TTL: every pending code is already expired."""
     engine = create_engine(MEMORY_DATABASE_URL)
     async with engine.begin() as connection:
-        await connection.run_sync(InviteBase.metadata.create_all)
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
     session_factory: async_sessionmaker[AsyncSession] = create_session_factory(engine)
     yield SqlAlchemyInviteStore(session_factory, ttl_seconds=0)
     await engine.dispose()
@@ -177,7 +177,7 @@ async def test_store_without_ttl_claims_regardless_of_age(
 async def directory() -> AsyncIterator[SqlAlchemyMemberDirectory]:
     engine = create_engine(MEMORY_DATABASE_URL)
     async with engine.begin() as connection:
-        await connection.run_sync(InviteBase.metadata.create_all)
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
     session_factory: async_sessionmaker[AsyncSession] = create_session_factory(engine)
     yield SqlAlchemyMemberDirectory(session_factory)
     await engine.dispose()

@@ -114,9 +114,9 @@ from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
 from octoforge_web.telegram.admin import AdminAccess, AdminManageTool, AdminStores
 from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
+from octoforge_web.telegram.drafts import SqlAlchemyDraftStore
 from octoforge_web.telegram.images import TelegramImageResolver
 from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
-from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
 from octoforge_web.telegram.poller import (
     TelegramBridgeRegistry,
@@ -124,6 +124,7 @@ from octoforge_web.telegram.poller import (
     TelegramPoller,
     TelegramPollerOptions,
 )
+from octoforge_web.telegram.schema import TelegramSurfaceBase
 
 STATIC_DIR = Path(__file__).parent / "static"
 APP_TITLE = "OctoForge"
@@ -791,6 +792,7 @@ class _TelegramStores:
 
     invites: SqlAlchemyInviteStore
     directory: SqlAlchemyMemberDirectory
+    drafts: SqlAlchemyDraftStore
     engine: AsyncEngine
 
 
@@ -804,13 +806,14 @@ async def _build_telegram_stores(settings: Settings) -> _TelegramStores | None:
         return None
     engine = create_engine(settings.telegram_database_url)
     async with engine.begin() as connection:
-        await connection.run_sync(InviteBase.metadata.create_all)
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
     session_factory = create_session_factory(engine)
     return _TelegramStores(
         invites=SqlAlchemyInviteStore(
             session_factory, ttl_seconds=settings.telegram_invite_ttl_seconds
         ),
         directory=SqlAlchemyMemberDirectory(session_factory),
+        drafts=SqlAlchemyDraftStore(session_factory),
         engine=engine,
     )
 
@@ -866,6 +869,7 @@ def _start_telegram(
         runner_provider=runner_provider,
         client=client,
         edit_throttle_seconds=settings.telegram_edit_throttle_seconds,
+        drafts=resolved.stores.drafts if resolved.stores is not None else None,
     )
     membership = None
     if resolved.stores is not None and settings.telegram_admin_ids:

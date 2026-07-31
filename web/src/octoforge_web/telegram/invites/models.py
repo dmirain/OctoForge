@@ -1,21 +1,15 @@
-"""ORM model of the invite store: own Base, own database, no Alembic.
-
-The separate DeclarativeBase keeps the invites table out of core's
-`Base.metadata`, so it cannot leak into any core tooling even by accident.
-"""
+"""ORM models of the invite store: the Telegram surface's own database."""
 
 from datetime import datetime
 
 from octoforge_core.db.base import UTCDateTime
 from sqlalchemy import JSON, String
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
+
+from octoforge_web.telegram.schema import TelegramSurfaceBase
 
 
-class InviteBase(DeclarativeBase):
-    """Base class of the Telegram invite schema (isolated from core's Base)."""
-
-
-class MemberRow(InviteBase):
+class MemberRow(TelegramSurfaceBase):
     """Profile of a Telegram user who passed the gate, refreshed on contact.
 
     Names and usernames change, so this is a living mirror of what Telegram
@@ -32,7 +26,7 @@ class MemberRow(InviteBase):
     last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
 
-class InviteRow(InviteBase):
+class InviteRow(TelegramSurfaceBase):
     """One invite code: pending -> claimed -> (revoked -> claimed)."""
 
     __tablename__ = "invites"

@@ -34,6 +34,7 @@ from octoforge_web.telegram.client import (
     TelegramApiError,
     TelegramClient,
 )
+from octoforge_web.telegram.drafts import DraftStore, PersistedDraft
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,10 @@ class TelegramBridgeOptions:
     """Rendering knobs shared by every bridge of the surface."""
 
     edit_throttle_seconds: float
+    # remembers which message each live answer is being written into, so a
+    # dialog that moves to another process keeps editing it instead of
+    # starting a second one. None keeps drafts in memory only.
+    drafts: DraftStore | None = None
 
 
 @dataclass(slots=True)
@@ -102,6 +107,7 @@ class TelegramBridge:
         self._runner_provider = runner_provider
         self._client = client
         self._edit_throttle_seconds = options.edit_throttle_seconds
+        self._drafts_store = options.drafts
         self._runner: ConversationRunner | None = None
         self._forwarder: asyncio.Task[None] | None = None
         self._drafts: dict[str | None, _Draft] = {}
@@ -112,9 +118,15 @@ class TelegramBridge:
         self._reply_targets: OrderedDict[int, str] = OrderedDict()
 
     async def start(self) -> None:
-        """Resolve the runner and start forwarding its events to the chat."""
+        """Resolve the runner and start forwarding its events to the chat.
+
+        Remembered drafts are restored first: this bridge may be picking up a
+        dialog another process was mid-answer on, and the answer has to
+        continue in the message the user is already looking at.
+        """
         if self._forwarder is not None and not self._forwarder.done():
             return
+        await self._restore_drafts()
         runner = await self._ensure_runner()
         queue = runner.subscribe()  # subscribe before the run starts, events are not replayed
         self._forwarder = asyncio.create_task(self._forward(runner, queue))
@@ -204,6 +216,57 @@ class TelegramBridge:
         except (TelegramApiError, httpx.HTTPError):
             logger.warning("Telegram render failed for %s", self._user_id, exc_info=True)
 
+    async def _restore_drafts(self) -> None:
+        """Adopt the messages a previous owner of this dialog was writing into."""
+        if self._drafts_store is None:
+            return
+        try:
+            remembered = await self._drafts_store.load(self._chat_id)
+        except Exception:  # a lost draft costs a duplicate message, not the answer
+            logger.warning("could not load drafts for %s", self._user_id, exc_info=True)
+            return
+        for item in remembered:
+            self._drafts.setdefault(
+                item.exchange_id,
+                _Draft(
+                    exchange_id=item.exchange_id,
+                    message_id=item.message_id,
+                    reply_to=item.reply_to,
+                    sealed_chunks=item.sealed_chunks,
+                ),
+            )
+
+    async def _remember_draft(self, draft: _Draft) -> None:
+        """Write down which message this exchange's answer is being written into.
+
+        Only when a message is CREATED — an edit that appends text changes
+        nothing another process would need. Drafts with no exchange (broker
+        notices, RUN results) are one-shot and not remembered.
+        """
+        if self._drafts_store is None or draft.exchange_id is None or draft.message_id is None:
+            return
+        try:
+            await self._drafts_store.remember(
+                self._chat_id,
+                PersistedDraft(
+                    exchange_id=draft.exchange_id,
+                    message_id=draft.message_id,
+                    reply_to=draft.reply_to,
+                    sealed_chunks=draft.sealed_chunks,
+                ),
+            )
+        except Exception:  # rendering must not fail because bookkeeping did
+            logger.warning("could not remember draft for %s", self._user_id, exc_info=True)
+
+    async def _forget_draft(self, exchange_id: str | None) -> None:
+        """Drop the remembered draft; this answer is final."""
+        if self._drafts_store is None or exchange_id is None:
+            return
+        try:
+            await self._drafts_store.forget(exchange_id)
+        except Exception:
+            logger.warning("could not forget draft for %s", self._user_id, exc_info=True)
+
     def _draft_of(self, exchange_id: str | None) -> _Draft:
         draft = self._drafts.get(exchange_id)
         if draft is None:
@@ -243,6 +306,7 @@ class TelegramBridge:
             # left behind by a failed flush would corrupt (or silently eat)
             # the next answer delivered under the same exchange id
             self._drafts.pop(exchange_id, None)
+            await self._forget_draft(exchange_id)
 
     async def _flush_terminal_with_retry(self, draft: _Draft) -> None:
         """Flush the final draft, retrying once more on a transport/API hiccup.
@@ -310,6 +374,7 @@ class TelegramBridge:
             )
             if draft.exchange_id is not None:
                 self._record_reply_target(draft.message_id, draft.exchange_id)
+            await self._remember_draft(draft)
         else:
             await self._client.edit_message_rich(self._chat_id, draft.message_id, markdown)
         draft.delivered_text = markdown

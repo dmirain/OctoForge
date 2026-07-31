@@ -20,6 +20,7 @@ from octoforge_web.telegram.client import (
     TelegramApiError,
     TelegramClient,
 )
+from octoforge_web.telegram.drafts import DraftStore
 from octoforge_web.telegram.images import REF_PREFIX
 from octoforge_web.telegram.invites.api import (
     InviteAlreadyClaimedError,
@@ -193,10 +194,13 @@ class TelegramBridgeRegistry:
         runner_provider: RunnerProvider,
         client: TelegramClient,
         edit_throttle_seconds: float,
+        drafts: DraftStore | None = None,
     ) -> None:
         self._runner_provider = runner_provider
         self._client = client
-        self._options = TelegramBridgeOptions(edit_throttle_seconds=edit_throttle_seconds)
+        self._options = TelegramBridgeOptions(
+            edit_throttle_seconds=edit_throttle_seconds, drafts=drafts
+        )
         self._bridges: dict[str, TelegramBridge] = {}
 
     def existing(self, user_id: str) -> TelegramBridge | None:

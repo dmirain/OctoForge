@@ -52,6 +52,22 @@ split answer was no longer eligible for the upgrade, so its table arrived as raw
 Plain notices — greetings, refusals, invite texts — still go out as ordinary text messages; they carry
 no formatting to preserve.
 
+### Drafts survive a move
+
+A draft is which Telegram message an answer is being written into. It lives in the bridge's memory,
+which is enough while one process owns a dialog for its whole life — and wrong the moment dialogs
+move between processes: the new owner would start a *second* message, leaving the user with a
+truncated answer and a complete one under it.
+
+So the message id is written down, in the surface's own database (`telegram_drafts`), keyed by the
+exchange. Only what cannot be recreated is stored — which message, what it replies to, how many
+chunks of a long answer went before it. The text is not: the new owner re-answers and edits the same
+message until it holds the finished reply.
+
+Written once per message *created*, not per edit; read when a bridge attaches; dropped when the
+answer settles. A draft with no exchange (a broker notice, a background result) is one-shot and never
+remembered.
+
 ### Access control
 
 Access is invite-based (`telegram/invites/`), in its own SQLite (or Postgres) database with its own schema
@@ -92,6 +108,8 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 
 - **Private chats only.** Groups, threads and channels are not handled.
 - **One draft message per exchange**, and each answer replies to its question.
+- **A draft outlives the process that started it**, so a dialog that moves keeps writing into the
+  message the user is already looking at — see [dialog-ownership.md](dialog-ownership.md).
 - **An explicit reply never spends a router call.**
 - **Forwarded content is material**, and material never carries authority (it cannot cancel an exchange).
 - **A voice message is the user speaking**, not material.
@@ -109,7 +127,7 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 | `OF_TELEGRAM_ADMIN_IDS` | Admins; while empty the invite gate is inactive |
 | `OF_TELEGRAM_BOT_USERNAME` | The bot's public handle (`name`, `@name` or a t.me URL). Turns generated invites into one-tap deep links |
 | `OF_TELEGRAM_INVITE_TTL_SECONDS` | How long a code stays claimable |
-| `OF_TELEGRAM_DATABASE_URL` | The invite/member database |
+| `OF_TELEGRAM_DATABASE_URL` | The surface's own database: invites, member profiles, live drafts |
 | `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` | Long-poll timeout |
 | `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` | Minimum interval between draft edits |
 | `OF_VISION_*`, `OF_STT_*`, `OF_VOICE_MAX_SECONDS` | Images and voice |
@@ -135,6 +153,8 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 - `web/src/octoforge_web/telegram/bridge.py` — event rendering, drafts, throttling, reply threading
 - `web/src/octoforge_web/telegram/images.py` — image refs and resolution
 - `web/src/octoforge_web/telegram/invites/` — invite store, member directory
+- `web/src/octoforge_web/telegram/drafts.py` — where a live answer is being written
+- `web/src/octoforge_web/telegram/schema.py` — the surface's declarative base
 - `web/src/octoforge_web/telegram/admin.py` — the `admin_manage` tool
 - `web/src/octoforge_web/telegram/__main__.py` — the standalone entry point
 - `web/tests/test_telegram_*.py` — poller, bridge, markdown, rich, invites, images, standalone

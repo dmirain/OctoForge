@@ -37,7 +37,8 @@ from octoforge_core.db.engine import (
 from octoforge_core.db.models import DialogRow, MessageRow, TaskRow
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.memory.models import MemoryRow
-from octoforge_web.telegram.invites.models import InviteBase, InviteRow
+from octoforge_web.telegram.invites.models import InviteRow
+from octoforge_web.telegram.schema import TelegramSurfaceBase
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
@@ -55,7 +56,7 @@ CORE_TABLES: tuple[type[Base], ...] = (
     DatasetRecordRow,
     MemoryRow,
 )
-INVITE_TABLES: tuple[type[InviteBase], ...] = (InviteRow,)
+INVITE_TABLES: tuple[type[TelegramSurfaceBase], ...] = (InviteRow,)
 BATCH_SIZE = 500
 EXIT_MISMATCH = 1
 
@@ -143,7 +144,7 @@ async def migrate(
 async def _create_invite_schema(engine: AsyncEngine) -> None:
     """The invite schema has no Alembic chain of its own (see the web adapter)."""
     async with engine.begin() as connection:
-        await connection.run_sync(InviteBase.metadata.create_all)
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
 
 
 async def main() -> int:

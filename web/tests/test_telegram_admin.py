@@ -34,8 +34,8 @@ from octoforge_web.telegram.admin import (
 )
 from octoforge_web.telegram.client import TELEGRAM_CHANNEL
 from octoforge_web.telegram.invites.api import InviteStatus, MemberProfile
-from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
+from octoforge_web.telegram.schema import TelegramSurfaceBase
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 ADMIN_TELEGRAM_ID = 999
@@ -74,7 +74,7 @@ async def stores() -> AsyncIterator[StoresTuple]:
     core_sessions: async_sessionmaker[AsyncSession] = create_session_factory(core_engine)
     telegram_engine = create_engine(MEMORY_DATABASE_URL)
     async with telegram_engine.begin() as connection:
-        await connection.run_sync(InviteBase.metadata.create_all)
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
     telegram_sessions: async_sessionmaker[AsyncSession] = create_session_factory(telegram_engine)
     yield (
         SqlAlchemyInviteStore(telegram_sessions),

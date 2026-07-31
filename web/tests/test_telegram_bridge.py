@@ -60,6 +60,8 @@ from octoforge_web.telegram.client import (
     USER_ID_PREFIX,
     TelegramApiError,
 )
+from octoforge_web.telegram.drafts import SqlAlchemyDraftStore
+from octoforge_web.telegram.schema import TelegramSurfaceBase
 
 CHAT_ID = 12345
 TELEGRAM_USER_ID = f"{USER_ID_PREFIX}{CHAT_ID}"
@@ -68,6 +70,7 @@ MAX_ITERATIONS = 3
 MAX_PROCESSES = 5
 NO_THROTTLE = 0.0
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+EXCHANGE_ID = "ex-1"
 WAIT_TIMEOUT_SECONDS = 5.0
 POLL_SECONDS = 0.01
 REPLY = "final answer"
@@ -341,13 +344,14 @@ async def make_manager(
 def make_bridge(
     client: FakeTelegramClient,
     manager: ConversationManager,
+    drafts: SqlAlchemyDraftStore | None = None,
 ) -> TelegramBridge:
     return TelegramBridge(
         user_id=TELEGRAM_USER_ID,
         chat_id=CHAT_ID,
         runner_provider=manager.get_or_create_runner,
         client=client,
-        options=TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE),
+        options=TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE, drafts=drafts),
     )
 
 
@@ -840,3 +844,63 @@ async def test_the_bridge_drops_a_runner_that_handed_the_dialog_over(
     finally:
         await bridge.aclose()
         await manager.stop_all()
+
+
+async def draft_store() -> SqlAlchemyDraftStore:
+    """A draft store on its own in-memory copy of the surface schema."""
+    engine = create_engine(MEMORY_DATABASE_URL)
+    async with engine.begin() as connection:
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
+    return SqlAlchemyDraftStore(create_session_factory(engine))
+
+
+async def test_a_dialog_that_moved_keeps_writing_into_the_same_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The failure this prevents: a deploy mid-answer leaves the user with a
+    truncated message and a second, complete one underneath it."""
+    drafts = await draft_store()
+    first_client = FakeTelegramClient()
+    first = make_bridge(first_client, await make_manager([], session_factory), drafts=drafts)
+    await first._render_safely(TextDelta(text="Согласно отчёту"), EXCHANGE_ID)
+    assert first_client.sent  # the message exists now
+    message_id = first_client._next_message_id
+
+    # another process picks the dialog up and re-answers it from scratch
+    second_client = FakeTelegramClient()
+    second = make_bridge(second_client, await make_manager([], session_factory), drafts=drafts)
+    await second._restore_drafts()
+    await second._render_safely(TextDelta(text="Согласно отчёту за третий квартал"), EXCHANGE_ID)
+
+    assert second_client.sent == []  # no second message was started
+    assert [edit[1] for edit in second_client.edited] == [message_id]
+
+
+async def test_a_finished_answer_is_no_longer_remembered(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Otherwise the next answer of the same exchange would edit a message
+    that already holds a final reply."""
+    drafts = await draft_store()
+    client = FakeTelegramClient()
+    bridge = make_bridge(client, await make_manager([], session_factory), drafts=drafts)
+    await bridge._render_safely(TextDelta(text="почти"), EXCHANGE_ID)
+    assert await drafts.load(CHAT_ID) != []
+
+    await bridge._render_safely(Finished(message=reply("готово")), EXCHANGE_ID)
+
+    assert await drafts.load(CHAT_ID) == []
+
+
+async def test_a_notice_without_an_exchange_is_never_remembered(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Broker notices and background results are one-shot: there is no
+    exchange to key them by, and nothing to continue after a move."""
+    drafts = await draft_store()
+    client = FakeTelegramClient()
+    bridge = make_bridge(client, await make_manager([], session_factory), drafts=drafts)
+
+    await bridge._render_safely(TextDelta(text="фоновая работа готова"), None)
+
+    assert await drafts.load(CHAT_ID) == []

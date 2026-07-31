@@ -46,7 +46,6 @@ from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import USER_ID_PREFIX, TelegramApiError
 from octoforge_web.telegram.images import REF_PREFIX
 from octoforge_web.telegram.invites.api import MemberProfile
-from octoforge_web.telegram.invites.models import InviteBase
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore
 from octoforge_web.telegram.models import (
     TelegramChat,
@@ -86,6 +85,7 @@ from octoforge_web.telegram.poller import (
     TelegramPollerOptions,
     chat_id_from_user_id,
 )
+from octoforge_web.telegram.schema import TelegramSurfaceBase
 
 TELEGRAM_USER_ID = 12345
 USER_ID = f"{USER_ID_PREFIX}{TELEGRAM_USER_ID}"
@@ -687,7 +687,7 @@ INVITE_NOTE = "test invite"
 async def invite_store() -> AsyncIterator[SqlAlchemyInviteStore]:
     engine = create_engine(MEMORY_DATABASE_URL)
     async with engine.begin() as connection:
-        await connection.run_sync(InviteBase.metadata.create_all)
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
     yield SqlAlchemyInviteStore(create_session_factory(engine))
     await engine.dispose()
 
@@ -802,7 +802,7 @@ async def test_start_with_invalid_code_is_denied(
 async def test_start_with_expired_code_is_denied() -> None:
     engine = create_engine(MEMORY_DATABASE_URL)
     async with engine.begin() as connection:
-        await connection.run_sync(InviteBase.metadata.create_all)
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
     expiring = SqlAlchemyInviteStore(create_session_factory(engine), ttl_seconds=0)
     invite = await expiring.create(INVITE_NOTE)
     client = FakeTelegramClient()
