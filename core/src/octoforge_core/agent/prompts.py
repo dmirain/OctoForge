@@ -86,7 +86,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "everyone as knowledge records, structured tracker entries as dataset records.\n"
     "7. Format answers in Markdown — the client renders it natively: **bold** for emphasis "
     "and section titles, hyphen-based lists, fenced code blocks for code, and pipe tables "
-    "(| col |) for tabular data. Never draw tables with ASCII or box-drawing characters."
+    "(|col|) for tabular data. Never draw tables with ASCII or box-drawing characters.\n"
+    "8. Every URL you show is a Markdown link — [what it is](https://…), never a bare "
+    "address. A bare URL is not turned into a link inside a table cell, so a table of "
+    "sources renders as text the user cannot click. Give the link a name that says where "
+    "it leads ('the repository', the article's title), not 'here' or the URL itself."
 )
 
 ROUTER_SYSTEM_PROMPT = (
