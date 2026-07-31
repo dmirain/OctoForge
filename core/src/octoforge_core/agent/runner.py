@@ -2478,11 +2478,12 @@ class ConversationManager:
         key = (user_id, channel)
         async with self._lock:
             build = self._builds.get(key)
+            ours = build is None
             if build is None:
                 build = asyncio.create_task(self._build_runner(user_id, channel))
                 self._builds[key] = build
         try:
-            return await asyncio.shield(build)
+            runner = await asyncio.shield(build)
         except BaseException:
             # drop the memo only when the BUILD itself died — a caller
             # cancelled mid-await (shield keeps the build running) must not
@@ -2492,6 +2493,14 @@ class ConversationManager:
                     if self._builds.get(key) is build:
                         del self._builds[key]
             raise
+        if ours:
+            # After the build, not inside it: a surface resolves runners
+            # through this manager, so attaching from within the build would
+            # make it await the task it is running in — a dialog that hangs
+            # on first contact forever. Only the caller that started the
+            # build attaches, so concurrent ones do not attach twice.
+            await self._attach_surface(runner)
+        return runner
 
     async def _build_runner(self, user_id: str, channel: str) -> ConversationRunner:
         dialog = await self._dialogs.get_or_create(user_id, channel)
@@ -2527,7 +2536,6 @@ class ConversationManager:
         # runner is handed out, so the caller's message meets a consistent
         # dialog.
         await self._recover_dialog(runner)
-        await self._attach_surface(runner)
         return runner
 
     async def _attach_surface(self, runner: ConversationRunner) -> None:

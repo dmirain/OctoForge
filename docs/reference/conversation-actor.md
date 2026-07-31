@@ -119,6 +119,10 @@ Core knows only the `DialogSurface` port — attach and detach, nothing about ch
 which transport is the composition root's decision, and a surface that fails to attach costs delivery
 through that transport, never the dialog.
 
+Attaching happens **after** the runner is built, not inside the build, and only for the caller that
+started it. A surface resolves runners through the same manager, so attaching from within the build
+would make it await the task it is running in — the dialog would hang on first contact forever.
+
 ## Invariants
 
 - **One actor per dialog, one task consuming its inbox.** Dialog state is never mutated concurrently.

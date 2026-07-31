@@ -27,6 +27,7 @@ from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import (
     STREAM_CLOSED,
     ConversationManager,
+    ConversationRunner,
     ManagerStores,
     OwnershipConfig,
     RunnerConfig,
@@ -495,5 +496,53 @@ async def test_a_surface_that_cannot_attach_does_not_break_the_dialog(
     try:
         runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
         assert runner.dialog_id
+    finally:
+        await manager.stop_all()
+
+
+class ResolvingSurface:
+    """A surface that looks its runner up the way a chat bridge does."""
+
+    def __init__(self, manager: ConversationManager) -> None:
+        self._manager = manager
+        self.attached = 0
+
+    async def attach(self, runner: ConversationRunner) -> None:
+        await self._manager.get_or_create_runner(runner.user_id, runner.channel)
+        self.attached += 1
+
+    async def detach(self, runner: ConversationRunner) -> None:
+        pass
+
+
+async def test_a_surface_may_resolve_the_runner_it_is_being_given(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Attaching used to happen inside the build, so a surface that resolved
+    runners through this manager made the build await the task it was running
+    in — the dialog hung on first contact, forever."""
+    manager = make_manager(session_factory)
+    surface = ResolvingSurface(manager)
+    manager.use_surface(surface)
+    try:
+        runner = await asyncio.wait_for(
+            manager.get_or_create_runner(USER_ID, CHANNEL), timeout=TIMEOUT_SECONDS
+        )
+        assert runner.dialog_id
+        assert surface.attached == 1
+    finally:
+        await manager.stop_all()
+
+
+async def test_concurrent_first_contacts_attach_the_surface_once(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Only the caller that started the build attaches; the others share it."""
+    surface = RecordingSurface()
+    manager = make_manager(session_factory)
+    manager.use_surface(surface)
+    try:
+        await asyncio.gather(*(manager.get_or_create_runner(USER_ID, CHANNEL) for _ in range(4)))
+        assert len(surface.attached) == 1
     finally:
         await manager.stop_all()
