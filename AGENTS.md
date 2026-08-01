@@ -14,17 +14,19 @@ conventions, structure, commands or language rules change, update both in the sa
 
 OctoForge is a self-hosted multi-user agent platform: skills, knowledge and callable HTTP endpoint
 contracts live in the database and are found by embedding search; a dialog is an actor with durable
-obligations; background work and cron run through the same machinery. Two projects, one dependency
-rule — `core/` is a typed library that never imports a web framework, `web/` is the FastAPI and
-Telegram adapter on top of it.
+obligations; background work and cron run through the same machinery. Six packages, one dependency
+rule — `core/` is a typed library that never imports a web framework, `server/` is the HTTP service
+over it, `surfaces/` holds the interfaces, `deploy/` assembles a deployment from them.
 
 ## Repository layout
 
 | Path | What |
 |---|---|
 | `core/src/octoforge_core/` | the library: domain modules (`agent/`, `dialogs/`, `instructions/`, `datasets/`, `memory/`, `context/`, `tasks/`, `cron/`, `secrets/`, `net/`, `search/`, `vision/`, `speech/`, `admin/`), framework packages (`tools/`, `llm/`, `db/`) and the builders in `composition.py` |
-| `web/src/octoforge_web/` | FastAPI app and `api/`, `telegram/`, `config.py`, `auth.py`, `capabilities.py`, and the composition root `main.py:runtime()` |
-| `core/tests/`, `web/tests/` | one module per source module, plus the boundary and modularity guards |
+| `server/src/octoforge_server/` | the HTTP service: `app.py`, `api/`, `auth.py`, `deps.py`, `config.py`, `capabilities.py`, and the `Surface` port in `surfaces.py`. Imports no interface |
+| `surfaces/telegram/`, `surfaces/console/`, `surfaces/webui/` | the interfaces, one package each. None imports another |
+| `deploy/src/octoforge_deploy/` | the composition root `main.py:runtime()`, the HTTP entry point, and the Telegram-only one. The only package that may import every other |
+| `core/tests/`, `deploy/tests/` | one module per source module, plus the boundary and modularity guards |
 | `docs/` | the documentation set — read `docs/CONVENTIONS.md` before editing it |
 | `tools/` | operator scripts: `quickstart.py`, `hash_password.py`, `bench_latency.py`, `check_docs.py`, `pg_backup.sh`, `sqlite_to_postgres.py` |
 
@@ -78,7 +80,7 @@ unchanged code. Bump a cap deliberately, with the fallout in the same change.
    `HTTPStatus`.
 5. **Dependencies point inward.** `core/` never imports fastapi, external clients arrive through
    `Protocol` ports, and nothing constructs its own dependencies — the graph is assembled in the
-   composition root (`web/src/octoforge_web/main.py`, builders in `composition.py`). Enforced by
+   composition root (`deploy/src/octoforge_deploy/main.py`, builders in `composition.py`). Enforced by
    `core/tests/test_boundaries.py`.
 6. **Complexity limits are enforced** (`C901` ≤ 10, `PLR0915` ≤ 50 statements, `PLR0911` ≤ 6
    returns). Split the function; do not disable the rule.

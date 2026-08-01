@@ -253,7 +253,7 @@ Dependencies point inward: the core defines `Protocol` ports and never construct
 dependencies, and one composition root assembles the graph. Every builder
 (`build_llm_client`, `build_tool_registry`, `build_conversation_manager`, …) lives in
 `core/composition.py` and takes ports and configs only — no FastAPI — so an alternative composition
-root reuses them instead of copying code. `web/src/octoforge_web/main.py:runtime()` is just the
+root reuses them instead of copying code. `deploy/src/octoforge_deploy/main.py:runtime()` is just the
 default assembly, shared by the HTTP app and the standalone Telegram surface.
 
 | You want to change | Swap this |

@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "octoforge-deploy"
+version = "0.8.0"
+description = "OctoForge assembled deployment: the service plus its interfaces"
+license = { text = "BUSL-1.1" }
+requires-python = ">=3.11"
+dependencies = [
+    "octoforge-server",
+    "octoforge-telegram",
+    "octoforge-console",
+    "octoforge-webui",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    # keep in sync with core's dev extra (see the note there)
+    "ruff>=0.16,<0.17",
+    "mypy>=2.3,<3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "C90", "PL", "RUF"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-statements = 50
+
+# One type check and one suite for the whole web side. The deployment is the
+# only package allowed to import every other one, so it is the only place
+# from which all of them can be checked together; the import-boundary tests
+# are what keep that privilege from spreading.
+[tool.mypy]
+strict = true
+mypy_path = [
+    "src",
+    "../server/src",
+    "../surfaces/telegram/src",
+    "../surfaces/console/src",
+    "../surfaces/webui/src",
+]
+packages = [
+    "octoforge_deploy",
+    "octoforge_server",
+    "octoforge_telegram",
+    "octoforge_console",
+    "octoforge_webui",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# see core/pyproject.toml: slow tests are visible on every run, hangs dump
+addopts = "--durations=15 --durations-min=0.5"
+faulthandler_timeout = 90

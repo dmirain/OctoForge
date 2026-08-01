@@ -31,16 +31,26 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_ROOTS = (
     Path("."),
     Path("core/src"),
-    Path("web/src"),
+    Path("server/src"),
+    Path("deploy/src"),
+    Path("surfaces/telegram/src"),
+    Path("surfaces/console/src"),
+    Path("surfaces/webui/src"),
     Path("core/src/octoforge_core"),
-    Path("web/src/octoforge_web"),
+    Path("server/src/octoforge_server"),
+    Path("deploy/src/octoforge_deploy"),
+    Path("surfaces/telegram/src/octoforge_telegram"),
 )
-# The two projects are also referred to by name — `core/composition.py`,
-# `web/telegram/bridge.py` — meaning "this module inside that project's
-# package". Applied only after the plain roots fail.
+# Projects are also referred to by name — `core/composition.py`,
+# `telegram/bridge.py` — meaning "this module inside that project's package".
+# Applied only after the plain roots fail.
 PATH_ALIASES = (
     ("core/", "core/src/octoforge_core/"),
-    ("web/", "web/src/octoforge_web/"),
+    ("server/", "server/src/octoforge_server/"),
+    ("telegram/", "surfaces/telegram/src/octoforge_telegram/"),
+    ("console/", "surfaces/console/src/octoforge_console/"),
+    ("webui/", "surfaces/webui/src/octoforge_webui/"),
+    ("deploy/", "deploy/src/octoforge_deploy/"),
 )
 ROOT_MARKDOWN = (
     "README.md",

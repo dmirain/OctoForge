@@ -1,26 +1,36 @@
 # Architecture
 
-Two Python projects, one dependency rule, and a single place where everything is wired together.
+Six Python packages, one dependency rule, and a single place where everything is wired together.
 
-## The two projects
+## The packages
 
-The repository is a monorepo of two independent packages, each with its own `pyproject.toml`,
-dependencies and test suite.
+The repository is a monorepo, each package with its own `pyproject.toml` and dependencies. They
+install separately, which is the point: a deployment takes the ones it wants.
 
 **`core/` — `octoforge-core`** (src layout, ships `py.typed`) holds the domain: the agent loop, the
 dialog actor, exchanges, instructions, datasets, memories, secrets, tasks, cron, context compaction,
 outbound HTTP, and the LLM/embedding/reranker clients. It never imports a web framework. SQLAlchemy
 appears only in `db/` (engine, declarative base, migrations) and in the per-module SQL stores.
 
-**`web/` — `octoforge-web`** (src layout) is the adapter layer: a FastAPI application (chat UI, dialog
-API, operator console, secret-entry form), a Telegram bot, the settings object, and the default
-composition root. It depends on `octoforge-core`.
+**`server/` — `octoforge-server`** is the HTTP service over the core: the dialog API, the event
+stream, the cron and secrets endpoints, the credential guard, the health probes, and the settings
+object. It serves the interfaces installed in front of it rather than the open internet, and it knows
+of no interface in particular.
 
-Nothing depends on `web`. An embedder replaces it.
+**`surfaces/telegram/`, `surfaces/console/`, `surfaces/webui/`** are the interfaces —
+`octoforge-telegram`, `octoforge-console`, `octoforge-webui`. Each depends on the service, none on
+another, and each is removable by not installing it.
+
+**`deploy/` — `octoforge-deploy`** is the assembled deployment: the composition root, the surfaces it
+runs, and the two entry points (the HTTP application, and the Telegram-only process). It is the only
+package allowed to import every other one.
+
+Nothing depends on `deploy`. An embedder replaces it — or replaces the service too, and keeps only
+the core.
 
 ## The dependency rule
 
-Dependencies point inward. The core defines what it needs as `Protocol` ports and never constructs
+Dependencies point inward: `deploy` → surfaces → `server` → `core`, and never back. The core defines what it needs as `Protocol` ports and never constructs
 its own dependencies; concrete implementations (an HTTP client, a database session factory, a bot
 client) are built outside and passed in.
 
@@ -43,7 +53,7 @@ Module boundaries inside the core are enforced by tests, not convention
 - `cron/` never imports `agent/` — it knows the `CronWaker` port, which the actor satisfies
   structurally.
 
-`web/tests/test_modularity.py` goes further: it builds a working `ConversationManager` the way a
+`deploy/tests/test_modularity.py` goes further: it builds a working `ConversationManager` the way a
 third-party installer would — from the core builders, with file-based prompts, a fake search provider
 and an in-memory instruction store — proving the seams are real without copying the default
 composition root.
@@ -85,7 +95,7 @@ persisted.
 | Framework | `core/src/octoforge_core/tools/`, `db/`, `llm/` | tool protocol and registry, engine and migrations, provider clients |
 | Domain modules | `core/src/octoforge_core/agent/`, `dialogs/`, `instructions/`, `datasets/`, `memory/`, `context/`, `tasks/`, `cron/`, `secrets/`, `net/`, `search/`, `vision/`, `speech/`, `admin/` | one concern each, with an `api.py` boundary and a local SQL store |
 | Composition | `core/src/octoforge_core/composition.py` | reusable builders over ports and configs, no web dependencies |
-| Adapters | `web/src/octoforge_web/` | FastAPI app, Telegram bot, settings, the default composition root in `main.py` |
+| Adapters | `server/src/octoforge_server/` | FastAPI app, Telegram bot, settings, the default composition root in `main.py` |
 
 A domain module is a package with the same internal anatomy: `api.py` (its `Protocol`s, DTOs and
 errors — the only thing neighbours import), `models.py` (its ORM rows), `store.py` (the SQL
@@ -101,7 +111,7 @@ Everything the core needs from the outside world, and what ships as the default 
 | `EmbeddingClient` | `llm/embeddings.py` | HTTP (`llm/embeddings.py`) or in-process (`llm/local_embeddings.py`) |
 | `RerankerClient` | `llm/reranker.py` | local cross-encoder (`llm/reranker.py`) or HTTP (`llm/http_reranker.py`); optional |
 | `MessageRouter` | `agent/router.py` | `LLMRouter` — one short tool call, deterministic fallback |
-| `PromptProvider` | `agent/prompts.py` | `StaticPromptProvider`; `web/prompts.py` adds file-backed overrides |
+| `PromptProvider` | `agent/prompts.py` | `StaticPromptProvider`; `server/prompts.py` adds file-backed overrides |
 | `DialogRepository`, `MessageRepository`, `ExchangeRepository` | `dialogs/api.py` | `dialogs/store.py` |
 | `InstructionStore`, `InstructionService`, `InstructionVectorSearch` | `instructions/api.py` | `instructions/store.py`, `instructions/local.py` |
 | `DatasetStore`, `DatasetService`, `DatasetVectorSearch` | `datasets/api.py` | `datasets/store.py`, `datasets/service.py` |
@@ -127,7 +137,7 @@ Everything the core needs from the outside world, and what ships as the default 
 `build_cron_outcome_reporter`. They take ports and dataclass configs, never a web settings object,
 and they are what an alternative composition root reuses.
 
-The HTTP service itself is `web/src/octoforge_web/app.py:build_app()`: the application, its
+The HTTP service itself is `server/src/octoforge_server/app.py:build_app()`: the application, its
 credential guard, its probes, and the mounting of whatever it is handed. It is given the runtime and
 the routes rather than building them, which is what lets an interface be optional — as long as the
 thing building the application also knew how to build a bot, a deployment without one meant editing
@@ -135,22 +145,22 @@ it. The service is meant to answer the interfaces installed in front of it rathe
 internet, though it is guarded either way: "internal" is a deployment promise, not a property of the
 code.
 
-`web/src/octoforge_web/main.py:runtime()` is the default assembly on top of them: it opens the
+`deploy/src/octoforge_deploy/main.py:runtime()` is the default assembly on top of them: it opens the
 database engine, runs migrations, creates the HTTP clients, chooses backends from `Settings`, builds
 the registry, starts the cron scheduler and the material sweep, starts the Telegram surface if
 configured, and yields a `Runtime` dataclass. Both the FastAPI lifespan and the standalone Telegram
-entry point (`python -m octoforge_web.telegram`) use that same function — the surfaces differ, the
+entry point (`python -m octoforge_deploy.telegram_only`) use that same function — the surfaces differ, the
 graph does not.
 
 Optional capabilities are decided here and nowhere else: an empty setting means the port is `None`
 and the feature is absent, which the startup capability report states explicitly
-(`web/capabilities.py`).
+(`server/capabilities.py`).
 
 ## Surfaces
 
 Everything a human or a chat talks to — the Telegram bot, the operator console, the browser chat
 page — is a *surface*: an optional interface plugged into the service through the `Surface` port
-(`web/src/octoforge_web/surfaces.py`).
+(`server/src/octoforge_server/surfaces.py`).
 
 A surface declares what it adds: a renderer for its channel (`DialogSurface`), tools the agent
 gains, and background work to run. Routes and pages are not among them — those mount while the
@@ -162,7 +172,7 @@ those, so a deployment without a bot rejects `telegram` instead of opening a dia
 the set is assembled from what is installed, never written into the service.
 
 The direction of the arrow is the whole point. **The service never imports a surface**, and an
-import-boundary test says so (`web/tests/test_surfaces.py`). Only the composition root knows which
+import-boundary test says so (`deploy/tests/test_surfaces.py`). Only the composition root knows which
 ones exist, and `_installed_surfaces()` is the single place that answers it — removing an interface is a matter of not constructing it, not of editing branches
 elsewhere. A surface that fails to start or stop is reported and skipped: a broken bot must not cost
 the console and the API.
@@ -206,6 +216,6 @@ process, since SQLite allows exactly one writer.
 
 - `core/src/octoforge_core/composition.py` — the builders
 - `core/src/octoforge_core/ports.py`, each module's `api.py` — the ports
-- `web/src/octoforge_web/main.py` — `runtime()`, the default composition root
+- `deploy/src/octoforge_deploy/main.py` — `runtime()`, the default composition root
 - `core/tests/test_boundaries.py` — the enforced import rules
-- `web/tests/test_modularity.py` — a third-party composition root, end to end
+- `deploy/tests/test_modularity.py` — a third-party composition root, end to end

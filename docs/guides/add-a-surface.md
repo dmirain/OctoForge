@@ -91,9 +91,9 @@ appending to whatever bubble happens to be last.
 
 ## Code anchors
 
-- `web/src/octoforge_web/api/dialog.py`, `web/src/octoforge_web/api/sse.py` — the smallest complete surface
+- `server/src/octoforge_server/api/dialog.py`, `server/src/octoforge_server/api/sse.py` — the smallest complete surface
   (REST + SSE)
-- `web/src/octoforge_web/telegram/bridge.py` — the thorough one: drafts, throttling, reply threading, chunking
-- `web/src/octoforge_web/telegram/poller.py` — ingestion, per-user queues, message-kind decisions
+- `surfaces/telegram/src/octoforge_telegram/bridge.py` — the thorough one: drafts, throttling, reply threading, chunking
+- `surfaces/telegram/src/octoforge_telegram/poller.py` — ingestion, per-user queues, message-kind decisions
 - `core/src/octoforge_core/agent/runner.py` — `subscribe`, `submit`, `cancel`, `ConversationEvent`
 - [../reference/conversation-actor.md](../reference/conversation-actor.md) — delivery guarantees in detail

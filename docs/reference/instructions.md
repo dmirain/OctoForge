@@ -179,7 +179,7 @@ searchability is delayed.
 - `core/src/octoforge_core/instructions/ranking.py` — the scoring functions
 - `core/src/octoforge_core/instructions/store.py` — SQL store, visibility predicates, uniqueness
 - `core/src/octoforge_core/instructions/registry.py` — the declarative system registry and its sync
-- `web/src/octoforge_web/skill_overlay.py`, `web/src/octoforge_web/system_skills.py` — the overlay and
+- `server/src/octoforge_server/skill_overlay.py`, `server/src/octoforge_server/system_skills.py` — the overlay and
   the web-side registry
 - `core/src/octoforge_core/instructions/tools.py` — `recall`, `instruction_save`, `instruction_delete`
 - `core/tests/test_instructions_local.py`, `core/tests/test_ranking.py`,

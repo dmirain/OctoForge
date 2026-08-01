@@ -109,4 +109,4 @@ they arrive as links the recipient only has to tap.
 
 - `tools/quickstart.py` — `.env` generation
 - `docker-compose.local.yml`, `Makefile` — the local stack
-- `web/src/octoforge_web/capabilities.py` — the startup report
+- `server/src/octoforge_server/capabilities.py` — the startup report

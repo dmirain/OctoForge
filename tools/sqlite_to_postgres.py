@@ -37,8 +37,8 @@ from octoforge_core.db.engine import (
 from octoforge_core.db.models import DialogRow, MessageRow, TaskRow
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.memory.models import MemoryRow
-from octoforge_web.telegram.invites.models import InviteRow
-from octoforge_web.telegram.schema import TelegramSurfaceBase
+from octoforge_telegram.invites.models import InviteRow
+from octoforge_telegram.schema import TelegramSurfaceBase
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase

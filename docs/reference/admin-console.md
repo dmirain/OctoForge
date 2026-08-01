@@ -80,7 +80,7 @@ operator, not a product surface.
 
 - `core/src/octoforge_core/admin/api.py` — `AdminReadModel`, `Page[T]`, the DTOs
 - `core/src/octoforge_core/admin/store.py` — the SQL implementation (SELECT and count only)
-- `web/src/octoforge_web/api/admin.py` — the HTTP surface and the two mutations
-- `web/src/octoforge_web/static/admin.html` — the page
-- `web/src/octoforge_web/telegram/admin.py` — the in-chat admin tool
-- `core/tests/test_admin_store.py`, `web/tests/test_admin_api.py`
+- `surfaces/console/src/octoforge_console/routes.py` — the HTTP surface and the two mutations
+- `surfaces/console/src/octoforge_console/static/admin.html` — the page
+- `surfaces/telegram/src/octoforge_telegram/admin.py` — the in-chat admin tool
+- `core/tests/test_admin_store.py`, `deploy/tests/test_admin_api.py`

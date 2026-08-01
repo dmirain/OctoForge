@@ -131,4 +131,4 @@ run it safely. Everything else assumes one writer per dialog; Postgres is requir
 - `docker-compose.yml`, `Dockerfile`, `docker/Caddyfile` — the topology
 - `docker/postgres-init/` — the extra databases
 - `tools/pg_backup.sh`, `tools/sqlite_to_postgres.py` — backups and the one-off migration
-- `web/src/octoforge_web/main.py` — startup, migrations, health probes
+- `deploy/src/octoforge_deploy/main.py` — startup, migrations, health probes

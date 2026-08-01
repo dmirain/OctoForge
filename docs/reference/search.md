@@ -47,5 +47,5 @@ points at `recall` for anything the installation should already know.
 - `core/src/octoforge_core/search/api.py` — `SearchProvider`, `SearchResponse`, `SearchResult`, `SearchError`
 - `core/src/octoforge_core/search/serper.py` — the serper.dev implementation
 - `core/src/octoforge_core/search/tools.py` — the `web_search` tool
-- `web/src/octoforge_web/main.py` — conditional registration
+- `deploy/src/octoforge_deploy/main.py` — conditional registration
 - `core/tests/test_serper_provider.py`

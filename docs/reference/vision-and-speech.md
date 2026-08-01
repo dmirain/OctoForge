@@ -97,7 +97,7 @@ the provider's daily quota.
 - `core/src/octoforge_core/vision/tools.py` — the `image_look` tool and its visibility rule
 - `core/src/octoforge_core/speech/api.py` — `TranscriptionClient`, `AudioData`, accepted extensions
 - `core/src/octoforge_core/speech/client.py` — the transcription client
-- `web/src/octoforge_web/telegram/images.py`, `web/src/octoforge_web/telegram/poller.py` — ingestion,
+- `surfaces/telegram/src/octoforge_telegram/images.py`, `surfaces/telegram/src/octoforge_telegram/poller.py` — ingestion,
   albums, resolvers, voice handling
 - `core/tests/test_vision_tools.py`, `core/tests/test_speech_client.py`,
-  `web/tests/test_telegram_images.py`
+  `deploy/tests/test_telegram_images.py`

@@ -143,12 +143,12 @@ string: front the deployment with a proxy that authenticates people and sets tha
 
 ## Code anchors
 
-- `web/src/octoforge_web/main.py` — `create_app()`, the middleware gate, health probes, static mounts
-- `web/src/octoforge_web/api/dialog.py` — messages, cancel, SSE
-- `web/src/octoforge_web/api/sse.py` — frame encoding and event payloads
-- `web/src/octoforge_web/api/cron.py`, `api/admin.py`, `api/secrets.py` — the other routers
-- `web/src/octoforge_web/api/schemas.py` — request and response models
-- `web/src/octoforge_web/auth.py` — hashing, verification, the open-path rules
-- `web/src/octoforge_web/deps.py` — dependency providers
-- `web/tests/test_dialog_api.py`, `web/tests/test_sse.py`, `web/tests/test_admin_api.py`,
-  `web/tests/test_cron_api.py`, `web/tests/test_secrets_api.py`
+- `deploy/src/octoforge_deploy/main.py` — `create_app()`, the middleware gate, health probes, static mounts
+- `server/src/octoforge_server/api/dialog.py` — messages, cancel, SSE
+- `server/src/octoforge_server/api/sse.py` — frame encoding and event payloads
+- `server/src/octoforge_server/api/cron.py`, `surfaces/console/src/octoforge_console/routes.py`, `api/secrets.py` — the other routers
+- `server/src/octoforge_server/api/schemas.py` — request and response models
+- `server/src/octoforge_server/auth.py` — hashing, verification, the open-path rules
+- `server/src/octoforge_server/deps.py` — dependency providers
+- `deploy/tests/test_dialog_api.py`, `deploy/tests/test_sse.py`, `deploy/tests/test_admin_api.py`,
+  `deploy/tests/test_cron_api.py`, `deploy/tests/test_secrets_api.py`

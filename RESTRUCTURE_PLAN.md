@@ -98,7 +98,7 @@ idea for routes, static files and tools.
 
 Each stage is one commit with a green gate, so any of them can be reverted on its own.
 
-### 1. The seam, without moving anything
+### 1. The seam, without moving anything — DONE
 
 Introduce `Surface` inside the current package and re-express Telegram, the admin console
 and the web UI as surfaces. No file moves, no behavior change.
@@ -108,13 +108,13 @@ routes. That edge is what blocks the admin console from moving at all.
 
 The point is to learn whether the abstraction fits before 60 files depend on it.
 
-### 2. The physical move
+### 2. The physical move — DONE
 
 Create the distributions, move the files, update imports, `Makefile`, `Dockerfile`, CI.
 No logic changes. The gate is a strong verifier here: imports either resolve or they do
 not, and the suites either pass or they do not.
 
-### 3. Boundaries under test
+### 3. Boundaries under test — DONE (in `deploy/tests/test_surfaces.py`)
 
 Extend the import-boundary tests:
 

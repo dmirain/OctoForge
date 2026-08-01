@@ -45,7 +45,7 @@ subscribe, submit, print deltas. Two details it depends on:
 
 ### Depth 3: the platform
 
-Use `core/src/octoforge_core/composition.py` and follow `web/src/octoforge_web/main.py:runtime()` as the
+Use `core/src/octoforge_core/composition.py` and follow `deploy/src/octoforge_deploy/main.py:runtime()` as the
 reference wiring. The builders take ports and dataclass configs only — never a web settings object — so your
 composition root reuses them instead of copying:
 
@@ -67,7 +67,7 @@ manager = build_conversation_manager(
 )
 ```
 
-`web/tests/test_modularity.py` is a working third-party composition root doing exactly this — file-backed
+`deploy/tests/test_modularity.py` is a working third-party composition root doing exactly this — file-backed
 prompts, a fake search provider, an in-memory instruction store — and running a dialog end to end. Read it
 as the executable version of this guide.
 
@@ -105,7 +105,7 @@ append-only and shared by every installation.
 ## Code anchors
 
 - `core/src/octoforge_core/composition.py` — the builders
-- `web/src/octoforge_web/main.py` — `runtime()`, the reference composition root
-- `web/tests/test_modularity.py` — a third-party composition root, executable
+- `deploy/src/octoforge_deploy/main.py` — `runtime()`, the reference composition root
+- `deploy/tests/test_modularity.py` — a third-party composition root, executable
 - `core/src/octoforge_core/__init__.py` — the public surface of the package
 - [../architecture.md](../architecture.md) — the port table and the dependency rule

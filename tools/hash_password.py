@@ -11,7 +11,7 @@ The generated password is shown once and never stored: only the hash belongs in
 import argparse
 import secrets
 
-from octoforge_web.auth import hash_password
+from octoforge_server.auth import hash_password
 
 GENERATED_BYTES = 18  # 24 characters of base64url
 

@@ -6,14 +6,14 @@ the ones in the code, not suggestions.
 
 ## How it works
 
-`web/src/octoforge_web/config.py` defines the settings and the derived questions the composition root
+`server/src/octoforge_server/config.py` defines the settings and the derived questions the composition root
 asks them (`embeddings_configured()`, `vision_configured()`, `speech_configured()`,
-`embeddings_inherit_llm()`, …). `web/src/octoforge_web/main.py:runtime()` reads those answers to
+`embeddings_inherit_llm()`, …). `deploy/src/octoforge_deploy/main.py:runtime()` reads those answers to
 decide which ports get real implementations and which stay `None`.
 
 An empty value is a real answer: it means the capability is off. Nothing degrades into a stub, and
 nothing guesses. What the current configuration adds up to is logged at startup by
-`web/src/octoforge_web/capabilities.py` — one line per capability with the endpoint or model behind
+`server/src/octoforge_server/capabilities.py` — one line per capability with the endpoint or model behind
 it, and a warning for the two gaps that make an installation useless or unreachable (embeddings and
 the operator credential). No secret value is ever logged.
 
@@ -212,8 +212,8 @@ That variable is read by `docker-compose.local.yml`, not by the application.
 
 ## Code anchors
 
-- `web/src/octoforge_web/config.py` — the settings, defaults and derived predicates
-- `web/src/octoforge_web/capabilities.py` — the startup report
-- `web/src/octoforge_web/main.py` — where each setting turns into a port or a `None`
+- `server/src/octoforge_server/config.py` — the settings, defaults and derived predicates
+- `server/src/octoforge_server/capabilities.py` — the startup report
+- `deploy/src/octoforge_deploy/main.py` — where each setting turns into a port or a `None`
 - `.env.example` — the annotated variable list
-- `web/tests/test_config.py`, `web/tests/test_capabilities.py` — behavior of the above
+- `deploy/tests/test_config.py`, `deploy/tests/test_capabilities.py` — behavior of the above

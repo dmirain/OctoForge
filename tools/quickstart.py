@@ -13,7 +13,7 @@ generates the first two, asks for the third and prints the credential once.
 Stdlib only, by design: it has to run before `make install` and outside the
 virtualenv, from the docker path where no Python dependency of the project is
 installed at all. The password hashing below therefore duplicates
-`octoforge_web.auth.hash_password`; `web/tests/test_quickstart.py` verifies the
+`octoforge_server.auth.hash_password`; `web/tests/test_quickstart.py` verifies the
 two still agree.
 """
 
@@ -33,7 +33,7 @@ DEFAULT_LLM_MODEL = "gpt-4o-mini"
 PLACEHOLDER_KEY = "REPLACE_ME"
 ADMIN_USERNAME = "admin"
 
-# Keep in sync with octoforge_web.auth (same constants, same format).
+# Keep in sync with octoforge_server.auth (same constants, same format).
 HASH_SCHEME = "pbkdf2_sha256"
 HASH_ITERATIONS = 240_000
 HASH_SEPARATOR = ":"

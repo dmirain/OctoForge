@@ -11,7 +11,9 @@ mental model). Nothing about behavior belongs in this file.
 OctoForge is a self-hosted multi-user agent platform: skills, knowledge and callable HTTP endpoint
 contracts live in the database and are found by embedding search; a dialog is an actor with durable
 obligations; background work and cron run through the same machinery. `core/` is a typed library that
-never imports a web framework; `web/` is the FastAPI and Telegram adapter on top of it.
+never imports a web framework; `server/` is the HTTP service over it; `surfaces/` holds the
+interfaces (Telegram, console, chat UI), each installable on its own; `deploy/` assembles a
+deployment from them and is the only package that may import every other one.
 
 ## Commands
 
@@ -32,7 +34,7 @@ One test — note the per-project working directory:
 
 ```bash
 cd core && ../.venv/bin/pytest tests/test_router.py -k test_name
-cd web  && ../.venv/bin/pytest tests/test_dialog_api.py
+cd deploy && ../.venv/bin/pytest tests/test_dialog_api.py
 ```
 
 Config is `.env` (see `.env.example`); every variable is prefixed `OF_`, and

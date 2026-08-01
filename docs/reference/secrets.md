@@ -99,6 +99,6 @@ anywhere but the host it was created for.
 - `core/src/octoforge_core/secrets/store.py` — the Fernet-encrypted SQL store
 - `core/src/octoforge_core/net/external.py` — resolution, header injection, scrubbing
 - `core/src/octoforge_core/net/tool_spec.py` — the `auth.secret` declaration
-- `web/src/octoforge_web/secret_links.py` — one-time tokens
-- `web/src/octoforge_web/api/secrets.py`, `web/src/octoforge_web/static/secrets.html` — the form and its API
-- `core/tests/test_secrets_store.py`, `web/tests/test_secrets_api.py`
+- `server/src/octoforge_server/secret_links.py` — one-time tokens
+- `server/src/octoforge_server/api/secrets.py`, `server/src/octoforge_server/static/secrets.html` — the form and its API
+- `core/tests/test_secrets_store.py`, `deploy/tests/test_secrets_api.py`

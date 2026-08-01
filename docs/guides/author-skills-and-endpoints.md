@@ -64,7 +64,7 @@ An endpoint record makes a system callable. Its content is a small JSON document
 Then write a skill that names the endpoint (as in the example above) so the agent knows when to use it.
 This is not optional bookkeeping: endpoint records **do not appear in default `recall` results** (only
 under `type=endpoint`), so an endpoint nobody's scenario mentions is effectively invisible. The
-usual pattern is one endpoint record plus one scenario per task it serves — `web/src/octoforge_web/system_skills.py`
+usual pattern is one endpoint record plus one scenario per task it serves — `server/src/octoforge_server/system_skills.py`
 ships exactly that shape as an example (a weather endpoint and the scenario that reads it).
 
 Users add their own secrets themselves: `/secrets` in Telegram returns a one-time link to a form. See
@@ -111,7 +111,7 @@ records — and a broken overlay is a logged warning, never a failed startup.
 ## Code anchors
 
 - `core/src/octoforge_core/instructions/registry.py` — the shipped scenarios, as writing examples
-- `web/src/octoforge_web/system_skills.py` — an endpoint record plus its scenario
+- `server/src/octoforge_server/system_skills.py` — an endpoint record plus its scenario
 - `core/src/octoforge_core/net/tool_spec.py` — the endpoint document format and its validation
-- `web/src/octoforge_web/skill_overlay.py` — the overlay format
+- `server/src/octoforge_server/skill_overlay.py` — the overlay format
 - [../reference/instructions.md](../reference/instructions.md) — ranking, ownership, the sync

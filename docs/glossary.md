@@ -32,7 +32,7 @@ branch copy; the stored narrative keeps clean text. See `agent/branch.py`.
 ### Capability report
 
 The block logged at startup listing every optional capability as on or off with the endpoint or model
-behind it. Produced by `web/capabilities.py`. Never contains secret values.
+behind it. Produced by `server/capabilities.py`. Never contains secret values.
 
 ### Channel
 

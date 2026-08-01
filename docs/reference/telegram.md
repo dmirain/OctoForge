@@ -106,7 +106,7 @@ performs (including a refused one) writes an audit line naming the admin's Teleg
 ### Running it
 
 Alongside the web app (same process, one composition root) or standalone:
-`python -m octoforge_web.telegram` — no HTTP port is opened at all, only outbound connections.
+`python -m octoforge_deploy.telegram_only` — no HTTP port is opened at all, only outbound connections.
 
 One process per bot token. A second poller against the same token steals updates from the first, which is
 why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_TOKEN` is set explicitly.
@@ -155,13 +155,13 @@ why the local quickstart stack keeps the bot off unless `OF_QUICKSTART_TELEGRAM_
 
 ## Code anchors
 
-- `web/src/octoforge_web/telegram/client.py` — the Bot API client and limits
-- `web/src/octoforge_web/telegram/poller.py` — long polling, per-user queues, commands, gating
-- `web/src/octoforge_web/telegram/bridge.py` — event rendering, drafts, throttling, reply threading
-- `web/src/octoforge_web/telegram/images.py` — image refs and resolution
-- `web/src/octoforge_web/telegram/invites/` — invite store, member directory
-- `web/src/octoforge_web/telegram/drafts.py` — where a live answer is being written
-- `web/src/octoforge_web/telegram/schema.py` — the surface's declarative base
-- `web/src/octoforge_web/telegram/admin.py` — the `admin_manage` tool
-- `web/src/octoforge_web/telegram/__main__.py` — the standalone entry point
-- `web/tests/test_telegram_*.py` — poller, bridge, markdown, rich, invites, images, standalone
+- `surfaces/telegram/src/octoforge_telegram/client.py` — the Bot API client and limits
+- `surfaces/telegram/src/octoforge_telegram/poller.py` — long polling, per-user queues, commands, gating
+- `surfaces/telegram/src/octoforge_telegram/bridge.py` — event rendering, drafts, throttling, reply threading
+- `surfaces/telegram/src/octoforge_telegram/images.py` — image refs and resolution
+- `surfaces/telegram/src/octoforge_telegram/invites/` — invite store, member directory
+- `surfaces/telegram/src/octoforge_telegram/drafts.py` — where a live answer is being written
+- `surfaces/telegram/src/octoforge_telegram/schema.py` — the surface's declarative base
+- `surfaces/telegram/src/octoforge_telegram/admin.py` — the `admin_manage` tool
+- `deploy/src/octoforge_deploy/telegram_only.py` — the standalone entry point
+- `deploy/tests/test_telegram_*.py` — poller, bridge, markdown, rich, invites, images, standalone

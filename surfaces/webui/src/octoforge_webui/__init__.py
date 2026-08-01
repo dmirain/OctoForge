@@ -1,0 +1,1 @@
+"""The browser chat surface."""

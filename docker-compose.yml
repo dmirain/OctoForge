@@ -113,7 +113,7 @@ services:
     profiles: ["standalone"]
     build: *app-build
     image: octoforge:local
-    command: ["python", "-m", "octoforge_web.telegram"]
+    command: ["python", "-m", "octoforge_deploy.telegram_only"]
     env_file:
       - .env
     environment: *app-databases

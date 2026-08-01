@@ -141,9 +141,9 @@ Security issues: see [../SECURITY.md](../SECURITY.md).
 
 ## Code anchors
 
-- `web/src/octoforge_web/auth.py` — hashing, verification, open paths, fail-closed behavior
+- `server/src/octoforge_server/auth.py` — hashing, verification, open paths, fail-closed behavior
 - `core/src/octoforge_core/net/guard.py` — the SSRF guard and its documented TOCTOU gap
 - `core/src/octoforge_core/net/external.py`, `net/tool_spec.py` — secret injection and scrubbing
 - `core/src/octoforge_core/secrets/` — the encrypted store
 - `core/src/octoforge_core/agent/branch.py` — how material is marked and other exchanges are hidden
-- `web/src/octoforge_web/telegram/invites/` — the access gate
+- `surfaces/telegram/src/octoforge_telegram/invites/` — the access gate

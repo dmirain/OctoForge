@@ -19,7 +19,9 @@ install:
 	# a stock 3.11 is old enough that `make audit` reports advisories against the
 	# bootstrap tooling rather than against anything this project depends on.
 	$(BIN)/pip install --upgrade pip setuptools
-	$(BIN)/pip install -e "core[dev,local-embeddings]" -e "web[dev]"
+	$(BIN)/pip install -e "core[dev,local-embeddings]" \
+		-e server -e surfaces/telegram -e surfaces/console -e surfaces/webui \
+		-e "deploy[dev]"
 
 # Bring an existing .venv up to what CI installs. `install` leaves any
 # already-satisfied dependency alone, so a linter picked up weeks ago keeps
@@ -27,30 +29,31 @@ install:
 # something bumps it.
 #
 # Two steps on purpose. `core[dev]` is upgraded eagerly — that is where the
-# check tooling lives — while `web[dev]` only gets the default
-# only-if-needed pass: it depends on octoforge-core[local-embeddings], so an
-# eager resolve there would re-resolve torch for a multi-gigabyte download
-# (and off the CPU-only index the Dockerfile uses). Version caps from the
-# pyprojects are honored either way, unlike a bare `pip install -U ruff`.
+# check tooling lives — while `deploy[dev]` only gets the default
+# only-if-needed pass: it depends (through the service) on
+# octoforge-core[local-embeddings], so an eager resolve there would re-resolve
+# torch for a multi-gigabyte download (and off the CPU-only index the
+# Dockerfile uses). Version caps from the pyprojects are honored either way,
+# unlike a bare `pip install -U ruff`.
 upgrade:
 	$(BIN)/pip install --upgrade --upgrade-strategy eager -e "core[dev]"
-	$(BIN)/pip install --upgrade -e "web[dev]"
+	$(BIN)/pip install --upgrade -e "deploy[dev]"
 
 lint:
-	$(BIN)/ruff check core/src core/tests web/src web/tests tools
-	$(BIN)/ruff format --check core/src core/tests web/src web/tests tools
+	$(BIN)/ruff check core/src core/tests server/src surfaces/*/src deploy/src deploy/tests tools
+	$(BIN)/ruff format --check core/src core/tests server/src surfaces/*/src deploy/src deploy/tests tools
 
 format:
-	$(BIN)/ruff check --fix core/src core/tests web/src web/tests tools
-	$(BIN)/ruff format core/src core/tests web/src web/tests tools
+	$(BIN)/ruff check --fix core/src core/tests server/src surfaces/*/src deploy/src deploy/tests tools
+	$(BIN)/ruff format core/src core/tests server/src surfaces/*/src deploy/src deploy/tests tools
 
 typecheck:
 	cd core && ../$(BIN)/mypy
-	cd web && ../$(BIN)/mypy
+	cd deploy && ../$(BIN)/mypy
 
 test:
 	cd core && ../$(BIN)/pytest
-	cd web && ../$(BIN)/pytest
+	cd deploy && ../$(BIN)/pytest
 
 # Mechanical documentation check: every repository path named in docs/ (and in
 # the root markdown files) exists, every internal link resolves. It cannot check
@@ -106,7 +109,7 @@ bench:
 	$(BIN)/python tools/bench_latency.py
 
 run:
-	$(BIN)/uvicorn octoforge_web.main:app --reload --reload-dir web/src
+	$(BIN)/uvicorn octoforge_deploy.main:app --reload --reload-dir deploy/src --reload-dir server/src --reload-dir surfaces
 
 run-telegram:
-	$(BIN)/python -m octoforge_web.telegram
+	$(BIN)/python -m octoforge_deploy.telegram_only

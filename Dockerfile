@@ -24,10 +24,10 @@ ARG CORE_EXTRAS=local-embeddings,postgres
 # Dependencies live in their own layer keyed ONLY on the two pyproject.toml
 # files: a source-code change must not re-download torch. The extraction reads
 # the manifests directly (no package build, so no sources are needed yet); the
-# local octoforge-core dependency of web is skipped -- it is installed from
+# local octoforge-* dependencies are skipped -- they are installed from
 # sources below.
 COPY core/pyproject.toml /tmp/deps/core.toml
-COPY web/pyproject.toml /tmp/deps/web.toml
+COPY server/pyproject.toml /tmp/deps/server.toml
 RUN <<SH
 set -e
 CORE_EXTRAS="${CORE_EXTRAS}" python - > /tmp/deps/requirements.txt <<'PY'
@@ -46,7 +46,9 @@ def load(path, extras=()):
 
 chosen = tuple(part for part in os.environ["CORE_EXTRAS"].split(",") if part)
 deps = load("/tmp/deps/core.toml", chosen)
-deps += [dep for dep in load("/tmp/deps/web.toml") if not dep.startswith("octoforge-core")]
+# only the service brings third-party dependencies; the surfaces and the
+# deployment depend on octoforge-* alone, which is installed from sources
+deps += [dep for dep in load("/tmp/deps/server.toml") if not dep.startswith("octoforge-")]
 print("\n".join(deps))
 PY
 pip install --no-cache-dir --extra-index-url ${TORCH_INDEX_URL} -r /tmp/deps/requirements.txt
@@ -55,8 +57,11 @@ SH
 # Sources come last: rebuilding after a code change only re-runs this cheap
 # --no-deps install on top of the cached dependency layer.
 COPY core/ ./core/
-COPY web/ ./web/
-RUN pip install --no-cache-dir --no-deps ./core ./web
+COPY server/ ./server/
+COPY surfaces/ ./surfaces/
+COPY deploy/ ./deploy/
+RUN pip install --no-cache-dir --no-deps \
+    ./core ./server ./surfaces/telegram ./surfaces/console ./surfaces/webui ./deploy
 
 # Nothing here needs root: the process binds 8000 (unprivileged), writes only to
 # the model cache, and never installs anything at runtime. uid 1000 matches the
@@ -74,5 +79,5 @@ EXPOSE 8000
 # the whole internet as one client (five bad passwords locking out everyone) and
 # the audit trail would record Caddy instead of the operator. The trust boundary
 # is the compose network, hence the private ranges rather than "*".
-CMD ["uvicorn", "octoforge_web.main:app", "--host", "0.0.0.0", "--port", "8000", \
+CMD ["uvicorn", "octoforge_deploy.main:app", "--host", "0.0.0.0", "--port", "8000", \
      "--proxy-headers", "--forwarded-allow-ips", "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"]
