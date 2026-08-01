@@ -34,6 +34,7 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyMessageRepository,
 )
 from octoforge_core.domain import ToolCall
+from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
@@ -59,6 +60,7 @@ from octoforge_telegram.client import (
     TelegramApiError,
 )
 from octoforge_telegram.drafts import SqlAlchemyDraftStore
+from octoforge_telegram.poller import TelegramBridgeRegistry
 from octoforge_telegram.schema import TelegramSurfaceBase
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -404,6 +406,49 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     assert client.sent == [(CHAT_ID, CRON_RESULT)]
     await wait_until(lambda: task.delivered_at is not None)
     await bridge.aclose()
+    await manager.stop_all()
+
+
+async def test_first_contact_through_the_poller_renders_the_answer_once(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The in-process arrangement, which no test drove end to end before.
+
+    The bridge resolves its runner; resolving it attaches this surface to the
+    dialog; attaching starts the bridge for that dialog — this same object,
+    re-entrantly, from inside its own `_ensure_runner()`. The nested call ran
+    the whole of `start()` because `_forwarder` was still None, and the outer
+    call then subscribed a second time. Two forwarders appended deltas to one
+    draft and the user read every answer twice, interleaved:
+    "hhelellolo" instead of "hello".
+
+    Only the in-process path reaches it. With ingestion in its own process a
+    bridge is born from the attach, after the runner build is memoized, so
+    the nested resolve never attaches again.
+    """
+    identities = SqlAlchemyIdentityStore(session_factory)
+    person = await identities.resolve_or_create(TELEGRAM_CHANNEL, str(CHAT_ID))
+    client = FakeTelegramClient()
+    manager = await make_manager(ChunkedLLM(["hel", "lo"]), session_factory)
+    registry = TelegramBridgeRegistry(
+        runner_provider=manager.get_or_create_runner,
+        client=client,
+        edit_throttle_seconds=NO_THROTTLE,
+        identities=identities,
+    )
+    manager.use_surface(registry)
+
+    # what the surface does at startup: warm the bridges of known dialogs.
+    # This is the entry that reaches it — `handle_text` resolves the runner
+    # BEFORE calling start(), so the nested start finishes first and the
+    # outer one finds a live forwarder.
+    await registry.warm([person])
+    bridge = await registry.gateway_for(TELEGRAM_USER_ID, CHAT_ID)
+    await bridge.handle_text("hi")
+    await wait_until(lambda: client.current_text() == "hello" if client.sent else False)
+
+    assert client.current_text() == "hello"
+    await registry.aclose()
     await manager.stop_all()
 
 

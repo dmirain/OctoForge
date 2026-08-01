@@ -110,6 +110,9 @@ class TelegramBridge:
         self._drafts_store = options.drafts
         self._runner: ConversationRunner | None = None
         self._forwarder: asyncio.Task[None] | None = None
+        # Raised for the whole of `start()`, not just around its awaits: see
+        # the note there. `_forwarder` alone cannot express "starting".
+        self._starting = False
         self._drafts: dict[str | None, _Draft] = {}
         # sent message id -> exchange id, for resolving a Telegram reply back
         # to its exchange without an LLM routing call; bounded (oldest
@@ -123,13 +126,33 @@ class TelegramBridge:
         Remembered drafts are restored first: this bridge may be picking up a
         dialog another process was mid-answer on, and the answer has to
         continue in the message the user is already looking at.
+
+        Re-entrant. Resolving the runner attaches this surface to it, and
+        attaching means starting the bridge for that dialog — which is this
+        method, called on this very object, from inside its own
+        `_ensure_runner()`. Guarding on `_forwarder` alone cannot see that:
+        it is still None until the last line, so the nested call ran the
+        whole body, and the outer one then subscribed a SECOND time. Both
+        forwarders appended deltas to one draft, and the user read every
+        answer twice, interleaved.
+
+        The flag is raised before the first await, so the nested call returns
+        at once and lets the outer finish the job. It also makes two
+        concurrent starts safe, which the old check was not.
         """
+        if self._starting:
+            return
         if self._forwarder is not None and not self._forwarder.done():
             return
-        await self._restore_drafts()
-        runner = await self._ensure_runner()
-        queue = runner.subscribe()  # subscribe before the run starts, events are not replayed
-        self._forwarder = asyncio.create_task(self._forward(runner, queue))
+        self._starting = True
+        try:
+            await self._restore_drafts()
+            runner = await self._ensure_runner()
+            # subscribe before the run starts: events are not replayed
+            queue = runner.subscribe()
+            self._forwarder = asyncio.create_task(self._forward(runner, queue))
+        finally:
+            self._starting = False
 
     async def handle_text(  # noqa: PLR0913, PLR0917 — transport-shaped boundary signature
         self,
