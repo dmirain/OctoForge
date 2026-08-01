@@ -138,6 +138,26 @@ Optional capabilities are decided here and nowhere else: an empty setting means 
 and the feature is absent, which the startup capability report states explicitly
 (`web/capabilities.py`).
 
+## Surfaces
+
+Everything a human or a chat talks to — the Telegram bot, the operator console, the browser chat
+page — is a *surface*: an optional interface plugged into the service through the `Surface` port
+(`web/src/octoforge_web/surfaces.py`).
+
+A surface declares what it adds: a renderer for its channel (`DialogSurface`), tools the agent
+gains, and background work to run. Routes and pages are not among them — those mount while the
+application is built, before any surface object exists, so each surface module exposes them as
+constants the composition root mounts directly.
+
+The direction of the arrow is the whole point. **The service never imports a surface.** Only the
+composition root knows which ones exist, and `_installed_surfaces()` is the single place that
+answers it — removing an interface is a matter of not constructing it, not of editing branches
+elsewhere. A surface that fails to start or stop is reported and skipped: a broken bot must not cost
+the console and the API.
+
+A surface's own pages belong to it, not to the console: the Telegram who-is-who route ships with
+Telegram, because Telegram is what can answer it.
+
 ## Storage
 
 One relational database, two dialects. Postgres is the deployment target

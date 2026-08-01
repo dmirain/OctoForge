@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 from octoforge_core.config import EmbeddingBackend
 
+from octoforge_web.channels import WEB_CHANNEL
 from octoforge_web.config import Settings
-from octoforge_web.main import WEB_CHANNEL, _report_telegram_task_failure, runtime
+from octoforge_web.main import runtime
 from octoforge_web.telegram.__main__ import NO_TOKEN_MESSAGE, run_standalone
+from octoforge_web.telegram.surface import _report_failure
 
 
 def settings_for(tmp_path: Path, token: str = "") -> Settings:
@@ -39,7 +41,7 @@ async def test_runtime_builds_without_fastapi(tmp_path: Path) -> None:
 # --- the telegram task's done-callback (supervisor-lite) --------------------
 
 
-async def test_report_telegram_task_failure_logs_an_error(
+async def test_a_dying_surface_is_reported_loudly(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An exception escaping the Telegram surface task is logged loudly, not dropped."""
@@ -52,12 +54,12 @@ async def test_report_telegram_task_failure_logs_an_error(
         await task  # let it finish (and record its exception) before inspecting it
 
     with caplog.at_level(logging.ERROR):
-        _report_telegram_task_failure(task)
+        _report_failure(task)
 
-    assert any("Telegram surface task terminated" in record.message for record in caplog.records)
+    assert any("telegram surface stopped" in record.message for record in caplog.records)
 
 
-async def test_report_telegram_task_failure_ignores_cancellation() -> None:
+async def test_a_cancelled_surface_is_not_a_failure() -> None:
     """Normal shutdown (task.cancel() from `_stop_background_tasks`) is not a failure."""
 
     async def spin_forever() -> None:
@@ -68,4 +70,4 @@ async def test_report_telegram_task_failure_ignores_cancellation() -> None:
     with suppress(asyncio.CancelledError):
         await task
 
-    _report_telegram_task_failure(task)  # must not raise (task.exception() would, on cancel)
+    _report_failure(task)  # must not raise (task.exception() would, on cancel)

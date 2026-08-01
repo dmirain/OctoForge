@@ -5,15 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 from octoforge_core import (
     ClaimRepository,
     ConversationManager,
@@ -65,6 +64,7 @@ from octoforge_core.db.search_extensions import (
     installed_search_extensions,
 )
 from octoforge_core.db.sqlite_fts import has_sqlite_fts
+from octoforge_core.dialogs.api import MessageRepository
 from octoforge_core.dialogs.store import (
     SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
@@ -94,13 +94,15 @@ from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.speech.api import TranscriptionClient
 from octoforge_core.speech.client import OpenAITranscriptionClient
 from octoforge_core.tasks.store import TaskStore
+from octoforge_core.tools.base import Tool
+from octoforge_core.tools.registry import ToolRegistry
 from octoforge_core.vision.api import ImageResolver, VisionClient
 from octoforge_core.vision.client import OpenAIVisionClient
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from octoforge_web.api.admin import router as admin_router
+from octoforge_web import console, webui
 from octoforge_web.api.cron import router as cron_router
 from octoforge_web.api.dialog import router as dialog_router
 from octoforge_web.api.secrets import router as secrets_router
@@ -114,13 +116,16 @@ from octoforge_web.auth import (
 from octoforge_web.capabilities import log_capabilities
 from octoforge_web.channels import WEB_CHANNEL
 from octoforge_web.config import Settings
+from octoforge_web.console import ConsoleSurface
 from octoforge_web.prompts import FilePromptProvider
 from octoforge_web.secret_links import SecretLinkService
 from octoforge_web.skill_overlay import apply_overlay, load_overlay
+from octoforge_web.surfaces import StaticFile, Surface
 from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
+from octoforge_web.telegram import surface as telegram_surface
 from octoforge_web.telegram.admin import AdminAccess, AdminManageTool, AdminStores
 from octoforge_web.telegram.bridge import RunnerProvider
-from octoforge_web.telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
+from octoforge_web.telegram.client import TelegramBotClient
 from octoforge_web.telegram.drafts import SqlAlchemyDraftStore
 from octoforge_web.telegram.images import TelegramImageResolver
 from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
@@ -132,6 +137,8 @@ from octoforge_web.telegram.poller import (
     TelegramPollerOptions,
 )
 from octoforge_web.telegram.schema import TelegramSurfaceBase
+from octoforge_web.telegram.surface import TelegramSurface
+from octoforge_web.webui import WebUiSurface
 
 STATIC_DIR = Path(__file__).parent / "static"
 APP_TITLE = "OctoForge"
@@ -266,26 +273,17 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 ),
                 limits=_tool_limits(settings),
             )
-            if telegram_stores is not None and settings.telegram_admin_ids:
-                registry.register(
-                    AdminManageTool(
-                        AdminStores(
-                            invites=telegram_stores.invites,
-                            cron_store=cron_store,
-                            dialogs=dialogs,
-                            messages=manager_stores.messages,
-                            instructions=instructions,
-                            directory=telegram_stores.directory,
-                        ),
-                        AdminAccess(
-                            admin_ids=frozenset(settings.telegram_admin_ids),
-                            telegram=TelegramBotClient(
-                                http_client=outbound_http, token=settings.telegram_bot_token
-                            ),
-                            bot_username=settings.resolved_telegram_bot_username(),
-                        ),
-                    )
-                )
+            admin_tool = _build_telegram_admin_tool(
+                settings,
+                telegram_stores,
+                outbound_http,
+                _AdminToolServices(
+                    cron_store=cron_store,
+                    dialogs=dialogs,
+                    messages=manager_stores.messages,
+                    instructions=instructions,
+                ),
+            )
             prompt_provider: PromptProvider = FilePromptProvider(
                 files=settings.to_prompt_files(),
                 fallback=StaticPromptProvider(),
@@ -336,23 +334,26 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             manager.start()
             scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
             sweeper_task = _start_collecting_sweeper(exchanges, dialogs, manager, settings)
-            telegram = _start_telegram(
-                settings,
-                manager.get_or_create_runner,
-                dialogs,
-                outbound_http,
-                _TelegramExtras(
-                    stores=telegram_stores,
-                    secrets_link=(
-                        _secrets_link_builder(settings, secret_links)
-                        if secret_store is not None
-                        else None
+            surfaces = _installed_surfaces(
+                _build_telegram_surface(
+                    settings,
+                    manager.get_or_create_runner,
+                    dialogs,
+                    outbound_http,
+                    _TelegramExtras(
+                        stores=telegram_stores,
+                        secrets_link=(
+                            _secrets_link_builder(settings, secret_links)
+                            if secret_store is not None
+                            else None
+                        ),
+                        vision=vision_client,
+                        speech=speech_client,
+                        admin_tool=admin_tool,
                     ),
-                    vision=vision_client,
-                    speech=speech_client,
-                ),
+                )
             )
-            _bind_surface(manager, telegram)
+            await _install(surfaces, manager, registry)
             try:
                 yield Runtime(
                     settings=settings,
@@ -377,7 +378,9 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     ),
                 )
             finally:
-                await _stop_background_tasks(scheduler_task, sweeper_task, telegram)
+                await _stop_background_tasks(scheduler_task, sweeper_task)
+                for surface in surfaces:
+                    await _close_surface(surface)
                 await manager.stop_all()
     finally:
         await engine.dispose()
@@ -486,12 +489,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"status": NOT_READY_STATUS, "database": "down"}
         return {"status": READY_STATUS, "database": "ok"}
 
+    # the service's own endpoints
     app.include_router(dialog_router)
     app.include_router(cron_router)
-    app.include_router(admin_router)
     app.include_router(secrets_router)
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    _mount_surface_routes(app)
     return app
+
+
+def _mount_surface_routes(app: FastAPI) -> None:
+    """Mount what each installed surface serves.
+
+    Routes are mounted while the app is built, before any surface object
+    exists (they need the database and the model client), so they come from
+    module constants — see the `Surface` port. The secrets page belongs to
+    the service: it is how a secret gets filled in, not an interface anyone
+    chooses to install.
+    """
+    for routers, files in (
+        (console.ROUTERS, console.STATIC_FILES),
+        (webui.ROUTERS, webui.STATIC_FILES),
+        (telegram_surface.ROUTERS, telegram_surface.STATIC_FILES),
+    ):
+        for router in routers:
+            app.include_router(router)
+        for item in files:
+            _serve_file(app, item)
+    _serve_file(app, StaticFile(path="/secrets.html", file=STATIC_DIR / "secrets.html"))
+
+
+def _serve_file(app: FastAPI, item: StaticFile) -> None:
+    """Serve one file at one URL.
+
+    Per file rather than one mounted directory: several surfaces serve from
+    the same root, and two directories cannot both be mounted at `/`.
+    """
+
+    async def handler() -> FileResponse:
+        return FileResponse(item.file)
+
+    app.get(item.path, include_in_schema=False)(handler)
 
 
 async def _sweep_retention(
@@ -835,10 +872,52 @@ class _TelegramExtras:
 
     stores: _TelegramStores | None = None
     secrets_link: Callable[[str], str] | None = None
+    # the agent-facing admin command; None when this deployment has no admins
+    admin_tool: Tool | None = None
     # None: vision is off, Telegram keeps today's placeholder/text-only path
     vision: VisionClient | None = None
     # None: speech-to-text is off, a recording keeps the "text only" notice
     speech: TranscriptionClient | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AdminToolServices:
+    """Core services the Telegram admin command reads and edits through."""
+
+    cron_store: CronStore
+    dialogs: DialogRepository
+    messages: MessageRepository
+    instructions: InstructionService
+
+
+def _build_telegram_admin_tool(
+    settings: Settings,
+    stores: _TelegramStores | None,
+    http_client: httpx.AsyncClient,
+    services: _AdminToolServices,
+) -> Tool | None:
+    """Build `admin_manage`, or None when this deployment has no admins.
+
+    Core services go in from the outside: the surface reaches into them, they
+    never reach into it.
+    """
+    if stores is None or not settings.telegram_admin_ids:
+        return None
+    return AdminManageTool(
+        AdminStores(
+            invites=stores.invites,
+            cron_store=services.cron_store,
+            dialogs=services.dialogs,
+            messages=services.messages,
+            instructions=services.instructions,
+            directory=stores.directory,
+        ),
+        AdminAccess(
+            admin_ids=frozenset(settings.telegram_admin_ids),
+            telegram=TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token),
+            bot_username=settings.resolved_telegram_bot_username(),
+        ),
+    )
 
 
 def _secrets_link_builder(
@@ -859,28 +938,17 @@ def _secrets_link_builder(
     return build
 
 
-def _bind_surface(
-    manager: ConversationManager,
-    telegram: tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None,
-) -> None:
-    """Let the Telegram surface render every dialog of its channel.
-
-    Tied to the actor rather than to a request: a scheduled run finishing at
-    four in the morning still has to reach the chat, and a dialog that has
-    just moved to this process has nobody else left to deliver it.
-    """
-    if telegram is not None:
-        manager.use_surface(telegram[0])
-
-
-def _start_telegram(
+def _build_telegram_surface(
     settings: Settings,
     runner_provider: RunnerProvider,
     dialogs: DialogRepository,
     http_client: httpx.AsyncClient,
     extras: _TelegramExtras | None = None,
-) -> tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None:
-    """Start the Telegram long-poll adapter when a bot token is configured.
+) -> TelegramSurface | None:
+    """Assemble the Telegram surface when a bot token is configured; None otherwise.
+
+    None is what "not installed" looks like from here: nothing downstream
+    special-cases Telegram, it simply is not among the surfaces.
 
     The membership gate activates only with admin ids configured: without
     admins there is nobody to issue invites, and gating would lock every
@@ -912,56 +980,65 @@ def _start_telegram(
             voice_max_seconds=settings.voice_max_seconds,
         ),
     )
-    task = asyncio.create_task(_run_telegram(poller, registry, dialogs))
-    task.add_done_callback(_report_telegram_task_failure)
-    return registry, task
-
-
-async def _run_telegram(
-    poller: TelegramPoller,
-    registry: TelegramBridgeRegistry,
-    dialogs: DialogRepository,
-) -> None:
-    """Warm bridges for known Telegram dialogs, then poll for updates."""
-    user_ids = await dialogs.list_user_ids_by_channel(TELEGRAM_CHANNEL)
-    await registry.warm(user_ids)
-    await poller.run_forever()
-
-
-def _report_telegram_task_failure(task: asyncio.Task[None]) -> None:
-    """Supervisor-lite: loudly report the Telegram surface task dying.
-
-    `TelegramPoller.run_forever` already retries after any exception it can
-    see, so reaching here at all means something failed before that loop's
-    own catch-all could take over (warming bridges, listing dialogs) or an
-    exception type it cannot catch escaped. Either way the Telegram surface
-    is now dark for every user until a process restart, which is worth an
-    error-level log, not a silently dropped task result. Cancellation
-    (normal shutdown via `_stop_background_tasks`) is not a failure.
-    """
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.error("Telegram surface task terminated unexpectedly", exc_info=exc)
+    return TelegramSurface(
+        registry=registry,
+        poller=poller,
+        dialogs=dialogs,
+        admin_tool=resolved.admin_tool,
+    )
 
 
 async def _stop_background_tasks(
     scheduler_task: asyncio.Task[None],
     sweeper_task: asyncio.Task[None],
-    telegram: tuple[TelegramBridgeRegistry, asyncio.Task[None]] | None,
 ) -> None:
-    """Stop the background loops and the Telegram adapter, if it was started."""
+    """Stop the service's own background loops. Surfaces close themselves."""
     for task in (scheduler_task, sweeper_task):
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+
+
+def _installed_surfaces(telegram: TelegramSurface | None) -> tuple[Surface, ...]:
+    """Which interfaces this deployment runs.
+
+    The one place that knows the answer. Everything below is written against
+    the `Surface` port, so removing one from this tuple is the whole of
+    removing it — no branch elsewhere asks whether Telegram is there.
+    """
+    surfaces: list[Surface] = [ConsoleSurface(), WebUiSurface()]
     if telegram is not None:
-        registry, poller_task = telegram
-        poller_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await poller_task
-        await registry.aclose()
+        surfaces.append(telegram)
+    return tuple(surfaces)
+
+
+async def _install(
+    surfaces: Sequence[Surface], manager: ConversationManager, registry: ToolRegistry
+) -> None:
+    """Give the manager each surface's renderer and start their background work.
+
+    A surface that fails to start is reported and skipped rather than taking
+    the application down with it: a broken bot must not cost the console and
+    the API.
+    """
+    for surface in surfaces:
+        renderer = surface.dialog_surface()
+        if renderer is not None:
+            manager.use_surface(renderer)
+        for tool in surface.tools():
+            registry.register(tool)
+        try:
+            await surface.start()
+        except Exception:
+            logger.exception("surface failed to start: %s", surface.name)
+
+
+async def _close_surface(surface: Surface) -> None:
+    """Stop one surface; a failure must not block the rest of the shutdown."""
+    try:
+        await surface.aclose()
+    except Exception:
+        logger.exception("surface failed to close: %s", surface.name)
 
 
 app = create_app()
