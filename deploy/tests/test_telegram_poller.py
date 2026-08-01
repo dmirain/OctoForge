@@ -34,6 +34,7 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
 )
+from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
@@ -665,19 +666,27 @@ async def test_warm_starts_bridges_for_known_telegram_dialogs(
         return await manager.get_or_create_runner(user_id, channel)
 
     client = FakeTelegramClient()
+    identities = SqlAlchemyIdentityStore(session_factory)
+    known = await identities.resolve_or_create(CHANNEL, "424242")
+    stranger = await identities.create_user()
     registry = TelegramBridgeRegistry(
-        runner_provider=provider, client=client, edit_throttle_seconds=NO_THROTTLE
+        runner_provider=provider,
+        client=client,
+        edit_throttle_seconds=NO_THROTTLE,
+        identities=identities,
     )
 
-    await registry.warm([USER_ID, "alice", f"{USER_ID_PREFIX}not-a-number"])
+    # a person with no Telegram account of record has nowhere to be written to
+    await registry.warm([known, stranger.id])
 
-    assert requested == [(USER_ID, CHANNEL)]
+    assert requested == [(known, CHANNEL)]
     await manager.stop_all()
     await registry.aclose()
 
 
 # --- membership gate ---------------------------------------------------------
 
+RESEAT_ACCOUNT = 424242
 ADMIN_TELEGRAM_ID = 999
 INVITE_NOTE = "test invite"
 
@@ -1578,3 +1587,55 @@ async def test_transcription_failure_falls_back_without_propagating() -> None:
     await deliver(poller, make_voice_update(1))
 
     assert client.sent == [(TELEGRAM_USER_ID, TEXT_ONLY_NOTICE, None)]
+
+
+async def test_a_person_who_changed_telegram_keeps_their_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """What the whole identity change is for. The dialog belongs to the
+    person, so moving accounts must not strand it — and the bot must start
+    writing to the new chat without anything else being touched."""
+    manager = await make_manager([], session_factory)
+    identities = SqlAlchemyIdentityStore(session_factory)
+    registry = TelegramBridgeRegistry(
+        runner_provider=manager.get_or_create_runner,
+        client=FakeTelegramClient(),
+        edit_throttle_seconds=NO_THROTTLE,
+        identities=identities,
+    )
+    try:
+        person = await identities.resolve_or_create(CHANNEL, "111")
+        before = await registry.bridge_for(f"{USER_ID_PREFIX}111", 111)
+
+        await identities.reseat(CHANNEL, person, "222")
+        after = await registry.bridge_for(f"{USER_ID_PREFIX}222", 222)
+
+        # same person, so the same dialog and the same bridge
+        assert await identities.resolve(CHANNEL, "222") == person
+        assert after is before
+    finally:
+        await registry.aclose()
+        await manager.stop_all()
+
+
+async def test_the_delivery_address_comes_from_the_identity(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """It used to be parsed back out of who somebody was. A person's id
+    carries no structure now, so it has to be looked up — which is the point."""
+    manager = await make_manager([], session_factory)
+    identities = SqlAlchemyIdentityStore(session_factory)
+    registry = TelegramBridgeRegistry(
+        runner_provider=manager.get_or_create_runner,
+        client=FakeTelegramClient(),
+        edit_throttle_seconds=NO_THROTTLE,
+        identities=identities,
+    )
+    try:
+        person = await identities.resolve_or_create(CHANNEL, str(RESEAT_ACCOUNT))
+
+        assert chat_id_from_user_id(person) is None  # nothing to parse, by design
+        assert await registry._chat_of(person) == RESEAT_ACCOUNT
+    finally:
+        await registry.aclose()
+        await manager.stop_all()

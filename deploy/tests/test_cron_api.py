@@ -80,7 +80,8 @@ def test_create_job_returns_the_created_job(client: TestClient) -> None:
     assert response.status_code == HTTPStatus.CREATED
     body = response.json()
     assert body["id"]
-    assert body["user_id"] == USER_A
+    # the person behind the header, not the header itself
+    assert body["user_id"] != USER_A
     assert body["channel"] == WEB_CHANNEL
     assert body["title"] == "morning report"
     assert body["schedule"] == DAILY_9AM

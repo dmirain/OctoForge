@@ -70,6 +70,8 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyMessageRepository,
 )
 from octoforge_core.errors import LLMResponseError
+from octoforge_core.identity.api import IdentityStore
+from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.registry import (
     CORE_SYSTEM_SKILLS,
@@ -203,7 +205,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     await _sweep_retention(settings, session_factory)
     manager_stores = _build_manager_stores(session_factory)
     dialogs, exchanges = manager_stores.dialogs, manager_stores.exchanges
-    claims, task_store = manager_stores.claims, manager_stores.tasks
+    claims, task_store, identity = (
+        manager_stores.claims,
+        manager_stores.tasks,
+        SqlAlchemyIdentityStore(session_factory),
+    )
     cron_store = SqlAlchemyCronStore(session_factory)
     secret_store = _build_secret_store(settings, session_factory)
     secret_links = SecretLinkService()
@@ -340,6 +346,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         vision=vision_client,
                         speech=speech_client,
                         admin_tool=admin_tool,
+                        identities=identity,
                     ),
                 )
             )
@@ -360,6 +367,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     summary_store=summary_store,
                     exchanges=exchanges,
                     claims=claims,
+                    identity_store=identity,
                     channels=_served_channels(surfaces),
                     surface_state=_surface_state(telegram_stores),
                 )
@@ -783,6 +791,8 @@ class _TelegramExtras:
     secrets_link: Callable[[str], str] | None = None
     # the agent-facing admin command; None when this deployment has no admins
     admin_tool: Tool | None = None
+    # turns a Telegram account into the person it belongs to
+    identities: IdentityStore | None = None
     # None: vision is off, Telegram keeps today's placeholder/text-only path
     vision: VisionClient | None = None
     # None: speech-to-text is off, a recording keeps the "text only" notice
@@ -872,6 +882,7 @@ def _build_telegram_surface(
         client=client,
         edit_throttle_seconds=settings.telegram_edit_throttle_seconds,
         drafts=resolved.stores.drafts if resolved.stores is not None else None,
+        identities=resolved.identities,
     )
     membership = None
     if resolved.stores is not None and settings.telegram_admin_ids:

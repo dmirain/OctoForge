@@ -3,12 +3,13 @@
 from http import HTTPStatus
 from typing import Annotated, cast
 
-from fastapi import Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Request
 from octoforge_core import ConversationManager
 from octoforge_core.admin.api import AdminReadModel
 from octoforge_core.context.api import SummaryStore
 from octoforge_core.cron.api import CronStore
 from octoforge_core.dialogs.api import ClaimRepository, DialogRepository, ExchangeRepository
+from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
@@ -137,8 +138,33 @@ def get_operator(request: Request) -> str:
     return f"{username}@{client}"
 
 
-def get_user_id(x_user_id: Annotated[str | None, Header()] = None) -> str:
-    """Require the trusted user id header (pre-authentication stand-in)."""
+def get_external_id(x_user_id: Annotated[str | None, Header()] = None) -> str:
+    """What the calling surface calls this user.
+
+    Not a person: surfaces number their users independently, so `42` on one is
+    not `42` on another. Turning it into a person is `get_user_id`'s job.
+    """
     if x_user_id is None or not x_user_id.strip():
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=MISSING_USER_ID_MESSAGE)
     return x_user_id.strip()
+
+
+def get_identity_store(request: Request) -> IdentityStore:
+    """Return the identity store built at application startup."""
+    return cast(IdentityStore, request.app.state.identity_store)
+
+
+async def get_user_id(
+    request: Request,
+    external_id: Annotated[str, Depends(get_external_id)],
+    channel: Annotated[str, Depends(get_channel)],
+) -> str:
+    """The person behind (surface, external id), minted on first contact.
+
+    Resolution lives here rather than in each surface: a surface knows what it
+    calls someone and nothing more, and the actor below wants a person. Who
+    may talk at all was already decided — by the invite gate, or by the
+    credential in front of this service — so an unknown account arriving here
+    is somebody new.
+    """
+    return await get_identity_store(request).resolve_or_create(channel, external_id)

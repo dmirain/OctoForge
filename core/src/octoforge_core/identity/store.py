@@ -37,6 +37,26 @@ class SqlAlchemyIdentityStore:
             )
             return user_id
 
+    async def resolve_or_create(self, surface: str, external_id: str) -> str:
+        """The user this account belongs to, minting one on first contact.
+
+        Two first messages arriving together must not mint two people: the
+        loser of the unique constraint re-reads instead of raising, so both
+        end up on the same person.
+        """
+        found = await self.resolve(surface, external_id)
+        if found is not None:
+            return found
+        user = await self.create_user()
+        try:
+            await self.link(user.id, surface, external_id)
+        except IdentityTakenError:
+            owner = await self.resolve(surface, external_id)
+            if owner is None:  # taken by a revoked identity: nobody may enter
+                raise
+            return owner
+        return user.id
+
     async def create_user(self, email: str = "") -> User:
         """Mint a person with an id of their own."""
         row = UserRow(id=uuid.uuid4().hex, email=email or None)

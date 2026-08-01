@@ -18,7 +18,11 @@ therefore contain no wiring: they take ports and call them.
 | `POST /api/dialog/cancel` | Stop the dialog's live answer runs |
 | `GET /api/dialog/events` | Subscribe to the dialog's event stream over SSE |
 
-The dialog is selected by the `X-User-Id` header and the `X-Channel` one. `X-Channel` defaults to the
+The dialog is selected by the `X-User-Id` header and the `X-Channel` one. Together they name an
+account on a surface, not a person: surfaces number their users independently, so `42` on one is not
+`42` on another. The service turns the pair into a person, minting one on first contact — who may
+talk at all was decided before the request arrived, by an invite gate or by the credential in front
+of the service. `X-Channel` defaults to the
 channel the process declares (`web` for the HTTP app), which is why existing clients need not know it
 exists; a value outside the surfaces this deployment serves is refused with 400 rather than quietly
 given a dialog of its own. A per-request channel is what lets one process serve several surfaces

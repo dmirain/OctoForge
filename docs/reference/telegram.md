@@ -52,6 +52,22 @@ split answer was no longer eligible for the upgrade, so its table arrived as raw
 Plain notices — greetings, refusals, invite texts — still go out as ordinary text messages; they carry
 no formatting to preserve.
 
+### A person, not an account
+
+A dialog belongs to a person, and this surface records which Telegram account is theirs. Two
+consequences the surface has to live with:
+
+- **Where to write is looked up, not derived.** A person's id carries no structure, so the chat id
+  comes from their identity. `chat_id_from_user_id()` still exists, and is only for this surface's
+  own records — the invite store and the member directory file people under `tg:<id>`, which is a
+  Telegram id and always was.
+- **Changing accounts keeps everything.** Re-seating moves the identity; the dialog, its history and
+  the person's skills and secrets are filed under the person and do not move at all.
+
+An account arriving unknown becomes a new person. Attaching it to an *existing* one is what an
+invite carrying a user id does — if first contact could do it, a mistake would hand a stranger
+somebody's dialogs.
+
 ### The bridge follows the actor
 
 A chat bridge is attached when its dialog's actor is built and dropped when the dialog leaves this

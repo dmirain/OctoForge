@@ -7,6 +7,7 @@ messages, a lost one strands everything they own — so each is asserted rather
 than described.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
@@ -188,3 +189,43 @@ async def test_an_unknown_person_is_an_error_not_an_empty_user(
 ) -> None:
     with pytest.raises(UserNotFoundError):
         await store.get_user("nobody")
+
+
+async def test_first_contact_gives_the_newcomer_a_person(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    """Whether they may talk at all was decided before this — by the invite
+    gate or the credential in front of the service."""
+    user_id = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+
+    assert user_id
+    assert await store.resolve(TELEGRAM, ACCOUNT) == user_id
+
+
+async def test_coming_back_is_the_same_person(store: SqlAlchemyIdentityStore) -> None:
+    first = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+
+    assert await store.resolve_or_create(TELEGRAM, ACCOUNT) == first
+
+
+async def test_two_first_messages_at_once_make_one_person(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    """Otherwise a newcomer who sends twice quickly ends up as two people,
+    each holding half of what they say."""
+    ids = await asyncio.gather(*(store.resolve_or_create(TELEGRAM, ACCOUNT) for _ in range(4)))
+
+    assert len(set(ids)) == 1
+
+
+async def test_first_contact_never_attaches_itself_to_somebody(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    """Linking to an existing person is what an invite does. If arriving could
+    do it, a mistake would hand a stranger their dialogs."""
+    existing = await store.create_user()
+    await store.link(existing.id, WEB, "dmirain")
+
+    newcomer = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+
+    assert newcomer != existing.id

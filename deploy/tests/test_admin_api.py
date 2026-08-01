@@ -206,7 +206,9 @@ def test_dialog_and_its_messages_are_visible(client: TestClient) -> None:
     messages = client.get(f"/api/admin/dialogs/{dialog_id}/messages").json()
 
     assert dialogs["total"] == 1
-    assert dialogs["items"][0]["user_id"] == "alice"
+    # a person, not the handle the surface used: `alice` is what the caller
+    # calls them, and the console shows who they are
+    assert dialogs["items"][0]["user_id"] != "alice"
     assert [item["content"] for item in messages["items"]] == ["hi"]
 
 
@@ -237,6 +239,8 @@ def test_exchanges_carry_dialog_identity_and_filter_by_status(client: TestClient
     awaiting = client.get("/api/admin/exchanges?status=awaiting_user").json()
 
     assert everything["total"] == 1
+    # this dialog was built through the repository, so its user id is whatever
+    # the test wrote — the resolution below the API is not in play here
     assert everything["items"][0]["user_id"] == "alice"
     assert everything["items"][0]["channel"] == "web"
     assert for_alice["total"] == 1

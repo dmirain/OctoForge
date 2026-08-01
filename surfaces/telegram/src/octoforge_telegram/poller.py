@@ -11,6 +11,7 @@ from enum import StrEnum
 import httpx
 from octoforge_core.agent.runner import ConversationRunner
 from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
+from octoforge_core.identity.api import IdentityStore
 from octoforge_core.speech.api import AudioData, TranscriptionClient
 from octoforge_core.vision.api import ImageData, VisionClient
 
@@ -197,9 +198,13 @@ class TelegramBridgeRegistry:
         client: TelegramClient,
         edit_throttle_seconds: float,
         drafts: DraftStore | None = None,
+        identities: IdentityStore | None = None,
     ) -> None:
         self._runner_provider = runner_provider
         self._client = client
+        # a dialog names a PERSON; which chat to write to is what this
+        # surface knows about them, and it lives in their identity
+        self._identities = identities
         self._options = TelegramBridgeOptions(
             edit_throttle_seconds=edit_throttle_seconds, drafts=drafts
         )
@@ -214,6 +219,36 @@ class TelegramBridgeRegistry:
         and startup warms one for every known Telegram dialog.
         """
         return self._bridges.get(user_id)
+
+    async def person_of(self, external_id: str) -> str:
+        """The person behind a Telegram account, minted on first contact.
+
+        The gate decided whether they may talk at all; this decides who they
+        are. Without an identity store the account id doubles as the person,
+        which is what a deployment that never migrated looks like.
+        """
+        if self._identities is None:
+            return f"{USER_ID_PREFIX}{external_id}"
+        return await self._identities.resolve_or_create(TELEGRAM_CHANNEL, external_id)
+
+    async def bridge_for(self, handle: str, chat_id: int) -> TelegramBridge:
+        """The bridge for the PERSON behind a Telegram handle.
+
+        Bridges are keyed by person, not by account: a dialog belongs to
+        somebody, and that is what survives them changing accounts.
+        """
+        return self.get_or_create(
+            await self.person_of(handle.removeprefix(USER_ID_PREFIX)), chat_id
+        )
+
+    async def existing_for(self, handle: str) -> TelegramBridge | None:
+        """The person's bridge if one was already built, without creating one."""
+        if self._identities is None:
+            return self.existing(handle)
+        person = await self._identities.resolve(
+            TELEGRAM_CHANNEL, handle.removeprefix(USER_ID_PREFIX)
+        )
+        return None if person is None else self.existing(person)
 
     def get_or_create(self, user_id: str, chat_id: int) -> TelegramBridge:
         """Return the bridge for the user, creating it on first contact."""
@@ -232,7 +267,7 @@ class TelegramBridgeRegistry:
     async def warm(self, user_ids: Iterable[str]) -> None:
         """Start bridges for known Telegram dialogs so their notifications are delivered."""
         for user_id in user_ids:
-            chat_id = chat_id_from_user_id(user_id)
+            chat_id = await self._chat_of(user_id)
             if chat_id is None:
                 continue
             await self.get_or_create(user_id, chat_id).start()
@@ -247,11 +282,25 @@ class TelegramBridgeRegistry:
         """
         if runner.channel != TELEGRAM_CHANNEL:
             return
-        chat_id = chat_id_from_user_id(runner.user_id)
+        chat_id = await self._chat_of(runner.user_id)
         if chat_id is None:
-            logger.warning("no chat id in telegram user id %r", runner.user_id)
+            logger.warning("no telegram account on record for user %r", runner.user_id)
             return
         await self.get_or_create(runner.user_id, chat_id).start()
+
+    async def _chat_of(self, user_id: str) -> int | None:
+        """Where to write to this person, from their Telegram identity.
+
+        Read rather than derived: the id of a person carries no structure, and
+        that is what makes the old trick — parsing the chat back out of who
+        they are — impossible rather than merely discouraged.
+        """
+        if self._identities is None:
+            return None
+        for identity in await self._identities.identities_of(user_id):
+            if identity.surface == TELEGRAM_CHANNEL and identity.active:
+                return _as_chat_id(identity.external_id)
+        return None
 
     async def detach(self, runner: ConversationRunner) -> None:
         """Stop rendering a dialog that is leaving this process (`DialogSurface`)."""
@@ -426,7 +475,7 @@ class TelegramPoller:
         Queued messages are dropped with it; otherwise a transcript would
         surface seconds after the user said stop and start a fresh run.
         """
-        bridge = self._registry.existing(user_id)
+        bridge = await self._registry.existing_for(user_id)
         if bridge is None:
             return
         inbox = self._inboxes.get(user_id)
@@ -605,7 +654,7 @@ class TelegramPoller:
         kind: MessageKind,
     ) -> None:
         """Describe one picture and submit it; failures propagate to the caller's fallback."""
-        bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
+        bridge = await self._registry.bridge_for(user_id, chat_id)
         async with self._showing_activity(chat_id, kind):
             await self._submit_images(message, (image,), bridge, kind=kind)
 
@@ -699,7 +748,7 @@ class TelegramPoller:
             return
         forwarded = message.forward_origin is not None
         origin = message.forward_origin.display_name if message.forward_origin is not None else ""
-        bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
+        bridge = await self._registry.bridge_for(user_id, chat_id)
         await bridge.handle_text(
             _compose_voice_message(
                 transcript, caption=message.body or "", origin=origin, forwarded=forwarded
@@ -806,7 +855,7 @@ class TelegramPoller:
             return
         forwarded = anchor.forward_origin is not None
         kind = MessageKind.MATERIAL if forwarded or not caption else MessageKind.OWN
-        bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
+        bridge = await self._registry.bridge_for(user_id, chat_id)
         try:
             async with self._showing_activity(chat_id, kind):
                 await self._submit_images(anchor, images, bridge, kind=kind, caption=caption)
@@ -840,7 +889,7 @@ class TelegramPoller:
             if origin
             else MATERIAL_ATTRIBUTION_ANONYMOUS
         )
-        bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
+        bridge = await self._registry.bridge_for(user_id, chat_id)
         await bridge.handle_text(
             f"{attribution} {content}",
             client_message_id=str(message.message_id),
@@ -867,7 +916,7 @@ class TelegramPoller:
             # narrative, the archive or the LLM
             await self._send_secrets_link(user_id, chat_id)
             return
-        bridge = self._registry.get_or_create(user_id=user_id, chat_id=chat_id)
+        bridge = await self._registry.bridge_for(user_id, chat_id)
         # `/cancel` never reaches here: `dispatch` handles it straight off the
         # poll loop, so a stop does not queue behind slow ingestion
         # the chat-level message id, not update_id: it doubles as the reply
@@ -950,11 +999,23 @@ def _report_worker_exit(worker: asyncio.Task[None]) -> None:
 
 
 def chat_id_from_user_id(user_id: str) -> int | None:
-    """Derive the private chat id from a tg-prefixed user id (None when malformed)."""
+    """The private chat id behind a `tg:`-prefixed handle (None when malformed).
+
+    Only for this surface's OWN records — the invite store and the member
+    directory file people under `tg:<id>`, which is a Telegram id and always
+    was. It must never be pointed at a core user id: those carry no structure,
+    which is exactly what stops the delivery address from being read back out
+    of who somebody is.
+    """
     if not user_id.startswith(USER_ID_PREFIX):
         return None
+    return _as_chat_id(user_id.removeprefix(USER_ID_PREFIX))
+
+
+def _as_chat_id(external_id: str) -> int | None:
+    """A Telegram account id as the chat to write to (private chats only)."""
     try:
-        return int(user_id.removeprefix(USER_ID_PREFIX))
+        return int(external_id)
     except ValueError:
         return None
 

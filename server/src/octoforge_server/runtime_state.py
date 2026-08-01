@@ -19,6 +19,7 @@ from octoforge_core.admin.api import AdminReadModel
 from octoforge_core.context.api import SummaryStore
 from octoforge_core.cron.api import CronStore
 from octoforge_core.dialogs.api import ExchangeRepository
+from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
@@ -46,6 +47,7 @@ class Runtime:
     summary_store: SummaryStore
     exchanges: ExchangeRepository
     claims: ClaimRepository
+    identity_store: IdentityStore
     #: Channels this deployment serves, gathered from installed surfaces.
     channels: frozenset[str]
     #: Extra entries an installed surface needs its own dependencies to reach.

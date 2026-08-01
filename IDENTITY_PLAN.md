@@ -85,10 +85,10 @@ to a person.
 
 ## Order
 
-1. Core identity module: ports, models, store.
-2. The migration, verified on a copy of the production database before anything else.
-3. Resolution at the edge.
-4. Telegram: external id, delivery address from the identity, invites that link.
+1. Core identity module — DONE: ports, models, store.
+2. The migration — DONE, verified on a copy of the production database before anything else.
+3. Resolution at the edge — DONE.
+4. Telegram — DONE: external id, delivery address from the identity, invites that link.
 5. The console: a user is a person with identities, not a handle.
 6. Docs.
 

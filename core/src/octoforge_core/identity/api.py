@@ -78,6 +78,20 @@ class IdentityStore(Protocol):
         """
         ...
 
+    async def resolve_or_create(self, surface: str, external_id: str) -> str:
+        """The user this account belongs to, minting one on first contact.
+
+        Whether the account may talk at all was decided before this — by the
+        invite gate, or by the credential in front of the service. So an
+        account arriving here unknown is somebody new, and giving them a
+        person is the whole of onboarding.
+
+        Linking to an *existing* person is deliberately not this: that is what
+        an invite carrying a user id does. If first contact could attach
+        itself to somebody, a mistake would hand a stranger their dialogs.
+        """
+        ...
+
     async def create_user(self, email: str = "") -> User:
         """Mint a person with an id of their own."""
         ...
