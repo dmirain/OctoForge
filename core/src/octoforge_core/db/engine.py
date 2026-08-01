@@ -26,6 +26,7 @@ import octoforge_core.context.models
 import octoforge_core.cron.models
 import octoforge_core.datasets.models
 import octoforge_core.dialogs.models
+import octoforge_core.identity.models
 import octoforge_core.instructions.models
 import octoforge_core.secrets.models
 import octoforge_core.tasks.models  # noqa: F401

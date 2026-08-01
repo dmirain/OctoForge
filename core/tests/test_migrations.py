@@ -237,7 +237,13 @@ def _memory_instruction_rows(connection: Connection) -> list[tuple[str, str, str
 
 
 async def test_memories_migrate_into_instructions(tmp_path: Path) -> None:
-    """The data migration keeps every memory: owned rows stay owned, global go public."""
+    """The data migration keeps every memory: owned rows stay owned, global go public.
+
+    Ownership is asserted through the identity table rather than by the handle
+    the row was written with: `b6d4f2a91c85` renumbers owners onto opaque ids,
+    so the literal `user-a` is gone by the time the chain finishes — which is
+    the point of it.
+    """
     engine = create_engine(_database_url(tmp_path))
     try:
         async with engine.begin() as connection:
@@ -247,10 +253,24 @@ async def test_memories_migrate_into_instructions(tmp_path: Path) -> None:
         async with engine.connect() as connection:
             rows = await connection.run_sync(_memory_instruction_rows)
             tables = await connection.run_sync(_table_names)
+            owner = await connection.run_sync(_owner_of_identity, "web", "user-a")
     finally:
         await engine.dispose()
     assert rows == [
-        ("mem-1", "city", "user-a", "[]"),  # empty embedding: the startup sweep fills it
+        ("mem-1", "city", owner, "[]"),  # empty embedding: the startup sweep fills it
         ("mem-2", "shared", "", "[]"),
     ]
     assert "memories" not in tables
+
+
+def _owner_of_identity(connection: Connection, surface: str, external_id: str) -> str:
+    """The opaque user id the old handle was renumbered onto."""
+    row = connection.execute(
+        text(
+            "SELECT user_id FROM user_identities "
+            "WHERE surface = :surface AND external_id = :external_id"
+        ),
+        {"surface": surface, "external_id": external_id},
+    ).first()
+    assert row is not None, f"no identity for {surface}:{external_id}"
+    return str(row[0])

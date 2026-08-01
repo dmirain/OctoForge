@@ -7,6 +7,8 @@ and no ORM object ever crosses a module boundary — stores map rows to their mo
 
 | Table | Owner module | Holds |
 |---|---|---|
+| `users` | `identity/` | A person. The id is opaque: an id that can be parsed will be parsed |
+| `user_identities` | `identity/` | What one surface calls a person; unique on `(surface, external_id)` |
 | `dialogs` | `dialogs/` | One row per `(user_id, channel)` |
 | `messages` | `dialogs/` | The narrative and archive: role, content, kind, per-dialog `seq`, `exchange_id`, `task_id`, attachments |
 | `exchanges` | `dialogs/` | Obligations: status, title, owning task, pending question |
