@@ -46,11 +46,16 @@ class TelegramSurface:
         poller: TelegramPoller,
         dialogs: DialogRepository,
         admin_tool: Tool | None = None,
+        polls: bool = True,
     ) -> None:
         self._registry = registry
         self._poller = poller
         self._dialogs = dialogs
         self._admin_tool = admin_tool
+        # A token may be long-polled by exactly one process. With a separate
+        # ingestion node this pod renders and does not read — two readers
+        # would steal each other's updates.
+        self._polls = polls
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -70,7 +75,11 @@ class TelegramSurface:
         return () if self._admin_tool is None else (self._admin_tool,)
 
     async def start(self) -> None:
-        """Warm bridges for known dialogs, then poll for updates."""
+        """Warm bridges for known dialogs, then poll if this process reads.
+
+        Warming happens either way: a pod that only renders still has to have
+        somewhere to deliver a scheduled run to.
+        """
         if self._task is not None:
             return
         self._task = asyncio.create_task(self._run())
@@ -79,6 +88,9 @@ class TelegramSurface:
     async def _run(self) -> None:
         user_ids = await self._dialogs.list_user_ids_by_channel(TELEGRAM_CHANNEL)
         await self._registry.warm(user_ids)
+        if not self._polls:
+            logger.info("telegram: rendering only, ingestion runs elsewhere")
+            return
         await self._poller.run_forever()
 
     async def aclose(self) -> None:

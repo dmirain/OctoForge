@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
+from typing import cast
 
 import httpx
 import pytest
@@ -85,6 +86,7 @@ from octoforge_telegram.poller import (
     chat_id_from_user_id,
 )
 from octoforge_telegram.schema import TelegramSurfaceBase
+from octoforge_telegram.surface import TelegramSurface
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 TELEGRAM_USER_ID = 12345
@@ -1605,10 +1607,10 @@ async def test_a_person_who_changed_telegram_keeps_their_dialog(
     )
     try:
         person = await identities.resolve_or_create(CHANNEL, "111")
-        before = await registry.bridge_for(f"{USER_ID_PREFIX}111", 111)
+        before = await registry.gateway_for(f"{USER_ID_PREFIX}111", 111)
 
         await identities.reseat(CHANNEL, person, "222")
-        after = await registry.bridge_for(f"{USER_ID_PREFIX}222", 222)
+        after = await registry.gateway_for(f"{USER_ID_PREFIX}222", 222)
 
         # same person, so the same dialog and the same bridge
         assert await identities.resolve(CHANNEL, "222") == person
@@ -1638,4 +1640,38 @@ async def test_the_delivery_address_comes_from_the_identity(
         assert await registry._chat_of(person) == RESEAT_ACCOUNT
     finally:
         await registry.aclose()
+        await manager.stop_all()
+
+
+async def test_a_pod_that_only_renders_never_polls(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two readers on one token steal each other's updates, and the bot goes
+    quiet in a way nothing reports."""
+    polled = asyncio.Event()
+
+    class WatchfulPoller:
+        async def run_forever(self) -> None:
+            polled.set()
+
+    manager = await make_manager([], session_factory)
+    registry = TelegramBridgeRegistry(
+        runner_provider=manager.get_or_create_runner,
+        client=FakeTelegramClient(),
+        edit_throttle_seconds=0.0,
+    )
+    surface = TelegramSurface(
+        registry=registry,
+        poller=cast(TelegramPoller, WatchfulPoller()),
+        dialogs=SqlAlchemyDialogRepository(session_factory),
+        polls=False,
+    )
+    try:
+        await surface.start()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not polled.is_set()
+    finally:
+        await surface.aclose()
         await manager.stop_all()

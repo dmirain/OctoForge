@@ -905,6 +905,7 @@ def _build_telegram_surface(
         poller=poller,
         dialogs=dialogs,
         admin_tool=resolved.admin_tool,
+        polls=settings.telegram_poll_in_process,
     )
 
 

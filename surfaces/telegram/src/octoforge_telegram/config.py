@@ -51,6 +51,14 @@ class TelegramSettings(BaseSettings):
     # Longest recording accepted: a cap on latency and on the provider's daily
     # audio quota, checked against the duration the update carries.
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
+    # Where the ingestion node posts what it reads — the balancer in front of
+    # the pods. Empty means ingestion runs inside the pod, which is the
+    # single-pod arrangement and the default.
+    telegram_service_url: str = ""
+    # Whether THIS process polls. Set false in a pod when a separate ingestion
+    # node does it: a token may be long-polled by exactly one process, and two
+    # would steal each other's updates.
+    telegram_poll_in_process: bool = True
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod

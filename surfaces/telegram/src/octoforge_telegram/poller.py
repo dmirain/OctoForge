@@ -24,6 +24,7 @@ from octoforge_telegram.client import (
     TelegramClient,
 )
 from octoforge_telegram.drafts import DraftStore
+from octoforge_telegram.gateway import DialogGateway, GatewayRegistry
 from octoforge_telegram.images import REF_PREFIX
 from octoforge_telegram.invites.api import (
     InviteAlreadyClaimedError,
@@ -231,7 +232,7 @@ class TelegramBridgeRegistry:
             return f"{USER_ID_PREFIX}{external_id}"
         return await self._identities.resolve_or_create(TELEGRAM_CHANNEL, external_id)
 
-    async def bridge_for(self, handle: str, chat_id: int) -> TelegramBridge:
+    async def gateway_for(self, handle: str, chat_id: int) -> TelegramBridge:
         """The bridge for the PERSON behind a Telegram handle.
 
         Bridges are keyed by person, not by account: a dialog belongs to
@@ -367,7 +368,7 @@ class TelegramPoller:
     def __init__(
         self,
         client: TelegramClient,
-        registry: TelegramBridgeRegistry,
+        registry: GatewayRegistry,
         options: TelegramPollerOptions,
     ) -> None:
         self._client = client
@@ -654,7 +655,7 @@ class TelegramPoller:
         kind: MessageKind,
     ) -> None:
         """Describe one picture and submit it; failures propagate to the caller's fallback."""
-        bridge = await self._registry.bridge_for(user_id, chat_id)
+        bridge = await self._registry.gateway_for(user_id, chat_id)
         async with self._showing_activity(chat_id, kind):
             await self._submit_images(message, (image,), bridge, kind=kind)
 
@@ -662,7 +663,7 @@ class TelegramPoller:
         self,
         anchor: TelegramMessage,
         images: Sequence[TelegramImageRef],
-        bridge: TelegramBridge,
+        bridge: DialogGateway,
         *,
         kind: MessageKind,
         caption: str | None = None,
@@ -748,7 +749,7 @@ class TelegramPoller:
             return
         forwarded = message.forward_origin is not None
         origin = message.forward_origin.display_name if message.forward_origin is not None else ""
-        bridge = await self._registry.bridge_for(user_id, chat_id)
+        bridge = await self._registry.gateway_for(user_id, chat_id)
         await bridge.handle_text(
             _compose_voice_message(
                 transcript, caption=message.body or "", origin=origin, forwarded=forwarded
@@ -855,7 +856,7 @@ class TelegramPoller:
             return
         forwarded = anchor.forward_origin is not None
         kind = MessageKind.MATERIAL if forwarded or not caption else MessageKind.OWN
-        bridge = await self._registry.bridge_for(user_id, chat_id)
+        bridge = await self._registry.gateway_for(user_id, chat_id)
         try:
             async with self._showing_activity(chat_id, kind):
                 await self._submit_images(anchor, images, bridge, kind=kind, caption=caption)
@@ -889,7 +890,7 @@ class TelegramPoller:
             if origin
             else MATERIAL_ATTRIBUTION_ANONYMOUS
         )
-        bridge = await self._registry.bridge_for(user_id, chat_id)
+        bridge = await self._registry.gateway_for(user_id, chat_id)
         await bridge.handle_text(
             f"{attribution} {content}",
             client_message_id=str(message.message_id),
@@ -916,7 +917,7 @@ class TelegramPoller:
             # narrative, the archive or the LLM
             await self._send_secrets_link(user_id, chat_id)
             return
-        bridge = await self._registry.bridge_for(user_id, chat_id)
+        bridge = await self._registry.gateway_for(user_id, chat_id)
         # `/cancel` never reaches here: `dispatch` handles it straight off the
         # poll loop, so a stop does not queue behind slow ingestion
         # the chat-level message id, not update_id: it doubles as the reply
