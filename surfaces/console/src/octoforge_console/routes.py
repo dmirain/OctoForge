@@ -33,6 +33,7 @@ from octoforge_core.dialogs.api import (
     DialogRepository,
     ExchangeRepository,
 )
+from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import (
     Instruction,
     InstructionNotFoundError,
@@ -51,6 +52,7 @@ from octoforge_server.deps import (
     get_cron_store,
     get_dialog_repository,
     get_exchange_repository,
+    get_identity_store,
     get_instruction_service,
     get_operator,
     get_summary_store,
@@ -68,6 +70,7 @@ ManagerDep = Annotated[ConversationManager, Depends(get_conversation_manager)]
 DialogsDep = Annotated[DialogRepository, Depends(get_dialog_repository)]
 OperatorDep = Annotated[str, Depends(get_operator)]
 ExchangesDep = Annotated[ExchangeRepository, Depends(get_exchange_repository)]
+IdentityStoreDep = Annotated[IdentityStore, Depends(get_identity_store)]
 ClaimsDep = Annotated[ClaimRepository, Depends(get_claim_repository)]
 SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
 LimitDep = Annotated[int | None, Query(ge=1)]
@@ -516,3 +519,32 @@ def _exchange_to_dict(item: ExchangeOverview) -> dict[str, Any]:
 
 def _iso(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
+
+
+@router.get("/users")
+async def users(identities: IdentityStoreDep) -> dict[str, Any]:
+    """Who the installation knows, and which accounts each person answers on.
+
+    A person is the unit here, not a handle: the same human may arrive from
+    Telegram and from a browser, and everything they own is filed under them.
+    Revoked identities are shown rather than hidden — that an account was once
+    theirs is part of the answer to "who is this".
+    """
+    people = await identities.list_users()
+    items = [
+        {
+            "user_id": person.id,
+            "email": person.email,
+            "created_at": person.created_at.isoformat() if person.created_at else None,
+            "identities": [
+                {
+                    "surface": item.surface,
+                    "external_id": item.external_id,
+                    "active": item.active,
+                }
+                for item in await identities.identities_of(person.id)
+            ],
+        }
+        for person in people
+    ]
+    return {"items": items, "total": len(items)}

@@ -30,8 +30,14 @@ that boundary intact — enforced by `core/tests/test_boundaries.py`.
 
 Page size defaults to 50 and is capped at 500.
 
-The web layer adds one Telegram-specific listing (`GET /api/admin/telegram/users`) that joins the member
-directory with invite attribution, so a `tg:<id>` shows up as a person with the invite they came through.
+`GET /api/admin/users` lists people and the accounts each one answers on. A person is the unit here,
+not a handle: the same human may arrive from Telegram and from a browser, and everything they own is
+filed under them. Revoked identities are listed rather than hidden — that an account was once theirs
+is part of the answer to "who is this".
+
+The Telegram surface adds its own listing (`GET /api/admin/telegram/users`), which joins the member
+directory with invite attribution: names, usernames and which invite somebody came through are
+Telegram's own knowledge, and only Telegram can answer for them.
 
 ### Mutations are not part of it
 

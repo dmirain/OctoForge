@@ -64,6 +64,7 @@ class UserIdentity:
     updated_at: datetime | None = None
 
 
+UserList = list[User]
 UserIdentityList = list[UserIdentity]
 
 
@@ -123,6 +124,10 @@ class IdentityStore(Protocol):
 
     async def deactivate(self, surface: str, external_id: str) -> None:
         """Revoke an account without erasing that it was once used."""
+        ...
+
+    async def list_users(self) -> "UserList":
+        """Everyone the installation knows, newest first (operator console)."""
         ...
 
     async def identities_of(self, user_id: str) -> UserIdentityList:

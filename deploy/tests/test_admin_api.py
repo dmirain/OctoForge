@@ -406,3 +406,18 @@ def test_telegram_users_join_profile_with_invite(client: TestClient) -> None:
     assert item["invite_code"] == "SECRETCODE"
     assert item["invite_note"] == "for Alice"
     assert item["invite_status"] == "claimed"
+
+
+def test_the_console_shows_people_and_the_accounts_they_answer_on(
+    client: TestClient,
+) -> None:
+    """A person is the unit, not a handle: the same human may arrive from
+    Telegram and from a browser, and everything they own is filed under them."""
+    client.post("/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "alice"})
+
+    body = client.get("/api/admin/users").json()
+
+    assert body["total"] == 1
+    person = body["items"][0]
+    assert person["user_id"] != "alice"  # the person, not what the surface calls them
+    assert person["identities"] == [{"surface": "web", "external_id": "alice", "active": True}]

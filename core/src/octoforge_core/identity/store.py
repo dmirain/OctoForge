@@ -13,6 +13,7 @@ from octoforge_core.identity.api import (
     User,
     UserIdentity,
     UserIdentityList,
+    UserList,
     UserNotFoundError,
 )
 from octoforge_core.identity.models import UserIdentityRow, UserRow
@@ -138,6 +139,12 @@ class SqlAlchemyIdentityStore:
                 .values(active=False, updated_at=utc_now())
             )
             await session.commit()
+
+    async def list_users(self) -> UserList:
+        """Everyone the installation knows, newest first."""
+        async with self._session_factory() as session:
+            rows = await session.scalars(select(UserRow).order_by(UserRow.created_at.desc()))
+            return [_to_user(row) for row in rows.all()]
 
     async def identities_of(self, user_id: str) -> UserIdentityList:
         """Every surface this person is known on, revoked ones included."""
