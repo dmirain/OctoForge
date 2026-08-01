@@ -108,10 +108,113 @@ re-issuing — and burning rate limit. Keep it.
 and verifies row counts, handling the timezone difference through the ORM rather than moving raw values. Stop
 every writer first: a bot still appending rows will fail the count check.
 
-**Scaling.** The cron scheduler claims firings with a SQL compare-and-swap lease, so several instances can
-run it safely. Everything else assumes one writer per dialog; Postgres is required for more than one process
-(SQLite allows exactly one writer). One asyncio loop serves every dialog of a process — see
-[performance.md](performance.md) for what that implies.
+**Scaling.** Postgres is required for more than one process (SQLite allows exactly one writer); which
+process runs a dialog is settled by a claim, and the cron scheduler leases its firings with a SQL
+compare-and-swap. One asyncio loop serves every dialog of a process — see
+[performance.md](performance.md) for what that implies, and "More than one pod" below for the
+arrangement.
+
+## More than one pod
+
+A second machine running the app, with the first one balancing across both. What this buys is
+throughput and an upgrade that does not take the service down; it is **not** high availability —
+the database primary and the domain both still live on the first host, so losing it is a manual
+failover either way (see below).
+
+Three roles, and it is worth being precise about which process is which:
+
+| Role | Runs | Where |
+|---|---|---|
+| **Balancer** | Caddy, TLS, affinity | the host the domain points at |
+| **Pod** | the app: dialogs, the agent loop, the HTTP API | that host and every other one (`docker-compose.pod.yml`) |
+| **Ingestion** | the Telegram long poll, the invite gate | exactly one host (`--profile ingest`) |
+
+**The pods reach one database.** `OF_PRIMARY_HOST` points every pod at the **primary** over the
+private network — never at a standby. Replication is asynchronous, so a pod reading one would see a
+stale `dialog_claims` table and two processes would each conclude they own a dialog, which is the
+exact corruption [../reference/dialog-ownership.md](../reference/dialog-ownership.md) exists to
+prevent. `pg_hba.conf` on the primary has to grant the app role from the pod's address, next to the
+`replication` line a standby needs:
+
+```
+host    all            octoforge     10.8.0.2/32    scram-sha-256
+```
+
+**Affinity, not distribution.** `OF_POD_UPSTREAMS` lists the pods; Caddy hashes `X-User-Id` to pick
+one, so a user keeps arriving at the pod already running their dialog. Routing them elsewhere is
+*safe* — a claim is takeable, and the new owner recovers the dialog — but it costs a reload of the
+context, so this is a latency decision rather than a correctness one. Requests with no such header
+(static files, the operator console, the secrets form, health probes) carry no per-pod state and are
+spread round-robin.
+
+The mapping is computed over the configured pod list, not the reachable one, which is what makes a
+failure cheap: when a pod fails its `/health/ready` probe its users move to the survivor and
+**everyone else stays put**, and when it returns they move back. Nothing reshuffles.
+
+**What must not be duplicated.** One Telegram token may be long-polled by one process, so ingestion
+runs once, outside the pods, and every pod sets `OF_TELEGRAM_POLL_IN_PROCESS=false`; the pod compose
+file pins that regardless of `.env`. Everything else is already safe to run twice: cron firings are
+claimed with a SQL compare-and-swap lease, and background sweeps hand back a dialog another instance
+owns instead of taking it.
+
+**What each pod costs.** The local embedding backend loads a model of its own into every process.
+Two of them will not fit on a small host beside Postgres — put the extra pods on
+`OF_EMBEDDING_BACKEND=openai`, or give them their own machine.
+
+## Replication and failover
+
+A streaming standby on a second machine, for the case where the first one is gone. It is **not** a
+second writable node and must never be used as one: replication is asynchronous, so a pod reading a
+standby would see a stale `dialog_claims` table and two instances would decide they both own a
+dialog — the exact corruption [../reference/dialog-ownership.md](../reference/dialog-ownership.md)
+exists to prevent. Every pod points at the primary. The standby is promoted by hand when the
+primary is lost, and then it *is* the primary.
+
+**The network first.** The standby reaches the primary over a private address — a WireGuard peer or
+a provider's internal network — never the public internet. `POSTGRES_PEER_BIND` publishes Postgres
+on that address (default loopback, i.e. off) and `pg_hba.conf` decides what may then be done from
+it: grant the standby's address `replication` for the replication role and nothing else, so a
+compromise of that host cannot read the database itself.
+
+Rotate `POSTGRES_PASSWORD` before binding anywhere but loopback. The compose default is a published
+constant.
+
+**Setting it up.** On the primary, a role and a slot:
+
+```sql
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '...';
+SELECT pg_create_physical_replication_slot('standby_one');
+```
+
+and in `pg_hba.conf` (then `SELECT pg_reload_conf()`, no restart):
+
+```
+host    replication    replicator    10.8.0.2/32    scram-sha-256
+```
+
+`wal_level=replica`, `hot_standby=on` and the sender/slot limits are already the stock defaults —
+check `pg_settings` before planning a restart you may not need. On the standby, take the base backup
+with the **same image** (the extensions must match) and start it:
+
+```
+pg_basebackup -h <primary> -U replicator -D $PGDATA -S standby_one -R -P -Xs -c fast
+```
+
+`-R` writes `standby.signal` and `primary_conninfo`; `-S` binds it to the slot.
+
+**Watching it.** On the primary, `pg_stat_replication` should show the standby `streaming` with a
+lag in milliseconds; `pg_replication_slots.active` should be true.
+
+**Promotion** is `SELECT pg_promote(wait => true)`, after which the machine is a normal read-write
+primary on a new timeline. Point the pods at it. Rehearse this before you need it — an unrehearsed
+failover is a guess.
+
+> **An inactive slot never releases WAL.** A standby that is down, or promoted and not rebuilt,
+> makes the primary keep every segment since it left, until the disk fills. Drop the slot
+> (`pg_drop_replication_slot`) as soon as a standby is gone for good, and watch
+> `pg_replication_slots` — this is the one way a standby can take the primary down with it.
+
+A standby is not a backup: a deletion replicates in milliseconds. Keep `tools/pg_backup.sh` running.
 
 ## Hardening checklist
 
@@ -122,13 +225,17 @@ run it safely. Everything else assumes one writer per dialog; Postgres is requir
 - The HTTP surface authenticates the *operator*, not your employees. If people other than operators will use
   the web UI, put an authenticating proxy in front and have it set `X-User-Id` — see
   [../security.md](../security.md).
-- Postgres stays on loopback. Do not publish 5432 to the network.
+- Postgres stays on loopback. The one exception is `POSTGRES_PEER_BIND` for a standby or a second
+  pod, and it takes a **private** address only — never a public interface, and never with the
+  default password still in place.
 - `OF_SECRETS_KEY` backed up somewhere separate from the database dump: losing it makes every stored secret
   unreadable, having both in one place defeats the encryption.
 
 ## Code anchors
 
-- `docker-compose.yml`, `Dockerfile`, `docker/Caddyfile` — the topology
+- `docker-compose.yml`, `Dockerfile`, `docker/Caddyfile` — the topology and the balancer
+- `docker-compose.pod.yml` — a node that runs the app alone
+- `surfaces/telegram/src/octoforge_telegram/ingest/__main__.py` — the ingestion node
 - `docker/postgres-init/` — the extra databases
 - `tools/pg_backup.sh`, `tools/sqlite_to_postgres.py` — backups and the one-off migration
 - `deploy/src/octoforge_deploy/main.py` — startup, migrations, health probes

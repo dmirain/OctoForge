@@ -6,7 +6,17 @@ BIN := $(VENV)/bin
 
 # Test database of the compose postgres service. Separate from the app database
 # on purpose: the Postgres store tests drop and recreate the public schema.
-PG_TEST_URL ?= postgresql+asyncpg://octoforge:octoforge@127.0.0.1:5432/octoforge_test
+#
+# The password is read from `.env` rather than hardcoded: a deployment that
+# rotated `POSTGRES_PASSWORD` (which it must, once anything reaches the server
+# from another host) would otherwise leave `make test-pg` failing to
+# authenticate, with nothing to say why. Falls back to the compose default,
+# which is what a fresh clone and CI both have.
+PG_PASSWORD := $(shell sed -n 's/^POSTGRES_PASSWORD=//p' .env 2>/dev/null)
+ifeq ($(strip $(PG_PASSWORD)),)
+PG_PASSWORD := octoforge
+endif
+PG_TEST_URL ?= postgresql+asyncpg://octoforge:$(PG_PASSWORD)@127.0.0.1:5432/octoforge_test
 
 # The local stack: production compose plus the overlay that drops Caddy and
 # publishes the app on loopback (no domain, no certificate).

@@ -1,13 +1,16 @@
-# TLS terminator in front of the app. Caddy obtains and renews the Let's
-# Encrypt certificate itself (HTTP-01 on :80, then serves :443), so there is no
-# certbot, no cron job and no renewal hook to forget. Certificates and the ACME
-# account live in the caddy-data volume — keep it, or every rebuild starts a new
-# issuance and burns rate limit.
+# TLS terminator and balancer in front of the app. Caddy obtains and renews the
+# Let's Encrypt certificate itself (HTTP-01 on :80, then serves :443), so there
+# is no certbot, no cron job and no renewal hook to forget. Certificates and the
+# ACME account live in the caddy-data volume — keep it, or every rebuild starts a
+# new issuance and burns rate limit.
 #
 # ACME_CA lets a deployment point at the staging endpoint while verifying that
 # port 80 is reachable from the internet; unset it for the real certificate.
 {
-	email {$ACME_EMAIL}
+	# quoted: compose defaults ACME_EMAIL to empty, and a bare placeholder then
+	# expands to no argument at all — which Caddy rejects outright, so the whole
+	# stack fails to start over an optional setting
+	email "{$ACME_EMAIL}"
 	acme_ca {$ACME_CA:https://acme-v02.api.letsencrypt.org/directory}
 }
 
@@ -17,7 +20,42 @@
 	# The app authenticates every request itself (HTTP Basic, health probes
 	# aside), so the proxy stays a plain terminator and forwards credentials
 	# untouched.
-	reverse_proxy app:8000
+	#
+	# OF_POD_UPSTREAMS is the whole of the multi-node story on this side: one
+	# address is the stock single-host deployment, several turn this into the
+	# balancer for them. They are reached over a private network (see
+	# ../docs/guides/deployment.md) — a pod publishes no TLS of its own.
+	reverse_proxy {$OF_POD_UPSTREAMS:app:8000} {
+		# Affinity, not distribution. A dialog is run by one process at a
+		# time, and sending a user to the pod that already holds theirs
+		# avoids a handover: the new owner would have to reload the dialog's
+		# context and reopen whatever was in flight. Mis-routing is safe —
+		# ownership is a claim, and taking a dialog over is a supported
+		# move — it is merely slower, so this is a latency decision.
+		#
+		# X-User-Id is the key because it names the dialog: the surfaces
+		# prefix their account ids, so one value cannot mean two dialogs.
+		# Requests that carry no such header (static files, the operator
+		# console, the secrets form, health probes) hold no per-pod state
+		# and are spread instead.
+		lb_policy header X-User-Id {
+			fallback round_robin
+		}
+
+		# Readiness, not liveness: /health/ready touches the database, and a
+		# pod that cannot reach it has nothing to answer with. A dead pod is
+		# taken out of rotation here, and its users rehash onto the survivor.
+		health_uri /health/ready
+		health_interval 10s
+		health_timeout 5s
+
+		# Passive half: a pod that starts failing requests between probes is
+		# remembered as bad for fail_duration, and the request itself is
+		# retried on the other one. Retries only ever happen before a
+		# response is written, so a streaming answer is never replayed.
+		fail_duration 30s
+		lb_retries 2
+	}
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"

@@ -44,6 +44,14 @@ services:
     ports:
       # loopback only: psql/pg_dump from the host without exposing the server
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+      # A second address for the other machines of a multi-node installation —
+      # a standby streaming from here, or a second pod writing here. Defaults
+      # to loopback, i.e. off: an unset variable must not put a database on a
+      # public interface. Set it to a PRIVATE address only (a WireGuard peer,
+      # a provider's internal network); who may then do what is still decided
+      # by pg_hba.conf, which grants the tunnel replication and nothing else
+      # until a pod actually needs to write.
+      - "${POSTGRES_PEER_BIND:-127.0.0.1}:${POSTGRES_PEER_PORT:-5433}:5432"
     volumes:
       # 18+ stores the cluster in a major-version subdirectory (/var/lib/postgresql/18/docker)
       # and refuses to start with a mount on the old /var/lib/postgresql/data path,
@@ -125,6 +133,34 @@ services:
     # No ports and no healthcheck on purpose: this surface only makes outbound
     # connections (Bot API long poll, LLM, embeddings) and exposes no endpoint
     # to probe. Liveness is left to `restart`.
+    restart: unless-stopped
+
+  ingest:
+    # The Telegram half that cannot be duplicated. A token may be long-polled by
+    # exactly one process, so the moment the service runs on more than one pod,
+    # ingestion moves out here and the pods keep only the rendering half of the
+    # surface. Enable it together with OF_TELEGRAM_POLL_IN_PROCESS=false, or the
+    # two pollers steal each other's updates.
+    profiles: ["ingest"]
+    build: *app-build
+    image: octoforge:local
+    command: ["python", "-m", "octoforge_telegram.ingest"]
+    env_file:
+      - .env
+    environment:
+      # Its own small database — the invite gate and the member directory. It
+      # keeps no dialogs: those live behind the API it posts to.
+      OF_TELEGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_TELEGRAM_DB:-octoforge_telegram}
+      # Where it submits what it reads. Caddy, so the affinity that puts a user
+      # on the right pod applies to Telegram exactly as it does to the web.
+      OF_TELEGRAM_SERVICE_URL: ${OF_TELEGRAM_SERVICE_URL:-https://${SITE_DOMAIN:-localhost}}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No ports and no healthcheck: this process only makes outbound connections
+    # (Bot API long poll, the service) and exposes nothing to probe. It refuses
+    # to start without OF_SERVICE_PASSWORD rather than dropping every message
+    # into a 401 — read the log if it exits at once.
     restart: unless-stopped
 
 volumes:

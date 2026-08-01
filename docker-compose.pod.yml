@@ -1,0 +1,50 @@
+# A second node that runs the app and nothing else.
+#
+# Used ON ITS OWN (`docker compose -f docker-compose.pod.yml up -d`), not as an
+# overlay: this is a different machine, and it needs none of what the primary
+# host runs. No Postgres — it writes to the primary's, over the private network.
+# No Caddy — the balancer on the primary terminates TLS and reaches this pod
+# through the tunnel. No Telegram long poll — one token may be polled by exactly
+# one process, and that is the ingestion node's job (`--profile ingest` in
+# docker-compose.yml).
+#
+# What makes it a *second* pod rather than a second installation is that every
+# dialog is claimed: the two processes agree in the database on who runs what,
+# and the balancer's affinity keeps a user on the pod that already holds theirs.
+# See docs/guides/deployment.md and docs/reference/dialog-ownership.md.
+services:
+  app:
+    build:
+      context: .
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+    image: octoforge:local
+    env_file:
+      - .env
+    environment:
+      # Both databases live on the primary. Asynchronous replication means a
+      # standby is behind, so a pod reading one would see a stale claims table
+      # and two processes would each believe they own a dialog — every pod
+      # points at the PRIMARY, and the standby is only ever promoted by hand.
+      OF_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@${OF_PRIMARY_HOST:?set OF_PRIMARY_HOST to the primary's private address}:${OF_PRIMARY_PORT:-5432}/${POSTGRES_DB:-octoforge}
+      OF_TELEGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@${OF_PRIMARY_HOST:?set OF_PRIMARY_HOST to the primary's private address}:${OF_PRIMARY_PORT:-5432}/${POSTGRES_TELEGRAM_DB:-octoforge_telegram}
+      # Not negotiable on a pod, whatever .env says: a second long poll would
+      # steal updates from the ingestion node rather than share them.
+      OF_TELEGRAM_POLL_IN_PROCESS: "false"
+    ports:
+      # The balancer's address, and only it. Defaults to loopback so an unset
+      # variable cannot put an unauthenticated app on a public interface —
+      # a pod publishes no TLS and trusts whoever reaches it.
+      - "${OF_POD_BIND:-127.0.0.1}:${OF_POD_PORT:-8000}:8000"
+    volumes:
+      # the host's model cache: without it the container re-downloads the
+      # 1.1 GB embedding model on first start
+      - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface
+      - ./docker/system_skills.ru.json:/etc/octoforge/system_skills.json:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
