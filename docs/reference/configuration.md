@@ -97,7 +97,8 @@ and dataset search are unavailable — the system-record sync is skipped too.
 |---|---|---|
 | `OF_MAX_PROCESSES` | `5` | Concurrent processes (and therefore live exchanges) per dialog |
 | `OF_SERVICE_USERNAME` | *(empty)* | A second credential opening only `/api/dialog/*`, for a process that relays a surface's traffic. Empty means no such credential exists |
-| `OF_SERVICE_PASSWORD_HASH` | *(empty)* | Its PBKDF2 hash, same format as the operator one (`tools/hash_password.py`) |
+| `OF_SERVICE_PASSWORD_HASH` | *(empty)* | Its PBKDF2 hash, same format as the operator one (`tools/hash_password.py`). Set on the pod, which *verifies* against it |
+| `OF_SERVICE_PASSWORD` | *(empty)* | The same credential's password, set on the relay, which *presents* it. Sending the hash instead is a wrong password, refused silently |
 | `OF_NODE_ID` | hostname | Names this process as a dialog owner. Must be stable across this instance's own restarts and unique against every other instance sharing the database — see [dialog-ownership.md](dialog-ownership.md) |
 | `OF_ROUTER_TIMEOUT_SECONDS` | `10.0` | Router LLM call timeout; on timeout the message opens a new exchange |
 | `OF_MATERIAL_QUIET_SECONDS` | `30.0` | How long forwarded material may stay quiet before the agent reacts on its own |
@@ -188,6 +189,24 @@ setting is read is an internal matter.
 | `OF_TELEGRAM_INVITE_TTL_SECONDS` | `259200.0` | How long a generated invite code stays claimable (3 days) |
 | `OF_TELEGRAM_POLL_TIMEOUT_SECONDS` | `30.0` | Long-poll timeout |
 | `OF_TELEGRAM_EDIT_THROTTLE_SECONDS` | `1.5` | Minimum interval between edits of a streaming draft message |
+| `OF_TELEGRAM_SERVICE_URL` | *(empty)* | Where the ingestion node posts what it reads (the balancer in front of the pods). Set on the node only; empty means this process has its dialogs in-process |
+| `OF_TELEGRAM_POLL_IN_PROCESS` | `true` | Whether *this* process long-polls. Set `false` on every pod once a separate ingestion node does it |
+
+### Ingestion out of process
+
+One bot token may be long-polled by exactly one process, so beyond a single pod the polling half
+moves out: run `python -m octoforge_telegram.ingest` beside the pods, pointed at the balancer. The
+pods keep the rendering half and stop polling.
+
+| | polls | `OF_TELEGRAM_SERVICE_URL` | `OF_TELEGRAM_POLL_IN_PROCESS` | credential |
+|---|---|---|---|---|
+| single pod (default) | the pod | *(empty)* | `true` | none needed |
+| ingestion node | the node | the balancer | *(unused)* | `OF_SERVICE_USERNAME` + `OF_SERVICE_PASSWORD` |
+| pod behind a node | nobody | *(empty)* | `false` | `OF_SERVICE_USERNAME` + `OF_SERVICE_PASSWORD_HASH` |
+
+The node refuses to start without a service credential. Starting anyway would be the worst outcome
+available: it holds the token, so no other process may poll, and drops every update it takes on a
+401.
 
 In the local quickstart stack the bot is opt-in through `OF_QUICKSTART_TELEGRAM_TOKEN` instead — a
 bot can only be long-polled by one process, and a second poller would steal a live bot's updates.

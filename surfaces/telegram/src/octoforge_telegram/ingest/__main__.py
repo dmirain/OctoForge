@@ -41,6 +41,12 @@ NO_SERVICE_URL_MESSAGE = (
     "OF_TELEGRAM_SERVICE_URL is required: the ingestion node has no dialogs of its own, "
     "it posts them to the service"
 )
+NO_CREDENTIAL_MESSAGE = (
+    "OF_SERVICE_USERNAME and OF_SERVICE_PASSWORD are required: the service refuses "
+    "an unauthenticated relay, and it would refuse it silently — every message would "
+    "be dropped with nothing but a 401 in this log. Note OF_SERVICE_PASSWORD, not the "
+    "_HASH the pod verifies against."
+)
 UP_MESSAGE = "Telegram ingestion is up; send SIGINT/SIGTERM to stop"
 DOWN_MESSAGE = "Telegram ingestion stopped"
 
@@ -51,6 +57,8 @@ async def run_ingest(settings: Settings, telegram: TelegramSettings) -> None:
         raise SystemExit(NO_TOKEN_MESSAGE)
     if not telegram.telegram_service_url:
         raise SystemExit(NO_SERVICE_URL_MESSAGE)
+    if not (settings.service_username and settings.service_password):
+        raise SystemExit(NO_CREDENTIAL_MESSAGE)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -64,6 +72,18 @@ async def run_ingest(settings: Settings, telegram: TelegramSettings) -> None:
     logger.info(DOWN_MESSAGE)
 
 
+def service_headers(settings: Settings) -> dict[str, str]:
+    """The credential this node presents to the service.
+
+    Its own function so a test can hand the result to the real gate: the two
+    halves of one credential live in different processes, and nothing else
+    checks that they still fit. They did not — this node presented the *hash*,
+    which the gate hashes again and refuses, and the only evidence was a 401
+    the user never saw.
+    """
+    return basic_auth_header(settings.service_username, settings.service_password)
+
+
 async def _build(
     stack: AsyncExitStack, settings: Settings, telegram: TelegramSettings
 ) -> TelegramPoller:
@@ -72,7 +92,7 @@ async def _build(
     service = await stack.enter_async_context(
         httpx.AsyncClient(
             base_url=telegram.telegram_service_url,
-            headers=basic_auth_header(settings.service_username, settings.service_password_hash),
+            headers=service_headers(settings),
         )
     )
     engine = create_engine(telegram.telegram_database_url)

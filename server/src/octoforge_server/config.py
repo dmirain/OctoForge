@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     # `tools/hash_password.py`, same format as the operator one.
     service_username: str = ""
     service_password_hash: str = ""
+    # The same credential seen from the other side. A pod *verifies* against
+    # the hash; a relay has to *present* the password, and no amount of hashing
+    # turns one into the other — sending the hash is simply a wrong password.
+    # So the two halves are separate settings: a pod sets the hash, an
+    # ingestion node sets this, and neither needs the other's.
+    service_password: str = ""
     router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
     llm_stream_idle_timeout_seconds: float = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS
     # Wall-clock ceiling on one tool call. A tool that never returns holds its

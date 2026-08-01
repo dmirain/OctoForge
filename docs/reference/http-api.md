@@ -107,6 +107,11 @@ node — need not carry operator power: a compromise there must not become a com
 the instructions and the secret store. Each credential has its own verification cache, so one verified
 on a dialog request cannot satisfy an admin one. Leaving it unset turns it off.
 
+The two sides of that credential are configured separately, and confusing them fails quietly: the
+service verifies against `OF_SERVICE_PASSWORD_HASH`, while the relay presents `OF_SERVICE_PASSWORD`.
+A relay that sends the hash is sending a wrong password, and a rejected relay looks exactly like a
+silent one — the user gets no answer and only a 401 in a log records why.
+
 This authenticates the **operator**, not the agent's users. `X-User-Id` selects the dialog and is a trusted
 string: front the deployment with a proxy that authenticates people and sets that header. See
 [../security.md](../security.md).
