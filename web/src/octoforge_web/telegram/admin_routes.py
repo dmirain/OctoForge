@@ -19,7 +19,8 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
 
-from octoforge_web.deps import get_telegram_invites, get_telegram_members, require_admin
+from octoforge_web.deps import require_admin
+from octoforge_web.telegram.deps import get_invites, get_members
 from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 
 # `require_admin` exactly as on the console's own router: defense in depth
@@ -28,8 +29,8 @@ from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 # move it out from behind its guard.
 router = APIRouter(prefix="/api/admin/telegram", dependencies=[Depends(require_admin)])
 
-MembersDep = Annotated["MemberDirectory | None", Depends(get_telegram_members)]
-InvitesDep = Annotated["InviteStore | None", Depends(get_telegram_invites)]
+MembersDep = Annotated["MemberDirectory | None", Depends(get_members)]
+InvitesDep = Annotated["InviteStore | None", Depends(get_invites)]
 
 
 @router.get("/users")

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from fastapi import APIRouter
 from octoforge_core.agent.runner import DialogSurface
 from octoforge_core.tools.base import Tool
 
@@ -38,6 +39,21 @@ class StaticFile:
 
     path: str
     file: Path
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceRoutes:
+    """What a surface serves, gathered before the surface itself exists.
+
+    Mounting happens while the application is built; a surface needs the
+    database and the model client, which are assembled later in the lifespan.
+    So routes travel separately, as module constants collected by the
+    composition root.
+    """
+
+    name: str
+    routers: Sequence[APIRouter] = ()
+    static_files: Sequence[StaticFile] = ()
 
 
 class Surface(Protocol):
@@ -58,6 +74,14 @@ class Surface(Protocol):
     @property
     def name(self) -> str:
         """Short name for the startup report and logs."""
+        ...
+
+    def channel(self) -> str | None:
+        """The channel whose dialogs belong to this surface, if it has one.
+
+        What the service accepts in `X-Channel` is the union of these — the
+        surfaces installed decide it, not a list written into the service.
+        """
         ...
 
     def dialog_surface(self) -> DialogSurface | None:

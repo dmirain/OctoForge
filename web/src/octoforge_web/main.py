@@ -9,12 +9,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Request, Response
 from octoforge_core import (
-    ClaimRepository,
     ConversationManager,
     DialogRepository,
     ExchangeRepository,
@@ -42,7 +41,6 @@ from octoforge_core import (
     create_session_factory,
     init_db,
 )
-from octoforge_core.admin.api import AdminReadModel
 from octoforge_core.admin.store import SqlAlchemyAdminStore
 from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
 from octoforge_core.composition import (
@@ -53,7 +51,6 @@ from octoforge_core.composition import (
     ToolStores,
 )
 from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
-from octoforge_core.context.api import SummaryStore
 from octoforge_core.context.compactor import CompactorConfig
 from octoforge_core.cron.api import CronStore
 from octoforge_core.cron.scheduler import CronSchedulerConfig
@@ -93,34 +90,24 @@ from octoforge_core.secrets.api import SecretStore
 from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.speech.api import TranscriptionClient
 from octoforge_core.speech.client import OpenAITranscriptionClient
-from octoforge_core.tasks.store import TaskStore
 from octoforge_core.tools.base import Tool
 from octoforge_core.tools.registry import ToolRegistry
 from octoforge_core.vision.api import ImageResolver, VisionClient
 from octoforge_core.vision.client import OpenAIVisionClient
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from octoforge_web import console, webui
-from octoforge_web.api.cron import router as cron_router
-from octoforge_web.api.dialog import router as dialog_router
-from octoforge_web.api.secrets import router as secrets_router
-from octoforge_web.auth import (
-    CROSS_SITE_MESSAGE,
-    AuthGate,
-    allows_service_credential,
-    is_cross_site_mutation,
-    is_open_path,
-)
+from octoforge_web.app import build_app
 from octoforge_web.capabilities import log_capabilities
 from octoforge_web.channels import WEB_CHANNEL
 from octoforge_web.config import Settings
 from octoforge_web.console import ConsoleSurface
 from octoforge_web.prompts import FilePromptProvider
+from octoforge_web.runtime_state import Runtime
 from octoforge_web.secret_links import SecretLinkService
 from octoforge_web.skill_overlay import apply_overlay, load_overlay
-from octoforge_web.surfaces import StaticFile, Surface
+from octoforge_web.surfaces import StaticFile, Surface, SurfaceRoutes
 from octoforge_web.system_skills import WEB_SYSTEM_SKILLS
 from octoforge_web.telegram import surface as telegram_surface
 from octoforge_web.telegram.admin import AdminAccess, AdminManageTool, AdminStores
@@ -128,7 +115,6 @@ from octoforge_web.telegram.bridge import RunnerProvider
 from octoforge_web.telegram.client import TelegramBotClient
 from octoforge_web.telegram.drafts import SqlAlchemyDraftStore
 from octoforge_web.telegram.images import TelegramImageResolver
-from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 from octoforge_web.telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
 from octoforge_web.telegram.poller import (
     TelegramBridgeRegistry,
@@ -154,30 +140,6 @@ logger = logging.getLogger(__name__)
 
 # Signature of the next handler in Starlette's middleware chain.
 NextCall = Callable[[Request], Awaitable[Response]]
-
-
-@dataclass(slots=True)
-class Runtime:
-    """Assembled services shared by the HTTP app and standalone surfaces."""
-
-    settings: Settings
-    conversation_manager: ConversationManager
-    channel: str
-    cron_store: CronStore
-    session_factory: async_sessionmaker[AsyncSession]
-    task_store: TaskStore
-    instructions: InstructionService
-    admin_read_model: AdminReadModel
-    secret_store: SecretStore | None
-    secret_links: SecretLinkService
-    dialogs: DialogRepository
-    summary_store: SummaryStore
-    exchanges: ExchangeRepository
-    claims: ClaimRepository
-    # Telegram who-is-who (None: bot not configured) — read by the operator
-    # console to decorate user ids with names and invite attribution
-    telegram_members: MemberDirectory | None = None
-    telegram_invites: InviteStore | None = None
 
 
 def _build_manager_stores(
@@ -370,12 +332,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     summary_store=summary_store,
                     exchanges=exchanges,
                     claims=claims,
-                    telegram_members=(
-                        telegram_stores.directory if telegram_stores is not None else None
-                    ),
-                    telegram_invites=(
-                        telegram_stores.invites if telegram_stores is not None else None
-                    ),
+                    channels=_served_channels(surfaces),
+                    surface_state=_surface_state(telegram_stores),
                 )
             finally:
                 await _stop_background_tasks(scheduler_task, sweeper_task)
@@ -402,133 +360,60 @@ def _configure_logging() -> None:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """Build the FastAPI application with all dependencies wired."""
+    """Build this deployment: the service, plus the interfaces installed on it."""
     _configure_logging()
-    resolved_settings = settings or Settings()
+    resolved = settings or Settings()
+    return build_app(resolved, runtime, _surface_routes())
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        async with runtime(resolved_settings) as rt:
-            app.state.settings = rt.settings
-            app.state.conversation_manager = rt.conversation_manager
-            app.state.channel = rt.channel
-            app.state.cron_store = rt.cron_store
-            app.state.session_factory = rt.session_factory
-            app.state.task_store = rt.task_store
-            app.state.instructions = rt.instructions
-            app.state.admin_read_model = rt.admin_read_model
-            app.state.secret_store = rt.secret_store
-            app.state.secret_links = rt.secret_links
-            app.state.dialogs = rt.dialogs
-            app.state.summary_store = rt.summary_store
-            app.state.exchanges = rt.exchanges
-            app.state.claims = rt.claims
-            app.state.telegram_members = rt.telegram_members
-            app.state.telegram_invites = rt.telegram_invites
-            yield
 
-    app = FastAPI(title=APP_TITLE, lifespan=lifespan)
+def _surface_routes() -> tuple[SurfaceRoutes, ...]:
+    """What the installed interfaces serve.
 
-    gate = AuthGate(
-        username=resolved_settings.admin_username,
-        password_hash=resolved_settings.admin_password_hash,
-        service_username=resolved_settings.service_username,
-        service_password_hash=resolved_settings.service_password_hash,
+    Gathered from module constants because mounting happens before any
+    surface object exists — see the `Surface` port. This tuple and
+    `_installed_surfaces` are the two halves of "which interfaces does this
+    deployment have", and they are meant to be read together.
+    """
+    return (
+        SurfaceRoutes(
+            name=console.SURFACE_NAME,
+            routers=console.ROUTERS,
+            static_files=console.STATIC_FILES,
+        ),
+        SurfaceRoutes(
+            name=webui.SURFACE_NAME, routers=webui.ROUTERS, static_files=webui.STATIC_FILES
+        ),
+        SurfaceRoutes(
+            name=telegram_surface.SURFACE_NAME,
+            routers=telegram_surface.ROUTERS,
+            static_files=telegram_surface.STATIC_FILES,
+        ),
+        # the secrets page is the service's own: it is how a secret gets filled
+        # in, not an interface anyone chooses to install
+        SurfaceRoutes(
+            name="secrets",
+            static_files=(StaticFile(path="/secrets.html", file=STATIC_DIR / "secrets.html"),),
+        ),
     )
-    # the admin router's own dependency resolves the same object, so a request
-    # verified by the middleware does not hash again
-    app.state.auth_gate = gate
-
-    @app.middleware("http")
-    async def authenticate(request: Request, call_next: NextCall) -> Response:
-        """Require the operator credential for everything but the health probes.
-
-        A middleware rather than per-router dependencies because it has to cover
-        what routers do not: the static console, `/docs` and `/openapi.json`.
-        Exceptions raised here bypass the app's handlers, so the responses are
-        built by hand.
-
-        Two checks, in order. The first refuses state-changing requests a
-        browser sends from another site: with Basic auth the credential rides
-        along automatically, so a form on an attacker's page would otherwise
-        act as the operator. The second is the credential itself.
-        """
-        if is_cross_site_mutation(request):
-            logger.warning("cross-site %s to %s refused", request.method, request.url.path)
-            return JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content={"detail": CROSS_SITE_MESSAGE},
-            )
-        if not is_open_path(request.url.path):
-            try:
-                await gate.authenticate(
-                    request, service_allowed=allows_service_credential(request.url.path)
-                )
-            except HTTPException as denied:
-                return JSONResponse(
-                    status_code=denied.status_code,
-                    content={"detail": denied.detail},
-                    headers=denied.headers,
-                )
-        return await call_next(request)
-
-    @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": HEALTH_STATUS}
-
-    @app.get("/health/ready")
-    async def ready(response: Response) -> dict[str, str]:
-        """Readiness probe: verify the database answers a trivial query."""
-        session_factory: async_sessionmaker[AsyncSession] = app.state.session_factory
-        try:
-            async with session_factory() as session:
-                await session.execute(text("SELECT 1"))
-        except SQLAlchemyError:
-            logger.warning("readiness check failed: database unavailable", exc_info=True)
-            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            return {"status": NOT_READY_STATUS, "database": "down"}
-        return {"status": READY_STATUS, "database": "ok"}
-
-    # the service's own endpoints
-    app.include_router(dialog_router)
-    app.include_router(cron_router)
-    app.include_router(secrets_router)
-    _mount_surface_routes(app)
-    return app
 
 
-def _mount_surface_routes(app: FastAPI) -> None:
-    """Mount what each installed surface serves.
+def _served_channels(surfaces: Sequence[Surface]) -> frozenset[str]:
+    """Which channels a request may name, as the installed surfaces declared them.
 
-    Routes are mounted while the app is built, before any surface object
-    exists (they need the database and the model client), so they come from
-    module constants — see the `Surface` port. The secrets page belongs to
-    the service: it is how a secret gets filled in, not an interface anyone
-    chooses to install.
+    Assembled rather than written down: a deployment without Telegram must
+    not accept `telegram`, or a message would open a dialog nobody reads.
     """
-    for routers, files in (
-        (console.ROUTERS, console.STATIC_FILES),
-        (webui.ROUTERS, webui.STATIC_FILES),
-        (telegram_surface.ROUTERS, telegram_surface.STATIC_FILES),
-    ):
-        for router in routers:
-            app.include_router(router)
-        for item in files:
-            _serve_file(app, item)
-    _serve_file(app, StaticFile(path="/secrets.html", file=STATIC_DIR / "secrets.html"))
+    return frozenset(
+        channel for channel in (surface.channel() for surface in surfaces) if channel is not None
+    )
 
 
-def _serve_file(app: FastAPI, item: StaticFile) -> None:
-    """Serve one file at one URL.
-
-    Per file rather than one mounted directory: several surfaces serve from
-    the same root, and two directories cannot both be mounted at `/`.
-    """
-
-    async def handler() -> FileResponse:
-        return FileResponse(item.file)
-
-    app.get(item.path, include_in_schema=False)(handler)
+def _surface_state(stores: _TelegramStores | None) -> dict[str, Any]:
+    """What installed surfaces need their own dependencies to reach."""
+    return {
+        "telegram_members": stores.directory if stores is not None else None,
+        "telegram_invites": stores.invites if stores is not None else None,
+    }
 
 
 async def _sweep_retention(

@@ -13,6 +13,7 @@ from fastapi import APIRouter
 from octoforge_core.agent.runner import DialogSurface
 from octoforge_core.tools.base import Tool
 
+from octoforge_web.channels import WEB_CHANNEL
 from octoforge_web.surfaces import StaticFile
 
 SURFACE_NAME = "webui"
@@ -35,6 +36,10 @@ class WebUiSurface:
     @property
     def name(self) -> str:
         return SURFACE_NAME
+
+    def channel(self) -> str | None:
+        """A browser talks to the service directly."""
+        return WEB_CHANNEL
 
     def dialog_surface(self) -> DialogSurface | None:
         """None: a browser subscribes over the API rather than being pushed to."""

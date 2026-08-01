@@ -127,6 +127,14 @@ Everything the core needs from the outside world, and what ships as the default 
 `build_cron_outcome_reporter`. They take ports and dataclass configs, never a web settings object,
 and they are what an alternative composition root reuses.
 
+The HTTP service itself is `web/src/octoforge_web/app.py:build_app()`: the application, its
+credential guard, its probes, and the mounting of whatever it is handed. It is given the runtime and
+the routes rather than building them, which is what lets an interface be optional — as long as the
+thing building the application also knew how to build a bot, a deployment without one meant editing
+it. The service is meant to answer the interfaces installed in front of it rather than the open
+internet, though it is guarded either way: "internal" is a deployment promise, not a property of the
+code.
+
 `web/src/octoforge_web/main.py:runtime()` is the default assembly on top of them: it opens the
 database engine, runs migrations, creates the HTTP clients, chooses backends from `Settings`, builds
 the registry, starts the cron scheduler and the material sweep, starts the Telegram surface if
@@ -149,9 +157,13 @@ gains, and background work to run. Routes and pages are not among them — those
 application is built, before any surface object exists, so each surface module exposes them as
 constants the composition root mounts directly.
 
-The direction of the arrow is the whole point. **The service never imports a surface.** Only the
-composition root knows which ones exist, and `_installed_surfaces()` is the single place that
-answers it — removing an interface is a matter of not constructing it, not of editing branches
+A surface also names the channel it serves. What the service accepts in `X-Channel` is the union of
+those, so a deployment without a bot rejects `telegram` instead of opening a dialog nobody reads —
+the set is assembled from what is installed, never written into the service.
+
+The direction of the arrow is the whole point. **The service never imports a surface**, and an
+import-boundary test says so (`web/tests/test_surfaces.py`). Only the composition root knows which
+ones exist, and `_installed_surfaces()` is the single place that answers it — removing an interface is a matter of not constructing it, not of editing branches
 elsewhere. A surface that fails to start or stop is reported and skipped: a broken bot must not cost
 the console and the API.
 

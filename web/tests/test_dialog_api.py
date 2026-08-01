@@ -447,9 +447,13 @@ async def test_events_endpoint_ends_the_stream_when_the_dialog_moves(
     await manager.stop_all()
 
 
-def channel_request(headers: dict[str, str], declared: str = CHANNEL) -> Request:
+def channel_request(
+    headers: dict[str, str],
+    declared: str = CHANNEL,
+    served: frozenset[str] = frozenset({CHANNEL, TELEGRAM_CHANNEL}),
+) -> Request:
     """A request carrying only what `get_channel` looks at."""
-    app = SimpleNamespace(state=SimpleNamespace(channel=declared))
+    app = SimpleNamespace(state=SimpleNamespace(channel=declared, channels=served))
     return Request(
         {
             "type": "http",
@@ -475,6 +479,18 @@ def test_an_unknown_channel_is_refused() -> None:
     """An accepted typo would strand the user's messages in a dialog nobody reads."""
     with pytest.raises(HTTPException) as raised:
         get_channel(channel_request({CHANNEL_HEADER: "telgram"}))
+
+    assert raised.value.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_a_channel_this_deployment_does_not_serve_is_refused() -> None:
+    """Which channels exist is what the installed surfaces declared. Without a
+    bot, `telegram` is not one of them, and accepting it would open a dialog
+    nobody would ever read."""
+    request = channel_request({CHANNEL_HEADER: TELEGRAM_CHANNEL}, served=frozenset({CHANNEL}))
+
+    with pytest.raises(HTTPException) as raised:
+        get_channel(request)
 
     assert raised.value.status_code == HTTPStatus.BAD_REQUEST
 

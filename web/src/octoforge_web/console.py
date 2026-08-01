@@ -36,6 +36,10 @@ class ConsoleSurface:
     def name(self) -> str:
         return SURFACE_NAME
 
+    def channel(self) -> str | None:
+        """None: the console reads every dialog and owns no channel."""
+        return None
+
     def dialog_surface(self) -> DialogSurface | None:
         """None: the console reads dialogs, it is not one."""
         return None

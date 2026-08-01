@@ -6,11 +6,7 @@ surfaces are a property of this deployment, not of the library — which is why
 the list of real ones lives here, at the edge that serves them.
 """
 
-from octoforge_web.telegram.client import TELEGRAM_CHANNEL
-
+#: The channel of a browser talking to the service directly. Every other one
+#: is named by the surface that serves it — which channels exist at all is a
+#: property of what a deployment installed, not of this module.
 WEB_CHANNEL = "web"
-
-#: Every channel this application serves. A request naming anything else is
-#: rejected rather than quietly given a dialog of its own: a typo would strand
-#: a user's messages in a conversation nobody reads.
-KNOWN_CHANNELS = frozenset({WEB_CHANNEL, TELEGRAM_CHANNEL})

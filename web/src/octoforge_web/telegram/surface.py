@@ -57,6 +57,10 @@ class TelegramSurface:
     def name(self) -> str:
         return SURFACE_NAME
 
+    def channel(self) -> str | None:
+        """Dialogs of the Telegram channel are this surface's."""
+        return TELEGRAM_CHANNEL
+
     def dialog_surface(self) -> DialogSurface | None:
         """The bridge registry renders dialogs of the Telegram channel."""
         return self._registry

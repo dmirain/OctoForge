@@ -38,6 +38,58 @@ def imported_modules(path: Path) -> set[str]:
     return found
 
 
+#: The service: what serves core over HTTP. It is handed its runtime and its
+#: routes, so it has no business knowing what a bot or a console is.
+SERVICE_MODULES = (
+    "app.py",
+    "auth.py",
+    "deps.py",
+    "channels.py",
+    "surfaces.py",
+    "runtime_state.py",
+    "capabilities.py",
+    "api/dialog.py",
+    "api/cron.py",
+    "api/secrets.py",
+    "api/schemas.py",
+    "api/sse.py",
+)
+
+#: The interfaces. None of them may reach into another: that is what makes
+#: each one removable by not installing it.
+SURFACE_PREFIXES = ("octoforge_web.telegram", "octoforge_web.console", "octoforge_web.webui")
+
+
+@pytest.mark.parametrize("module", SERVICE_MODULES)
+def test_the_service_does_not_import_a_surface(module: str) -> None:
+    """If it did, "optional" would be a fiction: removing an interface would
+    mean editing the service."""
+    imports = imported_modules(WEB_SRC / module)
+
+    assert not [name for name in imports if name.startswith(SURFACE_PREFIXES)]
+
+
+@pytest.mark.parametrize(
+    ("surface", "forbidden"),
+    [
+        ("console.py", ("octoforge_web.telegram", "octoforge_web.webui")),
+        ("webui.py", ("octoforge_web.telegram", "octoforge_web.console")),
+        ("telegram/surface.py", ("octoforge_web.console", "octoforge_web.webui")),
+    ],
+)
+def test_a_surface_does_not_import_another(surface: str, forbidden: tuple[str, ...]) -> None:
+    imports = imported_modules(WEB_SRC / surface)
+
+    assert not [name for name in imports if name.startswith(forbidden)]
+
+
+def test_only_the_deployment_knows_every_interface() -> None:
+    """One file is allowed to: the composition root that assembles them."""
+    imports = imported_modules(WEB_SRC / "main.py")
+
+    assert all(any(name.startswith(p) for name in imports) for p in SURFACE_PREFIXES)
+
+
 def test_the_console_does_not_reach_into_telegram() -> None:
     """It used to serve Telegram's who-is-who by reading that surface's store,
     which quietly made the console undeployable without a bot."""

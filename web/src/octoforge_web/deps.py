@@ -14,10 +14,8 @@ from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
 
 from octoforge_web.auth import AuthGate
-from octoforge_web.channels import KNOWN_CHANNELS
 from octoforge_web.config import Settings
 from octoforge_web.secret_links import SecretLinkService
-from octoforge_web.telegram.invites.api import InviteStore, MemberDirectory
 
 CHANNEL_HEADER = "X-Channel"
 UNKNOWN_CHANNEL_MESSAGE = "unknown channel: {channel}"
@@ -69,19 +67,14 @@ def get_claim_repository(request: Request) -> ClaimRepository:
     return cast(ClaimRepository, request.app.state.claims)
 
 
-def get_telegram_members(request: Request) -> "MemberDirectory | None":
-    """Return the Telegram member directory (None: bot not configured)."""
-    return cast("MemberDirectory | None", request.app.state.telegram_members)
-
-
-def get_telegram_invites(request: Request) -> "InviteStore | None":
-    """Return the Telegram invite store (None: bot not configured)."""
-    return cast("InviteStore | None", request.app.state.telegram_invites)
-
-
 def get_summary_store(request: Request) -> SummaryStore:
     """Return the dialog summary store built at application startup."""
     return cast(SummaryStore, request.app.state.summary_store)
+
+
+def _known_channels(request: Request) -> frozenset[str]:
+    """Every channel this deployment serves, as its surfaces declared them."""
+    return cast(frozenset[str], request.app.state.channels)
 
 
 def get_channel(request: Request) -> str:
@@ -100,7 +93,7 @@ def get_channel(request: Request) -> str:
     channel = request.headers.get(CHANNEL_HEADER)
     if channel is None:
         return declared
-    if channel not in KNOWN_CHANNELS:
+    if channel not in _known_channels(request):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
             detail=UNKNOWN_CHANNEL_MESSAGE.format(channel=channel),
