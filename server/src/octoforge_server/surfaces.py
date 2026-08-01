@@ -14,7 +14,9 @@ than of what is written.
 A surface may plug in two ways, and the port is the same either way: as a
 library this process loads, or as its own process talking to the service over
 HTTP. Which one a deployment uses is a deployment decision — see
-`RESTRUCTURE_PLAN.md`.
+`docs/architecture.md`, and `docs/reference/configuration.md` for the
+Telegram case, where the second mode exists because one bot token may be
+long-polled by exactly one process.
 """
 
 from collections.abc import Sequence
