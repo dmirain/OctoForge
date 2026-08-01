@@ -19,6 +19,7 @@ from octoforge_core.cron.api import (
     CronJob,
     CronStore,
     CronWaker,
+    WakeOutcome,
     compute_next_fire,
     count_missed,
 )
@@ -106,7 +107,16 @@ class CronScheduler:
             logger.exception("cron wake delivery failed: job=%s user=%s", job.id, job.user_id)
             await self._store.release_claim(job.id)
             return
-        if not delivered:
+        if delivered is WakeOutcome.NOT_OURS:
+            # Another live instance owns this dialog. Winning the lease is not
+            # a reason to move a conversation here: this instance simply got
+            # to a globally-visible due job first. Hand it straight back, so
+            # the owner fires it on its own next tick rather than after a
+            # whole lease TTL. Both instances poll, so a job whose owner is
+            # alive lands there within a tick or two.
+            await self._store.release_claim(job.id)
+            return
+        if delivered is not WakeOutcome.DELIVERED:
             # process limit was hit: no process was started, so this was not a
             # real fire. Leave the claim in place rather than advancing
             # next_fire_at (which would silently skip the job to its next

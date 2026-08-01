@@ -83,6 +83,28 @@ before claims existed at all are therefore still recovered.
 
 A clean shutdown releases its claims, so its dialogs are free at once rather than after the window.
 
+### Background work does not move a dialog
+
+Claiming is unconditional because placement is a routing decision: a message arrived *here*, so this
+process should own the dialog. Background work has no such decision behind it. The cron scheduler
+and the collecting sweep both read tables that are global — every instance sees every due job and
+every settled collection — so whoever polls first would take the dialog, and with several instances
+polling every second a conversation would hop between them for no reason.
+
+So background work follows the opposite rule from a message:
+
+| The dialog is | What happens |
+|---|---|
+| already ours | acted on directly |
+| held by nobody, or by a dead owner | adopted, exactly as a message would |
+| held by a live peer | left alone — that peer sweeps too, and its own tick picks the work up |
+
+A cron job whose dialog belongs elsewhere is **handed back at once** (`WakeOutcome.NOT_OURS`
+releases the lease) rather than held for a lease TTL: both instances poll, so the owner fires it
+within a tick or two. The collecting sweep simply skips it.
+
+With one instance this changes nothing — `held_elsewhere()` never returns your own claims.
+
 ## Invariants
 
 - **Claiming never fails.** The database records placement, it does not decide it.
@@ -93,6 +115,9 @@ A clean shutdown releases its claims, so its dialogs are free at once rather tha
   startup sweep.
 - **Recovery never touches a dialog a live peer holds.** This is the rule that makes a second
   process safe; without it a starting instance resets exchanges its peers are answering.
+- **Background work never takes a dialog.** A cron firing or a settled collection is acted on by
+  the instance that already owns the dialog, or by anyone if nobody does. Only a message moves a
+  conversation, because only a message was routed.
 - **`reopen_in_progress` is scoped to one dialog.** There is no way to express the global reset that
   a single-process world could afford.
 - **A stand-down is not a failure and not a user cancellation.** No error reaches the user; the work
@@ -124,6 +149,7 @@ a dead process.
 | An instance's `OF_NODE_ID` changes on restart | Correct but slower: its own stranded work waits out the staleness window instead of being recovered at once |
 | The claim table is unreachable at startup | Nothing is recovered this start; the next restart, or the owning process, picks the work up |
 | The claim table is unreachable during a run | The ownership check passes, the answer proceeds, and the heartbeat retries on its next tick |
+| The claim lookup fails while placing background work | Treated as somebody else's: the firing is handed back and retried, rather than moving the dialog on a guess |
 
 ## Code anchors
 
@@ -131,7 +157,9 @@ a dead process.
 - `core/src/octoforge_core/dialogs/store.py` — `SqlAlchemyClaimRepository`
 - `core/src/octoforge_core/dialogs/models.py` — `DialogClaimRow`
 - `core/src/octoforge_core/agent/runner.py` — `OwnershipConfig`, `ConversationManager._beat_once`,
-  `ConversationManager.recover_interrupted`, `ConversationRunner.stand_down`, `STREAM_CLOSED`
+  `ConversationManager.recover_interrupted`, `ConversationManager._runner_for_background`,
+  `ConversationRunner.stand_down`, `STREAM_CLOSED`
+- `core/src/octoforge_core/cron/api.py` — `WakeOutcome`
 - `core/src/octoforge_core/db/migrations/versions/a4e9c2b7f513_dialog_claims.py` — the table
 - `core/tests/test_dialog_claims.py` — the claim rules
 - `core/tests/test_dialog_ownership.py` — recovery scope and stand-down

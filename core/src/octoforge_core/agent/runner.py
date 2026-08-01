@@ -46,6 +46,7 @@ from octoforge_core.agent.router import (
     RouteDecision,
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
+from octoforge_core.cron.api import WakeOutcome
 from octoforge_core.dialogs.api import (
     ClaimRepository,
     DialogClaim,
@@ -2588,9 +2589,39 @@ class ConversationManager:
                 revived,
             )
 
+    async def _runner_for_background(self, user_id: str, channel: str) -> ConversationRunner | None:
+        """The dialog's runner for work nobody asked this process to do.
+
+        Background work — a settled collection, a cron firing — is found by
+        sweeping the whole database, so every instance sees every candidate.
+        Routing it through `get_or_create_runner` would make each of them
+        *take* the dialog, because claiming is what building a runner does:
+        one cron job would move a conversation to whichever instance won the
+        lease, and the collecting sweep would bounce dialogs between
+        instances every tick. Neither is placement — nothing decided the
+        dialog should move; the sweep merely got there first.
+
+        So the rule for background work is the opposite of the rule for a
+        message: act on the dialogs we already hold, adopt the ones nobody
+        holds, and leave a live peer's alone — it sweeps too, and its own
+        tick will pick this up.
+
+        With one instance `held_elsewhere` never matches (our own claims are
+        never returned), so this is exactly `get_or_create_runner`.
+        """
+        dialog = await self._dialogs.get_or_create(user_id, channel)
+        existing = self._runners.get(dialog.id)
+        if existing is not None:
+            return existing  # ours already; the heartbeat stands it down if that changes
+        if await self._held_elsewhere(frozenset({dialog.id})):
+            return None
+        return await self.get_or_create_runner(user_id, channel)
+
     async def promote_collection(self, user_id: str, channel: str, exchange_id: str) -> None:
         """Hand a settled material collection to its dialog (sweep entry point)."""
-        runner = await self.get_or_create_runner(user_id, channel)
+        runner = await self._runner_for_background(user_id, channel)
+        if runner is None:
+            return  # the instance that owns the dialog promotes it on its own tick
         await runner.promote_collected(exchange_id)
 
     async def wake(
@@ -2600,13 +2631,17 @@ class ConversationManager:
         title: str,
         prompt: str,
         cron_job_id: str,
-    ) -> bool:
+    ) -> WakeOutcome:
         """Deliver a cron firing into the user's dialog as a background process.
 
-        Returns whether the process was actually started (see `ConversationRunner.wake`).
+        See `WakeOutcome`: only DELIVERED is a fire, and NOT_OURS asks the
+        scheduler to hand the job back rather than move the dialog here.
         """
-        runner = await self.get_or_create_runner(user_id, channel)
-        return await runner.wake(title, prompt, cron_job_id)
+        runner = await self._runner_for_background(user_id, channel)
+        if runner is None:
+            return WakeOutcome.NOT_OURS
+        started = await runner.wake(title, prompt, cron_job_id)
+        return WakeOutcome.DELIVERED if started else WakeOutcome.LIMITED
 
     def use_surface(self, surface: DialogSurface) -> None:
         """Bind the transport that renders dialogs of its channel.

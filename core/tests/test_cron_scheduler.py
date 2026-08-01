@@ -13,6 +13,7 @@ from octoforge_core.cron.api import (
     CronJob,
     CronScheduleError,
     Scheduler,
+    WakeOutcome,
     compute_next_fire,
     count_missed,
 )
@@ -76,12 +77,17 @@ class WakeCall:
 
 
 class RecordingWaker:
-    """CronWaker stub recording delivered wakes; can be told to fail or skip (limit hit)."""
+    """CronWaker stub recording delivered wakes.
+
+    Can be told to raise, to hit the process limit, or to report the dialog
+    as another instance's.
+    """
 
     def __init__(self) -> None:
         self.calls: list[WakeCall] = []
         self.fail = False
         self.skip = False
+        self.foreign = False
 
     async def wake(
         self,
@@ -90,9 +96,11 @@ class RecordingWaker:
         title: str,
         prompt: str,
         cron_job_id: str,
-    ) -> bool:
+    ) -> WakeOutcome:
         if self.fail:
             raise RuntimeError(WAKE_FAILURE)
+        if self.foreign:
+            return WakeOutcome.NOT_OURS  # nothing started, so nothing recorded
         self.calls.append(
             WakeCall(
                 user_id=user_id,
@@ -102,7 +110,7 @@ class RecordingWaker:
                 cron_job_id=cron_job_id,
             )
         )
-        return not self.skip
+        return WakeOutcome.LIMITED if self.skip else WakeOutcome.DELIVERED
 
 
 def make_job(**overrides: object) -> CronJob:
@@ -228,6 +236,35 @@ async def test_replay_limit_defers_the_remaining_jobs(
     await scheduler.tick(now=NOW)
 
     assert len(waker.calls) == THREE_JOBS
+
+
+async def test_a_job_whose_dialog_another_instance_owns_is_handed_back_at_once(
+    store: SqlAlchemyCronStore,
+    waker: RecordingWaker,
+    no_stagger: None,
+) -> None:
+    """Every instance polls the same jobs table, so any of them may win the
+    lease for a dialog somebody else is running. That is not a failure and
+    not a fire — it is the wrong instance holding the job, and holding it for
+    a whole lease TTL would delay the firing by a minute for nothing.
+    """
+    await store.create(BASE_JOB)
+    scheduler = make_scheduler(store, waker)
+    waker.foreign = True
+
+    await scheduler.tick(now=NOW)
+
+    assert waker.calls == []
+    job = await store.get(BASE_JOB.id)
+    assert job.claimed_by is None  # handed straight back, not held for the TTL
+    assert job.last_fire_at is None
+    assert job.next_fire_at == DUE_AT  # not advanced: it never fired
+
+    # the owning instance's tick (or ours, once it lets go) fires it normally
+    waker.foreign = False
+    await scheduler.tick(now=NOW)
+
+    assert len(waker.calls) == 1
 
 
 async def test_failed_wake_releases_the_claim(

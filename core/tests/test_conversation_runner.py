@@ -39,6 +39,7 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.agent.runner import (
     BACKGROUND_TASK_PROMPT,
+    CLAIM_STALE_AFTER_SECONDS,
     MATERIAL_DIGEST_CHARS,
     MATERIAL_QUIET_SECONDS,
     MATERIAL_TITLE_ANONYMOUS,
@@ -61,7 +62,7 @@ from octoforge_core.agent.runner import (
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, AssembledContext, ContextCompactor
 from octoforge_core.context.compactor import NoopContextCompactor
-from octoforge_core.cron.api import CronWaker
+from octoforge_core.cron.api import CronWaker, WakeOutcome
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.api import ExchangeStatus
@@ -569,6 +570,8 @@ class ManagerOptions:
     compactor: ContextCompactor | None = None
     vision: VisionClient | None = None
     image_resolver: ImageResolver | None = None
+    #: How long a claim may go unrefreshed before its owner reads as dead.
+    stale_after_seconds: float = CLAIM_STALE_AFTER_SECONDS
 
 
 def make_manager(
@@ -600,7 +603,9 @@ def make_manager(
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
         ),
-        ownership=OwnershipConfig(node_id=NODE_ID),
+        ownership=OwnershipConfig(
+            node_id=NODE_ID, stale_after_seconds=resolved.stale_after_seconds
+        ),
     )
 
 
@@ -1823,6 +1828,91 @@ CRON_JOB_ID = "cron-job-1"
 CRON_TITLE = "morning report"
 CRON_PROMPT = "prepare the daily report"
 
+#: A second live instance sharing this database.
+PEER_NODE = "another-node"
+
+
+async def test_a_cron_firing_leaves_a_dialog_another_instance_is_running(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Winning a cron lease is not a reason to move a conversation.
+
+    Every instance sweeps the same jobs table, so whoever polls first sees
+    every due job — including jobs of dialogs somebody else is actively
+    running. Firing it here would take the dialog, and with two instances
+    polling every second a user's conversation would hop between them for no
+    reason at all.
+    """
+    manager = make_manager(BranchLLM(main=[], background=[]), ToolRegistry(), session_factory)
+    dialog = await get_dialog(session_factory)
+    claims = SqlAlchemyClaimRepository(session_factory)
+    held = await claims.claim(dialog.id, PEER_NODE)
+
+    outcome = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+
+    assert outcome is WakeOutcome.NOT_OURS
+    # the peer still owns it at the same generation: nothing was taken
+    assert await claims.current_generation(dialog.id) == held.generation
+
+
+async def test_a_settled_collection_is_left_to_the_instance_that_owns_the_dialog(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Same rule for the material sweep, which has no lease at all — so
+    without this every instance would grab every settled collection, and the
+    dialog would land wherever the last tick happened to run."""
+    store = InMemoryTaskStore()
+    manager = make_manager(
+        BranchLLM(main=[], background=[]),
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(store=store),
+    )
+    dialog = await get_dialog(session_factory)
+    claims = SqlAlchemyClaimRepository(session_factory)
+    held = await claims.claim(dialog.id, PEER_NODE)
+
+    await manager.promote_collection(USER_ID, CHANNEL, "exchange-1")
+
+    assert await claims.current_generation(dialog.id) == held.generation
+    assert await store.list(dialog.id) == []  # nothing was started here
+
+
+async def test_background_work_adopts_a_dialog_nobody_is_running(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Refusing a peer's dialog must not become refusing every dialog: an
+    idle user's cron still has to fire somewhere, and an unclaimed dialog is
+    exactly what a fresh instance sees for all of them."""
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
+    manager = make_manager(llm, ToolRegistry(), session_factory)
+    dialog = await get_dialog(session_factory)
+
+    outcome = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+
+    assert outcome is WakeOutcome.DELIVERED
+    assert await SqlAlchemyClaimRepository(session_factory).current_generation(dialog.id)
+
+
+async def test_a_stale_claim_does_not_hold_background_work_hostage(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A claim whose owner died stops being a reason to defer. Otherwise a
+    crashed instance would silence its users' cron jobs permanently."""
+    llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
+    manager = make_manager(
+        llm,
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(stale_after_seconds=0.0),  # every claim reads as dead
+    )
+    dialog = await get_dialog(session_factory)
+    await SqlAlchemyClaimRepository(session_factory).claim(dialog.id, PEER_NODE)
+
+    outcome = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+
+    assert outcome is WakeOutcome.DELIVERED
+
 
 async def test_wake_runs_cron_tagged_background_process(
     session_factory: async_sessionmaker[AsyncSession],
@@ -1834,7 +1924,7 @@ async def test_wake_runs_cron_tagged_background_process(
     queue = runner.subscribe()
 
     delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
-    assert delivered is True
+    assert delivered is WakeOutcome.DELIVERED
     events = await collect_until(queue, is_delivered(TASK_RESULT))
 
     # exactly one delivered message, with the verbatim result and the task link
@@ -1867,7 +1957,7 @@ async def test_wake_delivers_a_failed_event_for_a_failed_cron_task(
     queue = runner.subscribe()
 
     delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
-    assert delivered is True
+    assert delivered is WakeOutcome.DELIVERED
     events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
 
     failed = [e.payload for e in events if isinstance(e.payload, Failed)]
@@ -2746,7 +2836,8 @@ async def test_cron_result_of_an_unwatched_dialog_waits_for_a_subscriber(
         ManagerOptions(store=store),
     )
 
-    assert await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID) is True
+    fired = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    assert fired is WakeOutcome.DELIVERED
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     task = await single_task(store, runner.dialog_id)
     await wait_for_condition(lambda: task.status is TaskStatus.DONE)

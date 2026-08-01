@@ -22,7 +22,11 @@ user's local morning, while every stored timestamp is aware UTC.
    claimant wins, so several instances can run schedulers against one database; a claim from a process
    that died expires after `OF_CRON_LEASE_TTL_SECONDS` and is reclaimed by a live one.
 3. The job fires through the `CronWaker` port — implemented by `ConversationManager.wake()`, which
-   creates a RUN task in the owner's dialog and starts a process for it.
+   creates a RUN task in the owner's dialog and starts a process for it. It answers with a
+   `WakeOutcome`, and only `DELIVERED` is a fire: `LIMITED` (the dialog is at its process limit)
+   keeps the claim so the job retries once the lease goes stale, and `NOT_OURS` (a live peer owns
+   the dialog) releases it immediately so that peer fires it — winning a lease must not move a
+   conversation, see [dialog-ownership.md](dialog-ownership.md).
 4. `complete_fire()` — `next_fire_at` is recomputed *from the fire time*, and `last_fire_at` is set.
 
 ### Missed firings are coalesced, not replayed
@@ -69,6 +73,7 @@ Outcomes always flow back through `record_fire_result`.
 
 - **A job is owned by one user**, and firing enters that user's dialog only.
 - **Claiming is atomic.** Two schedulers cannot fire the same job for the same due time.
+- **Winning a lease does not move the dialog.** The job is handed back to the instance that owns it.
 - **A lease expires**, so a crashed instance does not freeze a job forever.
 - **`next_fire_at` is computed from the fire time**, never from "now plus period", so downtime cannot
   shift a schedule permanently.
@@ -96,6 +101,7 @@ Outcomes always flow back through `record_fire_result`.
 | Job prompt depends on dialog context that is gone | The run does the wrong thing — hence the tool description insists prompts be self-contained |
 | Firing fails | `last_status=failed`, `last_error` recorded; no retry; next regular firing proceeds |
 | Dialog at its process limit when a job fires | The firing is refused and reported as such; the schedule is untouched |
+| The winning instance does not own the dialog | The lease is released at once; the owning instance fires it on its own next tick |
 | Invalid cron expression or timezone | Rejected at creation with `CronScheduleError` |
 
 ## Code anchors

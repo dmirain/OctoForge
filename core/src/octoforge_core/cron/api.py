@@ -22,6 +22,7 @@ flow back through `record_fire_result` (called by the dialog side via the
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -161,6 +162,28 @@ class CronStore(Protocol):
         ...
 
 
+class WakeOutcome(StrEnum):
+    """What became of a firing — three cases the scheduler must tell apart.
+
+    Only `DELIVERED` is a fire. The other two are not failures either, and
+    they differ in what the lease should do next, which is why one boolean
+    could not carry them.
+    """
+
+    #: The process started. Advance the schedule.
+    DELIVERED = "delivered"
+    #: The dialog's process limit was hit, so nothing started. Keep the claim:
+    #: releasing it would retry every poll tick and spam the limit note, and
+    #: advancing the schedule would silently skip the job — up to a year for a
+    #: dated one-shot. It retries once the lease goes stale.
+    LIMITED = "limited"
+    #: Another live instance owns this dialog. Nothing was started and nothing
+    #: is wrong: the job belongs to that instance's tick. Release the claim at
+    #: once so it can take it, rather than holding the job hostage for a lease
+    #: TTL.
+    NOT_OURS = "not_ours"
+
+
 class CronWaker(Protocol):
     """Port the scheduler fires due jobs through: deliver the prompt to a dialog."""
 
@@ -171,12 +194,11 @@ class CronWaker(Protocol):
         title: str,
         prompt: str,
         cron_job_id: str,
-    ) -> bool:
+    ) -> WakeOutcome:
         """Start the job's background process in the user's dialog.
 
-        Returns `False` when the process limit was hit and the job was not
-        actually started (a system note is published instead); the caller
-        must not advance the job's schedule in that case.
+        Only `WakeOutcome.DELIVERED` means the job fired; see `WakeOutcome`
+        for what the other two ask of the lease.
         """
         ...
 
