@@ -107,6 +107,11 @@ services:
     environment:
       SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
       ACME_EMAIL: ${ACME_EMAIL:-}
+      # The pods to balance across, read by the Caddyfile. It has to be listed
+      # here: this service has no env_file, so nothing in .env reaches it
+      # otherwise — and the Caddyfile's own default would quietly leave a
+      # multi-pod deployment talking to one pod, with no error anywhere.
+      OF_POD_UPSTREAMS: ${OF_POD_UPSTREAMS:-app:8000}
       # point ACME_CA at https://acme-staging-v02.api.letsencrypt.org/directory
       # while checking that inbound :80 works — staging has loose rate limits
       ACME_CA: ${ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}

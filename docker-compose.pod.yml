@@ -31,6 +31,16 @@ services:
       # Not negotiable on a pod, whatever .env says: a second long poll would
       # steal updates from the ingestion node rather than share them.
       OF_TELEGRAM_POLL_IN_PROCESS: "false"
+      # NOT set here, and it matters: OF_EMBEDDING_BACKEND and
+      # OF_EMBEDDING_MODEL must be IDENTICAL on every pod. They share one
+      # vector table, the column carries no declared dimension, and nothing
+      # records which model wrote a row — so a pod embedding with a different
+      # model writes vectors that mean nothing next to the others, and the
+      # damage is silent and permanent until everything is re-embedded.
+      #
+      # With a local backend that means the model loads into every pod, ~2 GB
+      # each. If that does not fit, the answer is to move ALL of them onto one
+      # shared remote endpoint, never to give one pod a different model.
     ports:
       # The balancer's address, and only it. Defaults to loopback so an unset
       # variable cannot put an unauthenticated app on a public interface —

@@ -133,11 +133,18 @@ Three roles, and it is worth being precise about which process is which:
 private network — never at a standby. Replication is asynchronous, so a pod reading one would see a
 stale `dialog_claims` table and two processes would each conclude they own a dialog, which is the
 exact corruption [../reference/dialog-ownership.md](../reference/dialog-ownership.md) exists to
-prevent. `pg_hba.conf` on the primary has to grant the app role from the pod's address, next to the
-`replication` line a standby needs:
+prevent.
+
+Check what `pg_hba.conf` already says before adding to it. The stock Postgres image ends it with
+`host all all all scram-sha-256`, so a pod needs no new rule — and, more to the point, **that line
+is what your access control actually is**: any address reaching the port may authenticate to any
+database. What limits the blast radius is `POSTGRES_PEER_BIND`, which decides who can reach the port
+at all. If you want the tunnel to carry replication and nothing else, that permissive line has to go
+first, replaced with explicit rules:
 
 ```
-host    all            octoforge     10.8.0.2/32    scram-sha-256
+host    replication    replicator    10.8.0.2/32    scram-sha-256
+host    all            octoforge     10.8.0.2/32    scram-sha-256   # only if a pod runs there
 ```
 
 **Affinity, not distribution.** `OF_POD_UPSTREAMS` lists the pods; Caddy hashes `X-User-Id` to pick
@@ -157,9 +164,12 @@ file pins that regardless of `.env`. Everything else is already safe to run twic
 claimed with a SQL compare-and-swap lease, and background sweeps hand back a dialog another instance
 owns instead of taking it.
 
-**What each pod costs.** The local embedding backend loads a model of its own into every process.
-Two of them will not fit on a small host beside Postgres — put the extra pods on
-`OF_EMBEDDING_BACKEND=openai`, or give them their own machine.
+**Every pod must embed with the same model.** They share one vector table, the column carries no
+declared dimension, and no row records which model wrote it — so a pod configured with a different
+`OF_EMBEDDING_MODEL` writes vectors that mean nothing beside the others, nothing fails loudly, and
+the damage stands until everything is re-embedded. If a local backend will not fit twice (it loads
+~2 GB into each process), move **all** pods onto one shared remote endpoint. Never give one pod a
+model of its own.
 
 ## Replication and failover
 
@@ -172,9 +182,11 @@ primary is lost, and then it *is* the primary.
 
 **The network first.** The standby reaches the primary over a private address — a WireGuard peer or
 a provider's internal network — never the public internet. `POSTGRES_PEER_BIND` publishes Postgres
-on that address (default loopback, i.e. off) and `pg_hba.conf` decides what may then be done from
-it: grant the standby's address `replication` for the replication role and nothing else, so a
-compromise of that host cannot read the database itself.
+on that address (default loopback, i.e. off), and that publication is the real boundary: the stock
+image's `pg_hba.conf` ends with `host all all all scram-sha-256`, so everything that can reach the
+port may authenticate to any database. To make the tunnel carry replication only, replace that line
+with a rule naming the replication role and the standby's address — otherwise a compromise of the
+standby's host reads the database as easily as it replicates it.
 
 Rotate `POSTGRES_PASSWORD` before binding anywhere but loopback. The compose default is a published
 constant.

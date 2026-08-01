@@ -7,6 +7,10 @@ __pycache__/
 .ruff_cache/
 dist/
 .env
+# every variant, not just the exact name: a `.env.bak.HHMMSS` written before
+# an edit is the same secrets under a name nothing was ignoring
+.env.*
+!.env.example
 octoforge.db
 telegram.db
 *.bak
