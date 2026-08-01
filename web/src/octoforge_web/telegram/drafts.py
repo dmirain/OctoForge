@@ -18,7 +18,7 @@ text changes nothing anyone else would need.
 from dataclasses import dataclass
 from typing import Protocol
 
-from sqlalchemy import Integer, String, delete, select
+from sqlalchemy import BigInteger, Integer, String, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -57,10 +57,15 @@ class DraftRow(TelegramSurfaceBase):
     __tablename__ = "telegram_drafts"
 
     exchange_id: Mapped[str] = mapped_column(String, primary_key=True)
+    # BigInteger, not Integer: Telegram states its ids may outgrow 32 bits and
+    # tells clients to hold them in 64, and some accounts already do. A chat
+    # that does not fit would fail on insert — for that user only, and only
+    # once they are mid-answer during a handover, which is about the worst
+    # possible time to discover it.
     # indexed: a bridge attaching loads every draft of its chat at once
-    chat_id: Mapped[int] = mapped_column(Integer, index=True)
-    message_id: Mapped[int] = mapped_column(Integer)
-    reply_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    reply_to: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     sealed_chunks: Mapped[int] = mapped_column(Integer, default=0)
 
 
