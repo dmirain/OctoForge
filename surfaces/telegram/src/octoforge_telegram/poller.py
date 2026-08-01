@@ -928,11 +928,20 @@ class TelegramPoller:
         )
 
     async def _send_secrets_link(self, user_id: str, chat_id: int) -> None:
+        """Hand out a form link for this ACCOUNT; the service resolves the person.
+
+        The account id, not the handle and not the person: ingestion may be
+        running out of process, where nothing knows who an account belongs
+        to. Passing the handle put the form in a namespace of its own —
+        secrets written under `tg:<account>`, read back under the person, and
+        nothing anywhere reported a problem.
+        """
         if self._secrets_link is None:
             await self._client.send_message(chat_id, SECRETS_DISABLED_TEXT)
             return
+        external_id = user_id.removeprefix(USER_ID_PREFIX)
         await self._client.send_message(
-            chat_id, SECRETS_LINK_TEXT.format(url=self._secrets_link(user_id))
+            chat_id, SECRETS_LINK_TEXT.format(url=self._secrets_link(external_id))
         )
 
     async def _record_member(self, user_id: str, user: TelegramUser) -> None:

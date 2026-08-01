@@ -28,7 +28,7 @@ from octoforge_core.db.engine import create_engine, create_session_factory
 from octoforge_server.config import Settings
 from octoforge_server.secret_links import SecretLinkService, secrets_link_builder
 
-from octoforge_telegram.client import TelegramBotClient
+from octoforge_telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.gateway import ApiGatewayRegistry, basic_auth_header
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
@@ -90,14 +90,18 @@ def _secrets_link(settings: Settings) -> Callable[[str], str] | None:
     """The /secrets URL factory, when this installation stores secrets at all.
 
     Ingestion can hand out this link without reaching the service: the token
-    carries its own claim, signed with the installation's secrets key, and
-    whichever pod the form lands on validates it from that key alone. Without
-    the key nothing can store a secret anyway, and the bot says so rather than
-    sending a link to a form that answers 503.
+    names the Telegram ACCOUNT and is signed with the installation's secrets
+    key, so whichever pod the form lands on validates it from that key alone
+    and resolves the person itself. This node could not do that resolution —
+    it has no identity store, only its own invite database — which is exactly
+    why the token names an account and not a person.
+
+    Without the key nothing can store a secret anyway, and the bot says so
+    rather than sending a link to a form that answers 503.
     """
     if not settings.secrets_key:
         return None
-    return secrets_link_builder(settings, SecretLinkService(settings.secrets_key))
+    return secrets_link_builder(settings, SecretLinkService(settings.secrets_key), TELEGRAM_CHANNEL)
 
 
 async def _build(

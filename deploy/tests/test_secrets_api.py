@@ -1,5 +1,6 @@
 """Tests for the self-service secrets surface: token gate, form API, openness."""
 
+import sqlite3
 from collections.abc import Iterator
 from http import HTTPStatus
 from pathlib import Path
@@ -8,12 +9,16 @@ import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from octoforge_server.config import Settings
-from octoforge_server.secret_links import SecretLinkService
+from octoforge_server.secret_links import LinkSubject, SecretLinkService
 
 from octoforge_deploy.main import create_app
 
 TEST_BASE_URL = "http://test-llm/v1"
-USER = "tg:100500"
+# Deliberately ASYMMETRIC: the link names the Telegram account, the store is
+# keyed by the person. Making these the same string is exactly what let the
+# form write into a namespace the agent never reads — put and get agreed with
+# each other and with nothing else.
+ACCOUNT = "100500"
 CODE = "mail_token"
 VALUE = "tok-123"
 HOST = "api.mail.example.com"
@@ -33,9 +38,15 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
         yield test_client
 
 
+SUBJECT = LinkSubject(surface="telegram", external_id=ACCOUNT)
+
+
+def link_service(client: TestClient) -> SecretLinkService:
+    return client.app.state.secret_links  # type: ignore[attr-defined,no-any-return]
+
+
 def issue_token(client: TestClient) -> str:
-    links: SecretLinkService = client.app.state.secret_links  # type: ignore[attr-defined]
-    return links.issue(USER)
+    return link_service(client).issue(SUBJECT)
 
 
 def test_form_and_api_are_reachable_without_the_operator_credential(
@@ -66,10 +77,40 @@ def test_full_form_flow(client: TestClient) -> None:
     assert empty["secrets"] == []
 
 
+def test_the_form_writes_where_the_agent_reads(client: TestClient, tmp_path: Path) -> None:
+    """The regression that made every new secret silently unusable.
+
+    The link names a Telegram account; the agent resolves secrets by the
+    person, because that is what a tool context carries. While the form took
+    the account id at face value the two never met: `put` and `get` agreed
+    with each other and with nothing else, so a saved secret came back to the
+    agent as SECRET_MISSING with no error on the way in.
+
+    Asserted against the database rather than through the API, because the
+    API would resolve the token the same way twice and agree with itself.
+    """
+    client.post(
+        "/api/secrets/set",
+        json={"token": issue_token(client), "code": CODE, "value": VALUE, "allowed_host": HOST},
+    )
+
+    with sqlite3.connect(tmp_path / "secrets-test.db") as db:
+        owner = db.execute("select user_id from secrets where code = ?", (CODE,)).fetchone()
+        person = db.execute(
+            "select user_id from user_identities where surface = ? and external_id = ?",
+            (SUBJECT.surface, SUBJECT.external_id),
+        ).fetchone()
+
+    assert owner is not None, "the form stored nothing"
+    assert person is not None, "the account was never resolved to a person"
+    assert owner[0] == person[0]
+    assert owner[0] != f"tg:{ACCOUNT}"  # the shape the old code stored under
+
+
 def test_expired_or_foreign_token_is_rejected(client: TestClient) -> None:
-    links: SecretLinkService = client.app.state.secret_links  # type: ignore[attr-defined]
+    links = link_service(client)
     links.ttl_seconds = -1.0  # everything issued is instantly expired
-    token = links.issue(USER)
+    token = links.issue(SUBJECT)
 
     response = client.post(
         "/api/secrets/set",
@@ -100,26 +141,22 @@ def test_delete_of_a_missing_secret_is_a_404(client: TestClient) -> None:
 
 def test_disabled_secrets_answer_503(tmp_path: Path) -> None:
     with TestClient(create_app(make_settings(tmp_path, with_key=False))) as client:
-        links: SecretLinkService = client.app.state.secret_links  # type: ignore[attr-defined]
-        token = links.issue(USER)
+        token = link_service(client).issue(SUBJECT)
 
         response = client.post("/api/secrets/session", json={"token": token})
 
     assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
 
 
-def test_tokens_are_user_bound_and_expire() -> None:
+def test_tokens_name_one_account_and_expire() -> None:
     service = SecretLinkService(ttl_seconds=600)
+    other = LinkSubject(surface="telegram", external_id="2")
 
-    token = service.issue(USER)
-    other = service.issue("tg:2")
-
-    assert service.redeem(token) == USER
-    assert service.redeem(other) == "tg:2"
+    assert service.redeem(service.issue(SUBJECT)) == SUBJECT
+    assert service.redeem(service.issue(other)) == other
     assert service.redeem("garbage") is None
     service.ttl_seconds = -1.0
-    expired = service.issue(USER)
-    assert service.redeem(expired) is None
+    assert service.redeem(service.issue(SUBJECT)) is None
 
 
 def test_a_token_is_redeemed_by_a_pod_that_did_not_issue_it() -> None:
@@ -134,7 +171,7 @@ def test_a_token_is_redeemed_by_a_pod_that_did_not_issue_it() -> None:
     issued_on = SecretLinkService(key)
     redeemed_on = SecretLinkService(key)
 
-    assert redeemed_on.redeem(issued_on.issue(USER)) == USER
+    assert redeemed_on.redeem(issued_on.issue(SUBJECT)) == SUBJECT
 
 
 def test_another_installations_token_is_worthless_here() -> None:
@@ -142,7 +179,7 @@ def test_another_installations_token_is_worthless_here() -> None:
     ours = SecretLinkService(Fernet.generate_key().decode())
     theirs = SecretLinkService(Fernet.generate_key().decode())
 
-    assert ours.redeem(theirs.issue(USER)) is None
+    assert ours.redeem(theirs.issue(SUBJECT)) is None
 
 
 def test_an_installation_without_a_key_mints_nothing_another_can_redeem() -> None:
@@ -154,4 +191,4 @@ def test_an_installation_without_a_key_mints_nothing_another_can_redeem() -> Non
     one = SecretLinkService()
     two = SecretLinkService()
 
-    assert two.redeem(one.issue(USER)) is None
+    assert two.redeem(one.issue(SUBJECT)) is None

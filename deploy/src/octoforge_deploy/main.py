@@ -345,7 +345,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     _TelegramExtras(
                         stores=telegram_stores,
                         secrets_link=(
-                            secrets_link_builder(settings, secret_links)
+                            secrets_link_builder(settings, secret_links, TELEGRAM_CHANNEL)
                             if secret_store is not None
                             else None
                         ),

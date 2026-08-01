@@ -12,6 +12,7 @@ from http import HTTPStatus
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from octoforge_core.identity.api import IdentityStore
 from octoforge_core.secrets.api import (
     InvalidSecretError,
     SecretNotFoundError,
@@ -19,7 +20,7 @@ from octoforge_core.secrets.api import (
 )
 from pydantic import BaseModel, Field
 
-from octoforge_server.deps import get_secret_links, get_secret_store
+from octoforge_server.deps import get_identity_store, get_secret_links, get_secret_store
 from octoforge_server.secret_links import SecretLinkService
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ BAD_TOKEN_DETAIL = "the link has expired; run /secrets in Telegram to get a fres
 
 StoreDep = Annotated[SecretStore | None, Depends(get_secret_store)]
 LinksDep = Annotated[SecretLinkService, Depends(get_secret_links)]
+IdentityDep = Annotated[IdentityStore, Depends(get_identity_store)]
 
 
 class SetSecretRequest(BaseModel):
@@ -57,21 +59,44 @@ class SessionRequest(BaseModel):
     token: str
 
 
-def _authorize(links: SecretLinkService, store: SecretStore | None, token: str) -> str:
+async def _authorize(
+    links: SecretLinkService,
+    store: SecretStore | None,
+    identities: IdentityStore,
+    token: str,
+) -> str:
+    """The person whose secrets this token opens, or an HTTP error.
+
+    The token names an *account* on a surface; the store is keyed by person.
+    Turning one into the other is the service's job — the same resolution
+    `X-User-Id` gets — and doing it anywhere else is what broke this form:
+    the link named the account, the form wrote under it, and the agent read
+    under the person, so every secret saved after the identity migration was
+    invisible without a single error.
+
+    `resolve_or_create`, deliberately. `/secrets` is intercepted before the
+    dialog pipeline, so somebody whose very first message is that command has
+    passed the invite gate but has no person yet — `resolve` alone would
+    refuse them a form they are entitled to, permanently. Minting here is the
+    same thing their first ordinary message would have done, and the token is
+    unforgeable and only ever issued by a surface that already let them in.
+    """
     if store is None:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=SECRETS_DISABLED_DETAIL
         )
-    user_id = links.redeem(token)
-    if user_id is None:
+    subject = links.redeem(token)
+    if subject is None:
         raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=BAD_TOKEN_DETAIL)
-    return user_id
+    return await identities.resolve_or_create(subject.surface, subject.external_id)
 
 
 @router.post("/session")
-async def session(request: SessionRequest, store: StoreDep, links: LinksDep) -> dict[str, Any]:
+async def session(
+    request: SessionRequest, store: StoreDep, links: LinksDep, identities: IdentityDep
+) -> dict[str, Any]:
     """Validate the token and list the user's secrets metadata (never values)."""
-    user_id = _authorize(links, store, request.token)
+    user_id = await _authorize(links, store, identities, request.token)
     assert store is not None  # _authorize raised otherwise
     infos = await store.list(user_id)
     return {
@@ -90,9 +115,11 @@ async def session(request: SessionRequest, store: StoreDep, links: LinksDep) -> 
 
 
 @router.post("/set")
-async def set_secret(request: SetSecretRequest, store: StoreDep, links: LinksDep) -> dict[str, str]:
+async def set_secret(
+    request: SetSecretRequest, store: StoreDep, links: LinksDep, identities: IdentityDep
+) -> dict[str, str]:
     """Store or replace one secret for the token's user."""
-    user_id = _authorize(links, store, request.token)
+    user_id = await _authorize(links, store, identities, request.token)
     assert store is not None
     try:
         info = await store.put(user_id, request.code, request.value, request.allowed_host)
@@ -104,10 +131,10 @@ async def set_secret(request: SetSecretRequest, store: StoreDep, links: LinksDep
 
 @router.post("/delete")
 async def delete_secret(
-    request: DeleteSecretRequest, store: StoreDep, links: LinksDep
+    request: DeleteSecretRequest, store: StoreDep, links: LinksDep, identities: IdentityDep
 ) -> dict[str, str]:
     """Delete one secret for the token's user."""
-    user_id = _authorize(links, store, request.token)
+    user_id = await _authorize(links, store, identities, request.token)
     assert store is not None
     try:
         await store.delete(user_id, request.code)

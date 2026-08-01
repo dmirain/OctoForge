@@ -5,10 +5,21 @@ with a short-lived link to the HTTPS form, and the secret travels straight
 from the browser to the backend — it never exists inside a Telegram chat,
 a dialog narrative or an LLM prompt.
 
-The token is a capability: whoever holds it may manage that user's secrets
-until it expires. It carries its own claim rather than naming a row: the
-user id encrypted under a key derived from the installation's secrets key,
-with Fernet's own timestamp as the expiry. Nothing is stored anywhere.
+The token is a capability: whoever holds it may manage that account's
+secrets until it expires. It carries its own claim rather than naming a row:
+the account it was issued for, encrypted under a key derived from the
+installation's secrets key, with Fernet's own timestamp as the expiry.
+Nothing is stored anywhere.
+
+It names an **account**, not a person, and the service turns one into the
+other when the form arrives. That direction is not a detail. Whoever hands
+out the link may not know who the account belongs to — the Telegram
+ingestion node has no identity store, only its own invite database — while
+the service always does, because it answers `X-User-Id` the same way. Having
+the link name a person instead once put the form in a different namespace
+from the agent: it wrote secrets under `tg:<account>`, the agent looked for
+them under the person, and every secret saved after the identity migration
+was invisible with no error anywhere.
 
 That is not a micro-optimization, it is what makes the form work at all once
 the service runs on more than one pod. The form has no `X-User-Id` to be
@@ -21,7 +32,9 @@ that there is no table of pending tokens to bound, purge or replicate.
 
 import base64
 import hashlib
+import json
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -40,6 +53,19 @@ def derive_link_key(secrets_key: str) -> bytes:
     return base64.urlsafe_b64encode(digest)
 
 
+@dataclass(frozen=True, slots=True)
+class LinkSubject:
+    """The account a link was issued for, as the surface names it.
+
+    Two fields rather than one prefixed string, so nothing downstream is
+    tempted to recover the surface by parsing an id. That parsing is what
+    hid `admin_manage` and what broke this form.
+    """
+
+    surface: str
+    external_id: str
+
+
 class SecretLinkService:
     """Issues and validates the tokens of the secrets form."""
 
@@ -52,12 +78,13 @@ class SecretLinkService:
         self._fernet = Fernet(derive_link_key(key) if key else Fernet.generate_key())
         self.ttl_seconds = ttl_seconds
 
-    def issue(self, user_id: str) -> str:
-        """Return a fresh token authorizing secret management for `user_id`."""
-        return self._fernet.encrypt(user_id.encode()).decode()
+    def issue(self, subject: LinkSubject) -> str:
+        """Return a fresh token authorizing secret management for that account."""
+        payload = json.dumps({"s": subject.surface, "e": subject.external_id})
+        return self._fernet.encrypt(payload.encode()).decode()
 
-    def redeem(self, token: str) -> str | None:
-        """Return the user id a valid token is bound to; None otherwise.
+    def redeem(self, token: str) -> LinkSubject | None:
+        """Return the account a valid token is bound to; None otherwise.
 
         Deliberately not single-use: the form makes several calls (list, add,
         delete) within one session; the TTL bounds the exposure instead.
@@ -68,15 +95,24 @@ class SecretLinkService:
         margin; Fernet additionally refuses a token stamped in the future.
         """
         try:
-            return self._fernet.decrypt(token.encode(), ttl=int(self.ttl_seconds)).decode()
-        except (InvalidToken, ValueError):
-            # invalid, expired, or not a Fernet token at all — to the caller
-            # these are one situation: this token buys nothing
+            raw = self._fernet.decrypt(token.encode(), ttl=int(self.ttl_seconds))
+            payload = json.loads(raw)
+            return LinkSubject(surface=str(payload["s"]), external_id=str(payload["e"]))
+        except (InvalidToken, ValueError, KeyError, TypeError):
+            # invalid, expired, not a Fernet token, or a payload this version
+            # does not understand — to the caller these are one situation:
+            # this token buys nothing
             return None
 
 
-def secrets_link_builder(settings: Settings, links: SecretLinkService) -> Callable[[str], str]:
-    """Build the /secrets URL factory: a fresh token per request.
+def secrets_link_builder(
+    settings: Settings, links: SecretLinkService, surface: str
+) -> Callable[[str], str]:
+    """Build the /secrets URL factory, keyed by the surface's own account id.
+
+    Takes an external id — what the surface calls the account — because that
+    is all the caller reliably has. The ingestion node in particular knows
+    nothing else.
 
     The token rides in the URL *fragment*, not the query string: a fragment is
     never sent to the server, so it cannot land in an access log (Caddy logs
@@ -90,7 +126,8 @@ def secrets_link_builder(settings: Settings, links: SecretLinkService) -> Callab
     """
     base = settings.resolved_public_base_url()
 
-    def build(user_id: str) -> str:
-        return f"{base}/secrets.html#token={links.issue(user_id)}"
+    def build(external_id: str) -> str:
+        token = links.issue(LinkSubject(surface=surface, external_id=external_id))
+        return f"{base}/secrets.html#token={token}"
 
     return build

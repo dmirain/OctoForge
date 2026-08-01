@@ -829,16 +829,21 @@ async def test_secrets_command_replies_with_a_link_and_never_reaches_the_dialog(
     client = FakeTelegramClient()
     issued: list[str] = []
 
-    def link(user_id: str) -> str:
-        issued.append(user_id)
-        return f"https://example.com/secrets.html?token=tok-{user_id}"
+    def link(external_id: str) -> str:
+        issued.append(external_id)
+        return f"https://example.com/secrets.html?token=tok-{external_id}"
 
     # forbidden_provider raises if the message ever reaches the dialog pipeline
     poller = make_poller(client, secrets_link=link)
 
     await deliver(poller, make_update(1, "/secrets"))
 
-    assert issued == [USER_ID]
+    # The ACCOUNT id, bare — not the `tg:` handle. Ingestion may be running out
+    # of process, where nothing can say who an account belongs to; the service
+    # resolves the person when the form arrives. Handing over the handle put
+    # the form in a namespace of its own and made every saved secret invisible
+    # to the agent.
+    assert issued == [USER_ID.removeprefix("tg:")]
     ((_, text, _),) = client.sent
     assert "secrets.html?token=tok-" in text
     assert "Никогда не присылайте секреты" in text

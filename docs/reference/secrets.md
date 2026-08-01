@@ -38,9 +38,20 @@ sequenceDiagram
 ```
 
 The token is a capability, valid for ten minutes. It carries its own claim rather than naming a stored
-row: the user id encrypted under a key derived from `OF_SECRETS_KEY`, with the expiry stamped inside it.
-Nothing about pending links is kept anywhere, so a restart no longer invalidates a link somebody is
-about to open — and any process holding the key can both issue and validate one.
+row: the **account** it was issued for — surface and external id — encrypted under a key derived from
+`OF_SECRETS_KEY`, with the expiry stamped inside it. Nothing about pending links is kept anywhere, so a
+restart no longer invalidates a link somebody is about to open, and any process holding the key can
+issue one.
+
+**An account, not a person, and the service resolves it on arrival.** Whoever hands out the link may
+not know who the account belongs to — the Telegram ingestion node has only its own invite database —
+while the service always does, because that is the same resolution `X-User-Id` gets. Naming the person
+in the link instead put the form in a different namespace from the agent: secrets were written under
+`tg:<account>` and read back under the person, so everything saved after the identity migration was
+invisible, reported to the agent as a missing secret with no error at the point of writing.
+
+Resolution is `resolve_or_create`, because `/secrets` is intercepted before the dialog pipeline: for
+somebody whose first message is that command, the person does not exist yet.
 
 That last property is what makes the form work behind a balancer. The form sends no `X-User-Id`; the
 token *is* its identity, so nothing can route it back to whichever process issued it, and a token held
