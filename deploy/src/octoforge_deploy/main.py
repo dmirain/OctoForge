@@ -111,7 +111,7 @@ from octoforge_telegram import capabilities as telegram_capabilities
 from octoforge_telegram import surface as telegram_surface
 from octoforge_telegram.admin import AdminAccess, AdminManageTool, AdminStores
 from octoforge_telegram.bridge import RunnerProvider
-from octoforge_telegram.client import TelegramBotClient
+from octoforge_telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.drafts import SqlAlchemyDraftStore
 from octoforge_telegram.images import TelegramImageResolver
@@ -137,6 +137,11 @@ NOT_READY_STATUS = "not-ready"
 HTTPX_LOGGER = "httpx"
 USER_ID_HEADER = "X-User-Id"
 USER_ID_HEADER_VALUE_TEMPLATE = "{user_id}"
+ADMIN_NOT_SEEN_MESSAGE = (
+    "%d of %d OF_TELEGRAM_ADMIN_IDS have never messaged this bot, so they have no "
+    "person to be an admin as and admin_manage stays hidden from them; it appears "
+    "after they write once and this process restarts"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +274,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 ),
                 limits=_tool_limits(settings),
             )
-            admin_tool = _build_telegram_admin_tool(
+            admin_tool = await _build_telegram_admin_tool(
                 telegram_settings,
                 telegram_stores,
                 outbound_http,
@@ -278,6 +283,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     dialogs=dialogs,
                     messages=manager_stores.messages,
                     instructions=instructions,
+                    identities=identity,
                 ),
             )
             prompt_provider: PromptProvider = FilePromptProvider(
@@ -807,9 +813,35 @@ class _AdminToolServices:
     dialogs: DialogRepository
     messages: MessageRepository
     instructions: InstructionService
+    identities: IdentityStore
 
 
-def _build_telegram_admin_tool(
+async def _admin_user_ids(identities: IdentityStore, admin_ids: Sequence[int]) -> frozenset[str]:
+    """Turn the configured Telegram accounts into the people they belong to.
+
+    Done once, here, because the visibility hook that needs the answer is
+    synchronous and sits on the path that builds every LLM request — it must
+    not reach a database. The mapping never changes once made, so caching it
+    costs nothing in correctness.
+
+    An admin the identity store has never seen is one who has not messaged
+    the bot yet, and is reported rather than passed over in silence: they get
+    no admin tool until they do and this process restarts.
+    """
+    resolved: set[str] = set()
+    unknown: list[int] = []
+    for external in admin_ids:
+        user_id = await identities.resolve(TELEGRAM_CHANNEL, str(external))
+        if user_id is None:
+            unknown.append(external)
+        else:
+            resolved.add(user_id)
+    if unknown:
+        logger.warning(ADMIN_NOT_SEEN_MESSAGE, len(unknown), len(admin_ids))
+    return frozenset(resolved)
+
+
+async def _build_telegram_admin_tool(
     settings: TelegramSettings,
     stores: _TelegramStores | None,
     http_client: httpx.AsyncClient,
@@ -832,7 +864,7 @@ def _build_telegram_admin_tool(
             directory=stores.directory,
         ),
         AdminAccess(
-            admin_ids=frozenset(settings.telegram_admin_ids),
+            admin_user_ids=await _admin_user_ids(services.identities, settings.telegram_admin_ids),
             telegram=TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token),
             bot_username=settings.resolved_bot_username(),
         ),

@@ -101,7 +101,17 @@ REVOKED_NOTICE_TEXT = "Ваш доступ к боту отозван админ
 class AdminAccess:
     """Who the admins are and how to reach users (optional notifications)."""
 
-    admin_ids: frozenset[int]
+    # Core user ids, not Telegram ones. OF_TELEGRAM_ADMIN_IDS names Telegram
+    # accounts, and the composition root turns them into people through the
+    # identity store — the only thing that knows which account is whom.
+    #
+    # This used to hold the Telegram ids and derive them back out of
+    # context.user_id, which worked only while a dialog was owned by an
+    # account. Once a dialog belonged to a person, a core user id carried no
+    # `tg:` prefix to strip, every admin check silently answered "no", and the
+    # tool stopped being offered to the model at all — the failure looked like
+    # the tool vanishing rather than refusing.
+    admin_user_ids: frozenset[str]
     telegram: TelegramClient | None = None
     # the bot's public @handle (no decoration), used to build invite deep
     # links; empty means invites are handed out as bare codes
@@ -189,10 +199,16 @@ class AdminManageTool:
         return result
 
     def _is_admin(self, context: ToolContext) -> bool:
+        """Membership, not parsing: a core user id has no structure to read.
+
+        The channel still matters. The same person may reach the agent from
+        the web too, where nothing proved they are who Telegram says — the
+        admin power is granted to an account on this surface, not to a person
+        everywhere.
+        """
         if context.channel != TELEGRAM_CHANNEL:
             return False
-        numeric_id = chat_id_from_user_id(context.user_id)
-        return numeric_id is not None and numeric_id in self._access.admin_ids
+        return context.user_id in self._access.admin_user_ids
 
     async def _list_users(self, arguments: dict[str, Any]) -> str:
         invites = await self._invites.list_all()

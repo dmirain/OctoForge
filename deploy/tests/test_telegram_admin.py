@@ -38,7 +38,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 ADMIN_TELEGRAM_ID = 999
-ADMIN_USER_ID = "tg:999"
+# What a dialog is actually owned by since a dialog belongs to a person: an
+# opaque core id with nothing to parse. These deliberately carry no `tg:`
+# prefix — the tests used to, which is why the admin check could go on
+# stripping a prefix that production had stopped sending.
+ADMIN_USER_ID = "6f1c8d24a70b4e93"
+MEMBER_USER_ID = "b3a05e71c9d84f26"
+# The invite store and the member directory are this surface's OWN records and
+# do file people under `tg:<id>` — that has not changed, and the admin tool
+# still reads a chat id back out of them to notify somebody.
 USER_ID = "tg:111"
 DIALOG_ID = "dlg-1"
 NOTE = "for Alice"
@@ -47,7 +55,7 @@ CRON_SCHEDULE = "0 9 * * *"
 NEXT_FIRE = datetime(2026, 1, 2, 9, 0, tzinfo=UTC)
 
 ADMIN_CONTEXT = ToolContext(user_id=ADMIN_USER_ID, channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID)
-USER_CONTEXT = ToolContext(user_id=USER_ID, channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID)
+USER_CONTEXT = ToolContext(user_id=MEMBER_USER_ID, channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID)
 WEB_ADMIN_CONTEXT = ToolContext(user_id=ADMIN_USER_ID, channel="web", dialog_id=DIALOG_ID)
 
 StoresTuple = tuple[
@@ -91,7 +99,7 @@ def make_tool(
     bot_username: str = "",
 ) -> AdminManageTool:
     invites, cron_store, messages, dialogs, instructions = stores
-    access = AdminAccess(admin_ids=frozenset({ADMIN_TELEGRAM_ID}), bot_username=bot_username)
+    access = AdminAccess(admin_user_ids=frozenset({ADMIN_USER_ID}), bot_username=bot_username)
     backends = AdminStores(
         invites=invites,
         cron_store=cron_store,
@@ -162,6 +170,27 @@ async def test_visible_to_only_for_telegram_admins(
     assert tool.visible_to(ADMIN_CONTEXT) is True
     assert tool.visible_to(USER_CONTEXT) is False
     assert tool.visible_to(WEB_ADMIN_CONTEXT) is False
+
+
+async def test_admin_is_recognised_by_the_person_not_by_a_parsed_handle(
+    stores: StoresTuple,
+) -> None:
+    """The regression that made the tool disappear in production.
+
+    A dialog belongs to a person, so `context.user_id` is an opaque core id.
+    The check used to derive a Telegram id back out of that string, which
+    stopped matching anyone — and because the same check drives visibility,
+    the tool was not offered to the model at all. It looked like the tool
+    vanishing, not like a refusal, which is a much harder thing to report.
+    """
+    tool = make_tool(stores)
+    handle_shaped = ToolContext(
+        user_id=f"tg:{ADMIN_TELEGRAM_ID}", channel=TELEGRAM_CHANNEL, dialog_id=DIALOG_ID
+    )
+
+    assert tool.visible_to(ADMIN_CONTEXT) is True
+    # the shape the old check required, which now belongs to nobody
+    assert tool.visible_to(handle_shaped) is False
 
 
 async def test_generate_invite_returns_the_code(
@@ -394,7 +423,7 @@ async def test_list_users_shows_name_and_invite_attribution(stores: StoresTuple)
             instructions=instructions,
             directory=OneProfileDirectory(profile),
         ),
-        AdminAccess(admin_ids=frozenset({ADMIN_TELEGRAM_ID})),
+        AdminAccess(admin_user_ids=frozenset({ADMIN_USER_ID})),
     )
     output = await tool.execute({"action": "list_users"}, ADMIN_CONTEXT)
     assert "Alice Smith (@alice)" in output
