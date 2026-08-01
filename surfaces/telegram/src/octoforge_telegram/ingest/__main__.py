@@ -20,11 +20,13 @@ owns that user.
 import asyncio
 import logging
 import signal
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 
 import httpx
 from octoforge_core.db.engine import create_engine, create_session_factory
 from octoforge_server.config import Settings
+from octoforge_server.secret_links import SecretLinkService, secrets_link_builder
 
 from octoforge_telegram.client import TelegramBotClient
 from octoforge_telegram.config import TelegramSettings
@@ -84,6 +86,20 @@ def service_headers(settings: Settings) -> dict[str, str]:
     return basic_auth_header(settings.service_username, settings.service_password)
 
 
+def _secrets_link(settings: Settings) -> Callable[[str], str] | None:
+    """The /secrets URL factory, when this installation stores secrets at all.
+
+    Ingestion can hand out this link without reaching the service: the token
+    carries its own claim, signed with the installation's secrets key, and
+    whichever pod the form lands on validates it from that key alone. Without
+    the key nothing can store a secret anyway, and the bot says so rather than
+    sending a link to a form that answers 503.
+    """
+    if not settings.secrets_key:
+        return None
+    return secrets_link_builder(settings, SecretLinkService(settings.secrets_key))
+
+
 async def _build(
     stack: AsyncExitStack, settings: Settings, telegram: TelegramSettings
 ) -> TelegramPoller:
@@ -116,6 +132,7 @@ async def _build(
             membership=membership,
             directory=SqlAlchemyMemberDirectory(session_factory),
             voice_max_seconds=telegram.voice_max_seconds,
+            secrets_link=_secrets_link(settings),
         ),
     )
 

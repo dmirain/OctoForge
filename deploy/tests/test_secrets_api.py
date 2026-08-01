@@ -120,3 +120,38 @@ def test_tokens_are_user_bound_and_expire() -> None:
     service.ttl_seconds = -1.0
     expired = service.issue(USER)
     assert service.redeem(expired) is None
+
+
+def test_a_token_is_redeemed_by_a_pod_that_did_not_issue_it() -> None:
+    """The form carries no X-User-Id, so no balancer can route it back.
+
+    Two instances of one installation stand for two pods. A token that only
+    the issuing process can redeem makes the secrets form fail on whichever
+    pod the browser happens to reach — with a 403 the user cannot act on.
+    """
+    key = Fernet.generate_key().decode()
+
+    issued_on = SecretLinkService(key)
+    redeemed_on = SecretLinkService(key)
+
+    assert redeemed_on.redeem(issued_on.issue(USER)) == USER
+
+
+def test_another_installations_token_is_worthless_here() -> None:
+    """The key is what binds a token to an installation, not a shared table."""
+    ours = SecretLinkService(Fernet.generate_key().decode())
+    theirs = SecretLinkService(Fernet.generate_key().decode())
+
+    assert ours.redeem(theirs.issue(USER)) is None
+
+
+def test_an_installation_without_a_key_mints_nothing_another_can_redeem() -> None:
+    """No key means the surface is off; tokens must not be forgeable meanwhile.
+
+    Deriving from the empty string would make the link key a public constant,
+    so every keyless installation would share it.
+    """
+    one = SecretLinkService()
+    two = SecretLinkService()
+
+    assert two.redeem(one.issue(USER)) is None

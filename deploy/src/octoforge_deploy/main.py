@@ -103,7 +103,7 @@ from octoforge_server.channels import WEB_CHANNEL
 from octoforge_server.config import Settings
 from octoforge_server.prompts import FilePromptProvider
 from octoforge_server.runtime_state import Runtime
-from octoforge_server.secret_links import SecretLinkService
+from octoforge_server.secret_links import SecretLinkService, secrets_link_builder
 from octoforge_server.skill_overlay import apply_overlay, load_overlay
 from octoforge_server.surfaces import Surface, SurfaceRoutes
 from octoforge_server.system_skills import WEB_SYSTEM_SKILLS
@@ -212,7 +212,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     )
     cron_store = SqlAlchemyCronStore(session_factory)
     secret_store = _build_secret_store(settings, session_factory)
-    secret_links = SecretLinkService()
+    secret_links = SecretLinkService(settings.secrets_key)
     telegram_stores = await _build_telegram_stores(telegram_settings)
     try:
         async with (
@@ -339,7 +339,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     _TelegramExtras(
                         stores=telegram_stores,
                         secrets_link=(
-                            _secrets_link_builder(settings, secret_links)
+                            secrets_link_builder(settings, secret_links)
                             if secret_store is not None
                             else None
                         ),
@@ -837,24 +837,6 @@ def _build_telegram_admin_tool(
             bot_username=settings.resolved_bot_username(),
         ),
     )
-
-
-def _secrets_link_builder(
-    settings: Settings, secret_links: SecretLinkService
-) -> Callable[[str], str]:
-    """Build the /secrets URL factory: a fresh one-time token per request.
-
-    The token rides in the URL *fragment*, not the query string: a fragment is
-    never sent to the server, so it cannot land in an access log (Caddy logs
-    the request URI), in a proxy log or in a Referer header. The page reads it
-    from `location.hash` and posts it in a request body.
-    """
-
-    def build(user_id: str) -> str:
-        token = secret_links.issue(user_id)
-        return f"{settings.resolved_public_base_url()}/secrets.html#token={token}"
-
-    return build
 
 
 def _build_telegram_surface(

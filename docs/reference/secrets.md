@@ -37,10 +37,18 @@ sequenceDiagram
     Note over U,S: the value never enters the dialog, the narrative or a prompt
 ```
 
-The token is a capability: 128 bits of randomness, valid for ten minutes, held in memory (losing it on a
-restart just means running `/secrets` again), and capped in count. The form and its endpoints are outside
-the operator's HTTP Basic gate — dialog users have no operator credential — and are authorized by that
-token alone.
+The token is a capability, valid for ten minutes. It carries its own claim rather than naming a stored
+row: the user id encrypted under a key derived from `OF_SECRETS_KEY`, with the expiry stamped inside it.
+Nothing about pending links is kept anywhere, so a restart no longer invalidates a link somebody is
+about to open — and any process holding the key can both issue and validate one.
+
+That last property is what makes the form work behind a balancer. The form sends no `X-User-Id`; the
+token *is* its identity, so nothing can route it back to whichever process issued it, and a token held
+in one process's memory would be refused on every other pod. It is also why the Telegram ingestion node
+can hand out the link without asking the service for one.
+
+The form and its endpoints are outside the operator's HTTP Basic gate — dialog users have no operator
+credential — and are authorized by that token alone.
 
 ### How a secret gets used
 
@@ -73,7 +81,8 @@ anywhere but the host it was created for.
 - **An empty `OF_SECRETS_KEY` disables the feature** — endpoints needing it fail loudly rather than
   calling without auth.
 - **A malformed master key fails startup**, instead of surfacing later as a confusing per-call error.
-- **One-time tokens expire** and are bounded in number.
+- **Link tokens expire on their own**, checked by the pod that redeems them, and are signed with a key
+  derived separately from the one that encrypts values — the two uses of `OF_SECRETS_KEY` are kept apart.
 
 ## Configuration
 
