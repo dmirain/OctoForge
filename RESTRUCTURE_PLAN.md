@@ -125,10 +125,13 @@ Extend the import-boundary tests:
 
 Without this the structure drifts back — that is exactly how `/telegram/users` appeared.
 
-### 4. Settings split
+### 4. Settings split — DONE
 
 Each surface owns its settings; `deploy` assembles them. Separate from the move because
 `Settings` is used everywhere and mixing the two would hide which change broke what.
+
+All four stages are done on `feat/surfaces-as-modules`. What follows is the next
+work, and belongs on its own branches.
 
 ## After this plan, on their own branches
 
