@@ -11,6 +11,8 @@ from octoforge_server.capabilities import (
     log_capabilities,
 )
 from octoforge_server.config import Settings
+from octoforge_telegram import capabilities as telegram_capabilities
+from octoforge_telegram.config import TelegramSettings
 
 LLM_KEY = "sk-llm"
 LLM_BASE_URL = "https://gateway.example.com/v1"
@@ -60,7 +62,6 @@ def test_bare_installation_reports_everything_off() -> None:
     assert not report["llm"]
     assert not report[EMBEDDINGS]
     assert not report[OPERATOR]
-    assert not report[TELEGRAM]
     assert not report["web search"]
     assert not report["secret store"]
     # the database is always there — SQLite by default
@@ -113,15 +114,25 @@ def test_secrets_never_appear_in_the_report(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_telegram_without_admins_is_reported_as_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The surface describes itself: the service cannot report on a bot it
+    does not know exists."""
     monkeypatch.setenv("OF_TELEGRAM_BOT_TOKEN", "123:abc")
-    settings = Settings()
 
-    assert states(settings)[TELEGRAM]
-    assert "OPEN TO EVERYONE" in detail(settings, TELEGRAM)
+    reported = telegram_capabilities.describe(TelegramSettings())
+
+    assert reported.enabled
+    assert "OPEN TO EVERYONE" in reported.detail
 
     monkeypatch.setenv("OF_TELEGRAM_ADMIN_IDS", "1,2")
 
-    assert "invite gate, 2 admin(s)" in detail(Settings(), TELEGRAM)
+    assert "invite gate, 2 admin(s)" in telegram_capabilities.describe(TelegramSettings()).detail
+
+
+def test_the_service_report_says_nothing_about_interfaces() -> None:
+    """It would have to import one to know, which is the rule the layout exists for."""
+    names = {cap.name for cap in describe_capabilities(Settings())}
+
+    assert TELEGRAM not in names
 
 
 def test_sqlite_default_mentions_the_single_writer() -> None:

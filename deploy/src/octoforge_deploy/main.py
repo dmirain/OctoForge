@@ -105,10 +105,12 @@ from octoforge_server.secret_links import SecretLinkService
 from octoforge_server.skill_overlay import apply_overlay, load_overlay
 from octoforge_server.surfaces import Surface, SurfaceRoutes
 from octoforge_server.system_skills import WEB_SYSTEM_SKILLS
+from octoforge_telegram import capabilities as telegram_capabilities
 from octoforge_telegram import surface as telegram_surface
 from octoforge_telegram.admin import AdminAccess, AdminManageTool, AdminStores
 from octoforge_telegram.bridge import RunnerProvider
 from octoforge_telegram.client import TelegramBotClient
+from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.drafts import SqlAlchemyDraftStore
 from octoforge_telegram.images import TelegramImageResolver
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
@@ -140,6 +142,32 @@ logger = logging.getLogger(__name__)
 NextCall = Callable[[Request], Awaitable[Response]]
 
 
+async def _probe_backends(engine: AsyncEngine) -> tuple[frozenset[str], LexicalBackend]:
+    """What the database can actually do, asked once the schema exists."""
+    search_extensions = await _probe_search_extensions(engine)
+    return search_extensions, await _probe_lexical_backend(engine, search_extensions)
+
+
+def _report_capabilities(
+    settings: Settings,
+    telegram_settings: TelegramSettings,
+    search_extensions: frozenset[str],
+    lexical_backend: LexicalBackend,
+) -> None:
+    """One startup report, assembled from the service and its interfaces.
+
+    The service cannot describe a bot it does not know exists, so each
+    surface says its own piece and the deployment gathers them.
+    """
+    log_capabilities(
+        settings,
+        logger,
+        search_extensions,
+        lexical_backend,
+        extra=(telegram_capabilities.describe(telegram_settings),),
+    )
+
+
 def _build_manager_stores(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> ManagerStores:
@@ -162,13 +190,15 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     assembled from the reusable builders of `octoforge_core.composition`;
     only the settings/transport specifics live here.
     """
+    # each surface reads its own settings from the same environment; the
+    # service's object never carried them
+    telegram_settings = TelegramSettings()
     engine = create_engine(settings.database_url)
     await _bootstrap_schema(engine)
     # after the bootstrap: the schema step is what creates the extensions, so
     # probing earlier would report a gap the next line has already filled
-    search_extensions = await _probe_search_extensions(engine)
-    lexical_backend = await _probe_lexical_backend(engine, search_extensions)
-    log_capabilities(settings, logger, search_extensions, lexical_backend)
+    search_extensions, lexical_backend = await _probe_backends(engine)
+    _report_capabilities(settings, telegram_settings, search_extensions, lexical_backend)
     session_factory = create_session_factory(engine)
     await _sweep_retention(settings, session_factory)
     manager_stores = _build_manager_stores(session_factory)
@@ -177,7 +207,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
     cron_store = SqlAlchemyCronStore(session_factory)
     secret_store = _build_secret_store(settings, session_factory)
     secret_links = SecretLinkService()
-    telegram_stores = await _build_telegram_stores(settings)
+    telegram_stores = await _build_telegram_stores(telegram_settings)
     try:
         async with (
             httpx.AsyncClient(base_url=settings.llm_base_url) as llm_http,
@@ -191,7 +221,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             vision_client = _build_vision_client(settings, vision_http)
             deep_vision_client = _build_deep_vision_client(settings, vision_http)
             speech_client = _build_speech_client(settings, speech_http)
-            image_resolver = _build_telegram_image_resolver(settings, outbound_http)
+            image_resolver = _build_telegram_image_resolver(telegram_settings, outbound_http)
             instructions = build_instruction_service(
                 build_instruction_store(session_factory, vector_search=VECTOR in search_extensions),
                 embedder,
@@ -234,7 +264,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 limits=_tool_limits(settings),
             )
             admin_tool = _build_telegram_admin_tool(
-                settings,
+                telegram_settings,
                 telegram_stores,
                 outbound_http,
                 _AdminToolServices(
@@ -296,7 +326,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             sweeper_task = _start_collecting_sweeper(exchanges, dialogs, manager, settings)
             surfaces = _installed_surfaces(
                 _build_telegram_surface(
-                    settings,
+                    telegram_settings,
                     manager.get_or_create_runner,
                     dialogs,
                     outbound_http,
@@ -606,7 +636,7 @@ def _build_speech_client(
 
 
 def _build_telegram_image_resolver(
-    settings: Settings, http_client: httpx.AsyncClient
+    settings: TelegramSettings, http_client: httpx.AsyncClient
 ) -> ImageResolver | None:
     """Build the Telegram-backed `ImageResolver`; None when the bot is not configured.
 
@@ -723,7 +753,7 @@ class _TelegramStores:
     engine: AsyncEngine
 
 
-async def _build_telegram_stores(settings: Settings) -> _TelegramStores | None:
+async def _build_telegram_stores(settings: TelegramSettings) -> _TelegramStores | None:
     """Build the invite store and member directory when Telegram is enabled.
 
     The schema is bootstrapped with a plain create_all: a couple of small
@@ -770,7 +800,7 @@ class _AdminToolServices:
 
 
 def _build_telegram_admin_tool(
-    settings: Settings,
+    settings: TelegramSettings,
     stores: _TelegramStores | None,
     http_client: httpx.AsyncClient,
     services: _AdminToolServices,
@@ -794,7 +824,7 @@ def _build_telegram_admin_tool(
         AdminAccess(
             admin_ids=frozenset(settings.telegram_admin_ids),
             telegram=TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token),
-            bot_username=settings.resolved_telegram_bot_username(),
+            bot_username=settings.resolved_bot_username(),
         ),
     )
 
@@ -818,7 +848,7 @@ def _secrets_link_builder(
 
 
 def _build_telegram_surface(
-    settings: Settings,
+    settings: TelegramSettings,
     runner_provider: RunnerProvider,
     dialogs: DialogRepository,
     http_client: httpx.AsyncClient,

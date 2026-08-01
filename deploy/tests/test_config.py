@@ -20,10 +20,13 @@ from octoforge_server.config import (
     DEFAULT_MAX_PROCESSES,
     DEFAULT_ROUTER_TIMEOUT_SECONDS,
     DEFAULT_SELF_BASE_URL,
-    DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS,
-    DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
     DEFAULT_VISION_DEEP_MODEL,
     Settings,
+)
+from octoforge_telegram.config import (
+    DEFAULT_EDIT_THROTTLE_SECONDS,
+    DEFAULT_POLL_TIMEOUT_SECONDS,
+    TelegramSettings,
 )
 
 from octoforge_deploy.main import _build_reranker
@@ -92,9 +95,9 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.cron_poll_interval_seconds == DEFAULT_CRON_POLL_INTERVAL_SECONDS
     assert settings.cron_lease_ttl_seconds == DEFAULT_CRON_LEASE_TTL_SECONDS
     assert settings.cron_replay_limit == DEFAULT_CRON_REPLAY_LIMIT
-    assert settings.telegram_bot_token == ""
-    assert settings.telegram_poll_timeout_seconds == DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
-    assert settings.telegram_edit_throttle_seconds == DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
+    assert TelegramSettings().telegram_bot_token == ""
+    assert TelegramSettings().telegram_poll_timeout_seconds == DEFAULT_POLL_TIMEOUT_SECONDS
+    assert TelegramSettings().telegram_edit_throttle_seconds == DEFAULT_EDIT_THROTTLE_SECONDS
     assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
     assert settings.to_embedding_config().backend == EmbeddingBackend.OPENAI
     assert settings.reranker_model == ""
@@ -156,11 +159,9 @@ def test_telegram_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OF_TELEGRAM_POLL_TIMEOUT_SECONDS", str(CUSTOM_TELEGRAM_POLL_TIMEOUT))
     monkeypatch.setenv("OF_TELEGRAM_EDIT_THROTTLE_SECONDS", str(CUSTOM_TELEGRAM_EDIT_THROTTLE))
 
-    settings = Settings()
-
-    assert settings.telegram_bot_token == CUSTOM_TELEGRAM_TOKEN
-    assert settings.telegram_poll_timeout_seconds == CUSTOM_TELEGRAM_POLL_TIMEOUT
-    assert settings.telegram_edit_throttle_seconds == CUSTOM_TELEGRAM_EDIT_THROTTLE
+    assert TelegramSettings().telegram_bot_token == CUSTOM_TELEGRAM_TOKEN
+    assert TelegramSettings().telegram_poll_timeout_seconds == CUSTOM_TELEGRAM_POLL_TIMEOUT
+    assert TelegramSettings().telegram_edit_throttle_seconds == CUSTOM_TELEGRAM_EDIT_THROTTLE
 
 
 def test_auth_whitelist_parsed_from_json_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,9 +338,7 @@ def test_build_reranker_disabled_without_model(monkeypatch: pytest.MonkeyPatch) 
 def test_telegram_admin_ids_parsed_from_csv(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OF_TELEGRAM_ADMIN_IDS", "123456, 789012")
 
-    settings = Settings()
-
-    assert settings.telegram_admin_ids == [123456, 789012]
+    assert TelegramSettings().telegram_admin_ids == [123456, 789012]
 
 
 def test_telegram_bot_username_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -352,21 +351,19 @@ def test_telegram_bot_username_is_normalized(monkeypatch: pytest.MonkeyPatch) ->
     for raw in written:
         monkeypatch.setenv("OF_TELEGRAM_BOT_USERNAME", raw)
 
-        assert Settings().resolved_telegram_bot_username() == "octoforge_bot"
+        assert TelegramSettings().resolved_bot_username() == "octoforge_bot"
 
 
 def test_telegram_bot_username_defaults_to_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OF_TELEGRAM_BOT_USERNAME", raising=False)
 
-    assert Settings().resolved_telegram_bot_username() == ""
+    assert TelegramSettings().resolved_bot_username() == ""
 
 
 def test_telegram_admin_ids_default_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OF_TELEGRAM_ADMIN_IDS", raising=False)
 
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
-
-    assert settings.telegram_admin_ids == []
+    assert TelegramSettings(_env_file=None).telegram_admin_ids == []  # type: ignore[call-arg]
 
 
 # --- deep vision (image_look tool) ---------------------------------------------

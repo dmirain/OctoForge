@@ -35,7 +35,6 @@ DEFAULT_DATASETS_QUERY_DEFAULT_LIMIT = 50
 DEFAULT_DATASETS_QUERY_MAX_LIMIT = 200
 DEFAULT_HISTORY_SEARCH_DEFAULT_LIMIT = 20
 # 10 minutes of audio: a cap on both latency and the provider's daily quota
-DEFAULT_VOICE_MAX_SECONDS = 600.0
 DEFAULT_HISTORY_SEARCH_MAX_LIMIT = 100
 DEFAULT_CONTEXT_HOT_MAX_CHARS = 12000
 DEFAULT_CONTEXT_COMPACT_TARGET_CHARS = 6000
@@ -58,10 +57,6 @@ DEFAULT_CRON_REPLAY_LIMIT = 5
 DEFAULT_RERANKER_MODEL = ""
 DEFAULT_RERANKER_API_URL = "https://api.siliconflow.cn/v1/rerank"
 DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
-DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30.0
-DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS = 1.5
-DEFAULT_TELEGRAM_DATABASE_URL = "sqlite+aiosqlite:///./telegram.db"
-DEFAULT_TELEGRAM_INVITE_TTL_SECONDS = 259200.0  # 3 days
 FILE_SCHEME_PREFIX = "file:"
 DEFAULT_ADMIN_USERNAME = "admin"
 # the cheap tier of the two-tier vision setup (see core.vision.api); the
@@ -148,16 +143,6 @@ class Settings(BaseSettings):
     material_sweep_interval_seconds: float = DEFAULT_MATERIAL_SWEEP_INTERVAL_SECONDS
     cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
     cron_replay_limit: int = DEFAULT_CRON_REPLAY_LIMIT
-    telegram_bot_token: str = ""
-    telegram_poll_timeout_seconds: float = DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
-    telegram_edit_throttle_seconds: float = DEFAULT_TELEGRAM_EDIT_THROTTLE_SECONDS
-    telegram_database_url: str = DEFAULT_TELEGRAM_DATABASE_URL
-    telegram_invite_ttl_seconds: float = DEFAULT_TELEGRAM_INVITE_TTL_SECONDS
-    telegram_admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
-    # The bot's public @handle. Only the Bot API knows it, and nothing in the
-    # code may assume it: with it configured, an invite is handed out as a
-    # t.me deep link instead of a bare code the recipient has to paste.
-    telegram_bot_username: str = ""
     # Origins the raw `http_request` tool may call, comma-separated. Empty is
     # the open web: the SSRF guard still blocks private space, but nothing stops
     # an agent that read a prompt-injected page from posting a dialog's contents
@@ -205,18 +190,6 @@ class Settings(BaseSettings):
     stt_api_key: str = ""
     stt_model: str = ""
     stt_language: str = ""
-    # Longest recording accepted: a cap on latency and on the provider's daily
-    # audio quota, checked against the duration the update carries.
-    voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
-
-    def resolved_telegram_bot_username(self) -> str:
-        """Bot handle without decoration: `@name`, a t.me URL or a bare name all work."""
-        raw = self.telegram_bot_username.strip()
-        for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
-            if raw.lower().startswith(prefix.lower()):
-                raw = raw[len(prefix) :]
-                break
-        return raw.strip("/").strip()
 
     def resolved_public_base_url(self) -> str:
         """Base URL for user-facing links: configured public one or self."""
@@ -323,14 +296,6 @@ class Settings(BaseSettings):
         """Accept a comma-separated string of origins (`.env` friendly)."""
         if isinstance(value, str):
             return [part.strip() for part in value.split(",") if part.strip()]
-        return value
-
-    @field_validator("telegram_admin_ids", mode="before")
-    @classmethod
-    def _parse_admin_ids(cls, value: object) -> object:
-        """Accept a comma-separated string for the admin id list (`.env` friendly)."""
-        if isinstance(value, str):
-            return [int(part) for part in value.split(",") if part.strip()]
         return value
 
     def to_external_call_auth_whitelist(self) -> tuple[ExternalCallAuth, ...]:

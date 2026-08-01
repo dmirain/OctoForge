@@ -175,6 +175,11 @@ The hash uses `:` separators rather than `$` because docker compose interpolates
 
 ## Telegram
 
+Read by the Telegram surface's own settings object (`TelegramSettings`), not by the service's: what
+a bot token is is that surface's business. The variable names are unchanged either way — where a
+setting is read is an internal matter.
+
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `OF_TELEGRAM_BOT_TOKEN` | *(empty)* | Bot token from @BotFather; empty means the adapter does not start |

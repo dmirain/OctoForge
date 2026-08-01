@@ -16,6 +16,7 @@ import logging
 import signal
 
 from octoforge_server.config import Settings
+from octoforge_telegram.config import TelegramSettings
 
 from octoforge_deploy.main import runtime
 
@@ -29,7 +30,7 @@ DOWN_MESSAGE = "Telegram surface stopped"
 
 async def run_standalone(settings: Settings) -> None:
     """Run the Telegram adapter (and cron scheduler) until SIGINT or SIGTERM."""
-    if not settings.telegram_bot_token:
+    if not TelegramSettings().telegram_bot_token:
         raise SystemExit(NO_TOKEN_MESSAGE)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

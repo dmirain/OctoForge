@@ -12,6 +12,7 @@ are never logged — only URLs, model names and counts.
 """
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -79,9 +80,15 @@ def log_capabilities(
     logger: logging.Logger,
     search_extensions: frozenset[str] = frozenset(),
     lexical_backend: LexicalBackend = LexicalBackend.NONE,
+    extra: Sequence[Capability] = (),
 ) -> None:
-    """Log the capability report; critical gaps also get their own warning."""
-    capabilities = describe_capabilities(settings, search_extensions, lexical_backend)
+    """Log the capability report; critical gaps also get their own warning.
+
+    `extra` is what the installed interfaces have to say about themselves.
+    The service cannot report on a bot it does not know exists, and an
+    operator reading the startup log still wants one list.
+    """
+    capabilities = (*describe_capabilities(settings, search_extensions, lexical_backend), *extra)
     logger.info("%s\n%s", REPORT_HEADER, "\n".join(cap.line() for cap in capabilities))
     for cap in capabilities:
         if not cap.enabled and cap.name in CRITICAL:
@@ -183,11 +190,6 @@ def _surface_capabilities(settings: Settings) -> tuple[Capability, ...]:
                 else "OF_ADMIN_PASSWORD_HASH is empty — the HTTP surface answers 503"
             ),
         ),
-        Capability(
-            name="telegram",
-            enabled=bool(settings.telegram_bot_token),
-            detail=_telegram_detail(settings),
-        ),
     )
 
 
@@ -210,14 +212,6 @@ def _reranker_detail(settings: Settings) -> str:
     if settings.reranker_model:
         return f"local cross-encoder, {settings.reranker_model}"
     return "OF_RERANKER_MODEL is empty — recall ranks by cosine only"
-
-
-def _telegram_detail(settings: Settings) -> str:
-    if not settings.telegram_bot_token:
-        return "OF_TELEGRAM_BOT_TOKEN is empty — the adapter does not start"
-    admins = len(settings.telegram_admin_ids)
-    gate = f"invite gate, {admins} admin(s)" if admins else "OPEN TO EVERYONE (no admin ids)"
-    return f"long-poll, {gate}"
 
 
 def _database_detail(url: str) -> str:

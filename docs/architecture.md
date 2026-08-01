@@ -154,7 +154,9 @@ graph does not.
 
 Optional capabilities are decided here and nowhere else: an empty setting means the port is `None`
 and the feature is absent, which the startup capability report states explicitly
-(`server/capabilities.py`).
+(`server/capabilities.py`). Each surface reads its own settings from the same environment and
+contributes its own line to that report — the service cannot describe an interface it does not know
+exists, and an operator still wants one list.
 
 ## Surfaces
 
