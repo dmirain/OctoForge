@@ -6,6 +6,7 @@ draws: what crosses it, and that nobody polls twice.
 """
 
 import json
+from contextlib import AsyncExitStack
 
 import httpx
 import pytest
@@ -15,7 +16,7 @@ from octoforge_server.auth import AuthGate, hash_password
 from octoforge_server.config import Settings
 from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.gateway import ApiGatewayRegistry, basic_auth_header
-from octoforge_telegram.ingest.__main__ import run_ingest, service_headers
+from octoforge_telegram.ingest.__main__ import _build, run_ingest, service_headers
 
 CHAT_ID = 424242
 HANDLE = f"tg:{CHAT_ID}"
@@ -153,3 +154,49 @@ async def test_a_refusal_is_not_swallowed() -> None:
 
         with pytest.raises(httpx.HTTPStatusError):
             await gateway.handle_text("привет")
+
+
+async def test_the_node_sees_and_hears_like_a_pod() -> None:
+    """The split's promise: describing images and transcribing recordings
+    happen at ingestion, so THIS process must hold the clients. Its first
+    deployment shipped without them, and voice and images silently degraded
+    to text for a day — the poller treats a missing client as a feature
+    turned off, which is exactly why nothing errored."""
+    settings = Settings(
+        service_username=SERVICE_USER,
+        service_password=SERVICE_PASSWORD,
+        vision_model="test-vision",
+        stt_model="test-whisper",
+        stt_base_url="https://stt.example",
+        llm_base_url="https://llm.example",
+    )
+    telegram = TelegramSettings(
+        telegram_bot_token="123:abc",
+        telegram_service_url="http://balancer",
+        telegram_database_url="sqlite+aiosqlite:///:memory:",
+    )
+    async with AsyncExitStack() as stack:
+        poller = await _build(stack, settings, telegram)
+        assert poller._vision is not None
+        assert poller._speech is not None
+
+
+async def test_the_node_keeps_its_senses_off_when_unconfigured() -> None:
+    """No model configured = the feature is off, not broken: the poller gets
+    None and keeps the text-only behavior on purpose."""
+    settings = Settings(
+        service_username=SERVICE_USER,
+        service_password=SERVICE_PASSWORD,
+        vision_model="",
+        stt_model="",
+        llm_base_url="https://llm.example",
+    )
+    telegram = TelegramSettings(
+        telegram_bot_token="123:abc",
+        telegram_service_url="http://balancer",
+        telegram_database_url="sqlite+aiosqlite:///:memory:",
+    )
+    async with AsyncExitStack() as stack:
+        poller = await _build(stack, settings, telegram)
+        assert poller._vision is None
+        assert poller._speech is None
