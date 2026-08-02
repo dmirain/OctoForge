@@ -115,9 +115,9 @@ One question answered from cold — build the actor, one `recall`, the answer, t
 | | Statements | Transactions | Concurrent |
 |---|---|---|---|
 | Before | 45 | 35 | none |
-| After | **29** | **27** | **6** |
+| After | **27** | **25** | **6** |
 
-Where the sixteen went:
+Where the eighteen went:
 
 - **Seven were the ORM re-reading a row it was about to write.** A SELECT before each UPDATE, inside the
   same store method. They are single UPDATEs now; the condition rides in the WHERE clause and `rowcount`
@@ -136,6 +136,9 @@ Where the sixteen went:
 - **Delivery is stamped by the finishing write** when it is already certain: an answer the user watched
   stream, or a deliberately empty one. A result going through the outbox is still stamped only after it
   has been broadcast — stamping early would stop the redelivery sweep on something nobody received.
+- **The dialog row is not written on the answer path at all.** It was touched twice a turn to keep an
+  `updated_at` that only two operator listings read, as a sort key and a "last seen" line. Both read the
+  message log now, where the answer is a fact rather than a denormalisation that can drift.
 - **Settling an exchange is one guarded write.** The check that this run still owns it moved from a
   preceding SELECT into the WHERE clause. That removes a round trip and a race: between the read and the
   write, a follow-up could take the exchange over, and the write would clobber it.

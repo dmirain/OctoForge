@@ -104,7 +104,10 @@ class SqlAlchemyAdminStore:
         )
         statement = (
             select(DialogRow, user_message_count, agent_message_count, task_count, last_message_at)
-            .order_by(DialogRow.updated_at.desc(), DialogRow.id)
+            # by what actually happened, not by when the row was last written:
+            # the dialog row is no longer touched per message (that was two
+            # writes a turn for this ordering alone)
+            .order_by(last_message_at.desc().nullslast(), DialogRow.id)
             .limit(limit)
             .offset(offset)
         )
@@ -117,7 +120,6 @@ class SqlAlchemyAdminStore:
                 user_id=row[0].user_id,
                 channel=row[0].channel,
                 created_at=row[0].created_at,
-                updated_at=row[0].updated_at,
                 user_message_count=row[1],
                 agent_message_count=row[2],
                 task_count=row[3],

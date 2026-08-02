@@ -8,11 +8,11 @@ second, defense-in-depth barrier against a direct call.
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from octoforge_core.cron.api import CronStore
 from octoforge_core.dialogs.api import DialogRepository, MessageRepository, MessageStats
-from octoforge_core.domain import Dialog
 from octoforge_core.instructions.api import (
     InstructionNotFoundError,
     InstructionService,
@@ -217,6 +217,10 @@ class AdminManageTool:
             for entry in await self._messages.stats_by_channel(TELEGRAM_CHANNEL)
         }
         dialogs = await self._dialogs.list_by_channel(TELEGRAM_CHANNEL)
+        # from the messages, not from the dialog row: that row is no longer
+        # touched per message, and a timestamp read off the log cannot drift
+        # from what actually happened
+        last_activity = await self._messages.last_activity_by_channel(TELEGRAM_CHANNEL)
         profiles = await self._member_profiles()
         user_ids = sorted(
             {invite.claimed_by for invite in invites if invite.claimed_by}
@@ -227,7 +231,11 @@ class AdminManageTool:
         for user_id in user_ids:
             lines.append(
                 await self._user_line(
-                    user_id, stats.get(user_id), dialogs, invites, profiles.get(user_id)
+                    user_id,
+                    stats.get(user_id),
+                    last_activity.get(user_id),
+                    invites,
+                    profiles.get(user_id),
                 )
             )
         pending = [invite for invite in invites if invite.status is InviteStatus.PENDING]
@@ -253,7 +261,7 @@ class AdminManageTool:
         self,
         user_id: str,
         stats: MessageStats | None,
-        dialogs: list[Dialog],
+        activity: datetime | None,
         invites: list[Invite],
         profile: MemberProfile | None,
     ) -> str:
@@ -264,10 +272,6 @@ class AdminManageTool:
         else:
             access = "no-invite (admin or pre-gate)"
         who = f" ({profile.display_name})" if profile is not None else ""
-        activity = max(
-            (dialog.updated_at for dialog in dialogs if dialog.user_id == user_id),
-            default=None,
-        )
         jobs = await self._cron.list_for_user(user_id)
         enabled_jobs = sum(1 for job in jobs if job.enabled)
         user_messages = stats.user_messages if stats is not None else 0

@@ -195,11 +195,6 @@ class SqlAlchemyMessageRepository:
                             attachments=_attachments_to_json(message.attachments),
                         )
                     )
-                    await session.execute(
-                        update(DialogRow)
-                        .where(DialogRow.id == dialog_id)
-                        .values(updated_at=utc_now())
-                    )
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
@@ -252,11 +247,6 @@ class SqlAlchemyMessageRepository:
                                 attachments=_attachments_to_json(message.attachments),
                             )
                         )
-                    await session.execute(
-                        update(DialogRow)
-                        .where(DialogRow.id == dialog_id)
-                        .values(updated_at=utc_now())
-                    )
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
@@ -277,6 +267,25 @@ class SqlAlchemyMessageRepository:
                 .limit(1)
             )
             return value is not None
+
+    async def last_activity_by_channel(self, channel: str) -> dict[str, datetime]:
+        """When each person of the channel last had a message, by person.
+
+        The dialog row used to carry this as `updated_at`, bumped on every
+        append — two writes per turn to serve two operator listings. Reading
+        it from the messages themselves costs nothing on the answer path and
+        cannot drift from what actually happened.
+        """
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(DialogRow.user_id, func.max(MessageRow.created_at))
+                    .join(DialogRow, MessageRow.dialog_id == DialogRow.id)
+                    .where(DialogRow.channel == channel)
+                    .group_by(DialogRow.user_id)
+                )
+            ).all()
+        return {user_id: last for user_id, last in rows if last is not None}
 
     async def list_hot_slice(self, dialog_id: str) -> list[ChatMessage]:
         """The narrative's hot slice: everything past the compaction boundary.

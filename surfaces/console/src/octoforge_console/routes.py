@@ -383,7 +383,6 @@ def _dialog_to_dict(item: DialogOverview) -> dict[str, Any]:
         "task_count": item.task_count,
         "last_message_at": _iso(item.last_message_at),
         "created_at": _iso(item.created_at),
-        "updated_at": _iso(item.updated_at),
     }
 
 

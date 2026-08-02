@@ -348,6 +348,10 @@ class MessageRepository(Protocol):
         """Return the messages past the dialog's compaction boundary, ordered by seq."""
         ...
 
+    async def last_activity_by_channel(self, channel: str) -> dict[str, datetime]:
+        """When each person of the channel last had a message, keyed by person."""
+        ...
+
     async def list(self, dialog_id: str) -> ChatMessageList:
         """Return the dialog messages ordered by seq."""
         ...

@@ -52,7 +52,6 @@ class DialogOverview:
     user_id: str
     channel: str
     created_at: datetime
-    updated_at: datetime
     # split by author: "how much did the person write" must not be buried
     # under the agent's (usually longer) share of the conversation
     user_message_count: int

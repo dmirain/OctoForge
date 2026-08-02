@@ -158,6 +158,44 @@ async def test_list_by_channel_returns_full_dialogs(
     assert all(dialog.updated_at.tzinfo == UTC for dialog in dialogs)
 
 
+async def test_appending_a_message_does_not_write_the_dialog_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The answer path must not touch `dialogs`.
+
+    It used to, twice a turn, to keep `updated_at` current for two operator
+    listings — a write nobody on the answer path needed. Both listings read
+    the message log instead now.
+    """
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="hello"))
+
+    assert (await dialogs.get(dialog.id)).updated_at == dialog.updated_at
+
+
+async def test_last_activity_reads_the_message_log(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Per-person activity of a channel, taken from what actually happened."""
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    first = await dialogs.get_or_create(USER_ID, CHANNEL)
+    second = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
+    elsewhere = await dialogs.get_or_create(USER_ID, OTHER_CHANNEL)
+    await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="one"))
+    await messages.append(elsewhere.id, ChatMessage(role=MessageRole.USER, content="other channel"))
+
+    activity = await messages.last_activity_by_channel(CHANNEL)
+
+    assert set(activity) == {USER_ID}  # the silent dialog has no entry, the other channel none
+    assert activity[USER_ID].tzinfo == UTC
+    assert second.user_id == OTHER_USER_ID  # created, never wrote
+
+
 async def test_message_stats_by_channel(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

@@ -104,7 +104,14 @@ class ChatMessage:
 
 @dataclass(frozen=True, slots=True)
 class Dialog:
-    """A conversation line owned by a user on a channel surface."""
+    """A conversation line owned by a user on a channel surface.
+
+    `updated_at` is when this ROW was last written, which is almost never:
+    the row is an identity anchor and nothing on it changes after creation.
+    It is NOT when the dialog was last active — that used to be its meaning,
+    paid for with a write on every message, and it is now read from the
+    messages themselves (`last_activity_by_channel`, `last_message_at`).
+    """
 
     id: str
     user_id: str
