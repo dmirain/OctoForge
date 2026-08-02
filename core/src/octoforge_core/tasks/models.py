@@ -27,12 +27,19 @@ class TaskRow(Base):
             sqlite_where=text("delivered_at IS NULL"),
             postgresql_where=text("delivered_at IS NULL"),
         ),
+        # the two questions asked per turn, each filtering on both columns:
+        # "what is this exchange's work" and "what did this dialog strand"
+        Index("ix_tasks_exchange_status", "exchange_id", "status"),
+        Index("ix_tasks_dialog_status", "dialog_id", "status"),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
     dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), index=True)
     user_id: Mapped[str] = mapped_column(String, index=True)
     channel: Mapped[str] = mapped_column(String)
+    # the obligation this run is paying; NULL for RUN tasks (cron and spawned
+    # work owe the user nothing) and on rows written before the column existed
+    exchange_id: Mapped[str | None] = mapped_column(ForeignKey("exchanges.id"), nullable=True)
     kind: Mapped[str] = mapped_column(String)
     title: Mapped[str] = mapped_column(String)
     input: Mapped[dict[str, Any]] = mapped_column(JSON)

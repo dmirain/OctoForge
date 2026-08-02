@@ -47,6 +47,9 @@ class Task:
     kind: TaskKind
     input: dict[str, Any]
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # the obligation this run is paying; None for RUN tasks, which owe the
+    # user nothing, and on rows written before the column existed
+    exchange_id: str | None = None
     status: TaskStatus = TaskStatus.PENDING
     result: str | None = None
     error: str | None = None

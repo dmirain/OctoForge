@@ -284,12 +284,6 @@ def _exchange_outcome(status: TaskStatus) -> ExchangeStatus:
     return ExchangeStatus.FAILED
 
 
-def _task_exchange(task: Task) -> str | None:
-    """The exchange an ANSWER task owes, if recorded."""
-    raw: object = task.input.get("exchange_id")
-    return raw if isinstance(raw, str) else None
-
-
 def _task_client_source(task: Task) -> str | None:
     """The transport-level id of the task's source message, if recorded."""
     raw = task.input.get("source_client_message_id")
@@ -736,7 +730,7 @@ class ConversationRunner:
         if task.kind is not TaskKind.ANSWER:
             self._start_process(task)
             return
-        exchange_id = _task_exchange(task)
+        exchange_id = task.exchange_id
         if exchange_id is not None and await self._exchange_awaits_user(exchange_id):
             # the run died between ask_user and its finalization: the ask
             # already went out and the exchange waits for the user — a
@@ -821,7 +815,8 @@ class ConversationRunner:
                 # the transport-level id of that message (reply threading)
                 task_input["source_client_message_id"] = source.client_message_id
             if source is not None and source.exchange_id is not None:
-                # the obligation this run owes: restored verbatim after a restart
+                # kept in the input too: it is part of what the run was given,
+                # and a run's input is not rewritten after the fact
                 task_input["exchange_id"] = source.exchange_id
         task = Task(
             dialog_id=self._dialog.id,
@@ -829,6 +824,9 @@ class ConversationRunner:
             channel=self._dialog.channel,
             title=title,
             kind=kind,
+            # the obligation as a column: joinable, indexable, and checked by
+            # the database, which a key inside a JSON blob is none of
+            exchange_id=source.exchange_id if source is not None else None,
             input=task_input,
             status=TaskStatus.RUNNING,
             started_at=utc_now(),
@@ -1595,7 +1593,7 @@ class ConversationRunner:
                         ),
                     ),
                     task_id=task.id,
-                    exchange_id=_task_exchange(task),
+                    exchange_id=task.exchange_id,
                 )
             )
         elif task.status is TaskStatus.FAILED:
@@ -1606,7 +1604,7 @@ class ConversationRunner:
                         Failed(error=task.error or DEFAULT_TASK_ERROR),
                     ),
                     task_id=task.id,
-                    exchange_id=_task_exchange(task),
+                    exchange_id=task.exchange_id,
                 )
             )
 
@@ -1626,7 +1624,7 @@ class ConversationRunner:
                         ),
                     ),
                     task_id=task.id,
-                    exchange_id=_task_exchange(task),
+                    exchange_id=task.exchange_id,
                 )
             )
         else:
@@ -1634,7 +1632,7 @@ class ConversationRunner:
                 _Delivery(
                     events=(_delivery_started(task), Failed(error=terminal.error)),
                     task_id=task.id,
-                    exchange_id=_task_exchange(task),
+                    exchange_id=task.exchange_id,
                 )
             )
 
@@ -2012,7 +2010,7 @@ class ConversationRunner:
             narrative_built=narrative_built,
             source_message_id=_task_source_message(task),
             source_client_message_id=_task_client_source(task),
-            exchange_id=_task_exchange(task),
+            exchange_id=task.exchange_id,
         )
         process.pump = asyncio.create_task(self._pump_process(process))
         self._processes[process.id] = process

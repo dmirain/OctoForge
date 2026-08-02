@@ -21,12 +21,17 @@ or error, and four timestamps (`created_at`, `started_at`, `finished_at`, `deliv
 `PENDING → RUNNING → DONE | FAILED | CANCELLED`. Rows are **kept forever**, terminal states included:
 they are the audit trail of what the installation did, and the source of restart recovery.
 
-### The input field carries the parent link
+### The obligation is a column; the input keeps the rest of the parent link
 
-`input` is where a task records what it came from, so a restart can reconstruct it:
+`exchange_id` is a real column with a foreign key to `exchanges`, NULL for `RUN` tasks — cron and
+spawned work owe the user nothing. It used to live only inside the `input` JSON, where nothing could
+join on it, index it or check it; the two composite indexes that make recovery cheap
+(`(exchange_id, status)` and `(dialog_id, status)`) exist because of it.
+
+`input` still records what the run was given, so a restart can reconstruct it:
 
 - an answer task: `{source_message_id, exchange_id}` — the user message being answered and the
-  obligation it owes;
+  obligation it owes (the same id as the column: a run's input is not rewritten after the fact);
 - a cron firing: `{cron_job_id, fired_at}`.
 
 ### Agent-facing tools

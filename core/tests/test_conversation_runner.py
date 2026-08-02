@@ -3405,6 +3405,7 @@ async def test_recover_interrupted_leaves_an_awaiting_user_answer_task_silently_
         dialog,
         kind=TaskKind.ANSWER,
         title="which city?",
+        exchange_id=exchange.id,
         input={"prompt": "which city?", "exchange_id": exchange.id},
     )
     await store.add(task)

@@ -1,7 +1,9 @@
 """Alembic schema bootstrap: fresh migrate, legacy stamp, and drift guard."""
 
+import json
 from pathlib import Path
 
+import sqlalchemy as sa
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
@@ -17,6 +19,7 @@ from octoforge_core.db.engine import (
     init_db,
 )
 from octoforge_core.db.sqlite_fts import include_object
+from octoforge_core.time import utc_now
 
 EXPECTED_TABLES = frozenset(
     {
@@ -176,6 +179,62 @@ async def test_bootstrap_adds_task_link_and_delivery_columns(tmp_path: Path) -> 
     assert "task_id" in message_columns
     assert "ix_messages_task_id" in message_indexes
     assert "delivered_at" in task_columns
+
+
+async def test_task_exchange_link_is_backfilled_from_the_input(tmp_path: Path) -> None:
+    """The column has to arrive carrying what the JSON already knew.
+
+    Rows written before it existed keep their obligation inside `input`, and
+    the code no longer looks there — an empty column would silently orphan
+    every answer that was mid-flight when the migration ran.
+    """
+    engine = create_engine(_database_url(tmp_path))
+    stamp = utc_now().isoformat()
+    try:
+        await bootstrap_schema(engine)
+        async with engine.begin() as connection:
+            await connection.run_sync(_downgrade_below_task_exchange)
+            await connection.execute(
+                sa.text(
+                    "insert into dialogs (id, user_id, channel, created_at, updated_at) "
+                    "values ('d-1', 'u-1', 'web', :now, :now)"
+                ),
+                {"now": stamp},
+            )
+            await connection.execute(
+                sa.text(
+                    "insert into exchanges (id, dialog_id, status, title, created_at, updated_at) "
+                    "values ('ex-1', 'd-1', 'open', 'q', :now, :now)"
+                ),
+                {"now": stamp},
+            )
+            await connection.execute(
+                sa.text(
+                    "insert into tasks (id, dialog_id, user_id, channel, kind, title, "
+                    "input, status, created_at) values "
+                    "('t-answer', 'd-1', 'u-1', 'web', 'answer', 'q', :owed, 'running', :now), "
+                    "('t-run', 'd-1', 'u-1', 'web', 'run', 'cron', :plain, 'running', :now)"
+                ),
+                {
+                    "owed": json.dumps({"prompt": "q", "exchange_id": "ex-1"}),
+                    "plain": json.dumps({"prompt": "sweep"}),
+                    "now": stamp,
+                },
+            )
+        async with engine.begin() as connection:
+            await connection.run_sync(_upgrade_to_head)
+        async with engine.connect() as connection:
+            rows = dict(
+                (await connection.execute(sa.text("select id, exchange_id from tasks"))).all()
+            )
+    finally:
+        await engine.dispose()
+    assert rows["t-answer"] == "ex-1"
+    assert rows["t-run"] is None  # a RUN task owes nobody, and must not be invented one
+
+
+def _downgrade_below_task_exchange(connection: Connection) -> None:
+    command.downgrade(_alembic_config(connection), "b6d4f2a91c85")
 
 
 def _downgrade_below_task_link(connection: Connection) -> None:
