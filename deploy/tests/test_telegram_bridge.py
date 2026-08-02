@@ -369,10 +369,11 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
 ) -> None:
     """A result redelivered before the bridge subscribes must still reach the chat.
 
-    `runtime()` sweeps undelivered results before the surfaces start, so the
-    redelivery finds no subscriber; the outbox has to hold it until the bridge
-    is warmed, otherwise a cron answer that landed while the bot was down is
-    silently stamped delivered and never shown.
+    Recovery asks for the redelivery while building the dialog's actor, and
+    the bridge is attached to that actor a moment later — so the request
+    arrives before anything is listening. The outbox has to hold it until the
+    bridge subscribes, otherwise a cron answer that landed while the bot was
+    down is silently stamped delivered and never shown.
     """
     client = FakeTelegramClient()
     tasks = InMemoryTaskStore()
@@ -400,7 +401,7 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     assert task.delivered_at is None
 
     bridge = make_bridge(client, manager)
-    await bridge.start()  # what TelegramBridgeRegistry.warm() does at startup
+    await bridge.start()  # what the manager's attach does once the actor exists
 
     await wait_until(lambda: client.sent != [])
     assert client.sent == [(CHAT_ID, CRON_RESULT)]
@@ -425,6 +426,11 @@ async def test_first_contact_through_the_poller_renders_the_answer_once(
     Only the in-process path reaches it. With ingestion in its own process a
     bridge is born from the attach, after the runner build is memoized, so
     the nested resolve never attaches again.
+
+    Startup warming was the caller that reached this, and it is gone. The
+    guard is kept — and driven here through the same two calls warming made —
+    because `start()` is public and `attach` calls it: anything that starts a
+    bridge before its dialog has an actor brings the bug straight back.
     """
     identities = SqlAlchemyIdentityStore(session_factory)
     person = await identities.resolve_or_create(TELEGRAM_CHANNEL, str(CHAT_ID))
@@ -438,11 +444,11 @@ async def test_first_contact_through_the_poller_renders_the_answer_once(
     )
     manager.use_surface(registry)
 
-    # what the surface does at startup: warm the bridges of known dialogs.
-    # This is the entry that reaches it — `handle_text` resolves the runner
-    # BEFORE calling start(), so the nested start finishes first and the
-    # outer one finds a live forwarder.
-    await registry.warm([person])
+    # starting a bridge whose dialog has no actor yet is the entry that
+    # reaches it — `handle_text` resolves the runner BEFORE calling start(),
+    # so there the nested start finishes first and the outer one finds a live
+    # forwarder
+    await registry.get_or_create(person, CHAT_ID).start()
     bridge = await registry.gateway_for(TELEGRAM_USER_ID, CHAT_ID)
     await bridge.handle_text("hi")
     await wait_until(lambda: client.current_text() == "hello" if client.sent else False)

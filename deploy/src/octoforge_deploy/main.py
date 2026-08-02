@@ -326,6 +326,35 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 stores=manager_stores,
                 ownership=OwnershipConfig(node_id=settings.node_id),
             )
+            # Renderers BEFORE recovery, so a dialog recovered here can be
+            # rendered: recovery builds that dialog's actor, and the manager
+            # attaches the surface to every actor it builds. Registered after
+            # recovery instead, a cron answer that finished while this process
+            # was down would be redelivered into a dialog with no transport
+            # and wait, marked undelivered, until its user wrote again.
+            surfaces = _attach_renderers(
+                _installed_surfaces(
+                    _build_telegram_surface(
+                        telegram_settings,
+                        manager.get_or_create_runner,
+                        outbound_http,
+                        _TelegramExtras(
+                            stores=telegram_stores,
+                            secrets_link=(
+                                secrets_link_builder(settings, secret_links, TELEGRAM_CHANNEL)
+                                if secret_store is not None
+                                else None
+                            ),
+                            vision=vision_client,
+                            speech=speech_client,
+                            admin_tool=admin_tool,
+                            identities=identity,
+                        ),
+                    )
+                ),
+                manager,
+                registry,
+            )
             # Sweep before the scheduler and surfaces start: orphaned tasks
             # are restarted as background processes and persisted results
             # that never reached their dialog are redelivered. Only dialogs
@@ -336,27 +365,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             manager.start()
             scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
             sweeper_task = _start_collecting_sweeper(exchanges, dialogs, manager, settings)
-            surfaces = _installed_surfaces(
-                _build_telegram_surface(
-                    telegram_settings,
-                    manager.get_or_create_runner,
-                    dialogs,
-                    outbound_http,
-                    _TelegramExtras(
-                        stores=telegram_stores,
-                        secrets_link=(
-                            secrets_link_builder(settings, secret_links, TELEGRAM_CHANNEL)
-                            if secret_store is not None
-                            else None
-                        ),
-                        vision=vision_client,
-                        speech=speech_client,
-                        admin_tool=admin_tool,
-                        identities=identity,
-                    ),
-                )
-            )
-            await _install(surfaces, manager, registry)
+            await _start_surfaces(surfaces)
             try:
                 yield Runtime(
                     settings=settings,
@@ -874,7 +883,6 @@ async def _build_telegram_admin_tool(
 def _build_telegram_surface(
     settings: TelegramSettings,
     runner_provider: RunnerProvider,
-    dialogs: DialogRepository,
     http_client: httpx.AsyncClient,
     extras: _TelegramExtras | None = None,
 ) -> TelegramSurface | None:
@@ -917,7 +925,6 @@ def _build_telegram_surface(
     return TelegramSurface(
         registry=registry,
         poller=poller,
-        dialogs=dialogs,
         admin_tool=resolved.admin_tool,
         polls=settings.telegram_poll_in_process,
     )
@@ -947,14 +954,16 @@ def _installed_surfaces(telegram: TelegramSurface | None) -> tuple[Surface, ...]
     return tuple(surfaces)
 
 
-async def _install(
+def _attach_renderers(
     surfaces: Sequence[Surface], manager: ConversationManager, registry: ToolRegistry
-) -> None:
-    """Give the manager each surface's renderer and start their background work.
+) -> Sequence[Surface]:
+    """Give the manager each surface's renderer and the agent its tools.
 
-    A surface that fails to start is reported and skipped rather than taking
-    the application down with it: a broken bot must not cost the console and
-    the API.
+    Separate from starting them because the two belong at different points of
+    startup: a renderer has to be in place before recovery (an actor built
+    there needs somewhere to deliver), while reading updates has to wait until
+    after it (see `runtime`). Returns what it was given, so the caller keeps
+    one name for the surfaces it will start later.
     """
     for surface in surfaces:
         renderer = surface.dialog_surface()
@@ -962,6 +971,17 @@ async def _install(
             manager.use_surface(renderer)
         for tool in surface.tools():
             registry.register(tool)
+    return surfaces
+
+
+async def _start_surfaces(surfaces: Sequence[Surface]) -> None:
+    """Start each surface's background work.
+
+    A surface that fails to start is reported and skipped rather than taking
+    the application down with it: a broken bot must not cost the console and
+    the API.
+    """
+    for surface in surfaces:
         try:
             await surface.start()
         except Exception:

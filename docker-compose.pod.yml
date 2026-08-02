@@ -31,6 +31,11 @@ services:
       # Not negotiable on a pod, whatever .env says: a second long poll would
       # steal updates from the ingestion node rather than share them.
       OF_TELEGRAM_POLL_IN_PROCESS: "false"
+      # Comes from this host's .env and must be set there, differently on every
+      # pod. The default is the hostname, which for a container is its id — a
+      # new one on every redeploy, so a restarted pod would not recognise the
+      # claims it left behind and would wait out the staleness window before
+      # picking up its own stranded work.
       # NOT set here, and it matters: OF_EMBEDDING_BACKEND and
       # OF_EMBEDDING_MODEL must be IDENTICAL on every pod. They share one
       # vector table, the column carries no declared dimension, and nothing

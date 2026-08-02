@@ -17,7 +17,6 @@ from collections.abc import Sequence
 from contextlib import suppress
 
 from octoforge_core.agent.runner import DialogSurface
-from octoforge_core.dialogs.api import DialogRepository
 from octoforge_core.tools.base import Tool
 from octoforge_server.surfaces import StaticFile
 
@@ -44,13 +43,11 @@ class TelegramSurface:
         self,
         registry: TelegramBridgeRegistry,
         poller: TelegramPoller,
-        dialogs: DialogRepository,
         admin_tool: Tool | None = None,
         polls: bool = True,
     ) -> None:
         self._registry = registry
         self._poller = poller
-        self._dialogs = dialogs
         self._admin_tool = admin_tool
         # A token may be long-polled by exactly one process. With a separate
         # ingestion node this pod renders and does not read — two readers
@@ -75,10 +72,21 @@ class TelegramSurface:
         return () if self._admin_tool is None else (self._admin_tool,)
 
     async def start(self) -> None:
-        """Warm bridges for known dialogs, then poll if this process reads.
+        """Poll, if this process is the one that reads.
 
-        Warming happens either way: a pod that only renders still has to have
-        somewhere to deliver a scheduled run to.
+        Nothing is prepared per dialog here, and that is deliberate. Startup
+        used to build a bridge for every known Telegram dialog so a scheduled
+        run would have somewhere to land — but a bridge cannot be built
+        without its dialog's actor, and building that actor is what CLAIMS
+        the dialog. Every pod therefore took every dialog on every start, and
+        the last one to boot owned them all: each deploy cut off whatever its
+        peer was mid-answer on.
+
+        Nothing was gained for it. `ConversationManager` attaches this
+        surface to each actor it builds, and it builds one on every path that
+        can produce an answer — an arriving message, a cron firing, a settled
+        collection — so the bridge exists exactly when there is something to
+        deliver through it.
         """
         if self._task is not None:
             return
@@ -86,8 +94,6 @@ class TelegramSurface:
         self._task.add_done_callback(_report_failure)
 
     async def _run(self) -> None:
-        user_ids = await self._dialogs.list_user_ids_by_channel(TELEGRAM_CHANNEL)
-        await self._registry.warm(user_ids)
         if not self._polls:
             logger.info("telegram: rendering only, ingestion runs elsewhere")
             return

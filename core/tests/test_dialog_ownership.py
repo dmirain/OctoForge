@@ -469,6 +469,33 @@ async def test_a_dialog_gets_its_surface_when_its_actor_is_built(
     assert surface.detached == [runner.dialog_id]
 
 
+async def test_a_dialog_recovered_at_startup_gets_its_surface(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Recovery is the only thing that reaches a dialog nobody has written to yet.
+
+    A cron answer that finished while this process was down is redelivered by
+    recovery, into a dialog whose actor recovery itself builds. If the
+    transport is registered after that, the answer is redelivered to nobody
+    and waits — still marked undelivered — until its user happens to write.
+    Nothing prepares dialogs at startup any more, so this attach is what
+    delivers it.
+    """
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    dialog_id = await make_dialog(session_factory)
+    await exchanges.create(dialog_id, "stranded by the restart", owner_task_id="task-1")
+
+    surface = RecordingSurface()
+    manager = make_manager(session_factory)
+    manager.use_surface(surface)
+    try:
+        await manager.recover_interrupted()
+
+        assert surface.attached == [dialog_id]
+    finally:
+        await manager.stop_all()
+
+
 async def test_a_dialog_that_moved_away_loses_its_surface(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

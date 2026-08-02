@@ -635,35 +635,6 @@ async def test_dispatch_forwards_no_reply_target_when_absent() -> None:
     assert fake_bridge.calls == [("plain", str(FIRST_UPDATE_ID), None)]
 
 
-async def test_warm_starts_bridges_for_known_telegram_dialogs(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    manager = await make_manager([], session_factory)
-    requested: list[tuple[str, str]] = []
-
-    async def provider(user_id: str, channel: str) -> ConversationRunner:
-        requested.append((user_id, channel))
-        return await manager.get_or_create_runner(user_id, channel)
-
-    client = FakeTelegramClient()
-    identities = SqlAlchemyIdentityStore(session_factory)
-    known = await identities.resolve_or_create(CHANNEL, "424242")
-    stranger = await identities.create_user()
-    registry = TelegramBridgeRegistry(
-        runner_provider=provider,
-        client=client,
-        edit_throttle_seconds=NO_THROTTLE,
-        identities=identities,
-    )
-
-    # a person with no Telegram account of record has nowhere to be written to
-    await registry.warm([known, stranger.id])
-
-    assert requested == [(known, CHANNEL)]
-    await manager.stop_all()
-    await registry.aclose()
-
-
 # --- membership gate ---------------------------------------------------------
 
 RESEAT_ACCOUNT = 424242
@@ -1621,7 +1592,6 @@ async def test_a_pod_that_only_renders_never_polls(
     surface = TelegramSurface(
         registry=registry,
         poller=cast(TelegramPoller, WatchfulPoller()),
-        dialogs=SqlAlchemyDialogRepository(session_factory),
         polls=False,
     )
     try:

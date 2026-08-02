@@ -26,6 +26,13 @@ A claim is two facts, kept apart because they answer different questions:
 decision, not the database's: taking a dialog somebody else holds is a legitimate handover, not a
 race to lose.
 
+Which is exactly why nothing may build an actor speculatively. **A starting process claims nothing**
+— only recovery of genuinely stranded work (below) and the arrival of real work claim anything. The
+Telegram surface used to prepare a bridge per known dialog at startup so a scheduled run would have
+somewhere to land; a bridge needs its dialog's actor, so every pod took every dialog on every start
+and the last one to boot owned them all. Nothing was gained for it: the manager attaches the surface
+to each actor it builds, on every path that can produce an answer.
+
 The identity of a claim is the **pair** `(owner, generation)`, never the number alone. Two processes
 racing to take the same dialog may compute the same next generation, but only one owner survives in
 the row, so the other fails its next check. This is also what retires an older actor in the *same*
@@ -77,7 +84,9 @@ before claims existed at all are therefore still recovered.
 
 - A process's **own** prior claim never blocks it. It just started, so it cannot be running that
   dialog, and waiting out the staleness window would stall every ordinary restart. This is why
-  `OF_NODE_ID` must be stable across restarts of the same instance.
+  `OF_NODE_ID` must be stable across restarts of the same instance — and why a container must be
+  given one explicitly: its hostname is its id, and a redeploy mints a new one, so the default
+  makes every restart a stranger to the claims it left behind seconds earlier.
 - A claim lookup that fails treats every candidate as somebody else's. Skipping recovery costs a
   delay; recovering a dialog another instance is actively running corrupts a live conversation.
 

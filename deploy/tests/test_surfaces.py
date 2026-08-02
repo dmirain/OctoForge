@@ -178,7 +178,7 @@ async def test_a_surface_that_cannot_start_does_not_stop_the_others(
     surfaces: tuple[Surface, ...] = (broken, quiet)
 
     with caplog.at_level(logging.ERROR):
-        await main._install(surfaces, _NoopManager(), ToolRegistry())
+        await main._start_surfaces(main._attach_renderers(surfaces, _NoopManager(), ToolRegistry()))
 
     assert quiet.started
     assert any("broken" in record.message for record in caplog.records)

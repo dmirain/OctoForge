@@ -291,10 +291,6 @@ class DialogRepository(Protocol):
         """Return the dialog by id or raise DialogNotFoundError."""
         ...
 
-    async def list_user_ids_by_channel(self, channel: str) -> list[str]:
-        """Return the user ids that have a dialog on the given channel."""
-        ...
-
     async def list_by_channel(self, channel: str) -> list[Dialog]:
         """Return the full dialogs of the given channel."""
         ...

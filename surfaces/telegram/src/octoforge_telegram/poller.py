@@ -249,14 +249,6 @@ class TelegramBridgeRegistry:
             self._bridges[user_id] = bridge
         return bridge
 
-    async def warm(self, user_ids: Iterable[str]) -> None:
-        """Start bridges for known Telegram dialogs so their notifications are delivered."""
-        for user_id in user_ids:
-            chat_id = await self._chat_of(user_id)
-            if chat_id is None:
-                continue
-            await self.get_or_create(user_id, chat_id).start()
-
     async def attach(self, runner: ConversationRunner) -> None:
         """Render this dialog, if it is one of ours (`DialogSurface`).
 
