@@ -1,9 +1,9 @@
 """How ingestion hands a message to the dialog it belongs to.
 
-The poller does one thing with what it receives: give it to the user's dialog,
-or cancel that dialog's runs. Which side of a process boundary the dialog is
-on is not its business — so it depends on this narrow port, and the two
-implementations are the two ways a deployment can be arranged:
+The poller does one thing with what it receives: give it to the user's dialog.
+Which side of a process boundary that dialog is on is not its business — so it
+depends on this narrow port, and the two implementations are the two ways a
+deployment can be arranged:
 
 - **in-process** — the bridge itself, when the poller and the core run
   together (`TelegramBridgeRegistry`);
@@ -27,7 +27,6 @@ from octoforge_telegram.client import TELEGRAM_CHANNEL, USER_ID_PREFIX
 logger = logging.getLogger(__name__)
 
 MESSAGES_PATH = "/api/dialog/messages"
-CANCEL_PATH = "/api/dialog/cancel"
 USER_ID_HEADER = "X-User-Id"
 CHANNEL_HEADER = "X-Channel"
 
@@ -47,20 +46,12 @@ class DialogGateway(Protocol):
         """Submit what the user said."""
         ...
 
-    async def cancel(self) -> None:
-        """Stop whatever the dialog is doing."""
-        ...
-
 
 class GatewayRegistry(Protocol):
     """Where the poller gets a chat's gateway."""
 
     async def gateway_for(self, handle: str, chat_id: int) -> DialogGateway:
         """The gateway for this chat, creating one if needed."""
-        ...
-
-    async def existing_for(self, handle: str) -> DialogGateway | None:
-        """The gateway if one already exists — the `/cancel` fast path."""
         ...
 
     async def aclose(self) -> None:
@@ -108,10 +99,6 @@ class ApiDialogGateway:
             },
         )
 
-    async def cancel(self) -> None:
-        """Stop the dialog's runs."""
-        await self._post(CANCEL_PATH, None)
-
     async def _post(self, path: str, body: dict[str, object] | None) -> None:
         response = await self._client.post(
             path,
@@ -134,10 +121,6 @@ class ApiGatewayRegistry:
 
     async def gateway_for(self, handle: str, chat_id: int) -> DialogGateway:
         return ApiDialogGateway(self._client, handle.removeprefix(USER_ID_PREFIX))
-
-    async def existing_for(self, handle: str) -> DialogGateway | None:
-        """Always available: there is no per-chat state to have been built."""
-        return await self.gateway_for(handle, 0)
 
     async def aclose(self) -> None:
         """The HTTP client is owned by whoever opened it."""

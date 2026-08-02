@@ -73,7 +73,7 @@ async def test_the_node_carries_a_credential() -> None:
     seen: list[httpx.Request] = []
     async with recording_client(seen) as client:
         gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
-        await gateway.cancel()
+        await gateway.handle_text("привет")
 
     assert seen[0].headers["Authorization"].startswith("Basic ")
 

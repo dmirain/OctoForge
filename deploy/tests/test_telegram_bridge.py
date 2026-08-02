@@ -623,6 +623,12 @@ async def test_tool_call_renders_status_line_before_the_answer(
 async def test_cancel_appends_the_cancelled_line(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """Whoever stops the run, the chat has to show that it stopped.
+
+    The stop reaches the dialog rather than the surface — a user asking to
+    stop is routed like anything else, and the web UI presses the API. The
+    bridge's job is only to render what comes back out.
+    """
     llm = StallingLLM()
     client = FakeTelegramClient()
     manager = await make_manager(llm, session_factory)
@@ -630,7 +636,8 @@ async def test_cancel_appends_the_cancelled_line(
 
     await bridge.handle_text("hi")
     await wait_until(lambda: bool(client.sent))
-    await bridge.cancel()
+    runner = await manager.get_or_create_runner(TELEGRAM_USER_ID, TELEGRAM_CHANNEL)
+    await runner.cancel()
     llm.release.set()
     expected = f"{PARTIAL}\n{CANCELLED_LINE}"
     await wait_until(lambda: client.current_text() == expected if client.edited else False)

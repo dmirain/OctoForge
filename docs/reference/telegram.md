@@ -114,7 +114,12 @@ console and the `admin_manage` tool can show who a `tg:<id>` actually is and whi
 ### Commands and the admin tool
 
 `/start [code]` joins; `/secrets` returns a one-time link to the secret form (see
-[secrets.md](secrets.md)). Admins additionally get the `admin_manage` tool inside the chat — list users
+[secrets.md](secrets.md)). That is the whole list — in particular there is **no stop command**:
+asking to stop is a message like any other, and the router decides which exchanges it refers to
+(see [routing.md](routing.md)). A command could not do that, because it has nowhere to say *which*
+of several running answers to stop.
+
+Admins additionally get the `admin_manage` tool inside the chat — list users
 with names and invite attribution, generate, revoke and restore invites, search instructions across users,
 publish one. It hides itself from non-admins through the registry's visibility hook, and every action it
 performs (including a refused one) writes an audit line naming the admin's Telegram id.

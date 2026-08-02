@@ -195,11 +195,6 @@ class TelegramBridge:
             source=MessageSource(kind=kind, origin=origin, attachments=attachments),
         )
 
-    async def cancel(self) -> None:
-        """Cancel the current run of the dialog."""
-        runner = await self._ensure_runner()
-        await runner.cancel()
-
     async def aclose(self) -> None:
         """Stop forwarding events (on app shutdown)."""
         if self._forwarder is not None:

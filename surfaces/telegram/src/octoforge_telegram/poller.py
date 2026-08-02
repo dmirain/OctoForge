@@ -46,15 +46,18 @@ from octoforge_telegram.models import (
 logger = logging.getLogger(__name__)
 
 COMMAND_START = "/start"
-COMMAND_CANCEL = "/cancel"
 COMMAND_SECRETS = "/secrets"
+# Stopping an answer is a request like any other — the router recognises it
+# and cancels the exchanges the user meant. There is no stop command: one
+# would be a second way to say the same thing, and a worse one, because it
+# cannot say WHICH of several running answers to stop.
 GREETING_TEXT = (
     "Привет! Я OctoForge — напиши вопрос, и я постараюсь помочь. "
-    "Команда /cancel прерывает текущий ответ."
+    "Чтобы прервать ответ, так и напиши: «стой»."
 )
 WELCOME_TEXT = (
     "Код принят, добро пожаловать! Я OctoForge — напиши вопрос, и я постараюсь помочь. "
-    "Команда /cancel прерывает текущий ответ."
+    "Чтобы прервать ответ, так и напиши: «стой»."
 )
 ACCESS_DENIED_TEXT = (
     "Нет доступа: обратитесь к администратору за инвайт-кодом и отправьте /start <код>."
@@ -211,16 +214,6 @@ class TelegramBridgeRegistry:
         )
         self._bridges: dict[str, TelegramBridge] = {}
 
-    def existing(self, user_id: str) -> TelegramBridge | None:
-        """The user's bridge if one was already built, without creating one.
-
-        The `/cancel` fast path needs "do we know this user" without touching
-        the invite store (a DB read the poll loop must not do): a bridge
-        exists only for someone who already passed the gate in this process,
-        and startup warms one for every known Telegram dialog.
-        """
-        return self._bridges.get(user_id)
-
     async def person_of(self, external_id: str) -> str:
         """The person behind a Telegram account, minted on first contact.
 
@@ -241,15 +234,6 @@ class TelegramBridgeRegistry:
         return self.get_or_create(
             await self.person_of(handle.removeprefix(USER_ID_PREFIX)), chat_id
         )
-
-    async def existing_for(self, handle: str) -> TelegramBridge | None:
-        """The person's bridge if one was already built, without creating one."""
-        if self._identities is None:
-            return self.existing(handle)
-        person = await self._identities.resolve(
-            TELEGRAM_CHANNEL, handle.removeprefix(USER_ID_PREFIX)
-        )
-        return None if person is None else self.existing(person)
 
     def get_or_create(self, user_id: str, chat_id: int) -> TelegramBridge:
         """Return the bridge for the user, creating it on first contact."""
@@ -425,23 +409,18 @@ class TelegramPoller:
             await self._dispatch_safely(update)
 
     async def dispatch(self, update: TelegramUpdate) -> None:
-        """Take one update off the loop: stop it now, or queue it for its user's worker.
+        """Take one update off the loop: queue it for its user's worker.
 
         This is everything the poll loop does per update, and it must stay
-        that way — the only awaits here belong to `/cancel`, which is
-        deliberately NOT queued: a stop has to act now, not behind a
-        two-minute voice message being transcribed. Everything else (the
-        invite gate, the profile mirror, downloads, vision, the dialog
-        itself) happens in `_handle`, inside the user's own worker.
+        that way — nothing here awaits anything. Everything else (the invite
+        gate, the profile mirror, downloads, vision, the dialog itself)
+        happens in `_handle`, inside the user's own worker, so one user's
+        two-minute voice message cannot hold up anybody else's text.
         """
         message = update.message
         if message is None or message.from_user is None:
             return
-        user_id = f"{USER_ID_PREFIX}{message.from_user.id}"
-        if message.chat.type is TelegramChatType.PRIVATE and _is_cancel(message):
-            await self._cancel_now(user_id)
-            return
-        self._enqueue(user_id, message)
+        self._enqueue(f"{USER_ID_PREFIX}{message.from_user.id}", message)
 
     def _enqueue(self, user_id: str, message: TelegramMessage) -> None:
         """Append the message to its user's queue, starting the worker if needed."""
@@ -460,33 +439,6 @@ class TelegramPoller:
         if inbox.worker is None or inbox.worker.done():
             inbox.worker = asyncio.create_task(self._work(user_id, inbox))
             inbox.worker.add_done_callback(_report_worker_exit)
-
-    async def _cancel_now(self, user_id: str) -> None:
-        """Stop the user's runs and drop the ingestion they asked to abandon.
-
-        Only for a user we already know (a bridge exists — they passed the
-        gate at some point in this process, and startup warms the bridges of
-        every known Telegram dialog): a stranger typing `/cancel` must not
-        make the bot do anything at all, and checking the invite store here
-        would put a DB read back into the poll loop.
-
-        Cancelling the worker abandons whatever it was doing mid-flight —
-        that is the point of a stop, and it needs no bookkeeping: an
-        interrupted download or description simply never reaches the dialog.
-        Queued messages are dropped with it; otherwise a transcript would
-        surface seconds after the user said stop and start a fresh run.
-        """
-        bridge = await self._registry.existing_for(user_id)
-        if bridge is None:
-            return
-        inbox = self._inboxes.get(user_id)
-        if inbox is not None:
-            inbox.pending.clear()
-            inbox.arrived.clear()
-            if inbox.worker is not None:
-                inbox.worker.cancel()
-                inbox.worker = None
-        await bridge.cancel()
 
     async def _work(self, user_id: str, inbox: _Inbox) -> None:
         """Drain one user's queue in order until it stays empty long enough."""
@@ -918,8 +870,6 @@ class TelegramPoller:
             await self._send_secrets_link(user_id, chat_id)
             return
         bridge = await self._registry.gateway_for(user_id, chat_id)
-        # `/cancel` never reaches here: `dispatch` handles it straight off the
-        # poll loop, so a stop does not queue behind slow ingestion
         # the chat-level message id, not update_id: it doubles as the reply
         # target when the answer threads back to this question, and it is
         # unique per chat — enough for the (dialog, client_message_id) dedup
@@ -992,11 +942,6 @@ class TelegramPoller:
             return
         if updates:
             self._offset = updates[-1].update_id + 1
-
-
-def _is_cancel(message: TelegramMessage) -> bool:
-    """Whether this message is the bare stop command."""
-    return (message.body or "").strip() == COMMAND_CANCEL
 
 
 def _report_worker_exit(worker: asyncio.Task[None]) -> None:

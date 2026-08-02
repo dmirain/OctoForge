@@ -61,7 +61,6 @@ from octoforge_telegram.models import (
 from octoforge_telegram.poller import (
     ACCESS_DENIED_TEXT,
     CAPTION_LABEL,
-    COMMAND_CANCEL,
     COMMAND_START,
     DEFAULT_VOICE_MAX_SECONDS,
     GREETING_TEXT,
@@ -202,9 +201,6 @@ class RecordingBridge:
         self.calls.append((content, client_message_id, reply_to_message_id))
         self.kinds.append((kind, origin))
         self.attachments.append(attachments)
-
-    async def cancel(self) -> None:
-        raise AssertionError("cancel should not be called in these tests")
 
 
 class ExplodingBridge:
@@ -391,13 +387,8 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
 
 
 def use_bridge(poller: TelegramPoller, bridge: object) -> None:
-    """Point the poller's registry at one stub bridge, created or not.
-
-    `existing` matters as much as `get_or_create`: the `/cancel` fast path
-    only acts for a user whose bridge already exists.
-    """
+    """Point the poller's registry at one stub bridge."""
     poller._registry.get_or_create = lambda user_id, chat_id: bridge  # type: ignore[assignment,method-assign,return-value]
-    poller._registry.existing = lambda user_id: bridge  # type: ignore[assignment,method-assign,return-value]
 
 
 async def settle(poller: TelegramPoller, user_id: str | None = None) -> None:
@@ -502,19 +493,6 @@ async def test_redelivered_update_is_not_answered_twice(
     assert len(client.sent) == EXPECTED_TWO_REPLIES
     # end-to-end: each answer replies to the message that asked it
     assert client.replies == [1001, 1002]
-    await manager.stop_all()
-
-
-async def test_cancel_command_is_accepted(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    manager = await make_manager([], session_factory)
-    client = FakeTelegramClient()
-    poller = make_poller(client, manager.get_or_create_runner)
-
-    await deliver(poller, make_update(FIRST_UPDATE_ID, text=COMMAND_CANCEL))
-
-    assert client.sent == []
     await manager.stop_all()
 
 
@@ -1285,48 +1263,23 @@ async def test_a_following_message_submits_the_album_before_itself() -> None:
     assert bridge.calls[1][0] == "что тут по белку?"
 
 
-class CancellableBridge(RecordingBridge):
-    """RecordingBridge that accepts `cancel` instead of refusing it."""
+async def test_there_is_no_stop_command_left_in_the_loop() -> None:
+    """Stopping is something the user asks for, not a command the poller knows.
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.cancels = 0
-
-    async def cancel(self) -> None:
-        self.cancels += 1
-
-
-async def test_cancel_acts_at_once_and_drops_what_was_queued() -> None:
-    """A stop must not queue behind slow work — nor be undone by it afterwards.
-
-    `/cancel` is handled straight off the poll loop, and the pictures the
-    user just abandoned never reach the dialog: a description surfacing
-    seconds after the stop would start a fresh run nobody asked for.
+    The router is what decides which exchanges a "стой" refers to, and it can
+    say *which* of several running answers to stop — a command could only ever
+    mean "all of them". So the poll loop keeps no special case: what looks
+    like the old command is ordinary text and travels the ordinary path.
     """
     client = FakeTelegramClient()
-    bridge = CancellableBridge()
-    poller = make_poller(client, vision=PerImageVisionClient(client))
+    bridge = RecordingBridge()
+    poller = make_poller(client)
     use_bridge(poller, bridge)
 
-    for update in make_album(caption=None):
-        await poller.dispatch(update)
-    await poller.dispatch(make_update(9, text=COMMAND_CANCEL))
+    await deliver(poller, make_update(FIRST_UPDATE_ID, text="/cancel", message_id=1001))
 
-    assert bridge.cancels == 1  # immediate, without waiting for the album
-    await settle(poller)
-    assert bridge.calls == []  # and the abandoned pictures stay out of the dialog
-    assert not poller._inboxes[USER_ID].pending
-
-
-async def test_cancel_from_a_stranger_does_nothing() -> None:
-    """No bridge yet means nobody to stop — and no invite-store read in the loop."""
-    client = FakeTelegramClient()
-    poller = make_poller(client)
-
-    await poller.dispatch(make_update(1, text=COMMAND_CANCEL))
-
+    assert [call[0] for call in bridge.calls] == ["/cancel"]
     assert client.sent == []
-    assert poller._inboxes == {}
 
 
 async def test_one_users_slow_ingestion_does_not_stall_another() -> None:
