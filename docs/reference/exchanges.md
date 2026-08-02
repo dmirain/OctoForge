@@ -8,7 +8,15 @@ still owe people?" a query instead of an inspection of process memory.
 
 Every exchange belongs to a dialog and carries a status, a title (derived from the question), the id of
 the task that currently owns it, and — when it is waiting — the question it asked the user. Messages
-point at their exchange through `messages.exchange_id`.
+point at their exchange through `messages.exchange_id`, and so does the task working on it
+(`tasks.exchange_id`).
+
+Both directions of that link are foreign keys, and both earn it. `tasks.exchange_id` is what makes
+"every attempt to settle this obligation" a query. `exchanges.owner_task_id` is not derivable from it
+and is not a cache: settling compares it against the terminating task to tell "still mine" from
+"changed hands", and that comparison has to work when no run is live anywhere — after a crash, or when
+a follow-up already took the exchange and finished. Deleting a task frees the exchange it held
+(`ON DELETE SET NULL`), which is what every reader of the column already assumed.
 
 ### Lifecycle
 
