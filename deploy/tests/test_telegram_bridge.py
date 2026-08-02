@@ -54,9 +54,10 @@ from octoforge_core.tools.base import ToolContext
 from octoforge_telegram import bridge as bridge_module
 from octoforge_telegram.bridge import (
     CANCELLED_LINE,
-    REPEAT_SUFFIX_TEMPLATE,
     REPLY_TARGET_MAP_SIZE,
-    THINKING_LINE_TEMPLATE,
+    STATUS_DIVIDER,
+    THINKING_LABEL,
+    TOOL_GROUPS,
     TOOL_LINE_TEMPLATE,
     RunnerProvider,
     TelegramBridge,
@@ -634,11 +635,11 @@ async def test_tool_call_renders_status_line_before_the_answer(
     bridge = make_bridge(client, manager)
 
     await bridge.handle_text("hi")
-    tool_line = TOOL_LINE_TEMPLATE.format(name=ECHO_TOOL)
-    expected = f"{tool_line}\n{REPLY}"
+    status_block = f"```\n{TOOL_LINE_TEMPLATE.format(name=ECHO_TOOL)} ·\n```"
+    expected = f"{status_block}\n{STATUS_DIVIDER}\n{REPLY}"
     await wait_until(lambda: client.current_text() == expected if client.sent else False)
 
-    assert client.sent == [(CHAT_ID, tool_line)]
+    assert client.sent == [(CHAT_ID, status_block)]
     assert client.edited == [(CHAT_ID, 1, expected)]
     await bridge.aclose()
     await manager.stop_all()
@@ -798,17 +799,22 @@ async def test_reply_target_map_is_bounded() -> None:
     assert overflow - 1 in bridge._reply_targets  # the newest survives
 
 
-async def test_thinking_renders_a_counting_tail_that_gives_way_to_text() -> None:
-    """While the model reasons, the draft ends with 💭 and a chunk counter;
-    the first real output replaces the tail instead of stacking under it."""
+def mono(*lines: str) -> str:
+    """The status block as the chat sees it: a fenced monospace section."""
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+async def test_thinking_renders_dots_that_give_way_to_text() -> None:
+    """While the model reasons, the status block ends with 💭 and growing
+    dots; the first real output replaces it instead of stacking under it."""
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
 
     await bridge._render(ReasoningDelta(), "x1")
-    assert client.sent == [(CHAT_ID, THINKING_LINE_TEMPLATE.format(count=1))]
+    assert client.sent == [(CHAT_ID, mono(f"{THINKING_LABEL} ·"))]
     await bridge._render(ReasoningDelta(), "x1")
-    assert client.current_text() == THINKING_LINE_TEMPLATE.format(count=2)
+    assert client.current_text() == mono(f"{THINKING_LABEL} ··")
 
     await bridge._render(TextDelta(text="Ответ"), "x1")
     assert client.current_text() == "Ответ"
@@ -816,21 +822,25 @@ async def test_thinking_renders_a_counting_tail_that_gives_way_to_text() -> None
     assert client.current_text() == "Ответ"
 
 
-async def test_repeated_tool_calls_collapse_into_one_counted_line() -> None:
-    """The same tool called back to back grows a counter suffix, not new lines."""
+async def test_repeated_calls_of_a_group_grow_dots_then_a_count() -> None:
+    """Calls of one tool group collapse into a single line: · ·· ··· ··4,
+    and a call of another group starts its own line."""
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
     same = ToolCall(id=CALL_ID, name=ECHO_TOOL, arguments={})
     other = ToolCall(id="call-2", name="web_search", arguments={})
-    counted = TOOL_LINE_TEMPLATE.format(name=ECHO_TOOL) + REPEAT_SUFFIX_TEMPLATE.format(count=3)
+    echo_line = TOOL_LINE_TEMPLATE.format(name=ECHO_TOOL)  # not in any group: raw name
 
     for _ in range(3):
         await bridge._render(ToolCallRequested(call=same), "x1")
-    assert client.current_text() == counted
+    assert client.current_text() == mono(f"{echo_line} ···")
+
+    await bridge._render(ToolCallRequested(call=same), "x1")
+    assert client.current_text() == mono(f"{echo_line} ··4")
 
     await bridge._render(ToolCallRequested(call=other), "x1")
-    assert client.current_text() == f"{counted}\n" + TOOL_LINE_TEMPLATE.format(name="web_search")
+    assert client.current_text() == mono(f"{echo_line} ··4", f"{TOOL_GROUPS['web_search']} ·")
 
 
 SHORT_THROTTLE_SECONDS = 0.05

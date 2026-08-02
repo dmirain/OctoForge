@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 from octoforge_core.agent.events import (
@@ -42,16 +42,46 @@ logger = logging.getLogger(__name__)
 
 RunnerProvider = Callable[[str, str], Awaitable[ConversationRunner]]
 
+# the fallback for a tool outside every group: the raw name is still better
+# than hiding that something runs
 TOOL_LINE_TEMPLATE = "⚙️ {name}"
 TOOL_FAIL_LINE_TEMPLATE = "⚠️ {name}: {error}"
 CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
 RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
-# transient tail shown while the model reasons: the count of reasoning chunks
-# received so far is the only progress a hidden think gives us to show
-THINKING_LINE_TEMPLATE = "💭 думает… ({count})"
-# a status line repeated back to back grows this suffix instead of a new line
-REPEAT_SUFFIX_TEMPLATE = " ×{count}"  # noqa: RUF001 — the typographic sign, on purpose
+# the label shown while the model reasons; its progress dots count the
+# reasoning chunks received so far
+THINKING_LABEL = "💭 думает"
+# what the user reads instead of raw tool names: one emoji + one short
+# Russian word per tool GROUP, so consecutive calls of a kind collapse into
+# a single line with progress dots
+TOOL_GROUPS: dict[str, str] = {
+    "recall": "🧠 память",
+    "memory_store": "🧠 память",
+    "memory_delete": "🧠 память",
+    "history_search": "💬 история",
+    "web_search": "🔎 поиск",
+    "http_request": "🌐 сеть",
+    "external_call": "🔌 сервис",
+    "endpoint_get": "🔌 сервис",
+    "image_look": "🖼 фото",
+    "cron_pause": "⏰ крон",
+    "cron_resume": "⏰ крон",
+    "data_put": "📊 данные",
+    "data_query": "📊 данные",
+    "data_forget": "📊 данные",
+    "instruction_save": "📚 знания",
+    "instruction_delete": "📚 знания",
+    "task_create": "🗂 задачи",
+    "task_delete": "🗂 задачи",
+    "task_list": "🗂 задачи",
+    "ask_user": "❓ вопрос",
+}
+# the line between the monospaced status block and the answer text
+STATUS_DIVIDER = "──────────"
+# progress dots grow one per call up to this; then the last dot becomes the
+# count itself: · ·· ··· ··4 ··5 …
+MAX_PLAIN_DOTS = 3
 # how many sent-message-id -> exchange-id mappings the bridge remembers for
 # reply routing; a restart loses the map entirely (routing falls back to the
 # LLM router), so this only bounds in-process memory, not correctness
@@ -72,6 +102,20 @@ class TelegramBridgeOptions:
     # dialog that moves to another process keeps editing it instead of
     # starting a second one. None keeps drafts in memory only.
     drafts: DraftStore | None = None
+
+
+@dataclass(slots=True)
+class _StatusEntry:
+    """One line of the monospaced status block above the answer text.
+
+    Counted entries (tool groups) collapse consecutive repeats into growing
+    progress dots; notices (a failed call, a retry, a terminal state) stand
+    as they are.
+    """
+
+    label: str
+    count: int = 1
+    counted: bool = True
 
 
 @dataclass(slots=True)
@@ -99,15 +143,13 @@ class _Draft:
     # without it, a model pausing mid-answer left text sitting undelivered
     # until the pause ended
     flush_timer: asyncio.Task[None] | None = None
-    # the model is reasoning: render a transient 💭 tail with the chunk
-    # count instead of silence; cleared by the next visible output
+    # the model is reasoning: render a transient 💭 tail with progress dots
+    # instead of silence; cleared by the next visible output
     thinking: bool = False
     reasoning_chunks: int = 0
-    # last appended status line with its count and buffer offset, so a
-    # back-to-back repeat rewrites the line into "⚙️ name xN" in place
-    repeat_line: str | None = None
-    repeat_count: int = 0
-    repeat_offset: int = 0
+    # the status block above the answer: tool groups with progress dots and
+    # standalone notices, in arrival order
+    status: list[_StatusEntry] = field(default_factory=list)
     # the exchange this draft belongs to, carried alongside so a fresh
     # message id can be recorded into the reply-target map at send time
     # without threading exchange_id through every render/flush call
@@ -346,17 +388,21 @@ class TelegramBridge:
             return
         if isinstance(event, TextDelta):
             draft.thinking = False
-            draft.repeat_line = None  # a later repeat of a status line is a new line
             draft.buffer += event.text
             await self._flush_throttled(draft)
             return
         if isinstance(event, (Finished, Cancelled, Failed)):
             await self._render_terminal(event, exchange_id, draft)
             return
-        line = _status_line(event)
+        if isinstance(event, ToolCallRequested):
+            draft.thinking = False
+            _count_status(draft, _tool_group(event.call.name))
+            await self._flush_throttled(draft)
+            return
+        line = _notice_line(event)
         if line is not None:
             draft.thinking = False
-            self._append_line(draft, line)
+            draft.status.append(_StatusEntry(label=line, counted=False))
             await self._flush_throttled(draft)
 
     async def _render_terminal(
@@ -408,22 +454,13 @@ class TelegramBridge:
                 )
 
     def _append_line(self, draft: _Draft, line: str) -> None:
-        """Append a status line, keeping the arrival order with the answer text.
+        """Append a terminal line to the answer text (Отменено / Ошибка).
 
-        A line identical to the previous one (the model calling the same tool
-        over and over) does not stack: the existing line is rewritten in
-        place as "⚙️ name xN", so a long tool run cannot fill the screen.
+        Outcomes belong under the text they conclude, not in the status
+        block above it.
         """
-        if draft.repeat_line == line:
-            draft.repeat_count += 1
-            counted = line + REPEAT_SUFFIX_TEMPLATE.format(count=draft.repeat_count)
-            draft.buffer = draft.buffer[: draft.repeat_offset] + counted + "\n"
-            return
         if draft.buffer and not draft.buffer.endswith("\n"):
             draft.buffer += "\n"
-        draft.repeat_line = line
-        draft.repeat_count = 1
-        draft.repeat_offset = len(draft.buffer)
         draft.buffer += line + "\n"
 
     async def _flush_throttled(self, draft: _Draft) -> None:
@@ -468,21 +505,17 @@ class TelegramBridge:
             draft.flush_timer = None
 
     async def _flush_draft(self, draft: _Draft) -> None:
-        """Push the buffer to the chat as the Rich Message(s) it renders into.
+        """Push the draft to the chat as the Rich Message(s) it renders into.
 
-        The buffer is the agent's Markdown and Telegram renders it natively,
-        so nothing is converted on the way out — the limit that applies is
-        the Rich Message one, eight times the plain-text budget. An answer
-        that still outgrows it is sealed and continued in a fresh message.
-
-        While the model reasons, a transient "💭 думает… (N)" tail rides at
-        the end; it is not part of the buffer, so the next real output
-        replaces it instead of stacking under it.
+        The visible message is composed on every flush: the monospaced
+        status block (tool groups with progress dots, the transient 💭 line
+        while the model reasons), a divider, then the answer text — the
+        agent's Markdown, which Telegram renders natively. The limit that
+        applies is the Rich Message one, eight times the plain-text budget;
+        an answer that still outgrows it is sealed and continued in a fresh
+        message.
         """
-        raw = draft.buffer.rstrip("\n")
-        if draft.thinking:
-            thinking = THINKING_LINE_TEMPLATE.format(count=draft.reasoning_chunks)
-            raw = f"{raw}\n{thinking}" if raw else thinking
+        raw = _compose(draft)
         if not raw:
             return
         chunks = _split_markdown(raw, MAX_RICH_MESSAGE_LENGTH)
@@ -492,9 +525,6 @@ class TelegramBridge:
             draft.message_id = None  # seal the head, continue in a fresh message
             draft.delivered_text = ""
             draft.sealed_chunks += 1
-            # text behind a sealed boundary is delivered and abandoned; a
-            # repeat-counter rewrite reaching into it would shift the split
-            draft.repeat_line = None
         if chunks[-1] != draft.delivered_text:
             await self._deliver(draft, chunks[-1])
 
@@ -597,9 +627,7 @@ def _reply_target(source_client_message_id: str | None) -> int | None:
     return int(source_client_message_id)
 
 
-def _status_line(event: LoopEvent) -> str | None:
-    if isinstance(event, ToolCallRequested):
-        return TOOL_LINE_TEMPLATE.format(name=event.call.name)
+def _notice_line(event: LoopEvent) -> str | None:
     if isinstance(event, ToolCallFailed):
         return TOOL_FAIL_LINE_TEMPLATE.format(name=event.call.name, error=event.error)
     if isinstance(event, RetryScheduled):
@@ -610,3 +638,48 @@ def _status_line(event: LoopEvent) -> str | None:
     # assistant messages, either streamed live per-exchange or delivered whole
     # through the outbox — there is no separate foreground path anymore.
     return None
+
+
+def _tool_group(name: str) -> str:
+    """The user-facing label of a tool: its group's emoji + short Russian word."""
+    return TOOL_GROUPS.get(name) or TOOL_LINE_TEMPLATE.format(name=name)
+
+
+def _count_status(draft: _Draft, label: str) -> None:
+    """Add a counted status entry; a back-to-back repeat only grows the dots."""
+    last = draft.status[-1] if draft.status else None
+    if last is not None and last.counted and last.label == label:
+        last.count += 1
+        return
+    draft.status.append(_StatusEntry(label=label))
+
+
+def _progress_dots(count: int) -> str:
+    """· then ·· then ···, and past that the last dot becomes the count."""
+    if count <= MAX_PLAIN_DOTS:
+        return "·" * count
+    return f"··{count}"
+
+
+def _compose(draft: _Draft) -> str:
+    """The full visible message: status block, divider, answer text.
+
+    The status block is monospaced (a fenced code block) so its lines and
+    dots stay aligned; the divider marks where the answer begins and only
+    appears once there is text to divide from.
+    """
+    lines = [
+        f"{entry.label} {_progress_dots(entry.count)}" if entry.counted else entry.label
+        for entry in draft.status
+    ]
+    if draft.thinking:
+        lines.append(f"{THINKING_LABEL} {_progress_dots(draft.reasoning_chunks)}")
+    text = draft.buffer.rstrip("\n")
+    parts: list[str] = []
+    if lines:
+        parts.append("```\n" + "\n".join(lines) + "\n```")
+        if text:
+            parts.append(STATUS_DIVIDER)
+    if text:
+        parts.append(text)
+    return "\n".join(parts)
