@@ -16,7 +16,14 @@ from octoforge_core import (
     ToolRegistry,
     ToolSpec,
 )
-from octoforge_core.agent.events import Cancelled, Finished, ProcessStarted, TextDelta
+from octoforge_core.agent.events import (
+    Cancelled,
+    Finished,
+    ProcessStarted,
+    ReasoningDelta,
+    TextDelta,
+    ToolCallRequested,
+)
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import (
@@ -47,7 +54,9 @@ from octoforge_core.tools.base import ToolContext
 from octoforge_telegram import bridge as bridge_module
 from octoforge_telegram.bridge import (
     CANCELLED_LINE,
+    REPEAT_SUFFIX_TEMPLATE,
     REPLY_TARGET_MAP_SIZE,
+    THINKING_LINE_TEMPLATE,
     TOOL_LINE_TEMPLATE,
     RunnerProvider,
     TelegramBridge,
@@ -718,13 +727,15 @@ async def test_a_table_reply_is_sent_rich_and_still_threads_its_reply(
 # --- reply-target routing (deterministic reply shortcut) --------------------
 
 
-def make_fake_bridge(client: FakeTelegramClient, runner: FakeRunner) -> TelegramBridge:
+def make_fake_bridge(
+    client: FakeTelegramClient, runner: FakeRunner, throttle: float = NO_THROTTLE
+) -> TelegramBridge:
     return TelegramBridge(
         user_id=TELEGRAM_USER_ID,
         chat_id=CHAT_ID,
         runner_provider=make_fake_provider(runner),
         client=client,
-        options=TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE),
+        options=TelegramBridgeOptions(edit_throttle_seconds=throttle),
     )
 
 
@@ -785,6 +796,63 @@ async def test_reply_target_map_is_bounded() -> None:
     assert len(bridge._reply_targets) == REPLY_TARGET_MAP_SIZE
     assert 0 not in bridge._reply_targets  # the oldest mappings were evicted
     assert overflow - 1 in bridge._reply_targets  # the newest survives
+
+
+async def test_thinking_renders_a_counting_tail_that_gives_way_to_text() -> None:
+    """While the model reasons, the draft ends with 💭 and a chunk counter;
+    the first real output replaces the tail instead of stacking under it."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge._render(ReasoningDelta(), "x1")
+    assert client.sent == [(CHAT_ID, THINKING_LINE_TEMPLATE.format(count=1))]
+    await bridge._render(ReasoningDelta(), "x1")
+    assert client.current_text() == THINKING_LINE_TEMPLATE.format(count=2)
+
+    await bridge._render(TextDelta(text="Ответ"), "x1")
+    assert client.current_text() == "Ответ"
+    await bridge._render(Finished(message=reply("Ответ")), "x1")
+    assert client.current_text() == "Ответ"
+
+
+async def test_repeated_tool_calls_collapse_into_one_counted_line() -> None:
+    """The same tool called back to back grows a counter suffix, not new lines."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+    same = ToolCall(id=CALL_ID, name=ECHO_TOOL, arguments={})
+    other = ToolCall(id="call-2", name="web_search", arguments={})
+    counted = TOOL_LINE_TEMPLATE.format(name=ECHO_TOOL) + REPEAT_SUFFIX_TEMPLATE.format(count=3)
+
+    for _ in range(3):
+        await bridge._render(ToolCallRequested(call=same), "x1")
+    assert client.current_text() == counted
+
+    await bridge._render(ToolCallRequested(call=other), "x1")
+    assert client.current_text() == f"{counted}\n" + TOOL_LINE_TEMPLATE.format(name="web_search")
+
+
+SHORT_THROTTLE_SECONDS = 0.05
+
+
+async def test_the_first_block_waits_out_the_throttle_window() -> None:
+    """The answer must not open as a two-letter message.
+
+    The first deltas accumulate for one throttle window and arrive as one
+    readable block — delivered by the deferred timer, since no further
+    event fires here to do it.
+    """
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner, throttle=SHORT_THROTTLE_SECONDS)
+
+    await bridge._render(TextDelta(text="Ин"), "x1")
+    await bridge._render(TextDelta(text="вайты создаются так."), "x1")
+    assert client.sent == []  # the window is still open, nothing went out
+
+    await wait_until(lambda: bool(client.sent))
+    assert client.sent == [(CHAT_ID, "Инвайты создаются так.")]
 
 
 async def test_typing_pulses_while_an_answer_is_in_flight() -> None:

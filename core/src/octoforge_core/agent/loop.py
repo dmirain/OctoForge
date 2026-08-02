@@ -14,6 +14,7 @@ from octoforge_core.agent.events import (
     Finished,
     IterationStarted,
     LoopEvent,
+    ReasoningDelta,
     RetryScheduled,
     TextDelta,
     ToolCallCompleted,
@@ -21,6 +22,7 @@ from octoforge_core.agent.events import (
     ToolCallRequested,
 )
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
+from octoforge_core.llm.events import ReasoningDelta as LlmReasoningDelta
 from octoforge_core.llm.events import RetryScheduled as LlmRetryScheduled
 from octoforge_core.llm.events import (
     StreamEvent,
@@ -400,6 +402,8 @@ class AgentLoop:
         if isinstance(event, LlmTextDelta):
             content_parts.append(event.text)
             events.append(TextDelta(text=event.text))
+        elif isinstance(event, LlmReasoningDelta):
+            events.append(ReasoningDelta())
         elif isinstance(event, ToolCallReady):
             tracker.spawn(event.call)
             events.append(ToolCallRequested(call=event.call))

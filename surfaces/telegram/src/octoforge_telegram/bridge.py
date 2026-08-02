@@ -15,6 +15,7 @@ from octoforge_core.agent.events import (
     Finished,
     LoopEvent,
     ProcessStarted,
+    ReasoningDelta,
     RetryScheduled,
     TextDelta,
     ToolCallFailed,
@@ -46,6 +47,11 @@ TOOL_FAIL_LINE_TEMPLATE = "⚠️ {name}: {error}"
 CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
 RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
+# transient tail shown while the model reasons: the count of reasoning chunks
+# received so far is the only progress a hidden think gives us to show
+THINKING_LINE_TEMPLATE = "💭 думает… ({count})"
+# a status line repeated back to back grows this suffix instead of a new line
+REPEAT_SUFFIX_TEMPLATE = " ×{count}"  # noqa: RUF001 — the typographic sign, on purpose
 # how many sent-message-id -> exchange-id mappings the bridge remembers for
 # reply routing; a restart loses the map entirely (routing falls back to the
 # LLM router), so this only bounds in-process memory, not correctness
@@ -85,7 +91,23 @@ class _Draft:
     # from ProcessStarted BEFORE the first send — Telegram can only thread
     # a reply at message creation, never on a later edit
     reply_to: int | None = None
-    last_flush_monotonic: float = 0.0
+    # when undelivered output STARTED accumulating; the flush fires one
+    # throttle interval after this, so the first visible block is a real
+    # block and not the stream's first two letters
+    pending_since: float | None = None
+    # delivers the pending buffer when no further event arrives to do it —
+    # without it, a model pausing mid-answer left text sitting undelivered
+    # until the pause ended
+    flush_timer: asyncio.Task[None] | None = None
+    # the model is reasoning: render a transient 💭 tail with the chunk
+    # count instead of silence; cleared by the next visible output
+    thinking: bool = False
+    reasoning_chunks: int = 0
+    # last appended status line with its count and buffer offset, so a
+    # back-to-back repeat rewrites the line into "⚙️ name xN" in place
+    repeat_line: str | None = None
+    repeat_count: int = 0
+    repeat_offset: int = 0
     # the exchange this draft belongs to, carried alongside so a fresh
     # message id can be recorded into the reply-target map at send time
     # without threading exchange_id through every render/flush call
@@ -206,6 +228,8 @@ class TelegramBridge:
     async def aclose(self) -> None:
         """Stop forwarding events (on app shutdown)."""
         self._stop_typing()
+        for draft in self._drafts.values():
+            self._cancel_flush_timer(draft)
         if self._forwarder is not None:
             self._forwarder.cancel()
             with suppress(asyncio.CancelledError):
@@ -235,9 +259,13 @@ class TelegramBridge:
                     return
                 await self._render_safely(event.payload, event.exchange_id)
         finally:
-            # whoever owns the dialog next shows their own indicator; ours
-            # must not keep promising an answer this process will not send
+            # whoever owns the dialog next shows their own indicator and
+            # continues the drafts; ours must not keep promising an answer
+            # this process will not send, nor fire a late edit into a
+            # message the new owner is already writing
             self._stop_typing()
+            for draft in self._drafts.values():
+                self._cancel_flush_timer(draft)
             runner.unsubscribe(queue)
 
     async def _render_safely(self, event: LoopEvent, exchange_id: str | None) -> None:
@@ -311,7 +339,14 @@ class TelegramBridge:
                 draft.reply_to = _reply_target(event.source_client_message_id)
             self._typing_on(exchange_id)
             return
+        if isinstance(event, ReasoningDelta):
+            draft.thinking = True
+            draft.reasoning_chunks += 1
+            await self._flush_throttled(draft)
+            return
         if isinstance(event, TextDelta):
+            draft.thinking = False
+            draft.repeat_line = None  # a later repeat of a status line is a new line
             draft.buffer += event.text
             await self._flush_throttled(draft)
             return
@@ -320,6 +355,7 @@ class TelegramBridge:
             return
         line = _status_line(event)
         if line is not None:
+            draft.thinking = False
             self._append_line(draft, line)
             await self._flush_throttled(draft)
 
@@ -328,8 +364,13 @@ class TelegramBridge:
     ) -> None:
         # stop pulsing before the final flush, so the message that ends the
         # answer is also the thing that clears the indicator — a pulse after
-        # it would show "typing" with nothing left to type
+        # it would show "typing" with nothing left to type. Same for the
+        # deferred flush timer: the terminal flush below is the last word,
+        # nothing may fire after it.
         self._typing_off(exchange_id)
+        draft.thinking = False
+        draft.pending_since = None
+        self._cancel_flush_timer(draft)
         if isinstance(event, Cancelled):
             self._append_line(draft, CANCELLED_LINE)
         elif isinstance(event, Failed):
@@ -367,16 +408,64 @@ class TelegramBridge:
                 )
 
     def _append_line(self, draft: _Draft, line: str) -> None:
-        """Append a status line, keeping the arrival order with the answer text."""
+        """Append a status line, keeping the arrival order with the answer text.
+
+        A line identical to the previous one (the model calling the same tool
+        over and over) does not stack: the existing line is rewritten in
+        place as "⚙️ name xN", so a long tool run cannot fill the screen.
+        """
+        if draft.repeat_line == line:
+            draft.repeat_count += 1
+            counted = line + REPEAT_SUFFIX_TEMPLATE.format(count=draft.repeat_count)
+            draft.buffer = draft.buffer[: draft.repeat_offset] + counted + "\n"
+            return
         if draft.buffer and not draft.buffer.endswith("\n"):
             draft.buffer += "\n"
+        draft.repeat_line = line
+        draft.repeat_count = 1
+        draft.repeat_offset = len(draft.buffer)
         draft.buffer += line + "\n"
 
     async def _flush_throttled(self, draft: _Draft) -> None:
+        """Deliver one block per throttle window, not one edit per delta.
+
+        The clock starts when undelivered output starts ACCUMULATING, so the
+        very first flush also waits a full window — the answer opens with a
+        readable block instead of the stream's first two letters. The timer
+        covers the other direction: output already pending is delivered on
+        time even when the stream goes silent (a model pausing mid-answer
+        used to leave its last words sitting in the buffer until the pause
+        ended).
+        """
         now = time.monotonic()
-        if now - draft.last_flush_monotonic >= self._edit_throttle_seconds:
-            draft.last_flush_monotonic = now
+        if draft.pending_since is None:
+            draft.pending_since = now
+        await self._flush_when_due(draft, now)
+
+    async def _flush_when_due(self, draft: _Draft, now: float) -> None:
+        if draft.pending_since is None:
+            return
+        wait = draft.pending_since + self._edit_throttle_seconds - now
+        if wait <= 0:
+            # reset BEFORE the await: a concurrent entry (the timer firing
+            # during this flush's HTTP call) must see nothing left to do
+            draft.pending_since = None
             await self._flush_draft(draft)
+        elif draft.flush_timer is None or draft.flush_timer.done():
+            draft.flush_timer = asyncio.create_task(self._flush_after(draft, wait))
+
+    async def _flush_after(self, draft: _Draft, delay: float) -> None:
+        await asyncio.sleep(delay)
+        try:
+            await self._flush_when_due(draft, time.monotonic())
+        except (TelegramApiError, httpx.HTTPError):
+            logger.warning("Telegram deferred flush failed for %s", self._user_id, exc_info=True)
+
+    @staticmethod
+    def _cancel_flush_timer(draft: _Draft) -> None:
+        if draft.flush_timer is not None:
+            draft.flush_timer.cancel()
+            draft.flush_timer = None
 
     async def _flush_draft(self, draft: _Draft) -> None:
         """Push the buffer to the chat as the Rich Message(s) it renders into.
@@ -385,8 +474,15 @@ class TelegramBridge:
         so nothing is converted on the way out — the limit that applies is
         the Rich Message one, eight times the plain-text budget. An answer
         that still outgrows it is sealed and continued in a fresh message.
+
+        While the model reasons, a transient "💭 думает… (N)" tail rides at
+        the end; it is not part of the buffer, so the next real output
+        replaces it instead of stacking under it.
         """
         raw = draft.buffer.rstrip("\n")
+        if draft.thinking:
+            thinking = THINKING_LINE_TEMPLATE.format(count=draft.reasoning_chunks)
+            raw = f"{raw}\n{thinking}" if raw else thinking
         if not raw:
             return
         chunks = _split_markdown(raw, MAX_RICH_MESSAGE_LENGTH)
@@ -396,6 +492,9 @@ class TelegramBridge:
             draft.message_id = None  # seal the head, continue in a fresh message
             draft.delivered_text = ""
             draft.sealed_chunks += 1
+            # text behind a sealed boundary is delivered and abandoned; a
+            # repeat-counter rewrite reaching into it would shift the split
+            draft.repeat_line = None
         if chunks[-1] != draft.delivered_text:
             await self._deliver(draft, chunks[-1])
 

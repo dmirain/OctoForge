@@ -20,6 +20,7 @@ from octoforge_core.llm.errors import (
     raise_for_error_status,
 )
 from octoforge_core.llm.events import (
+    ReasoningDelta,
     StreamEvent,
     StreamFinished,
     TextDelta,
@@ -39,9 +40,12 @@ SSE_DONE_MARKER = "[DONE]"
 # a silence this long between chunks of one stream is worth a log line: it is
 # what the user experiences as the bot freezing mid-answer
 STREAM_GAP_LOG_SECONDS = 3.0
-# delta fields the accumulator reads; anything else (e.g. a reasoning-model's
-# `reasoning` deltas) is invisible to the user and only counted for the log
-CONSUMED_DELTA_FIELDS = frozenset({"content", "tool_calls", "role"})
+# delta fields the accumulator reads; anything else is invisible to the user
+# and only counted for the log. `reasoning` is what ollama.com streams for a
+# thinking model, `reasoning_content` is DeepSeek's own API name for it.
+CONSUMED_DELTA_FIELDS = frozenset(
+    {"content", "tool_calls", "role", "reasoning", "reasoning_content"}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +308,9 @@ class _StreamAccumulator:
             raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
         events: list[StreamEvent] = []
         self._note_ignored(delta)
+        if delta.get("reasoning") or delta.get("reasoning_content"):
+            # the reasoning text is dropped on purpose; see ReasoningDelta
+            events.append(ReasoningDelta())
         content = delta.get("content")
         if content:
             self._content_parts.append(content)

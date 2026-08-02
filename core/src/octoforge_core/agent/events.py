@@ -21,6 +21,16 @@ class TextDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class ReasoningDelta:
+    """The model is thinking: one chunk of hidden reasoning arrived.
+
+    Carries no text (the reasoning is the model's scratchpad, never shown or
+    stored); surfaces render the state — and count the chunks as progress —
+    so a long think does not look like the bot dying mid-answer.
+    """
+
+
+@dataclass(frozen=True, slots=True)
 class AssistantMessage:
     """The completed assistant message of an iteration."""
 
@@ -114,6 +124,7 @@ class ProcessCompleted:
 LoopEvent = (
     IterationStarted
     | TextDelta
+    | ReasoningDelta
     | AssistantMessage
     | ToolCallRequested
     | ToolCallCompleted

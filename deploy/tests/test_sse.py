@@ -12,6 +12,7 @@ from octoforge_core.agent.events import (
     IterationStarted,
     ProcessCompleted,
     ProcessStarted,
+    ReasoningDelta,
     TextDelta,
     ToolCallCompleted,
     ToolCallFailed,
@@ -41,6 +42,7 @@ PAYLOAD_CASES: list[tuple[LoopEvent, dict[str, object]]] = [
         {"type": "iteration_started", "index": ITERATION_INDEX},
     ),
     (TextDelta(text=CONTENT), {"type": "text_delta", "text": CONTENT}),
+    (ReasoningDelta(), {"type": "reasoning_delta"}),
     (
         AssistantMessage(message=ASSISTANT, interrupted=True),
         {

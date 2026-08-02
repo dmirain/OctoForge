@@ -14,6 +14,17 @@ class TextDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class ReasoningDelta:
+    """One chunk of the model's hidden reasoning arrived.
+
+    The reasoning text itself is deliberately not carried: it is the model's
+    scratchpad, not part of the answer, and nothing downstream should store
+    or show it. The event exists so a surface can render the THINKING STATE
+    (and its progress — chunks keep arriving) instead of dead silence.
+    """
+
+
+@dataclass(frozen=True, slots=True)
 class ToolCallStarted:
     """A tool call slot appeared in the stream (id and name are known)."""
 
@@ -58,5 +69,11 @@ class RetryScheduled:
 
 
 StreamEvent = (
-    TextDelta | ToolCallStarted | ToolCallReady | ToolCallBroken | StreamFinished | RetryScheduled
+    TextDelta
+    | ReasoningDelta
+    | ToolCallStarted
+    | ToolCallReady
+    | ToolCallBroken
+    | StreamFinished
+    | RetryScheduled
 )

@@ -13,6 +13,7 @@ from octoforge_core.agent.events import (
     IterationStarted,
     ProcessCompleted,
     ProcessStarted,
+    ReasoningDelta,
     RetryScheduled,
     TextDelta,
     ToolCallCompleted,
@@ -64,6 +65,8 @@ def _stream_event_details(payload: LoopEvent) -> dict[str, Any] | None:
         return {"type": "iteration_started", "index": payload.index}
     if isinstance(payload, TextDelta):
         return {"type": "text_delta", "text": payload.text}
+    if isinstance(payload, ReasoningDelta):
+        return {"type": "reasoning_delta"}
     if isinstance(payload, AssistantMessage):
         return {
             "type": "assistant_message",

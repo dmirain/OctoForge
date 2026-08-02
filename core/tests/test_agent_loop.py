@@ -14,6 +14,7 @@ from octoforge_core.agent.events import (
     Finished,
     IterationStarted,
     LoopEvent,
+    ReasoningDelta,
     TextDelta,
     ToolCallCompleted,
     ToolCallFailed,
@@ -27,6 +28,7 @@ from octoforge_core.agent.loop import (
     AgentLoop,
 )
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
+from octoforge_core.llm.events import ReasoningDelta as LlmReasoningDelta
 from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallBroken, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
@@ -401,6 +403,28 @@ def eager_call(call_id: str = CALL_ID, name: str = TOOL_NAME) -> ToolCall:
 
 def eager_first_message(tool_calls: tuple[ToolCall, ...]) -> ChatMessage:
     return ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=tool_calls)
+
+
+REASONING_CHUNKS = 2
+
+
+async def test_reasoning_deltas_flow_through_as_loop_events() -> None:
+    """The thinking state must reach subscribers, or a long think looks dead."""
+    llm = EagerLLM(
+        [
+            *[LlmReasoningDelta() for _ in range(REASONING_CHUNKS)],
+            LlmTextDelta(text="done"),
+            StreamFinished(message=final_reply()),
+        ],
+        final_reply(),
+    )
+    loop = AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=3)
+
+    events = await collect(loop.stream([user_message()], LoopControl(), CTX))
+
+    reasoning = [e for e in events if isinstance(e, ReasoningDelta)]
+    assert len(reasoning) == REASONING_CHUNKS
+    assert isinstance(events[-1], Finished)
 
 
 async def test_tool_call_requested_before_stream_finished() -> None:

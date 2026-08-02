@@ -20,6 +20,7 @@ from octoforge_core import (
     Usage,
 )
 from octoforge_core.llm.events import (
+    ReasoningDelta,
     StreamEvent,
     StreamFinished,
     TextDelta,
@@ -106,6 +107,39 @@ async def test_stream_yields_text_deltas_and_final_message() -> None:
     final = events[-1]
     assert isinstance(final, StreamFinished)
     assert final.message == ChatMessage(role=MessageRole.ASSISTANT, content="Hello")
+
+
+async def test_stream_marks_reasoning_chunks_without_carrying_their_text() -> None:
+    """A thinking model's `reasoning` deltas become bare marker events.
+
+    The reasoning text must never reach the final message — it is the
+    model's scratchpad, not part of the answer.
+    """
+    client = make_client(
+        [
+            {"choices": [{"delta": {"reasoning": "let me think"}}]},
+            {"choices": [{"delta": {"reasoning": "more thinking"}}]},
+            content_chunk("Hi"),
+        ]
+    )
+
+    events = await collect(client.stream([USER_MESSAGE]))
+
+    assert events[:3] == [ReasoningDelta(), ReasoningDelta(), TextDelta(text="Hi")]
+    final = events[-1]
+    assert isinstance(final, StreamFinished)
+    assert final.message.content == "Hi"
+
+
+async def test_stream_reads_deepseeks_own_reasoning_field_too() -> None:
+    """DeepSeek's native API names the field `reasoning_content`."""
+    client = make_client(
+        [{"choices": [{"delta": {"reasoning_content": "хм"}}]}, content_chunk("Ok")]
+    )
+
+    events = await collect(client.stream([USER_MESSAGE]))
+
+    assert events[:2] == [ReasoningDelta(), TextDelta(text="Ok")]
 
 
 async def test_stream_accumulates_tool_calls() -> None:

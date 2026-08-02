@@ -35,6 +35,7 @@ from octoforge_core.agent.events import (
     LoopEvent,
     ProcessCompleted,
     ProcessStarted,
+    ReasoningDelta,
     TextDelta,
 )
 from octoforge_core.agent.loop import AgentLoop, format_error
@@ -263,7 +264,7 @@ def _muted_after_ask(event: LoopEvent) -> LoopEvent | None:
     nothing delivered). Only the visible output is muted — the loop itself,
     its tool calls and the terminal event keep flowing.
     """
-    if isinstance(event, TextDelta):
+    if isinstance(event, (TextDelta, ReasoningDelta)):
         return None
     if isinstance(event, Finished):
         return replace(event, message=replace(event.message, content=""))
