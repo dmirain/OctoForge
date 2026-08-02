@@ -141,7 +141,6 @@ SECOND_CALL = 2
 EXPECTED_LLM_CALLS = 3
 MESSAGES_AFTER_REFUSAL = 3
 MESSAGES_AFTER_INJECT = 2
-MESSAGES_AFTER_STRAY_REPLY = 3
 OTHER_TASK_ID = "other"
 DEAD_TASK_ID = "dead"
 NUDGE_STALE_SECONDS = NUDGE_AFTER_SECONDS + 100.0
@@ -681,6 +680,20 @@ async def collect_completions(
 
 def completions(events: list[ConversationEvent]) -> list[ProcessCompleted]:
     return [event.payload for event in events if isinstance(event.payload, ProcessCompleted)]
+
+
+async def wait_for_message(runner: ConversationRunner, content: str) -> None:
+    """Wait until a message with this content is in the narrative.
+
+    Not `len(history) == N`. Where the message being waited for spawns a run
+    of its own, the narrative only passes THROUGH N — the answer follows
+    within the same poll gap — and an equality that overshoots is never true
+    again, so the wait burns its whole timeout and reads as a hang. That is
+    the intermittent failure of this file that was blamed first on a loaded
+    host and then on the connection pool; it is neither, and the peak
+    concurrent checkout count is 1.
+    """
+    await wait_for_condition(lambda: any(item.content == content for item in runner.history()))
 
 
 async def wait_for_condition(predicate: Callable[[], bool]) -> None:
@@ -3471,7 +3484,7 @@ async def test_explicit_reply_joins_the_named_exchange_without_routing(
 
     # a reply_to naming an exchange that is not live falls back to the router
     await runner.submit("stray reply", reply_to_exchange_id="not-a-live-exchange")
-    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_STRAY_REPLY)
+    await wait_for_message(runner, "stray reply")
     assert len(router.calls) == 1
 
     tool.release.set()
@@ -3584,7 +3597,7 @@ async def test_message_appended_during_a_stalled_assemble_is_never_lost(
     # the actor is free (the stall sits in the PUMP task): a second reply is
     # persisted and routed while the frozen snapshot is stuck mid-return
     await runner.submit("clarification")
-    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_STRAY_REPLY)
+    await wait_for_message(runner, "clarification")
 
     compactor.gate.set()  # release the stale (pre-clarification) snapshot
     await collect_completions(queue, TWO_PROCESSES)  # this run, then the reopened fresh run
@@ -3773,7 +3786,7 @@ async def test_reply_while_the_asker_still_owns_the_exchange_spawns_no_second_ru
 
     router.decide_continue()
     await runner.submit("Moscow")
-    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_STRAY_REPLY)
+    await wait_for_message(runner, "Moscow")
     # the reply landed while the asker still owns the exchange: no new run
     assert len(runner._processes) == ONE_PROCESS
     assert next(iter(runner._processes.values())).exchange_id == exchange_id
