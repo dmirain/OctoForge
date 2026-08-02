@@ -21,7 +21,12 @@ from sqlalchemy.sql.selectable import ScalarSelect
 
 from octoforge_core.context.api import NO_COMPACTED_SEQ
 from octoforge_core.context.models import SummaryRow
-from octoforge_core.db.unit_of_work import in_unit_of_work, read_session, write_session
+from octoforge_core.db.unit_of_work import (
+    in_unit_of_work,
+    read_session,
+    unit_has_writes,
+    write_session,
+)
 from octoforge_core.dialogs.api import (
     LIVE_EXCHANGE_STATUSES,
     TITLE_MAX_LENGTH,
@@ -263,18 +268,30 @@ class SqlAlchemyMessageRepository:
         which writer got there first (a one-in-ten lost message under
         concurrent appends). Standalone, a failed attempt discards its own
         session; inside a unit of work the attempt must not take the unit's
-        earlier writes with it. On PostgreSQL that needs a SAVEPOINT (a
-        failed statement aborts the whole transaction there); on SQLite the
-        savepoint would be worse than useless — pysqlite implicitly COMMITS
-        the open transaction when one is issued, which is the exact opposite
-        of a unit of work — and unnecessary, because a failed statement
-        leaves a SQLite transaction usable.
+        earlier writes with it. On PostgreSQL, where a failed statement
+        aborts the whole transaction, that needs a SAVEPOINT — but only when
+        the unit HAS earlier writes: the common closing unit appends first,
+        and there rolling the still-empty transaction back on failure is
+        free, while a savepoint would cost two round trips on every answer.
+        On SQLite the savepoint would be worse than useless — pysqlite
+        implicitly COMMITS the open transaction when one is issued, the
+        exact opposite of a unit of work — and unnecessary, because a failed
+        statement leaves a SQLite transaction usable.
         """
         async with write_session(self._session_factory) as session:
             if in_unit_of_work() and session.get_bind().dialect.name != "sqlite":
-                async with session.begin_nested():
+                if unit_has_writes(session):
+                    async with session.begin_nested():
+                        for statement in statements:
+                            await session.execute(statement)
+                    return
+                try:
                     for statement in statements:
                         await session.execute(statement)
+                except IntegrityError:
+                    # the aborted transaction held nothing but this attempt
+                    await session.rollback()
+                    raise
                 return
             for statement in statements:
                 await session.execute(statement)

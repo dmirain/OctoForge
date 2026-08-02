@@ -50,6 +50,7 @@ _active_session: ContextVar[AsyncSession | None] = ContextVar("uow_session", def
 
 _BUSY_KEY = "uow_call_in_flight"
 _OPEN_KEY = "uow_open"
+_WROTE_KEY = "uow_has_writes"
 _CONCURRENT_USE = (
     "concurrent store calls inside a unit of work share one connection; "
     "run parallel reads outside the unit, each wrapped in outside_uow(...)"
@@ -93,6 +94,7 @@ class UnitOfWork:
             )
         async with self._session_factory() as session:
             session.info[_OPEN_KEY] = True
+            session.info[_WROTE_KEY] = False
             token = _active_session.set(session)
             try:
                 yield
@@ -124,6 +126,11 @@ async def write_session(
         yield session
         if owned:
             await session.commit()
+        else:
+            # the unit now holds writes worth protecting: a later store call
+            # that must survive its own failed statement (`unit_has_writes`)
+            # takes a SAVEPOINT instead of risking them
+            session.info[_WROTE_KEY] = True
 
 
 async def outside_uow(coro: Coroutine[Any, Any, _T]) -> _T:
@@ -141,6 +148,17 @@ async def outside_uow(coro: Coroutine[Any, Any, _T]) -> _T:
         return await coro
     finally:
         _active_session.reset(token)
+
+
+def unit_has_writes(session: AsyncSession) -> bool:
+    """Whether the active unit already ran a write before this call.
+
+    The difference a retrying write cares about: with prior writes in the
+    transaction, its failed attempt must be contained in a SAVEPOINT; with
+    none, rolling the (empty) transaction back and retrying costs nothing —
+    and skips the savepoint's two round trips on the common path.
+    """
+    return bool(session.info.get(_WROTE_KEY))
 
 
 def in_unit_of_work() -> bool:

@@ -42,6 +42,7 @@ from octoforge_core.db.search_extensions import (
     installed_search_extensions,
 )
 from octoforge_core.db.unit_of_work import UnitOfWork
+from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.dialogs.models import DialogRow, MessageRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
@@ -343,6 +344,30 @@ async def test_unit_of_work_savepoint_spares_earlier_writes(
 
     assert (await exchanges.get(exchange.id)).title == "still alive"
     assert [message.content for message in await messages.list(dialog.id)] == ["hi", "again"]
+
+
+async def test_unit_of_work_first_append_survives_its_violation_bare(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """With no earlier writes in the unit, the failed attempt skips the
+    SAVEPOINT and rolls the still-empty transaction back — the unit stays
+    usable and commits everything that comes after."""
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    uow = UnitOfWork(session_factory)
+    dialog = await dialogs.get_or_create(USER_A, CHANNEL)
+    original = ChatMessage(role=MessageRole.USER, content="hi")
+    await messages.append(dialog.id, original, client_message_id="uow-dup")
+
+    async with uow():
+        with pytest.raises(IntegrityError):  # first call of the unit, key taken
+            await messages.append(dialog.id, original, client_message_id="uow-dup")
+        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="again"))
+        exchange = await exchanges.create(dialog.id, "question")
+
+    assert [message.content for message in await messages.list(dialog.id)] == ["hi", "again"]
+    assert (await exchanges.get(exchange.id)).status is ExchangeStatus.OPEN
 
 
 async def test_cron_claim_is_won_once(session_factory: async_sessionmaker[AsyncSession]) -> None:

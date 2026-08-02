@@ -115,9 +115,10 @@ One question answered from cold — build the actor, one `recall`, the answer, t
 | | Statements | Transactions | Concurrent |
 |---|---|---|---|
 | Before | 45 | 35 | none |
-| After | **27** | **25** | **6** |
+| After the statement diet | 27 | 25 | 6 |
+| After units of work | **26** | **22** | **12** |
 
-Where the eighteen went:
+Where the eighteen statements went:
 
 - **Seven were the ORM re-reading a row it was about to write.** A SELECT before each UPDATE, inside the
   same store method. They are single UPDATEs now; the condition rides in the WHERE clause and `rowcount`
@@ -147,19 +148,32 @@ And six of the remaining statements now run **concurrently**: `recall`'s vector 
 indexes and the dataset lookup answer independent questions, so none waits out another's round trip. The
 usage counter of the hits is written off the answer's path entirely.
 
-What the shape still shows:
+The third row is the **unit of work** (`db/unit_of_work.py`): one transaction spanning several store
+calls, without any store port changing — the active session travels in a ContextVar and the stores pick it
+up. Where the transactions and the sequencing went:
 
-- **Every store call is its own transaction.** Nothing groups them, so a request has no atomicity and pays
-  BEGIN/COMMIT per call. This is now the dominant cost: removing a statement from inside an existing
-  transaction saves one round trip, removing the transaction saves three.
-- **Repeats remain** within one turn: the dialog's live exchanges are listed three times, its `updated_at`
-  bumped twice, its task re-read twice.
+- **The writes of one phase commit together.** Building a runner (find the dialog + claim it), starting an
+  answer (the task + the exchange's IN_PROGRESS flip) and finishing one (the assistant message + the
+  task's terminal state; for a cancellation, the salvaged pair + the cancelled mark) are one transaction
+  each. Beside the round trips this bought atomicity: the half-states these pairs could leave — an
+  answered narrative under a still-RUNNING task, an IN_PROGRESS exchange with no task — can no longer
+  exist, and the recovery paths that untangled them are now for crashes only.
+- **Independent reads run side by side.** Recovery's two questions; the three reads of context assembly
+  (summaries, the hot-tail counter — its boundary is a subquery, not a prior read — and the live-exchange
+  list); `recall`'s four searches. Three phases, one round-trip wait each.
+- **A unit never pays for protection it does not need.** The message append retries a lost seq race; inside
+  a unit with earlier writes that takes a SAVEPOINT on PostgreSQL, but the common closing unit appends
+  *first*, where rolling the still-empty transaction back is free — and SQLite never uses savepoints at
+  all (pysqlite implicitly commits on one, and a failed statement does not abort there).
+- **Repeats remain**: the dialog's live exchanges are read once at intake (routing and the nudge now share
+  it) and once at assembly, whose freshness is what marks unclaimed questions in the branch.
 
 Round trips matter more than milliseconds because they multiply by the distance to the database. On a host
 sharing a machine with Postgres a statement costs ~0.3 ms and a session ~0.35 ms; across a WireGuard tunnel
-to another datacenter the same numbers were 11.6 ms and 36.5 ms. The same question that costs 77 ms beside
-its database costs on the order of a second away from it — which is why **a pod and its database belong in
-the same datacenter**, and why the counts above are the thing to drive down.
+to another datacenter the same numbers were 11.6 ms and 36.5 ms. Before this work the question above cost
+about a second across that tunnel; the sequential wall is now ~14 round-trip steps instead of ~35, roughly
+0.4–0.5 s — which is still why **a pod and its database belong in the same datacenter**, and why the counts
+above are the thing to drive down.
 
 ## What to watch in production
 
