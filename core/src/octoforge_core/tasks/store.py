@@ -320,8 +320,6 @@ def _to_task_row(task: Task) -> TaskRow:
     return TaskRow(
         id=task.id,
         dialog_id=task.dialog_id,
-        user_id=task.user_id,
-        channel=task.channel,
         exchange_id=task.exchange_id,
         kind=task.kind.value,
         title=task.title,
@@ -340,8 +338,6 @@ def _to_task(row: TaskRow) -> Task:
     return Task(
         id=row.id,
         dialog_id=row.dialog_id,
-        user_id=row.user_id,
-        channel=row.channel,
         exchange_id=row.exchange_id,
         kind=TaskKind(row.kind),
         title=row.title,

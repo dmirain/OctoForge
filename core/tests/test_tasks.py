@@ -101,8 +101,6 @@ def ctx_with(
 def make_task(ctx: ToolContext = CTX, title: str = "t", **overrides: object) -> Task:
     task = Task(
         dialog_id=ctx.dialog_id,
-        user_id=ctx.user_id,
-        channel=ctx.channel,
         title=title,
         kind=TaskKind.RUN,
         input={"title": title, "prompt": PROMPT_CONTENT},

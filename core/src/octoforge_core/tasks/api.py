@@ -41,8 +41,6 @@ class Task:
     """A background unit of work spawned by the agent."""
 
     dialog_id: str
-    user_id: str
-    channel: str
     title: str
     kind: TaskKind
     input: dict[str, Any]

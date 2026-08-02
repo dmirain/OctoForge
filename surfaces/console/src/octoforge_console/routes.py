@@ -22,6 +22,7 @@ from octoforge_core.admin.api import (
     ExchangeOverview,
     MessageRecord,
     Page,
+    TaskOverview,
     clamp_page,
 )
 from octoforge_core.context.api import DialogueSummary, SummaryStore
@@ -42,7 +43,7 @@ from octoforge_core.instructions.api import (
     SystemInstructionError,
 )
 from octoforge_core.memory.api import Memory
-from octoforge_core.tasks.api import Task, TaskNotFoundError
+from octoforge_core.tasks.api import TaskNotFoundError
 from octoforge_core.tasks.store import TaskStore
 from octoforge_server import audit
 from octoforge_server.deps import (
@@ -399,7 +400,7 @@ def _message_to_dict(item: MessageRecord) -> dict[str, Any]:
     }
 
 
-def _task_to_dict(item: Task) -> dict[str, Any]:
+def _task_to_dict(item: TaskOverview) -> dict[str, Any]:
     return {
         "id": item.id,
         "dialog_id": item.dialog_id,

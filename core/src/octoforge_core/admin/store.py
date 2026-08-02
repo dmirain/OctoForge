@@ -18,6 +18,7 @@ from octoforge_core.admin.api import (
     ExchangeOverview,
     MessageRecord,
     Page,
+    TaskOverview,
     Totals,
 )
 from octoforge_core.context.api import DialogueSummary
@@ -32,7 +33,7 @@ from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
 from octoforge_core.instructions.api import Instruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.memory.api import Memory
-from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
+from octoforge_core.tasks.api import TaskKind, TaskStatus
 from octoforge_core.tasks.models import TaskRow
 
 
@@ -154,23 +155,29 @@ class SqlAlchemyAdminStore:
         offset: int,
         status: str | None = None,
         kind: str | None = None,
-    ) -> Page[Task]:
+    ) -> Page[TaskOverview]:
         filters = []
         if status is not None:
             filters.append(TaskRow.status == status)
         if kind is not None:
             filters.append(TaskRow.kind == kind)
         statement = (
-            select(TaskRow)
+            select(TaskRow, DialogRow.user_id, DialogRow.channel)
+            .join(DialogRow, TaskRow.dialog_id == DialogRow.id)
             .where(*filters)
             .order_by(TaskRow.created_at.desc(), TaskRow.id)
             .limit(limit)
             .offset(offset)
         )
         counter = select(func.count()).select_from(TaskRow).where(*filters)
-        rows, total = await self._page(statement, counter)
+        async with self._session_factory() as session:
+            rows = (await session.execute(statement)).all()
+            total = await _count(session, counter)
         return Page(
-            items=tuple(_to_task(row) for row in rows), total=total, limit=limit, offset=offset
+            items=tuple(_to_task_overview(row[0], row[1], row[2]) for row in rows),
+            total=total,
+            limit=limit,
+            offset=offset,
         )
 
     async def list_cron_jobs(self, limit: int, offset: int) -> Page[CronJob]:
@@ -280,10 +287,10 @@ class SqlAlchemyAdminStore:
     ) -> Page[ExchangeOverview]:
         """Exchanges of every dialog, most recently updated first.
 
-        `ExchangeRow` doesn't carry user_id/channel (unlike tasks, which
-        denormalize those onto their own row), so this joins `DialogRow` the
-        same way `list_dialogs` correlates its counters — here as a plain
-        join since every exchange has exactly one owning dialog.
+        `ExchangeRow` doesn't carry user_id/channel — no table does, identity
+        is the dialog's — so this joins `DialogRow` the same way
+        `list_dialogs` correlates its counters, as a plain join since every
+        exchange has exactly one owning dialog.
         """
         filters = []
         if user_id is not None:
@@ -340,20 +347,19 @@ def _to_message_record(row: MessageRow) -> MessageRecord:
     )
 
 
-def _to_task(row: TaskRow) -> Task:
-    return Task(
+def _to_task_overview(row: TaskRow, user_id: str, channel: str) -> TaskOverview:
+    return TaskOverview(
         id=row.id,
         dialog_id=row.dialog_id,
-        user_id=row.user_id,
-        channel=row.channel,
+        user_id=user_id,
+        channel=channel,
         kind=TaskKind(row.kind),
         title=row.title,
-        input=row.input,
         status=TaskStatus(row.status),
+        input=row.input,
         result=row.result,
         error=row.error,
         created_at=row.created_at,
-        started_at=row.started_at,
         finished_at=row.finished_at,
         delivered_at=row.delivered_at,
     )

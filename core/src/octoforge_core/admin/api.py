@@ -13,7 +13,7 @@ so an admin action goes through the same invariants a user action does.
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 
 from octoforge_core.context.api import DialogueSummary
 from octoforge_core.cron.api import CronJob
@@ -21,7 +21,7 @@ from octoforge_core.datasets.api import Dataset, DatasetRecord
 from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.instructions.api import Instruction
 from octoforge_core.memory.api import Memory
-from octoforge_core.tasks.api import Task
+from octoforge_core.tasks.api import TaskKind, TaskStatus
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 500
@@ -80,13 +80,36 @@ class MessageRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskOverview:
+    """A task with the dialog identity an operator needs to place it.
+
+    `Task` (the `tasks` module's own DTO) carries no user_id/channel — like
+    every table, identity is reached through the dialog. This DTO joins in
+    what `DialogRow` knows, the same way the other listings do.
+    """
+
+    id: str
+    dialog_id: str
+    user_id: str
+    channel: str
+    kind: TaskKind
+    title: str
+    status: TaskStatus
+    input: dict[str, Any]
+    result: str | None
+    error: str | None
+    created_at: datetime
+    finished_at: datetime | None
+    delivered_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class ExchangeOverview:
     """An exchange with the dialog identity an operator needs to place it.
 
-    `Exchange` (the `dialogs` module's own DTO) doesn't carry user_id/channel
-    — only tasks denormalize those onto their own row. This DTO joins in what
-    `DialogRow` knows, the same way `DialogOverview` does for the dialogs
-    listing.
+    `Exchange` (the `dialogs` module's own DTO) doesn't carry user_id/channel;
+    this DTO joins in what `DialogRow` knows, the same way `DialogOverview`
+    does for the dialogs listing.
     """
 
     id: str
@@ -137,7 +160,7 @@ class AdminReadModel(Protocol):
         offset: int,
         status: str | None = None,
         kind: str | None = None,
-    ) -> Page[Task]:
+    ) -> Page[TaskOverview]:
         """Tasks newest first, optionally filtered by status and kind."""
         ...
 

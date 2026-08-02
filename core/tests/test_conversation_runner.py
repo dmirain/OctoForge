@@ -2470,8 +2470,6 @@ async def add_exchange_task(
     task = Task(
         id=task_id,
         dialog_id=dialog.id,
-        user_id=dialog.user_id,
-        channel=dialog.channel,
         title=task_id,
         kind=TaskKind.ANSWER,
         exchange_id=exchange_id,
@@ -2491,8 +2489,6 @@ def orphaned_task(dialog: Dialog, cron_job_id: str | None = None, **overrides: o
         task_input["cron_job_id"] = cron_job_id
     task = Task(
         dialog_id=dialog.id,
-        user_id=dialog.user_id,
-        channel=dialog.channel,
         title=TASK_TITLE,
         kind=TaskKind.RUN,
         input=task_input,

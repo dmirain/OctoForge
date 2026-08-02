@@ -74,15 +74,12 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 
 def make_task(
     dialog_id: str = DIALOG_ID,
-    user_id: str = USER_ID,
     title: str = TASK_TITLE,
     created_at: datetime = CREATED_EARLIER,
     status: TaskStatus = TaskStatus.PENDING,
 ) -> Task:
     return Task(
         dialog_id=dialog_id,
-        user_id=user_id,
-        channel=CHANNEL,
         title=title,
         kind=TaskKind.RUN,
         input={"title": title, "prompt": "solve 2+2"},
@@ -486,7 +483,6 @@ async def test_task_add_and_get(session_factory: async_sessionmaker[AsyncSession
 
     assert stored.id == task.id
     assert stored.dialog_id == task.dialog_id
-    assert stored.user_id == task.user_id
     assert stored.status is TaskStatus.PENDING
     assert stored.kind is TaskKind.RUN
     assert stored.created_at.tzinfo == UTC
@@ -505,7 +501,7 @@ async def test_task_list_scoped_by_dialog(
     store = SqlAlchemyTaskStore(session_factory)
     await store.add(make_task(title="a"))
     await store.add(make_task(title="b"))
-    await store.add(make_task(dialog_id=OTHER_DIALOG_ID, user_id=OTHER_USER_ID, title="c"))
+    await store.add(make_task(dialog_id=OTHER_DIALOG_ID, title="c"))
 
     own = await store.list(DIALOG_ID)
     other = await store.list(OTHER_DIALOG_ID)
@@ -865,8 +861,6 @@ async def test_an_open_exchange_with_a_live_task_is_not_unowned(
         await tasks.add(
             Task(
                 dialog_id=DIALOG_ID,
-                user_id=USER_ID,
-                channel=CHANNEL,
                 title=exchange.title,
                 kind=TaskKind.ANSWER,
                 exchange_id=exchange.id,

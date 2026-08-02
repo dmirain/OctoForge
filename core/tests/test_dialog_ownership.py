@@ -265,8 +265,6 @@ async def test_an_orphaned_task_of_a_peers_dialog_is_not_restarted_here(
         Task(
             id="task-1",
             dialog_id=dialog_id,
-            user_id=USER_ID,
-            channel=CHANNEL,
             kind=TaskKind.RUN,
             title="peer's background work",
             input={},

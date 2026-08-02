@@ -383,8 +383,6 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     )
     task = Task(
         dialog_id=dialog.id,
-        user_id=dialog.user_id,
-        channel=dialog.channel,
         title=CRON_TITLE,
         kind=TaskKind.RUN,
         input={"prompt": CRON_TITLE},

@@ -76,11 +76,9 @@ def cron_job(job_id: str, user_id: str, next_fire_at: datetime) -> CronJob:
     )
 
 
-def task(dialog_id: str, user_id: str, status: TaskStatus, kind: TaskKind = TaskKind.RUN) -> Task:
+def task(dialog_id: str, status: TaskStatus, kind: TaskKind = TaskKind.RUN) -> Task:
     return Task(
         dialog_id=dialog_id,
-        user_id=user_id,
-        channel=CHANNEL,
         title=f"{kind.value}-{status.value}",
         kind=kind,
         input={"prompt": "x"},
@@ -116,7 +114,7 @@ async def test_totals_counts_every_entity(
     await SqlAlchemyMessageRepository(session_factory).append(
         dialog.id, ChatMessage(role=MessageRole.USER, content="hi")
     )
-    await SqlAlchemyTaskStore(session_factory).add(task(dialog.id, USER_A, TaskStatus.DONE))
+    await SqlAlchemyTaskStore(session_factory).add(task(dialog.id, TaskStatus.DONE))
     await SqlAlchemyCronStore(session_factory).create(cron_job("j1", USER_A, NOW))
     await SqlAlchemyInstructionStore(session_factory).upsert(memory_draft("diet", USER_A))
     await SqlAlchemyExchangeRepository(session_factory).create(dialog.id, "a question")
@@ -139,7 +137,7 @@ async def test_dialogs_carry_counters_and_newest_activity_first(
     await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="one"))
     await messages.append(second.id, ChatMessage(role=MessageRole.USER, content="two"))
     await messages.append(second.id, ChatMessage(role=MessageRole.ASSISTANT, content="three"))
-    await SqlAlchemyTaskStore(session_factory).add(task(second.id, USER_B, TaskStatus.RUNNING))
+    await SqlAlchemyTaskStore(session_factory).add(task(second.id, TaskStatus.RUNNING))
 
     page = await store.list_dialogs(DEFAULT_LIMIT, 0)
 
@@ -176,9 +174,9 @@ async def test_tasks_filter_by_status_and_kind(
 ) -> None:
     dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
     tasks = SqlAlchemyTaskStore(session_factory)
-    await tasks.add(task(dialog.id, USER_A, TaskStatus.DONE))
-    await tasks.add(task(dialog.id, USER_A, TaskStatus.FAILED))
-    await tasks.add(task(dialog.id, USER_A, TaskStatus.DONE, kind=TaskKind.ANSWER))
+    await tasks.add(task(dialog.id, TaskStatus.DONE))
+    await tasks.add(task(dialog.id, TaskStatus.FAILED))
+    await tasks.add(task(dialog.id, TaskStatus.DONE, kind=TaskKind.ANSWER))
 
     done = await store.list_tasks(DEFAULT_LIMIT, 0, status=TaskStatus.DONE.value)
     answers = await store.list_tasks(DEFAULT_LIMIT, 0, kind=TaskKind.ANSWER.value)

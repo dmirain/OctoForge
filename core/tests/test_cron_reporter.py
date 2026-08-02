@@ -51,8 +51,6 @@ def make_job(**overrides: object) -> CronJob:
 def make_task(error: str | None = None, cron_job_id: object = JOB_ID) -> Task:
     return Task(
         dialog_id=DIALOG_ID,
-        user_id=USER_A,
-        channel=CHANNEL,
         title="morning report",
         kind=TaskKind.RUN,
         input={} if cron_job_id is None else {"cron_job_id": cron_job_id},

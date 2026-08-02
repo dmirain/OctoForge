@@ -34,9 +34,11 @@ class TaskRow(Base):
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    # identity lives on the dialog, reached through this key — same as every
+    # other table. Copies of user_id/channel used to ride along "for the
+    # sweeps", but nothing ever filtered by them; the user_id copy even kept
+    # an index no query read, maintained on the answer path's INSERT.
     dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), index=True)
-    user_id: Mapped[str] = mapped_column(String, index=True)
-    channel: Mapped[str] = mapped_column(String)
     # the obligation this run is paying; NULL for RUN tasks (cron and spawned
     # work owe the user nothing) and on rows written before the column existed
     exchange_id: Mapped[str | None] = mapped_column(ForeignKey("exchanges.id"), nullable=True)

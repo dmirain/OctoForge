@@ -818,8 +818,6 @@ class ConversationRunner:
                 task_input["exchange_id"] = source.exchange_id
         task = Task(
             dialog_id=self._dialog.id,
-            user_id=self._dialog.user_id,
-            channel=self._dialog.channel,
             title=title,
             kind=kind,
             # the obligation as a column: joinable, indexable, and checked by

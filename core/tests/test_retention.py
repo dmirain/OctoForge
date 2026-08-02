@@ -164,8 +164,6 @@ async def test_an_undelivered_task_is_never_deleted(
             TaskRow(
                 id="t1",
                 dialog_id=DIALOG,
-                user_id=USER,
-                channel=CHANNEL,
                 kind="background",
                 title="pending delivery",
                 input={},
@@ -178,8 +176,6 @@ async def test_an_undelivered_task_is_never_deleted(
             TaskRow(
                 id="t2",
                 dialog_id=DIALOG,
-                user_id=USER,
-                channel=CHANNEL,
                 kind="background",
                 title="delivered",
                 input={},
