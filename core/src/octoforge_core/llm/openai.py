@@ -1,6 +1,8 @@
 """OpenAI-compatible chat-completion client."""
 
 import json
+import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -34,6 +36,66 @@ ARGUMENTS_NOT_OBJECT_MESSAGE = "tool call arguments are not a JSON object"
 FUNCTION_TOOL_TYPE = "function"
 SSE_DATA_PREFIX = "data:"
 SSE_DONE_MARKER = "[DONE]"
+# a silence this long between chunks of one stream is worth a log line: it is
+# what the user experiences as the bot freezing mid-answer
+STREAM_GAP_LOG_SECONDS = 3.0
+# delta fields the accumulator reads; anything else (e.g. a reasoning-model's
+# `reasoning` deltas) is invisible to the user and only counted for the log
+CONSUMED_DELTA_FIELDS = frozenset({"content", "tool_calls", "role"})
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _StreamTiming:
+    """Chunk-arrival timing of one stream, for diagnosing mid-answer stalls.
+
+    Logs a line whenever a chunk ends a silence past `STREAM_GAP_LOG_SECONDS`
+    (with how much visible text the user had at that point) and a one-line
+    summary per stream. Diagnostic only: nothing reads these numbers back.
+    """
+
+    started: float = field(default_factory=time.monotonic)
+    last_chunk: float = 0.0
+    first_content: float | None = None
+    largest_gap: float = 0.0
+    largest_gap_at_chars: int = 0
+    content_chars: int = 0
+    chunks: int = 0
+
+    def observe(self, events: list[StreamEvent]) -> None:
+        now = time.monotonic()
+        if self.chunks > 0:
+            gap = now - self.last_chunk
+            if gap > self.largest_gap:
+                self.largest_gap = gap
+                self.largest_gap_at_chars = self.content_chars
+            if gap >= STREAM_GAP_LOG_SECONDS:
+                logger.info(
+                    "stream stalled: %.1fs of silence ended after %d visible chars",
+                    gap,
+                    self.content_chars,
+                )
+        self.last_chunk = now
+        self.chunks += 1
+        for event in events:
+            if isinstance(event, TextDelta):
+                if self.first_content is None:
+                    self.first_content = now - self.started
+                self.content_chars += len(event.text)
+
+    def log_summary(self, ignored_fields: dict[str, int]) -> None:
+        logger.info(
+            "stream timing: %.1fs total, first content at %s, %d chunks, %d chars, "
+            "largest gap %.1fs after %d chars, ignored delta fields %s",
+            time.monotonic() - self.started,
+            f"{self.first_content:.1f}s" if self.first_content is not None else "never",
+            self.chunks,
+            self.content_chars,
+            self.largest_gap,
+            self.largest_gap_at_chars,
+            ignored_fields or "none",
+        )
 
 
 def _stream_error_status(chunk: dict[str, Any]) -> int:
@@ -88,18 +150,22 @@ class OpenAICompatibleClient:
             ) as response:
                 await araise_for_error_status(response)
                 accumulator = _StreamAccumulator()
+                timing = _StreamTiming()
                 async for line in response.aiter_lines():
                     if not line.startswith(SSE_DATA_PREFIX):
                         continue
                     data = line[len(SSE_DATA_PREFIX) :].strip()
                     if data == SSE_DONE_MARKER:
                         break
-                    for event in accumulator.feed(data):
+                    events = accumulator.feed(data)
+                    timing.observe(events)
+                    for event in events:
                         yield event
                 for event in accumulator.finish():
                     yield event
         except httpx.HTTPError as exc:
             raise TransportError(str(exc) or type(exc).__name__) from exc
+        timing.log_summary(accumulator.ignored_fields)
         yield StreamFinished(message=accumulator.build_message(), usage=accumulator.usage)
 
     def _build_payload(
@@ -204,11 +270,17 @@ class _StreamAccumulator:
         self._tool_calls: dict[int, _ToolCallSlot] = {}
         self._open_index: int | None = None
         self._usage: Usage | None = None
+        self._ignored_fields: dict[str, int] = {}
 
     @property
     def usage(self) -> Usage | None:
         """Token usage reported by the provider, when it sent any."""
         return self._usage
+
+    @property
+    def ignored_fields(self) -> dict[str, int]:
+        """Delta fields fed to this stream that nothing consumed, with counts."""
+        return self._ignored_fields
 
     def feed(self, data: str) -> list[StreamEvent]:
         """Consume one SSE data payload and emit stream events."""
@@ -231,6 +303,7 @@ class _StreamAccumulator:
         except (IndexError, AttributeError, TypeError) as exc:
             raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
         events: list[StreamEvent] = []
+        self._note_ignored(delta)
         content = delta.get("content")
         if content:
             self._content_parts.append(content)
@@ -238,6 +311,12 @@ class _StreamAccumulator:
         for raw_call in delta.get("tool_calls") or []:
             events.extend(self._feed_tool_call(raw_call))
         return events
+
+    def _note_ignored(self, delta: dict[str, Any]) -> None:
+        """Count delta fields nothing consumes (e.g. `reasoning`), for the log."""
+        for key, value in delta.items():
+            if value and key not in CONSUMED_DELTA_FIELDS:
+                self._ignored_fields[key] = self._ignored_fields.get(key, 0) + 1
 
     def _feed_tool_call(self, raw: dict[str, Any]) -> list[StreamEvent]:
         index = raw.get("index", 0)
