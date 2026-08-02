@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import inspect, select, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from octoforge_core.context.pg_store import PostgresSummaryStore
@@ -40,8 +41,13 @@ from octoforge_core.db.search_extensions import (
     has_russian_unaccent,
     installed_search_extensions,
 )
+from octoforge_core.db.unit_of_work import UnitOfWork
 from octoforge_core.dialogs.models import DialogRow, MessageRow
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
 from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import (
     InstructionDraft,
@@ -307,6 +313,36 @@ async def test_concurrent_appends_get_distinct_seq(
     async with session_factory() as session:
         seqs = sorted((await session.scalars(select(MessageRow.seq))).all())
     assert seqs == [1, 2]
+
+
+async def test_unit_of_work_savepoint_spares_earlier_writes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The append-retry SAVEPOINT branch is PostgreSQL-only, so it is proven here.
+
+    On Postgres a failed statement aborts the whole transaction; without the
+    savepoint the violation below would poison the unit and take the created
+    exchange with it. (SQLite takes the other branch: pysqlite's savepoints
+    implicitly commit, and a failed statement does not abort there anyway.)
+    """
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    uow = UnitOfWork(session_factory)
+    dialog = await dialogs.get_or_create(USER_A, CHANNEL)
+    original = ChatMessage(role=MessageRole.USER, content="hi")
+    await messages.append(dialog.id, original, client_message_id="uow-dup")
+
+    async with uow():
+        exchange = await exchanges.create(dialog.id, "question")
+        with pytest.raises(IntegrityError):  # the idempotency key is taken
+            await messages.append(dialog.id, original, client_message_id="uow-dup")
+        # the violation cost the attempt alone: the unit is still usable
+        await exchanges.set_title(exchange.id, "still alive")
+        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="again"))
+
+    assert (await exchanges.get(exchange.id)).title == "still alive"
+    assert [message.content for message in await messages.list(dialog.id)] == ["hi", "again"]
 
 
 async def test_cron_claim_is_won_once(session_factory: async_sessionmaker[AsyncSession]) -> None:

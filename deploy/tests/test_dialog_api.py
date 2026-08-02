@@ -26,6 +26,7 @@ from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import ManagerStores, OwnershipConfig, RunnerConfig
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.unit_of_work import UnitOfWork
 from octoforge_core.dialogs.models import DialogRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyClaimRepository,
@@ -143,6 +144,7 @@ async def make_manager(
             tasks=SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
+            uow=UnitOfWork(session_factory),
         ),
         ownership=OwnershipConfig(node_id="test-node"),
     )

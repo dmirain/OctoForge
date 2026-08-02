@@ -49,6 +49,7 @@ _T = TypeVar("_T")
 _active_session: ContextVar[AsyncSession | None] = ContextVar("uow_session", default=None)
 
 _BUSY_KEY = "uow_call_in_flight"
+_OPEN_KEY = "uow_open"
 _CONCURRENT_USE = (
     "concurrent store calls inside a unit of work share one connection; "
     "run parallel reads outside the unit, each wrapped in outside_uow(...)"
@@ -64,27 +65,40 @@ class UnitOfWork:
         async with self._uow():
             await self._messages.append(...)
             await self._tasks.mark_done(...)
-            await self._exchanges.settle_owned(...)
 
     On a clean exit the unit commits; on an exception the whole phase rolls
     back together and nothing is persisted.
+
+    `UnitOfWork(None)` is the null unit for compositions whose stores do not
+    share a SQL database (the in-memory test stores): the block runs with no
+    transaction to group, and every store call keeps committing itself.
+
+    A task spawned inside a unit inherits the ContextVar but must never use
+    the unit's session — the unit may be gone when the task runs. The open
+    flag on the session guards that: once the unit exits, a stale reference
+    reads as "no unit" and the call opens its own session.
     """
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession] | None) -> None:
         self._session_factory = session_factory
 
     @asynccontextmanager
     async def __call__(self) -> AsyncIterator[None]:
-        if _active_session.get() is not None:
+        if self._session_factory is None:
+            yield
+            return
+        if in_unit_of_work():
             raise RuntimeError(
                 "a unit of work is already active; nesting would merge two transactions"
             )
         async with self._session_factory() as session:
+            session.info[_OPEN_KEY] = True
             token = _active_session.set(session)
             try:
                 yield
                 await session.commit()
             finally:
+                session.info[_OPEN_KEY] = False
                 _active_session.reset(token)
 
 
@@ -129,6 +143,18 @@ async def outside_uow(coro: Coroutine[Any, Any, _T]) -> _T:
         _active_session.reset(token)
 
 
+def in_unit_of_work() -> bool:
+    """Whether a live unit of work is active in the current context.
+
+    Stores whose write needs special handling inside a shared transaction
+    (a SAVEPOINT around a commit-as-race-detector) branch on this. The open
+    flag matters: a background task spawned inside a unit inherits the
+    ContextVar, and by the time it runs the unit is closed.
+    """
+    active = _active_session.get()
+    return active is not None and bool(active.info.get(_OPEN_KEY))
+
+
 @asynccontextmanager
 async def _borrow(
     session_factory: async_sessionmaker[AsyncSession],
@@ -140,7 +166,7 @@ async def _borrow(
     it from an obscure driver error into a `RuntimeError` that names the fix.
     """
     active = _active_session.get()
-    if active is None:
+    if active is None or not active.info.get(_OPEN_KEY):
         async with session_factory() as session:
             yield session, True
         return

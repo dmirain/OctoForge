@@ -71,6 +71,7 @@ from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.api import CronWaker, WakeOutcome
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.unit_of_work import UnitOfWork
 from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.dialogs.models import ExchangeRow, MessageRow
 from octoforge_core.dialogs.store import (
@@ -609,6 +610,7 @@ def make_manager(
             else SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
+            uow=UnitOfWork(session_factory),
         ),
         ownership=OwnershipConfig(
             node_id=NODE_ID, stale_after_seconds=resolved.stale_after_seconds
@@ -4938,4 +4940,52 @@ async def test_look_at_image_without_vision_configured_is_refused(
 
     with pytest.raises(VisionUnavailableError):
         await runner.look_at_image(IMAGE_QUESTION)
+    await manager.stop_all()
+
+
+class _MarkDoneUnavailable(SqlAlchemyTaskStore):
+    """A task store whose `mark_done` is down (the finalize-unit rollback test)."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        super().__init__(session_factory)
+        self.failures = 0
+
+    async def mark_done(self, task_id: str, result: str, *, delivered: bool = False) -> Task:
+        self.failures += 1
+        raise RuntimeError("mark_done unavailable")
+
+
+async def test_a_failed_finalize_takes_the_persisted_answer_with_it(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The answer and the task's terminal state land together or not at all.
+
+    With `mark_done` down, committing the answer alone would leave an
+    answered narrative under a task that still claims to be running — and
+    recovery would then answer the question a second time. The unit of work
+    around the finalize rolls the answer back instead: the store ends in the
+    consistent "this run never finished" state.
+    """
+    store = _MarkDoneUnavailable(session_factory)
+    manager = make_manager(
+        ScriptedLLM([reply()]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    await collect_until(queue, is_completed)
+
+    assert store.failures == 1
+    task = await single_task(store, runner.dialog_id)
+    assert task.finished_at is None  # never marked done: the write failed
+    dialog = await get_dialog(session_factory)
+    async with session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(MessageRow).where(MessageRow.dialog_id == dialog.id).order_by(MessageRow.seq)
+            )
+        ).all()
+    # the question alone survives; the answer rolled back with the unit
+    assert [row.role for row in rows] == [MessageRole.USER.value]
     await manager.stop_all()

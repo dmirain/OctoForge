@@ -49,6 +49,7 @@ from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.unit_of_work import UnitOfWork
 from octoforge_core.dialogs.store import (
     SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
@@ -352,6 +353,7 @@ def build_third_party_root(
             tasks=SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
+            uow=UnitOfWork(session_factory),
         ),
         ownership=OwnershipConfig(node_id="test-node"),
     )

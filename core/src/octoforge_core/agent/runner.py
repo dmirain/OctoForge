@@ -20,7 +20,7 @@ import logging
 from collections import deque
 from collections.abc import Sequence
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from enum import StrEnum
 from typing import Any, Protocol
@@ -47,6 +47,7 @@ from octoforge_core.agent.router import (
 )
 from octoforge_core.context.api import INTERRUPTED_NOTE, ContextCompactor
 from octoforge_core.cron.api import WakeOutcome
+from octoforge_core.db.unit_of_work import UnitOfWork
 from octoforge_core.dialogs.api import (
     ClaimRepository,
     DialogClaim,
@@ -343,6 +344,7 @@ class _RunnerStores:
     tasks: TaskStore
     exchanges: ExchangeRepository
     claims: ClaimRepository
+    uow: UnitOfWork
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,6 +531,7 @@ class ConversationRunner:
         messages, tasks, exchanges = stores.messages, stores.tasks, stores.exchanges
         self._dialog = dialog
         self._claims = stores.claims
+        self._uow = stores.uow
         # the claim this actor was born with: everything user-visible is
         # gated on it still being the current one
         self._claim = claim
@@ -2274,24 +2277,34 @@ class ConversationRunner:
                     process.task_id,
                     process.title,
                 )
+            delivered = self._delivery_is_certain(process, terminal.message.content)
             if terminal.message.content.strip():
                 message = replace(
                     terminal.message,
                     task_id=process.task_id,
                     exchange_id=process.exchange_id,
                 )
-                await self._persist(message, usage=terminal.usage)
+                # the answer and the task's terminal state land together or
+                # not at all: a crash between them used to leave an answered
+                # narrative under a still-RUNNING task, which recovery would
+                # then answer again
+                async with self._uow():
+                    await self._persist(message, usage=terminal.usage)
+                    task = await self._tasks.mark_done(
+                        process.task_id, terminal.message.content, delivered=delivered
+                    )
+                # in-memory state only after the commit: a rolled-back unit
+                # must not leave a phantom message in the narrative
                 self._narrative.append(message)
                 if not process.narrative_built:
                     # RUN/cron results grow the narrative too, but only
                     # answer runs assemble branches — a dialog fed purely by
                     # cron would never trigger compaction and grow unbounded
                     await self._compact_after_run_final()
-            task = await self._tasks.mark_done(
-                process.task_id,
-                terminal.message.content,
-                delivered=self._delivery_is_certain(process, terminal.message.content),
-            )
+            else:
+                task = await self._tasks.mark_done(
+                    process.task_id, terminal.message.content, delivered=delivered
+                )
             status = TaskStatus.DONE
         elif isinstance(terminal, Failed):
             task = await self._tasks.mark_failed(
@@ -2301,8 +2314,11 @@ class ConversationRunner:
             )
             status = TaskStatus.FAILED
         else:
-            await self._salvage_interrupted_turn(process)
-            task = await self._tasks.mark_cancelled(process.task_id)
+            async with self._uow():
+                salvaged = await self._salvage_interrupted_turn(process)
+                task = await self._tasks.mark_cancelled(process.task_id)
+            if salvaged is not None:
+                self._narrative.extend(salvaged)
             status = TaskStatus.CANCELLED
         await self._report_outcome(task, status)
         return status, task
@@ -2347,21 +2363,25 @@ class ConversationRunner:
                 "task outcome report failed: dialog=%s task=%s", self._dialog.id, task.id
             )
 
-    async def _salvage_interrupted_turn(self, process: _Process) -> None:
-        """Keep a cancelled run's partial answer in the narrative, flagged as incomplete.
+    async def _salvage_interrupted_turn(
+        self, process: _Process
+    ) -> tuple[ChatMessage, ChatMessage] | None:
+        """Persist a cancelled run's partial answer, flagged as incomplete.
 
         Only the run's own messages (the private suffix) are salvageable.
         The pair is persisted atomically: the note must never be orphaned nor
         observed without the message it annotates (the compactor's tail
-        snapshot relies on the pair being indivisible).
+        snapshot relies on the pair being indivisible). Returns the pair for
+        the caller to put into the in-memory narrative — after its unit of
+        work commits, not before.
         """
         last = _latest_assistant_with_content(process.branch[process.synced_len :])
         if last is None:
-            return
+            return None
         salvaged = replace(last, task_id=process.task_id)
         note = ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE)
         await self._messages.append_pair(self._dialog.id, salvaged, note)
-        self._narrative.extend((salvaged, note))
+        return salvaged, note
 
     def _remove_process(self, process: _Process) -> None:
         self._processes.pop(process.id, None)
@@ -2490,13 +2510,20 @@ def _finished_build(build: "asyncio.Task[ConversationRunner]") -> "ConversationR
 
 @dataclass(frozen=True, slots=True)
 class ManagerStores:
-    """Persistence collaborators of one conversation manager."""
+    """Persistence collaborators of one conversation manager.
+
+    `uow` groups the store calls of one phase into one transaction; it must
+    be built over the same database the SQL stores write. The default is the
+    null unit — correct for the in-memory stores, which have no transactions
+    to group.
+    """
 
     dialogs: DialogRepository
     messages: MessageRepository
     tasks: TaskStore
     exchanges: ExchangeRepository
     claims: ClaimRepository
+    uow: UnitOfWork = field(default_factory=lambda: UnitOfWork(None))
 
 
 @dataclass(frozen=True, slots=True)
@@ -2536,6 +2563,7 @@ class ConversationManager:
         self._tasks = stores.tasks
         self._exchanges = stores.exchanges
         self._claims = stores.claims
+        self._uow = stores.uow
         self._node_id = ownership.node_id
         self._heartbeat_seconds = ownership.heartbeat_seconds
         self._stale_after_seconds = ownership.stale_after_seconds
@@ -2606,6 +2634,7 @@ class ConversationManager:
                 tasks=self._tasks,
                 exchanges=self._exchanges,
                 claims=self._claims,
+                uow=self._uow,
             ),
             history=history,
             claim=claim,

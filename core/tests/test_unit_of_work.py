@@ -11,12 +11,18 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.unit_of_work import UnitOfWork, outside_uow, read_session
-from octoforge_core.dialogs.api import ExchangeNotFoundError, ExchangeStatus
-from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyExchangeRepository
+from octoforge_core.dialogs.api import Exchange, ExchangeNotFoundError, ExchangeStatus
+from octoforge_core.dialogs.store import (
+    SqlAlchemyDialogRepository,
+    SqlAlchemyExchangeRepository,
+    SqlAlchemyMessageRepository,
+)
+from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
 
@@ -137,3 +143,79 @@ async def test_without_a_unit_every_call_still_commits_itself(
     """The pre-unit behavior is untouched: no unit, one transaction per call."""
     exchange = await exchanges.create(dialog_id, "question")
     assert (await exchanges.get(exchange.id)).status is ExchangeStatus.OPEN
+
+
+async def test_the_null_unit_groups_nothing(
+    exchanges: SqlAlchemyExchangeRepository,
+    dialog_id: str,
+) -> None:
+    """`UnitOfWork(None)` is for stores with no shared SQL database: the block
+    runs, and every call inside keeps committing itself."""
+    null_unit = UnitOfWork(None)
+    exchange_id = ""
+    with pytest.raises(RuntimeError, match="boom"):
+        async with null_unit():
+            exchange = await exchanges.create(dialog_id, "question")
+            exchange_id = exchange.id
+            raise RuntimeError("boom")
+    # no transaction to roll back: the write stands
+    assert (await exchanges.get(exchange_id)).status is ExchangeStatus.OPEN
+
+
+async def test_a_task_spawned_inside_a_unit_never_reuses_its_session(
+    uow: UnitOfWork,
+    exchanges: SqlAlchemyExchangeRepository,
+    dialog_id: str,
+) -> None:
+    """A background task inherits the ContextVar but may outlive the unit; the
+    stale reference must read as "no unit", not as a closed session."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def background() -> Exchange:
+        started.set()
+        await release.wait()  # deliberately outlive the unit
+        return await exchanges.create(dialog_id, "from the background")
+
+    async with uow():
+        job = asyncio.create_task(background())
+        await started.wait()
+        await exchanges.create(dialog_id, "inside the unit")
+    release.set()
+    created = await job
+    assert (await exchanges.get(created.id)).title == "from the background"
+
+
+async def test_appends_join_the_unit(
+    uow: UnitOfWork,
+    session_factory: async_sessionmaker[AsyncSession],
+    dialog_id: str,
+) -> None:
+    """`append` writes through the unit's session: a rolled-back unit takes
+    the message with it."""
+    messages = SqlAlchemyMessageRepository(session_factory)
+    with pytest.raises(RuntimeError, match="boom"):
+        async with uow():
+            await messages.append(dialog_id, ChatMessage(role=MessageRole.USER, content="hi"))
+            raise RuntimeError("boom")
+    assert await messages.list(dialog_id) == []
+
+
+async def test_a_failed_append_attempt_spares_the_units_earlier_writes(
+    uow: UnitOfWork,
+    exchanges: SqlAlchemyExchangeRepository,
+    session_factory: async_sessionmaker[AsyncSession],
+    dialog_id: str,
+) -> None:
+    """The retry SAVEPOINT rolls back the attempt alone: after the violation
+    the unit is intact and usable, and commits what came before."""
+    messages = SqlAlchemyMessageRepository(session_factory)
+    original = ChatMessage(role=MessageRole.USER, content="hi")
+    await messages.append(dialog_id, original, client_message_id="dup")
+    async with uow():
+        exchange = await exchanges.create(dialog_id, "question")
+        with pytest.raises(IntegrityError):  # the idempotency key is taken
+            await messages.append(dialog_id, original, client_message_id="dup")
+        await exchanges.set_title(exchange.id, "still alive")
+    assert (await exchanges.get(exchange.id)).title == "still alive"
+    assert len(await messages.list(dialog_id)) == 1  # the duplicate never landed

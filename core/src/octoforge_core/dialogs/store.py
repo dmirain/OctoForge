@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import ColumnElement, Exists, case, delete, func, insert, select, update
+from sqlalchemy import ColumnElement, Exists, Insert, case, delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
@@ -21,7 +21,7 @@ from sqlalchemy.sql.selectable import ScalarSelect
 
 from octoforge_core.context.api import NO_COMPACTED_SEQ
 from octoforge_core.context.models import SummaryRow
-from octoforge_core.db.unit_of_work import read_session, write_session
+from octoforge_core.db.unit_of_work import in_unit_of_work, read_session, write_session
 from octoforge_core.dialogs.api import (
     LIVE_EXCHANGE_STATUSES,
     TITLE_MAX_LENGTH,
@@ -169,55 +169,42 @@ class SqlAlchemyMessageRepository:
         submits; the unique (dialog_id, client_message_id) constraint rejects
         duplicates (raised on the final attempt, not silently retried away).
 
-        Deliberately NOT unit-of-work aware (raw `_session_factory`, like
-        `append_pair`): the retry loop rolls the session back on a lost seq
-        race, and inside a shared transaction that would discard every earlier
-        write of the unit. Joining a unit takes a SAVEPOINT around the INSERT
-        attempt; until that exists, appends keep their own transaction.
+        Inside a unit of work the failed attempt must not take the unit's
+        earlier writes with it, so there the INSERT runs under a SAVEPOINT
+        (`_insert_attempt`); standalone, a failed attempt simply discards its
+        own session, as it always has. Either way the violation is retried
+        with a fresh session/savepoint and a recomputed seq.
         """
         for attempt in range(MESSAGE_SEQ_RETRY_ATTEMPTS):
             row_id = uuid.uuid4().hex
-            async with self._session_factory() as session:
-                next_seq = (
-                    select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
-                    .where(MessageRow.dialog_id == dialog_id)
-                    .scalar_subquery()
-                )
-                # The INSERT is inside the try, not just the commit: a Core
-                # insert goes to the server immediately, so when the winning row
-                # is ALREADY committed the unique violation surfaces here rather
-                # than at commit time. Guarding only the commit made the retry
-                # work or not depending on which writer got there first — a
-                # one-in-ten lost message under concurrent appends to one
-                # dialog, which the exchange model makes routine.
-                try:
-                    await session.execute(
-                        insert(MessageRow).values(
-                            id=row_id,
-                            dialog_id=dialog_id,
-                            seq=next_seq,
-                            role=message.role.value,
-                            content=message.content,
-                            tool_calls=_tool_calls_to_json(message.tool_calls),
-                            tool_call_id=message.tool_call_id,
-                            client_message_id=client_message_id,
-                            prompt_tokens=usage.prompt_tokens if usage is not None else None,
-                            completion_tokens=(
-                                usage.completion_tokens if usage is not None else None
-                            ),
-                            task_id=message.task_id,
-                            exchange_id=message.exchange_id,
-                            kind=_kind_to_column(message.kind),
-                            attachments=_attachments_to_json(message.attachments),
-                        )
-                    )
-                    await session.commit()
-                except IntegrityError:
-                    await session.rollback()
-                    if attempt == MESSAGE_SEQ_RETRY_ATTEMPTS - 1:
-                        raise
-                    continue
-                return row_id
+            next_seq = (
+                select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
+                .where(MessageRow.dialog_id == dialog_id)
+                .scalar_subquery()
+            )
+            statement = insert(MessageRow).values(
+                id=row_id,
+                dialog_id=dialog_id,
+                seq=next_seq,
+                role=message.role.value,
+                content=message.content,
+                tool_calls=_tool_calls_to_json(message.tool_calls),
+                tool_call_id=message.tool_call_id,
+                client_message_id=client_message_id,
+                prompt_tokens=usage.prompt_tokens if usage is not None else None,
+                completion_tokens=(usage.completion_tokens if usage is not None else None),
+                task_id=message.task_id,
+                exchange_id=message.exchange_id,
+                kind=_kind_to_column(message.kind),
+                attachments=_attachments_to_json(message.attachments),
+            )
+            try:
+                await self._insert_attempt((statement,))
+            except IntegrityError:
+                if attempt == MESSAGE_SEQ_RETRY_ATTEMPTS - 1:
+                    raise
+                continue
+            return row_id
         raise AssertionError("unreachable: the final attempt either returns or raises")
 
     async def append_pair(
@@ -238,38 +225,59 @@ class SqlAlchemyMessageRepository:
         `MESSAGE_SEQ_RETRY_ATTEMPTS`).
         """
         for attempt in range(MESSAGE_SEQ_RETRY_ATTEMPTS):
-            async with self._session_factory() as session:
-                next_seq = (
-                    select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
-                    .where(MessageRow.dialog_id == dialog_id)
-                    .scalar_subquery()
+            next_seq = (
+                select(func.coalesce(func.max(MessageRow.seq), 0) + 1)
+                .where(MessageRow.dialog_id == dialog_id)
+                .scalar_subquery()
+            )
+            statements = tuple(
+                insert(MessageRow).values(
+                    id=uuid.uuid4().hex,
+                    dialog_id=dialog_id,
+                    seq=next_seq,
+                    role=message.role.value,
+                    content=message.content,
+                    tool_calls=_tool_calls_to_json(message.tool_calls),
+                    tool_call_id=message.tool_call_id,
+                    task_id=message.task_id,
+                    exchange_id=message.exchange_id,
+                    kind=_kind_to_column(message.kind),
+                    attachments=_attachments_to_json(message.attachments),
                 )
-                # Same reason as in `append`: the violation can surface on the
-                # INSERT itself, so the retry has to cover it.
-                try:
-                    for message in (first, second):
-                        await session.execute(
-                            insert(MessageRow).values(
-                                id=uuid.uuid4().hex,
-                                dialog_id=dialog_id,
-                                seq=next_seq,
-                                role=message.role.value,
-                                content=message.content,
-                                tool_calls=_tool_calls_to_json(message.tool_calls),
-                                tool_call_id=message.tool_call_id,
-                                task_id=message.task_id,
-                                exchange_id=message.exchange_id,
-                                kind=_kind_to_column(message.kind),
-                                attachments=_attachments_to_json(message.attachments),
-                            )
-                        )
-                    await session.commit()
-                except IntegrityError:
-                    await session.rollback()
-                    if attempt == MESSAGE_SEQ_RETRY_ATTEMPTS - 1:
-                        raise
-                    continue
+                for message in (first, second)
+            )
+            try:
+                await self._insert_attempt(statements)
+            except IntegrityError:
+                if attempt == MESSAGE_SEQ_RETRY_ATTEMPTS - 1:
+                    raise
+                continue
+            return
+
+    async def _insert_attempt(self, statements: tuple[Insert, ...]) -> None:
+        """Execute one append attempt so a unique violation stays retryable.
+
+        The INSERT goes to the server immediately (not at commit), so when
+        the winning row is ALREADY committed the violation surfaces here —
+        guarding only the commit made the retry work or not depending on
+        which writer got there first (a one-in-ten lost message under
+        concurrent appends). Standalone, a failed attempt discards its own
+        session; inside a unit of work the attempt must not take the unit's
+        earlier writes with it. On PostgreSQL that needs a SAVEPOINT (a
+        failed statement aborts the whole transaction there); on SQLite the
+        savepoint would be worse than useless — pysqlite implicitly COMMITS
+        the open transaction when one is issued, which is the exact opposite
+        of a unit of work — and unnecessary, because a failed statement
+        leaves a SQLite transaction usable.
+        """
+        async with write_session(self._session_factory) as session:
+            if in_unit_of_work() and session.get_bind().dialect.name != "sqlite":
+                async with session.begin_nested():
+                    for statement in statements:
+                        await session.execute(statement)
                 return
+            for statement in statements:
+                await session.execute(statement)
 
     async def find_by_client_id(self, dialog_id: str, client_message_id: str) -> bool:
         """Return True when a message with this idempotency key already exists."""

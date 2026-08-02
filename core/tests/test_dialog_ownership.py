@@ -35,6 +35,7 @@ from octoforge_core.agent.runner import (
 from octoforge_core.composition import build_agent_loop
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.db.unit_of_work import UnitOfWork
 from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.dialogs.models import DialogClaimRow
 from octoforge_core.dialogs.store import (
@@ -122,6 +123,7 @@ def make_manager(
             tasks=tasks if tasks is not None else SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
+            uow=UnitOfWork(session_factory),
         ),
         ownership=OwnershipConfig(
             node_id=node_id, heartbeat_seconds=0.01, stale_after_seconds=STALE_AFTER_SECONDS

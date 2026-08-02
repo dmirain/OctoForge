@@ -21,6 +21,7 @@ from octoforge_core import (
     ManagerStores,
     OwnershipConfig,
     SqlAlchemyTaskStore,
+    UnitOfWork,
     bootstrap_schema,
     build_agent_loop,
     build_collecting_sweeper,
@@ -185,6 +186,7 @@ def _build_manager_stores(
         tasks=SqlAlchemyTaskStore(session_factory),
         exchanges=SqlAlchemyExchangeRepository(session_factory),
         claims=SqlAlchemyClaimRepository(session_factory),
+        uow=UnitOfWork(session_factory),
     )
 
 
