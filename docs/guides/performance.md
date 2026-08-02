@@ -115,9 +115,9 @@ One question answered from cold — build the actor, one `recall`, the answer, t
 | | Statements | Transactions | Concurrent |
 |---|---|---|---|
 | Before | 45 | 35 | none |
-| After | **33** | **31** | **6** |
+| After | **29** | **27** | **6** |
 
-Where the twelve went:
+Where the sixteen went:
 
 - **Seven were the ORM re-reading a row it was about to write.** A SELECT before each UPDATE, inside the
   same store method. They are single UPDATEs now; the condition rides in the WHERE clause and `rowcount`
@@ -130,6 +130,15 @@ Where the twelve went:
 - **The two recovery sweeps of `tasks` are one query.** Same table, same dialog, disjoint conditions.
 - **A freshly created exchange is not re-read** before an owner is assigned to it: its id has not left the
   coroutine that minted it, so nothing can have claimed it. An exchange that already existed still is.
+- **A finished task is written once, and the write hands the row back.** It used to be fetched before the
+  write (nothing was decided on what it read) and fetched again by the delivery handler afterwards — the
+  same row that write had just produced. `UPDATE … RETURNING` replaces all three.
+- **Delivery is stamped by the finishing write** when it is already certain: an answer the user watched
+  stream, or a deliberately empty one. A result going through the outbox is still stamped only after it
+  has been broadcast — stamping early would stop the redelivery sweep on something nobody received.
+- **Settling an exchange is one guarded write.** The check that this run still owns it moved from a
+  preceding SELECT into the WHERE clause. That removes a round trip and a race: between the read and the
+  write, a follow-up could take the exchange over, and the write would clobber it.
 
 And six of the remaining statements now run **concurrently**: `recall`'s vector search, its two BM25
 indexes and the dataset lookup answer independent questions, so none waits out another's round trip. The

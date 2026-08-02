@@ -37,18 +37,6 @@ class TaskStore(Protocol):
         """Return tasks of one dialog."""
         ...
 
-    async def mark_done(self, task: Task, result: str) -> None:
-        """Mark the task as done with a result."""
-        ...
-
-    async def mark_failed(self, task: Task, error: str) -> None:
-        """Mark the task as failed with an error."""
-        ...
-
-    async def mark_cancelled(self, task: Task) -> None:
-        """Mark the task as cancelled; the row is kept, never delivered."""
-        ...
-
     async def delete(self, task_id: str) -> None:
         """Delete the task row or raise TaskNotFoundError."""
         ...
@@ -79,6 +67,25 @@ class TaskStore(Protocol):
         """Stamp the task's result as delivered to the user transport."""
         ...
 
+    async def mark_done(self, task_id: str, result: str, *, delivered: bool = False) -> Task:
+        """Finish the task with its result; return the stored row as it now is.
+
+        `delivered` stamps delivery in the same write, for the cases where it
+        is already certain: an answer the user watched stream, or a
+        deliberately empty one that must never be redelivered. It is NOT for
+        a result going through the outbox — that one is stamped after it has
+        actually been broadcast, and stamping it early would lose it.
+        """
+        ...
+
+    async def mark_failed(self, task_id: str, error: str, *, delivered: bool = False) -> Task:
+        """Fail the task with its error; return the stored row as it now is."""
+        ...
+
+    async def mark_cancelled(self, task_id: str) -> Task:
+        """Cancel the task; return the stored row as it now is."""
+        ...
+
 
 class InMemoryTaskStore:
     """Dict-backed task store; used in tests and as a behavioral reference."""
@@ -98,19 +105,29 @@ class InMemoryTaskStore:
     async def list(self, dialog_id: str) -> list[Task]:
         return [task for task in self._tasks.values() if task.dialog_id == dialog_id]
 
-    async def mark_done(self, task: Task, result: str) -> None:
+    async def mark_done(self, task_id: str, result: str, *, delivered: bool = False) -> Task:
+        task = await self.get(task_id)
         task.status = TaskStatus.DONE
         task.result = result
         task.finished_at = utc_now()
+        if delivered:
+            task.delivered_at = task.finished_at
+        return task
 
-    async def mark_failed(self, task: Task, error: str) -> None:
+    async def mark_failed(self, task_id: str, error: str, *, delivered: bool = False) -> Task:
+        task = await self.get(task_id)
         task.status = TaskStatus.FAILED
         task.error = error
         task.finished_at = utc_now()
+        if delivered:
+            task.delivered_at = task.finished_at
+        return task
 
-    async def mark_cancelled(self, task: Task) -> None:
+    async def mark_cancelled(self, task_id: str) -> Task:
+        task = await self.get(task_id)
         task.status = TaskStatus.CANCELLED
         task.finished_at = utc_now()
+        return task
 
     async def delete(self, task_id: str) -> None:
         task = await self.get(task_id)
@@ -176,22 +193,21 @@ class SqlAlchemyTaskStore:
             )
             return [_to_task(row) for row in result.all()]
 
-    async def mark_done(self, task: Task, result: str) -> None:
-        task.status = TaskStatus.DONE
-        task.result = result
-        task.finished_at = utc_now()
-        await self._update(task)
+    async def mark_done(self, task_id: str, result: str, *, delivered: bool = False) -> Task:
+        """Finish the task, optionally stamping delivery in the same write."""
+        return await self._finish(
+            task_id, status=TaskStatus.DONE, result=result, delivered=delivered
+        )
 
-    async def mark_failed(self, task: Task, error: str) -> None:
-        task.status = TaskStatus.FAILED
-        task.error = error
-        task.finished_at = utc_now()
-        await self._update(task)
+    async def mark_failed(self, task_id: str, error: str, *, delivered: bool = False) -> Task:
+        """Fail the task, optionally stamping delivery in the same write."""
+        return await self._finish(
+            task_id, status=TaskStatus.FAILED, error=error, delivered=delivered
+        )
 
-    async def mark_cancelled(self, task: Task) -> None:
-        task.status = TaskStatus.CANCELLED
-        task.finished_at = utc_now()
-        await self._update(task)
+    async def mark_cancelled(self, task_id: str) -> Task:
+        """Cancel the task."""
+        return await self._finish(task_id, status=TaskStatus.CANCELLED)
 
     async def delete(self, task_id: str) -> None:
         async with self._session_factory() as session:
@@ -263,26 +279,41 @@ class SqlAlchemyTaskStore:
                 raise TaskNotFoundError(task_id)
             await session.commit()
 
-    async def _update(self, task: Task) -> None:
-        """Write the task's mutable fields. One UPDATE, no read first."""
+    async def _finish(
+        self,
+        task_id: str,
+        *,
+        status: TaskStatus,
+        result: str | None = None,
+        error: str | None = None,
+        delivered: bool = False,
+    ) -> Task:
+        """Write the terminal state and read the row back in one statement.
+
+        `RETURNING` is what removes two round trips: the caller used to fetch
+        the task before writing it (nothing was decided on what it read) and
+        the delivery path used to fetch it again afterwards. Both get the row
+        from the write itself now.
+        """
+        now = utc_now()
+        values: dict[str, Any] = {"status": status.value, "finished_at": now}
+        if result is not None:
+            values["result"] = result
+        if error is not None:
+            values["error"] = error
+        if delivered:
+            values["delivered_at"] = now
         async with self._session_factory() as session:
-            result = cast(
-                "CursorResult[Any]",
-                await session.execute(
-                    update(TaskRow)
-                    .where(TaskRow.id == task.id)
-                    .values(
-                        status=task.status.value,
-                        result=task.result,
-                        error=task.error,
-                        started_at=task.started_at,
-                        finished_at=task.finished_at,
-                    )
-                ),
-            )
-            if result.rowcount == 0:
-                raise TaskNotFoundError(task.id)
+            row = (
+                await session.scalars(
+                    update(TaskRow).where(TaskRow.id == task_id).values(**values).returning(TaskRow)
+                )
+            ).first()
+            if row is None:
+                raise TaskNotFoundError(task_id)
+            task = _to_task(row)
             await session.commit()
+        return task
 
 
 def _to_task_row(task: Task) -> TaskRow:

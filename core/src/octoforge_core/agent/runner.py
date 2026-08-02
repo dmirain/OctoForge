@@ -412,6 +412,10 @@ class _ProcessTerminated:
     exchange_id: str | None = None
     delivered_live: bool = False
     exchange_status: ExchangeStatus | None = None
+    # The row as the finishing write left it, when there was one. It saves a
+    # read of what we just wrote. None on the recovery path (no run finished
+    # here) and when finalization failed — the handler reads then, as before.
+    task: Task | None = None
     # a message of the same exchange arrived after the run's last sync: the
     # answer could not have accounted for it, so the exchange reopens
     unseen_messages: _Unseen = _Unseen.NONE
@@ -721,7 +725,7 @@ class ConversationRunner:
             if len(self._processes) < self._max_processes:
                 await self._start_orphaned(task)
                 return
-        await self._tasks.mark_failed(task, RESTART_LIMIT_ERROR)
+        await self._tasks.mark_failed(task.id, RESTART_LIMIT_ERROR)
         self._pending_deliveries.append(
             _Delivery(events=(Failed(error=RESTART_LIMIT_ERROR),), task_id=task.id)
         )
@@ -738,7 +742,7 @@ class ConversationRunner:
             # already went out and the exchange waits for the user — a
             # restarted run would clobber that state and duplicate the work.
             # Close the row silently; the user's reply resumes the exchange.
-            await self._tasks.mark_done(task, "")
+            await self._tasks.mark_done(task.id, "")
             return
         narrative, watermark = await self._assemble_narrative(own_exchange_id=exchange_id)
         process = self._create_process(
@@ -1438,10 +1442,12 @@ class ConversationRunner:
         deliver nothing.
         """
         await self._settle_exchange(command)
-        try:
-            task = await self._tasks.get(command.task_id)
-        except TaskNotFoundError:
-            return  # the user deleted the row (task_delete); nothing to deliver
+        task = command.task
+        if task is None:
+            try:
+                task = await self._tasks.get(command.task_id)
+            except TaskNotFoundError:
+                return  # the user deleted the row (task_delete); nothing to deliver
         if _silent_done(task):
             # a deliberately empty result: stamp delivered, never enqueue —
             # otherwise the startup sweep would redeliver emptiness forever
@@ -1462,75 +1468,61 @@ class ConversationRunner:
     async def _settle_exchange(self, command: _ProcessTerminated) -> None:
         """Move the finished run's exchange to its next state.
 
-        Order matters: the owner guard first (a settled exchange that
-        changed hands belongs to its new owner), then the unseen-messages
-        reopen (a reply that arrived during the run's tail must get a fresh
-        run — even when the run had asked and parked the exchange), then the
-        AWAITING_USER handling (kept open for the user's move, closed on a
-        user cancel or when the run answered anyway).
+        One guarded write instead of a read followed by a write. The guard is
+        that this run still owns the exchange: it may have changed hands while
+        the termination sat in the actor's inbox (a follow-up spawned a fresh
+        owner, or a cancel cleared it), and settling it then would clobber a
+        live run or resurrect a cancelled exchange. As a preceding SELECT that
+        check had a window after it; in the WHERE clause it has none.
+
+        Which state to move to is decided from the command alone:
+
+        - something arrived after the run's last sync — the user's own words
+          reopen the exchange (even one it had asked about), while material
+          only parks it as a collection, so a forward burst reacts once when
+          the batch settles rather than once per message;
+        - otherwise the run's own outcome, except that an exchange parked on
+          the user's answer stays parked (`keep_if_awaiting`) — the question
+          went out, the next move is theirs. A user cancel still closes it,
+          or the nudge would re-ask what they explicitly stopped.
         """
         if command.exchange_id is None or command.exchange_status is None:
             return
-        try:
-            exchange = await self._exchanges.get(command.exchange_id)
-        except ExchangeNotFoundError:
+        cancelled = command.exchange_status is ExchangeStatus.CANCELLED
+        if not cancelled and command.unseen_messages is _Unseen.SPOKEN:
+            if await self._settle_to(command, ExchangeStatus.OPEN):
+                await self._resume_open_exchange(command.exchange_id)
             return
+        if not cancelled and command.unseen_messages is _Unseen.MATERIAL_ONLY:
+            if await self._settle_to(command, ExchangeStatus.COLLECTING):
+                await self._exchanges.touch(command.exchange_id)
+            return
+        await self._settle_to(command, command.exchange_status, keep_if_awaiting=not cancelled)
+
+    async def _settle_to(
+        self,
+        command: _ProcessTerminated,
+        status: ExchangeStatus,
+        *,
+        keep_if_awaiting: bool = False,
+    ) -> bool:
+        """Write the settled status under the ownership guard; False when it did not apply."""
+        assert command.exchange_id is not None  # the caller checked
+        settled = await self._exchanges.settle_owned(
+            command.exchange_id,
+            command.task_id,
+            status,
+            keep_if_awaiting=keep_if_awaiting,
+        )
         logger.info(
-            "settling exchange: dialog=%s exchange=%s from=%s to=%s unseen=%s",
+            "settling exchange: dialog=%s exchange=%s to=%s unseen=%s applied=%s",
             self._dialog.id,
             command.exchange_id,
-            exchange.status.value,
-            command.exchange_status.value,
+            status.value,
             command.unseen_messages,
+            settled is not None,
         )
-        if exchange.owner_task_id != command.task_id:
-            # the exchange changed hands while this termination sat in the
-            # inbox (a follow-up already spawned a fresh owner, or a cancel
-            # cleared it): the new owner settles it — touching it here would
-            # clobber a live run's ownership or resurrect a cancelled exchange
-            logger.info(
-                "settle skipped, exchange changed hands: dialog=%s exchange=%s task=%s owner=%s",
-                self._dialog.id,
-                exchange.id,
-                command.task_id,
-                exchange.owner_task_id,
-            )
-            return
-        if command.exchange_status is not ExchangeStatus.CANCELLED:
-            # something arrived after the run's last sync. The user's own
-            # words reopen immediately — even ones the run asked for
-            # (AWAITING_USER). Material only parks the exchange as a
-            # collection: a forward burst would otherwise reopen it once per
-            # message, and the sweep reacts once when the batch settles.
-            # A user-cancelled run resurrects itself either way: the stop
-            # came after the message, so the stop covers it.
-            if command.unseen_messages is _Unseen.SPOKEN:
-                await self._exchanges.set_status(exchange.id, ExchangeStatus.OPEN)
-                await self._resume_open_exchange(exchange.id)
-                return
-            if command.unseen_messages is _Unseen.MATERIAL_ONLY:
-                await self._exchanges.set_status(exchange.id, ExchangeStatus.COLLECTING)
-                await self._exchanges.touch(exchange.id)
-                return
-        if exchange.status is ExchangeStatus.AWAITING_USER:
-            await self._settle_awaiting(exchange, command)
-            return
-        await self._exchanges.set_status(exchange.id, command.exchange_status)
-
-    async def _settle_awaiting(self, exchange: Exchange, command: _ProcessTerminated) -> None:
-        """Settle a run that asked the user something and then terminated.
-
-        The obligation stays open: the question went out, so the next move
-        is the user's and their reply resumes it. The one exception is a
-        user cancel, which closes it — otherwise the nudge would re-ask a
-        question the user explicitly stopped.
-
-        A run cannot "ask but answer anyway": once it asked, its output is
-        muted (`_muted_after_ask`), so the terminal carries nothing to close
-        the obligation with.
-        """
-        if command.exchange_status is ExchangeStatus.CANCELLED:
-            await self._exchanges.set_status(exchange.id, ExchangeStatus.CANCELLED)
+        return settled is not None
 
     async def _resume_open_exchange(self, exchange_id: str, *, notify_limit: bool = True) -> None:
         """Give an OPEN exchange a fresh run (its last one missed something)."""
@@ -1647,7 +1639,14 @@ class ConversationRunner:
             )
 
     async def _mark_streamed_delivered(self, task: Task) -> None:
-        """Stamp a task as delivered: the user already watched it stream live."""
+        """Stamp a task as delivered: the user already watched it stream live.
+
+        A no-op when the finishing write already stamped it — which is the
+        common case now (`_delivery_is_certain`), and the reason this costs
+        no statement on the live-answer path.
+        """
+        if task.delivered_at is not None:
+            return
         if task.status in (TaskStatus.DONE, TaskStatus.FAILED):
             with suppress(TaskNotFoundError):  # a racing task_delete may drop the row
                 await self._tasks.mark_delivered(task.id)
@@ -2027,6 +2026,9 @@ class ConversationRunner:
         signalled so the slot is never leaked.
         """
         status = TaskStatus.FAILED
+        # None when finalization failed: the handler falls back to reading the
+        # row, exactly as it did before it was handed one
+        task: Task | None = None
         terminal: LoopEvent = Cancelled()  # a cancelled pump (shutdown) has no terminal
         try:
             try:
@@ -2039,13 +2041,13 @@ class ConversationRunner:
                 )
                 terminal = self._fail_run(process, format_error(exc))
             try:
-                status = await self._finalize(process, terminal)
+                status, task = await self._finalize(process, terminal)
             except Exception:  # a store failure must not wedge the process slot
                 logger.exception(
                     "process finalize failed: dialog=%s process=%s", self._dialog.id, process.id
                 )
         finally:
-            self._terminate_process(process, status, terminal)
+            self._terminate_process(process, status, terminal, task)
 
     async def _stream_terminal(self, process: _Process) -> LoopEvent:
         """Run the loop stream, compacting reactively once on a context overflow.
@@ -2155,7 +2157,11 @@ class ConversationRunner:
         return terminal
 
     def _terminate_process(
-        self, process: _Process, status: TaskStatus, terminal: LoopEvent
+        self,
+        process: _Process,
+        status: TaskStatus,
+        terminal: LoopEvent,
+        task: Task | None = None,
     ) -> None:
         """Remove the process, announce completion and hand the outcome to the actor."""
         logger.info(
@@ -2178,6 +2184,7 @@ class ConversationRunner:
                 delivered_live=process.terminal_accepted,
                 exchange_status=_exchange_outcome(status),
                 unseen_messages=self._unseen_kind(process),
+                task=task,
             )
         )
 
@@ -2205,8 +2212,13 @@ class ConversationRunner:
             return _Unseen.MATERIAL_ONLY
         return _Unseen.SPOKEN
 
-    async def _finalize(self, process: _Process, terminal: LoopEvent) -> TaskStatus:
+    async def _finalize(self, process: _Process, terminal: LoopEvent) -> tuple[TaskStatus, Task]:
         """Fold the run outcome into the narrative and the task store.
+
+        Returns the status and the task as the store now holds it. The row
+        used to be fetched here before writing it and fetched again by the
+        delivery handler afterwards; nothing was ever decided on the first
+        read, and the second one is the same row this write produced.
 
         An empty final is a process choosing silence (e.g. its question was
         taken over by another process, or the user said to drop it): the task
@@ -2214,7 +2226,6 @@ class ConversationRunner:
         delivered — an undelivered empty result would otherwise be redelivered
         by the startup sweep forever (see _handle_terminated's silent-done stamp).
         """
-        task = await self._tasks.get(process.task_id)
         if isinstance(terminal, Finished):
             if not terminal.message.content.strip():
                 # silence is legitimate but must never be invisible: it once
@@ -2238,17 +2249,41 @@ class ConversationRunner:
                     # answer runs assemble branches — a dialog fed purely by
                     # cron would never trigger compaction and grow unbounded
                     await self._compact_after_run_final()
-            await self._tasks.mark_done(task, terminal.message.content)
+            task = await self._tasks.mark_done(
+                process.task_id,
+                terminal.message.content,
+                delivered=self._delivery_is_certain(process, terminal.message.content),
+            )
             status = TaskStatus.DONE
         elif isinstance(terminal, Failed):
-            await self._tasks.mark_failed(task, terminal.error)
+            task = await self._tasks.mark_failed(
+                process.task_id,
+                terminal.error,
+                delivered=self._delivery_is_certain(process, terminal.error),
+            )
             status = TaskStatus.FAILED
         else:
             await self._salvage_interrupted_turn(process)
-            await self._tasks.mark_cancelled(task)
+            task = await self._tasks.mark_cancelled(process.task_id)
             status = TaskStatus.CANCELLED
         await self._report_outcome(task, status)
-        return status
+        return status, task
+
+    def _delivery_is_certain(self, process: _Process, content: str) -> bool:
+        """Whether this outcome is already in the user's hands.
+
+        Two cases, and only these: the terminal reached a live subscriber
+        queue, or the result is deliberately empty and there is nothing to
+        show. Both are settled by the time the run ends, so delivery can be
+        stamped in the same write that ends it.
+
+        Everything else goes through the outbox and is stamped only after it
+        has actually been broadcast — stamping early would stop the
+        redelivery sweep on a result nobody received.
+        """
+        return not content.strip() or (
+            process.exchange_id is not None and process.terminal_accepted
+        )
 
     async def _compact_after_run_final(self) -> None:
         """Run the compactor's overflow check for a narrative grown by RUN work.

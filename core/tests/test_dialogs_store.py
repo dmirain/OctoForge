@@ -506,14 +506,17 @@ async def test_mark_done_sets_result_and_finished_at(
     task = make_task()
     await store.add(task)
 
-    await store.mark_done(task, TASK_RESULT)
+    returned = await store.mark_done(task.id, TASK_RESULT)
 
     stored = await store.get(task.id)
     assert stored.status is TaskStatus.DONE
     assert stored.result == TASK_RESULT
     assert stored.finished_at is not None
     assert stored.finished_at.tzinfo == UTC
-    assert task.result == TASK_RESULT
+    # the write hands the row back, so no caller needs a read to see it
+    assert returned.result == TASK_RESULT
+    assert returned.status is TaskStatus.DONE
+    assert returned.delivered_at is None
 
 
 async def test_mark_failed_sets_error(session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -521,12 +524,32 @@ async def test_mark_failed_sets_error(session_factory: async_sessionmaker[AsyncS
     task = make_task()
     await store.add(task)
 
-    await store.mark_failed(task, TASK_ERROR)
+    await store.mark_failed(task.id, TASK_ERROR)
 
     stored = await store.get(task.id)
     assert stored.status is TaskStatus.FAILED
     assert stored.error == TASK_ERROR
     assert stored.finished_at is not None
+
+
+async def test_delivery_can_be_stamped_by_the_finishing_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An answer the user watched stream is delivered the moment it is done.
+
+    Stamping it in the same statement is what removes the second write — and
+    it is only correct because the caller asks for it exactly when delivery
+    is already certain (see `_delivery_is_certain`).
+    """
+    store = SqlAlchemyTaskStore(session_factory)
+    task = make_task()
+    await store.add(task)
+
+    returned = await store.mark_done(task.id, TASK_RESULT, delivered=True)
+
+    stored = await store.get(task.id)
+    assert stored.delivered_at is not None
+    assert returned.delivered_at == stored.delivered_at
 
 
 async def test_list_orphaned_returns_pending_and_running_without_mutation(

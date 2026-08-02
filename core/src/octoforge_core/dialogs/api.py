@@ -177,6 +177,17 @@ class ExchangeRepository(Protocol):
         """Move the exchange to `status`, replacing owner and pending question."""
         ...
 
+    async def settle_owned(
+        self,
+        exchange_id: str,
+        owner_task_id: str,
+        status: ExchangeStatus,
+        *,
+        keep_if_awaiting: bool = False,
+    ) -> Exchange | None:
+        """Set the status while `owner_task_id` still owns it; None when nothing was written."""
+        ...
+
     async def delete_for_dialog(self, dialog_id: str) -> None:
         """Drop every exchange of the dialog (admin dialog deletion)."""
         ...

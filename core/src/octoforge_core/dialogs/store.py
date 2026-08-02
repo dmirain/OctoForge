@@ -557,6 +557,53 @@ class SqlAlchemyExchangeRepository:
                 raise ExchangeNotFoundError(exchange_id)
             await session.commit()
 
+    async def settle_owned(
+        self,
+        exchange_id: str,
+        owner_task_id: str,
+        status: ExchangeStatus,
+        *,
+        keep_if_awaiting: bool = False,
+    ) -> Exchange | None:
+        """Move the exchange to `status`, but only while `owner_task_id` still owns it.
+
+        Returns the settled exchange, or None when nothing was written — the
+        exchange is gone, it changed hands, or it is parked on the user's
+        answer and this settle was told to leave that alone.
+
+        The guard belongs in the WHERE clause, not in a preceding SELECT.
+        Read-then-write left a window in which a follow-up could take the
+        exchange over between the check and the write, and the write would
+        then clobber a live run's ownership — the very thing the check was
+        there to prevent. One statement closes it, and saves a round trip
+        while doing so.
+
+        `keep_if_awaiting` is the AWAITING_USER carve-out: a run that asked
+        the user something leaves the obligation open, and overwriting it
+        would drop the pending question. A predicate rather than a branch,
+        because deciding it in Python is what needed the read.
+        """
+        conditions = [
+            ExchangeRow.id == exchange_id,
+            ExchangeRow.owner_task_id == owner_task_id,
+        ]
+        if keep_if_awaiting:
+            conditions.append(ExchangeRow.status != ExchangeStatus.AWAITING_USER.value)
+        async with self._session_factory() as session:
+            row = (
+                await session.scalars(
+                    update(ExchangeRow)
+                    .where(*conditions)
+                    .values(status=status.value, owner_task_id=None, pending_question=None)
+                    .returning(ExchangeRow)
+                )
+            ).first()
+            if row is None:
+                return None
+            exchange = _to_exchange(row)
+            await session.commit()
+        return exchange
+
     async def delete_for_dialog(self, dialog_id: str) -> None:
         async with self._session_factory() as session:
             await session.execute(delete(ExchangeRow).where(ExchangeRow.dialog_id == dialog_id))

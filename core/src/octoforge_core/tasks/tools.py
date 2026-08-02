@@ -197,7 +197,7 @@ class TaskDeleteTool:
             if not stopped:
                 # no live process (orphaned row or no deleter): cancel directly,
                 # a stopped process is marked CANCELLED by its finalization instead
-                await self._store.mark_cancelled(task)
+                await self._store.mark_cancelled(task.id)
         return STOPPED_TASK_MESSAGE.format(task_id=task.id)
 
     async def _delete_cron_job(self, job_id: str, context: ToolContext) -> str:
