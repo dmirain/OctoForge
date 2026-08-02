@@ -8,7 +8,8 @@ tasks with `delivered_at IS NULL` — crash leftovers and fresh finals alike.
 
 from typing import Any, Protocol, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_ as sa_and
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -68,6 +69,10 @@ class TaskStore(Protocol):
 
     async def list_undelivered(self, dialog_id: str | None = None) -> TaskList:
         """Terminal (DONE/FAILED) tasks whose result never reached the user."""
+        ...
+
+    async def list_for_recovery(self, dialog_id: str | None = None) -> tuple[TaskList, TaskList]:
+        """`(orphaned, undelivered)` in one lookup: recovery always wants both."""
         ...
 
     async def mark_delivered(self, task_id: str) -> None:
@@ -135,6 +140,12 @@ class InMemoryTaskStore:
             and (dialog_id is None or task.dialog_id == dialog_id)
         ]
 
+    async def list_for_recovery(self, dialog_id: str | None = None) -> tuple[TaskList, TaskList]:
+        return (
+            await self.list_orphaned(dialog_id),
+            await self.list_undelivered(dialog_id),
+        )
+
     async def mark_delivered(self, task_id: str) -> None:
         task = await self.get(task_id)
         task.delivered_at = utc_now()
@@ -201,48 +212,76 @@ class SqlAlchemyTaskStore:
             return result.rowcount or 0
 
     async def list_orphaned(self, dialog_id: str | None = None) -> TaskList:
-        query = (
-            select(TaskRow)
-            .where(TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value)))
-            .order_by(TaskRow.created_at)
-        )
-        if dialog_id is not None:
-            query = query.where(TaskRow.dialog_id == dialog_id)
-        async with self._session_factory() as session:
-            return [_to_task(row) for row in (await session.scalars(query)).all()]
+        orphaned, _ = await self.list_for_recovery(dialog_id)
+        return orphaned
 
     async def list_undelivered(self, dialog_id: str | None = None) -> TaskList:
+        _, undelivered = await self.list_for_recovery(dialog_id)
+        return undelivered
+
+    async def list_for_recovery(self, dialog_id: str | None = None) -> tuple[TaskList, TaskList]:
+        """Both recovery sets in one query: (orphaned, undelivered).
+
+        Recovery always wants both, they live in the same table under the same
+        dialog, and their conditions are disjoint — so asking twice buys
+        nothing and costs a round trip. Split here rather than in SQL because
+        the caller does different things with each.
+        """
         query = (
             select(TaskRow)
             .where(
-                TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)),
-                TaskRow.delivered_at.is_(None),
+                or_(
+                    TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value)),
+                    sa_and(
+                        TaskRow.status.in_((TaskStatus.DONE.value, TaskStatus.FAILED.value)),
+                        TaskRow.delivered_at.is_(None),
+                    ),
+                )
             )
             .order_by(TaskRow.created_at)
         )
         if dialog_id is not None:
             query = query.where(TaskRow.dialog_id == dialog_id)
+        active = (TaskStatus.PENDING, TaskStatus.RUNNING)
         async with self._session_factory() as session:
-            return [_to_task(row) for row in (await session.scalars(query)).all()]
+            tasks = [_to_task(row) for row in (await session.scalars(query)).all()]
+        return (
+            [task for task in tasks if task.status in active],
+            [task for task in tasks if task.status not in active],
+        )
 
     async def mark_delivered(self, task_id: str) -> None:
+        """Stamp delivery. One UPDATE: `rowcount` says whether the task exists."""
         async with self._session_factory() as session:
-            row = await session.get(TaskRow, task_id)
-            if row is None:
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(TaskRow).where(TaskRow.id == task_id).values(delivered_at=utc_now())
+                ),
+            )
+            if result.rowcount == 0:
                 raise TaskNotFoundError(task_id)
-            row.delivered_at = utc_now()
             await session.commit()
 
     async def _update(self, task: Task) -> None:
+        """Write the task's mutable fields. One UPDATE, no read first."""
         async with self._session_factory() as session:
-            row = await session.get(TaskRow, task.id)
-            if row is None:
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(TaskRow)
+                    .where(TaskRow.id == task.id)
+                    .values(
+                        status=task.status.value,
+                        result=task.result,
+                        error=task.error,
+                        started_at=task.started_at,
+                        finished_at=task.finished_at,
+                    )
+                ),
+            )
+            if result.rowcount == 0:
                 raise TaskNotFoundError(task.id)
-            row.status = task.status.value
-            row.result = task.result
-            row.error = task.error
-            row.started_at = task.started_at
-            row.finished_at = task.finished_at
             await session.commit()
 
 

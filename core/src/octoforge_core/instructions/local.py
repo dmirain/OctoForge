@@ -87,6 +87,9 @@ class LocalInstructionService:
         self._rerank_candidates = policy.rerank_candidates
         self._embedding_model = policy.embedding_model
         self._resync_batch = policy.resync_batch
+        # usage counters are written off the answer's path; the tasks are held
+        # so the loop cannot collect one mid-write
+        self._pending_bumps: set[asyncio.Task[None]] = set()
 
     async def search(
         self,
@@ -153,8 +156,32 @@ class LocalInstructionService:
         hits = await self._apply_reranker(query, shortlist, len(shortlist) if mixed else k)
         if mixed:
             hits = _cap_types(hits, k)
-        await self._store.bump_usage(tuple(hit.instruction.id for hit in hits))
+        self._bump_usage_later(tuple(hit.instruction.id for hit in hits))
         return hits
+
+    def _bump_usage_later(self, instruction_ids: tuple[str, ...]) -> None:
+        """Count the hits without making the caller wait for the write.
+
+        `usage_count` is a statistic, not part of the answer: nothing reads it
+        before the next search, and a lost increment costs nothing. Awaiting
+        it put a round trip between the agent and the records it had already
+        been given — free beside the database, 36 ms across a tunnel to one.
+
+        The task is kept referenced until it finishes, or the event loop is
+        free to garbage-collect it mid-flight.
+        """
+        if not instruction_ids:
+            return
+        task = asyncio.create_task(self._bump_usage_quietly(instruction_ids))
+        self._pending_bumps.add(task)
+        task.add_done_callback(self._pending_bumps.discard)
+
+    async def _bump_usage_quietly(self, instruction_ids: tuple[str, ...]) -> None:
+        """Write the counters; a failure must not surface anywhere."""
+        try:
+            await self._store.bump_usage(instruction_ids)
+        except Exception:
+            logger.warning("usage counters not recorded", exc_info=True)
 
     async def save(
         self,
@@ -346,8 +373,13 @@ class LocalInstructionService:
         a rare acronym. Where both exist their orderings are fused; where only
         one does, nothing about the result shape changes.
         """
-        vector_hits = await self._vector_candidates(query_embedding, fetch, user_id, kinds)
-        lexical_hits = await self._lexical_candidates(query, fetch, user_id, kinds)
+        # the two retrievers do not depend on each other, and waiting for one
+        # before starting the other costs a full round trip to the database —
+        # nothing beside it, a tenth of a second across a tunnel to one
+        vector_hits, lexical_hits = await asyncio.gather(
+            self._vector_candidates(query_embedding, fetch, user_id, kinds),
+            self._lexical_candidates(query, fetch, user_id, kinds),
+        )
         if lexical_hits is None:
             # off the event loop: brute-force scoring is CPU work that grows
             # with the table and must not stall every other dialog

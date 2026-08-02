@@ -112,8 +112,14 @@ class LlmContextCompactor(ContextCompactor):
         self._running: dict[str, asyncio.Task[None]] = {}
 
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
-        """Return `[topics block?] + hot tail`; trigger compaction on overflow."""
-        max_seq_to = await self._store.max_seq_to(dialog.id)
+        """Return `[topics block?] + hot tail`; trigger compaction on overflow.
+
+        The summaries are read once. The boundary used to be a second query
+        against the same table for `max(seq_to)` — the same fact these rows
+        already carry, bought with a round trip.
+        """
+        summaries = await self._store.list_for_dialog(dialog.id)
+        max_seq_to = max((summary.seq_to for summary in summaries), default=NO_COMPACTED_SEQ)
         tail_count = await self._archive.count_after(dialog.id, max_seq_to)
         # the snapshot moment: everything below is computed from `tail` and
         # `snapshot_len`, never from the live list again — the awaits that
@@ -124,7 +130,6 @@ class LlmContextCompactor(ContextCompactor):
             dialog, max_seq_to
         ):
             self._trigger_compact(dialog)
-        summaries = await self._store.list_for_dialog(dialog.id)
         if not summaries:
             return AssembledContext(messages=tail, tail_count=len(tail), snapshot_len=snapshot_len)
         return AssembledContext(

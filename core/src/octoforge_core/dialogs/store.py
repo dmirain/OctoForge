@@ -11,10 +11,15 @@ from datetime import datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import ColumnElement, case, delete, func, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.dml import ReturningInsert
 
+from octoforge_core.context.api import NO_COMPACTED_SEQ
+from octoforge_core.context.models import SummaryRow
 from octoforge_core.dialogs.api import (
     LIVE_EXCHANGE_STATUSES,
     TITLE_MAX_LENGTH,
@@ -51,10 +56,34 @@ MESSAGE_SEQ_RETRY_ATTEMPTS = 5
 # "never claimed" stay the same thing, told apart by None rather than by 0.
 FIRST_GENERATION = 1
 
-# Two processes can race to insert the FIRST claim of a dialog; the loser's
-# unique violation is retried once into the UPDATE branch. Bounded so a
-# genuine constraint failure still raises instead of looping.
-CLAIM_INSERT_RETRY_ATTEMPTS = 2
+
+def _claim_upsert(
+    session: AsyncSession, dialog_id: str, owner: str, now: datetime
+) -> ReturningInsert[tuple[int]]:
+    """INSERT-or-bump for one claim row, in this session's dialect.
+
+    `ON CONFLICT DO UPDATE` is spelled per dialect in SQLAlchemy even though
+    both backends support it, so the statement is built where the bind is
+    known rather than at import time. `RETURNING generation` is what makes it
+    one round trip: the new generation comes back from the write itself.
+    """
+    insert_for_dialect = (
+        postgresql_insert if session.get_bind().dialect.name == "postgresql" else sqlite_insert
+    )
+    statement = insert_for_dialect(DialogClaimRow).values(
+        dialog_id=dialog_id,
+        owner=owner,
+        generation=FIRST_GENERATION,
+        heartbeat_at=now,
+    )
+    return statement.on_conflict_do_update(
+        index_elements=[DialogClaimRow.dialog_id],
+        set_={
+            "owner": statement.excluded.owner,
+            "generation": DialogClaimRow.generation + 1,
+            "heartbeat_at": statement.excluded.heartbeat_at,
+        },
+    ).returning(DialogClaimRow.generation)
 
 
 class SqlAlchemyDialogRepository:
@@ -166,9 +195,11 @@ class SqlAlchemyMessageRepository:
                             attachments=_attachments_to_json(message.attachments),
                         )
                     )
-                    dialog = await session.get(DialogRow, dialog_id)
-                    if dialog is not None:
-                        dialog.updated_at = utc_now()
+                    await session.execute(
+                        update(DialogRow)
+                        .where(DialogRow.id == dialog_id)
+                        .values(updated_at=utc_now())
+                    )
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
@@ -221,9 +252,11 @@ class SqlAlchemyMessageRepository:
                                 attachments=_attachments_to_json(message.attachments),
                             )
                         )
-                    dialog = await session.get(DialogRow, dialog_id)
-                    if dialog is not None:
-                        dialog.updated_at = utc_now()
+                    await session.execute(
+                        update(DialogRow)
+                        .where(DialogRow.id == dialog_id)
+                        .values(updated_at=utc_now())
+                    )
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
@@ -244,6 +277,27 @@ class SqlAlchemyMessageRepository:
                 .limit(1)
             )
             return value is not None
+
+    async def list_hot_slice(self, dialog_id: str) -> list[ChatMessage]:
+        """The narrative's hot slice: everything past the compaction boundary.
+
+        The boundary is a subquery rather than a separate lookup. It used to
+        be two calls — ask the summaries for the highest covered seq, then ask
+        the messages for what comes after — and the first answer was never
+        needed for anything but the second question.
+        """
+        boundary = (
+            select(func.coalesce(func.max(SummaryRow.seq_to), NO_COMPACTED_SEQ))
+            .where(SummaryRow.dialog_id == dialog_id)
+            .scalar_subquery()
+        )
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(MessageRow)
+                .where(MessageRow.dialog_id == dialog_id, MessageRow.seq > boundary)
+                .order_by(MessageRow.seq)
+            )
+            return [_to_chat_message(row) for row in result.all()]
 
     async def list_after(self, dialog_id: str, after_seq: int) -> list[ChatMessage]:
         """Return the messages with seq strictly above `after_seq`, ordered by seq.
@@ -271,12 +325,20 @@ class SqlAlchemyMessageRepository:
             return [_to_chat_message(row) for row in result.all()]
 
     async def set_exchange(self, message_id: str, exchange_id: str) -> None:
-        """Attach a stored message to the exchange it belongs to."""
+        """Attach a stored message to the exchange it belongs to.
+
+        A bare UPDATE rather than read-modify-write: the row is not needed,
+        only written, and the extra SELECT is a round trip that costs nothing
+        beside the database and 11 ms across a tunnel to one. A message that
+        is not there is still not an error here — same as before.
+        """
         async with self._session_factory() as session:
-            row = await session.get(MessageRow, message_id)
-            if row is not None:
-                row.exchange_id = exchange_id
-                await session.commit()
+            await session.execute(
+                update(MessageRow)
+                .where(MessageRow.id == message_id)
+                .values(exchange_id=exchange_id)
+            )
+            await session.commit()
 
     async def stats_by_channel(self, channel: str) -> MessageStatsList:
         """Return per-user message counters of the channel, split by author.
@@ -379,19 +441,21 @@ class SqlAlchemyExchangeRepository:
     async def touch(self, exchange_id: str) -> None:
         """Bump `updated_at`; a missing row is a no-op (it may have been deleted)."""
         async with self._session_factory() as session:
-            row = await session.get(ExchangeRow, exchange_id)
-            if row is None:
-                return
-            row.updated_at = utc_now()
+            await session.execute(
+                update(ExchangeRow)
+                .where(ExchangeRow.id == exchange_id)
+                .values(updated_at=utc_now())
+            )
             await session.commit()
 
     async def set_title(self, exchange_id: str, title: str) -> None:
         """Rename the exchange; a missing row is a no-op (it may have been deleted)."""
         async with self._session_factory() as session:
-            row = await session.get(ExchangeRow, exchange_id)
-            if row is None:
-                return
-            row.title = title[:TITLE_MAX_LENGTH]
+            await session.execute(
+                update(ExchangeRow)
+                .where(ExchangeRow.id == exchange_id)
+                .values(title=title[:TITLE_MAX_LENGTH])
+            )
             await session.commit()
 
     async def get(self, exchange_id: str) -> Exchange:
@@ -470,13 +534,27 @@ class SqlAlchemyExchangeRepository:
         owner_task_id: str | None = None,
         pending_question: str | None = None,
     ) -> None:
+        """Write the exchange's status; raise if there is no such exchange.
+
+        One UPDATE, not a read followed by a write: `rowcount` answers the
+        same question the SELECT was asked (does this exchange exist), and
+        the condition rides in the WHERE clause instead of a round trip.
+        """
         async with self._session_factory() as session:
-            row = await session.get(ExchangeRow, exchange_id)
-            if row is None:
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(ExchangeRow)
+                    .where(ExchangeRow.id == exchange_id)
+                    .values(
+                        status=status.value,
+                        owner_task_id=owner_task_id,
+                        pending_question=pending_question,
+                    )
+                ),
+            )
+            if result.rowcount == 0:
                 raise ExchangeNotFoundError(exchange_id)
-            row.status = status.value
-            row.owner_task_id = owner_task_id
-            row.pending_question = pending_question
             await session.commit()
 
     async def delete_for_dialog(self, dialog_id: str) -> None:
@@ -488,56 +566,36 @@ class SqlAlchemyExchangeRepository:
 class SqlAlchemyClaimRepository:
     """Dialog ownership: which process runs which actor.
 
-    Claiming is a read-modify-write rather than an atomic increment, and that
-    is safe because the identity of a claim is the PAIR (owner, generation),
-    never the number alone. Two processes racing to take the same dialog may
-    both compute the same next generation, but only one owner survives in the
-    row, so the other fails its next check and stands down — which is exactly
-    the outcome an atomic increment would have produced.
+    Claiming is one upsert. The identity of a claim is the PAIR
+    (owner, generation), never the number alone: two processes racing to take
+    the same dialog may both land on the same generation, but only one owner
+    survives in the row, so the other fails its next check and stands down.
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
     async def claim(self, dialog_id: str, owner: str) -> DialogClaim:
-        """Take the dialog for `owner`, bumping its generation."""
-        for attempt in range(CLAIM_INSERT_RETRY_ATTEMPTS):
-            now = utc_now()
-            async with self._session_factory() as session:
-                row = await session.get(DialogClaimRow, dialog_id)
-                if row is None:
-                    try:
-                        await session.execute(
-                            insert(DialogClaimRow).values(
-                                dialog_id=dialog_id,
-                                owner=owner,
-                                generation=FIRST_GENERATION,
-                                heartbeat_at=now,
-                            )
-                        )
-                        await session.commit()
-                    except IntegrityError:
-                        # another process inserted the first claim between our
-                        # read and our write; retry and take the UPDATE branch
-                        await session.rollback()
-                        if attempt == CLAIM_INSERT_RETRY_ATTEMPTS - 1:
-                            raise
-                        continue
-                    return DialogClaim(
-                        dialog_id=dialog_id,
-                        owner=owner,
-                        generation=FIRST_GENERATION,
-                        heartbeat_at=now,
-                    )
-                row.generation += 1
-                row.owner = owner
-                row.heartbeat_at = now
-                generation = row.generation
-                await session.commit()
-                return DialogClaim(
-                    dialog_id=dialog_id, owner=owner, generation=generation, heartbeat_at=now
-                )
-        raise AssertionError("unreachable: the final attempt either returns or raises")
+        """Take the dialog for `owner`, bumping its generation.
+
+        One statement: INSERT the first claim, or bump the existing one on
+        conflict. It used to be a SELECT followed by an INSERT-or-UPDATE, with
+        a retry for the race where somebody inserted the first claim in
+        between — the upsert has no such window, so both the extra round trip
+        and the retry loop are gone. The generation is computed in SQL
+        (`generation + 1`), not in Python, so it cannot be computed from a
+        value that has already moved.
+        """
+        now = utc_now()
+        async with self._session_factory() as session:
+            generation = await session.scalar(_claim_upsert(session, dialog_id, owner, now))
+            await session.commit()
+        return DialogClaim(
+            dialog_id=dialog_id,
+            owner=owner,
+            generation=int(generation) if generation is not None else FIRST_GENERATION,
+            heartbeat_at=now,
+        )
 
     async def heartbeat(self, claims: DialogClaimList) -> frozenset[str]:
         """Refresh the given claims; return the ids still held by their owner."""

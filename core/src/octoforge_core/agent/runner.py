@@ -1704,6 +1704,7 @@ class ConversationRunner:
         """
         cancelled = await self._cancel_exchanges(decision.cancel_ids)
         exchange_id: str | None = None
+        created: Exchange | None = None
         refused = False
         if decision.action is RouteAction.CONTINUE and decision.exchange_id is not None:
             exchange_id = decision.exchange_id
@@ -1714,8 +1715,8 @@ class ConversationRunner:
             if self._exceeds_limit(self._cancelled_tasks(cancelled)):
                 refused = True
             else:
-                exchange = await self._exchanges.create(self._dialog.id, message.content)
-                exchange_id = exchange.id
+                created = await self._exchanges.create(self._dialog.id, message.content)
+                exchange_id = created.id
         # the user's message enters the narrative before anything reacts to it
         message = replace(message, exchange_id=exchange_id)
         self._narrative.append(message)
@@ -1734,6 +1735,7 @@ class ConversationRunner:
                 command.client_message_id,
                 cancelled,
                 cancel_epoch=command.cancel_epoch,
+                known=created,
             )
         await self._nudge_stale_exchanges(exchange_id)
 
@@ -1772,13 +1774,14 @@ class ConversationRunner:
                 cancelled.add(exchange_id)
         return cancelled
 
-    async def _ensure_owner(
+    async def _ensure_owner(  # noqa: PLR0913, PLR0917 — one call site, all of it needed
         self,
         exchange_id: str,
         message: ChatMessage,
         client_key: str | None,
         cancelled: set[str] | None = None,
         cancel_epoch: int | None = None,
+        known: Exchange | None = None,
     ) -> None:
         """Make sure a live run owes this exchange an answer.
 
@@ -1788,12 +1791,17 @@ class ConversationRunner:
         the exchanges the same routing decision just cancelled: their runs
         unwind cooperatively, so the limit check must discount them or a
         "stop X, continue Y" message hits the limit on X's still-live slot.
+
+        `known` is the exchange this very turn just created. Only then may the
+        read be skipped: its id has not left this coroutine, so nothing can
+        have claimed it in between. For an exchange that already existed the
+        read stays — and stays inside the lock.
         """
         with suppress(ExchangeNotFoundError):
             async with self._spawn_lock:
                 # read the exchange INSIDE the lock: a check-then-act across
                 # the lock await is how a second owner slips in
-                exchange = await self._exchanges.get(exchange_id)
+                exchange = known if known is not None else await self._exchanges.get(exchange_id)
                 if exchange.owner_task_id is not None and exchange.owner_task_id in self._processes:
                     return
                 if self._exceeds_limit(self._cancelled_tasks(cancelled or set())):
@@ -2510,9 +2518,10 @@ class ConversationManager:
         # it was replaced from the bumped generation
         claim = await self._claims.claim(dialog.id, self._node_id)
         # only the hot slice lives in memory: everything up to the compaction
-        # boundary is reachable through summaries and history_search
-        boundary = await self._config.compactor.compacted_boundary(dialog.id)
-        history = await self._messages.list_after(dialog.id, boundary)
+        # boundary is reachable through summaries and history_search. One
+        # query — the boundary rides in as a subquery, because its value was
+        # never wanted for anything except this very question.
+        history = await self._messages.list_hot_slice(dialog.id)
         # no awaits past this point: the runner is registered in the same
         # event-loop step it starts in, so a cancelled build cannot leak a
         # started actor
@@ -2573,13 +2582,16 @@ class ConversationManager:
         """
         dialog_id = runner.dialog_id
         reopened = await self._reopen_stranded_exchanges(dialog_id)
-        for task in await self._orphaned(dialog_id):
+        # both sets in one lookup: they are the same table under the same
+        # dialog, and asking twice costs a round trip that buys nothing
+        orphaned, undelivered = await self._for_recovery(dialog_id)
+        for task in orphaned:
             try:
                 await runner.restart_task(task)
             except Exception:
                 logger.exception("orphaned task restart failed: task=%s", task.id)
         revived = await self._revive_unowned_open(runner)
-        for task in await self._undelivered(dialog_id):
+        for task in undelivered:
             runner.request_result_delivery(task.id)
         if reopened or revived:
             logger.info(
@@ -2768,6 +2780,14 @@ class ConversationManager:
         except Exception:
             logger.exception("stranded dialog sweep failed")
             return []
+
+    async def _for_recovery(self, dialog_id: str | None) -> tuple[TaskList, TaskList]:
+        """`(orphaned, undelivered)` for this dialog; empty on failure."""
+        try:
+            return await self._tasks.list_for_recovery(dialog_id)
+        except Exception:
+            logger.exception("task recovery sweep failed: dialog=%s", dialog_id)
+            return [], []
 
     async def _orphaned(self, dialog_id: str | None) -> TaskList:
         try:

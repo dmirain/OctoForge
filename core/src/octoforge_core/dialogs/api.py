@@ -333,6 +333,10 @@ class MessageRepository(Protocol):
         """Return the messages with seq strictly above `after_seq`, ordered by seq."""
         ...
 
+    async def list_hot_slice(self, dialog_id: str) -> list[ChatMessage]:
+        """Return the messages past the dialog's compaction boundary, ordered by seq."""
+        ...
+
     async def list(self, dialog_id: str) -> ChatMessageList:
         """Return the dialog messages ordered by seq."""
         ...

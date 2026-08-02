@@ -100,13 +100,17 @@ class PostgresInstructionStore(SqlAlchemyInstructionStore):
         """
         if limit <= 0 or not query.strip():
             return []
-        rankings = [
-            await self._fetch(self._visible(statement, user_id, kinds).limit(limit))
-            for statement in (
-                self._ranked_by(InstructionRow.content, CONTENT_BM25_INDEX, query),
-                self._ranked_by(InstructionRow.title, TITLE_BM25_INDEX, query),
+        # concurrently: two independent index scans, and the second has no
+        # reason to wait out the first's round trip
+        rankings = await asyncio.gather(
+            *(
+                self._fetch(self._visible(statement, user_id, kinds).limit(limit))
+                for statement in (
+                    self._ranked_by(InstructionRow.content, CONTENT_BM25_INDEX, query),
+                    self._ranked_by(InstructionRow.title, TITLE_BM25_INDEX, query),
+                )
             )
-        ]
+        )
         # Two lexical signals merged into the one ordering this capability
         # promises. Combining them here rather than upstream keeps "how BM25 is
         # indexed" an implementation detail: the service fuses retrievers, not

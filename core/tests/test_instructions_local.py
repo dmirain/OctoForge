@@ -6,6 +6,7 @@ the same suite can later validate an HTTP implementation of the protocol by
 swapping that one fixture.
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC
 
@@ -31,6 +32,8 @@ EMBEDDED_TEXT_SEPARATOR = "\n"
 VERSION_CREATED = 1
 VERSION_REPLACED = 2
 USAGE_NEVER = 0
+USAGE_WAIT_SECONDS = 2.0
+USAGE_POLL_SECONDS = 0.01
 USAGE_ONCE = 1
 USAGE_TWICE = 2
 TWO_HITS = 2
@@ -40,6 +43,22 @@ MODEL_A = "model-a"
 MODEL_B = "model-b"
 THREE_HITS = 3
 TWO_EMBED_CALLS = 2
+
+
+async def wait_for_usage(service: LocalInstructionService, title: str, expected: int) -> None:
+    """Poll until the record's usage counter reaches `expected`.
+
+    The counter is written off the search's path — nothing waits for it, so a
+    test reading it in the same turn reads what was there before. Polling is
+    the honest assertion of the contract: recorded, just not synchronously.
+    """
+    deadline = asyncio.get_running_loop().time() + USAGE_WAIT_SECONDS
+    while asyncio.get_running_loop().time() < deadline:
+        if (await service.get_by_name(title, user_id=USER_ID)).usage_count == expected:
+            return
+        await asyncio.sleep(USAGE_POLL_SECONDS)
+    raise AssertionError(f"usage_count of {title!r} never reached {expected}")
+
 
 USER_ID = "user-test"
 OTHER_USER_ID = "user-other"
@@ -299,7 +318,7 @@ async def test_search_bumps_usage_of_returned_hits_only(
     await service.search(USER_ID, QUERY, k=1)
     await service.search(USER_ID, QUERY, k=1)
 
-    assert (await service.get_by_name(TITLE_ALPHA, user_id=USER_ID)).usage_count == USAGE_TWICE
+    await wait_for_usage(service, TITLE_ALPHA, USAGE_TWICE)
     assert (await service.get_by_name(TITLE_BETA, user_id=USER_ID)).usage_count == USAGE_NEVER
 
 

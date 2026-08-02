@@ -60,8 +60,14 @@ from octoforge_core.agent.runner import (
     _ProcessTerminated,
     _Unseen,
 )
-from octoforge_core.context.api import INTERRUPTED_NOTE, AssembledContext, ContextCompactor
+from octoforge_core.context.api import (
+    INTERRUPTED_NOTE,
+    AssembledContext,
+    ContextCompactor,
+    DialogueSummary,
+)
 from octoforge_core.context.compactor import NoopContextCompactor
+from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.api import CronWaker, WakeOutcome
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
@@ -3052,11 +3058,11 @@ class SlowHistoryRepository(SqlAlchemyMessageRepository):
         self.release = asyncio.Event()
         self.loads = 0
 
-    async def list_after(self, dialog_id: str, after_seq: int) -> list[ChatMessage]:
+    async def list_hot_slice(self, dialog_id: str) -> list[ChatMessage]:
         self.loads += 1
         if self.loads == 1:  # only the FIRST contact is slow
             await self.release.wait()
-        return await super().list_after(dialog_id, after_seq)
+        return await super().list_hot_slice(dialog_id)
 
 
 async def test_one_dialogs_slow_init_does_not_block_another(
@@ -3157,17 +3163,34 @@ async def test_narrative_trims_to_the_hot_tail(
 async def test_initial_narrative_load_starts_after_the_compaction_boundary(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A runner never loads compacted history into memory (S3)."""
+    """A runner never loads compacted history into memory (S3).
+
+    The boundary comes from the summaries themselves, in the same statement
+    that reads the messages — so this seeds a real summary covering the first
+    two rather than stubbing a number. What is compacted is a fact about the
+    data, not a policy the actor asks about separately.
+    """
     dialogs = SqlAlchemyDialogRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
     for content in ("old-1", "old-2", "hot-3"):
         await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content=content))
+    await SqlAlchemySummaryStore(session_factory).create(
+        DialogueSummary(
+            id="summary-1",
+            dialog_id=dialog.id,
+            seq_from=1,
+            seq_to=2,
+            topics=("old",),
+            content="the first two, compacted",
+            created_at=utc_now(),
+        )
+    )
     manager = make_manager(
         ScriptedLLM([]),
         quick_registry(),
         session_factory,
-        ManagerOptions(compactor=TailCompactor(tail=10, boundary=2)),
+        ManagerOptions(compactor=TailCompactor(tail=10)),
     )
 
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)

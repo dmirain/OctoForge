@@ -1,5 +1,6 @@
 """Tools of the instructions module: store search, authoring and deletion."""
 
+import asyncio
 from typing import Any
 
 from octoforge_core.datasets.api import DatasetHit, DatasetService
@@ -145,14 +146,24 @@ class InstructionSearchTool:
             raise ToolArgumentsError("query must be a non-empty string")
         k = self._parse_k(arguments.get("k"))
         kind = _parse_optional_kind(arguments.get("type"))
-        hits = await self._service.search(context.user_id, query, k, kind)
+        # both stores answer the same question about different tables, so the
+        # dataset lookup has no reason to wait out the instruction search's
+        # round trips; the blocks are still rendered instructions-first
+        hits, dataset_hits = await asyncio.gather(
+            self._service.search(context.user_id, query, k, kind),
+            self._dataset_hits(context.user_id, query, k),
+        )
         bodies = [_instruction_body(hit) for hit in hits]
-        if self._datasets is not None:
-            dataset_hits = await self._datasets.search(context.user_id, query, k)
-            bodies.extend(_dataset_body(hit) for hit in dataset_hits)
+        bodies.extend(_dataset_body(hit) for hit in dataset_hits)
         if not bodies:
             return NO_HITS_MESSAGE
         return _render(bodies[:k])
+
+    async def _dataset_hits(self, user_id: str, query: str, k: int) -> list[DatasetHit]:
+        """Dataset descriptors, or nothing when this deployment has no datasets."""
+        if self._datasets is None:
+            return []
+        return await self._datasets.search(user_id, query, k)
 
     def _parse_k(self, raw: object) -> int:
         if raw is None:

@@ -6,6 +6,8 @@ modularity roadmap, P1): brute-force ranking flows through
 `list_with_embeddings`, vector-capable stores get `search_by_vector` instead.
 """
 
+import asyncio
+
 import pytest
 
 from octoforge_core.instructions.api import (
@@ -27,9 +29,27 @@ EXACT_QUERY = "BETA FACT"  # matches TITLE_BETA case-insensitively
 FIRST_VERSION = 1
 SECOND_VERSION = 2
 USAGE_ONCE = 1
+USAGE_WAIT_SECONDS = 2.0
+USAGE_POLL_SECONDS = 0.01
 TWO_HITS = 2
 THREE_RECORDS = 3
 USER_ID = "user-test"
+
+
+async def wait_for_usage(service: LocalInstructionService, title: str, expected: int) -> None:
+    """Poll until the record's usage counter reaches `expected`.
+
+    The counter is written off the search's path — nothing waits for it, so a
+    test reading it in the same turn reads what was there before. Polling is
+    the honest assertion of the contract: recorded, just not synchronously.
+    """
+    deadline = asyncio.get_running_loop().time() + USAGE_WAIT_SECONDS
+    while asyncio.get_running_loop().time() < deadline:
+        if (await service.get_by_name(title, user_id=USER_ID)).usage_count == expected:
+            return
+        await asyncio.sleep(USAGE_POLL_SECONDS)
+    raise AssertionError(f"usage_count of {title!r} never reached {expected}")
+
 
 V_RIGHT = (1.0, 0.0)
 V_UP = (0.0, 1.0)
@@ -218,7 +238,7 @@ async def test_service_runs_over_an_in_memory_store() -> None:
 
     hits = await service.search(USER_ID, QUERY, k=1)
     assert [hit.instruction.title for hit in hits] == [TITLE_ALPHA]
-    assert (await service.get_by_name(TITLE_ALPHA, user_id=USER_ID)).usage_count == USAGE_ONCE
+    await wait_for_usage(service, TITLE_ALPHA, USAGE_ONCE)
 
     await service.delete(USER_ID, stored.id)
     with pytest.raises(InstructionNotFoundError):

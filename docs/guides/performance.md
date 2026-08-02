@@ -104,6 +104,51 @@ The rules that follow, applied when writing anything in the request path:
   CPU with the event loop; an HTTP backend keeps the CPU free at the cost of latency. On a small host, HTTP is
   usually the better trade.
 
+## The round-trip budget
+
+Latency is one axis; the **number of database round trips** is the other, and it is the one that decides
+whether a pod can live away from its database. Measured 2026-08-02 against a copy of a production database
+(1220 messages in the dialog, 44 instruction records), LLM and embedder stubbed, everything else real.
+
+One question answered from cold — build the actor, one `recall`, the answer, the closing bookkeeping:
+
+| | Statements | Transactions | Concurrent |
+|---|---|---|---|
+| Before | 45 | 35 | none |
+| After | **33** | **31** | **6** |
+
+Where the twelve went:
+
+- **Seven were the ORM re-reading a row it was about to write.** A SELECT before each UPDATE, inside the
+  same store method. They are single UPDATEs now; the condition rides in the WHERE clause and `rowcount`
+  answers the question the SELECT was asked ("does this row exist"), so the not-found errors are unchanged.
+  A single UPDATE is also atomic on its own — a transaction would have made it correct *and* slower.
+- **The claim is one upsert.** `INSERT … ON CONFLICT DO UPDATE … RETURNING generation` replaced a SELECT
+  followed by an INSERT-or-UPDATE, and with it the retry loop that existed only for the race in between.
+- **The compaction boundary is asked once instead of three times.** The initial narrative load carries it
+  as a subquery; prompt assembly takes it from the summaries it already reads.
+- **The two recovery sweeps of `tasks` are one query.** Same table, same dialog, disjoint conditions.
+- **A freshly created exchange is not re-read** before an owner is assigned to it: its id has not left the
+  coroutine that minted it, so nothing can have claimed it. An exchange that already existed still is.
+
+And six of the remaining statements now run **concurrently**: `recall`'s vector search, its two BM25
+indexes and the dataset lookup answer independent questions, so none waits out another's round trip. The
+usage counter of the hits is written off the answer's path entirely.
+
+What the shape still shows:
+
+- **Every store call is its own transaction.** Nothing groups them, so a request has no atomicity and pays
+  BEGIN/COMMIT per call. This is now the dominant cost: removing a statement from inside an existing
+  transaction saves one round trip, removing the transaction saves three.
+- **Repeats remain** within one turn: the dialog's live exchanges are listed three times, its `updated_at`
+  bumped twice, its task re-read twice.
+
+Round trips matter more than milliseconds because they multiply by the distance to the database. On a host
+sharing a machine with Postgres a statement costs ~0.3 ms and a session ~0.35 ms; across a WireGuard tunnel
+to another datacenter the same numbers were 11.6 ms and 36.5 ms. The same question that costs 77 ms beside
+its database costs on the order of a second away from it — which is why **a pod and its database belong in
+the same datacenter**, and why the counts above are the thing to drive down.
+
 ## What to watch in production
 
 | Symptom | Likely cause |
