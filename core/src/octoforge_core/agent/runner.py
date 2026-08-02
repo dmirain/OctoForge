@@ -1929,18 +1929,22 @@ class ConversationRunner:
                 exchange.id,
             )
             return
-        task = await self._prepare_process_task(
-            exchange.title,
-            message.content,
-            kind=TaskKind.ANSWER,
-            cron_job_id=None,
-            source=_AnswerSource(
-                message_id=message.id,
-                client_message_id=client_key,
-                exchange_id=exchange.id,
-            ),
-        )
-        await self._exchanges.set_status(exchange.id, ExchangeStatus.IN_PROGRESS)
+        # the task and the IN_PROGRESS flip land together: a crash between
+        # them used to leave an IN_PROGRESS exchange with no task behind it —
+        # a state only the reopen sweep could untangle
+        async with self._uow():
+            task = await self._prepare_process_task(
+                exchange.title,
+                message.content,
+                kind=TaskKind.ANSWER,
+                cron_job_id=None,
+                source=_AnswerSource(
+                    message_id=message.id,
+                    client_message_id=client_key,
+                    exchange_id=exchange.id,
+                ),
+            )
+            await self._exchanges.set_status(exchange.id, ExchangeStatus.IN_PROGRESS)
         narrative, watermark = await self._assemble_narrative(own_exchange_id=exchange.id)
         process = self._create_process(
             task=task,
@@ -1993,11 +1997,16 @@ class ConversationRunner:
         exchange state instead of the envelope patchwork it replaced.
         """
         async with self._assemble_lock:
-            assembled = await self._compactor.assemble(self._dialog, self._narrative)
+            # the live-exchange read rides beside the assemble: it does not
+            # touch the narrative the lock protects, and marking uses durable
+            # state as of the read either way — an exchange settling during
+            # the assemble was always a race, with the read after it or beside
+            assembled, live_ids = await asyncio.gather(
+                self._compactor.assemble(self._dialog, self._narrative),
+                self._live_exchange_ids(own_exchange_id),
+            )
             self._trim_narrative(assembled.snapshot_len - assembled.tail_count)
-        narrative = render_branch(
-            assembled.messages, own_exchange_id, await self._live_exchange_ids(own_exchange_id)
-        )
+        narrative = render_branch(assembled.messages, own_exchange_id, live_ids)
         if narrative:
             narrative[-1] = _with_date_envelope(narrative[-1])
         return narrative, assembled.tail_count
@@ -2613,11 +2622,15 @@ class ConversationManager:
         return runner
 
     async def _build_runner(self, user_id: str, channel: str) -> ConversationRunner:
-        dialog = await self._dialogs.get_or_create(user_id, channel)
-        # claimed before the actor exists: building one is what makes this
+        # one transaction: finding the dialog and claiming it are the same
+        # step of the same build — and beside a remote database, a merged
+        # BEGIN/COMMIT is a round trip saved on every cold contact.
+        # Claimed before the actor exists: building one is what makes this
         # process the dialog's owner, and a previous owner elsewhere learns
         # it was replaced from the bumped generation
-        claim = await self._claims.claim(dialog.id, self._node_id)
+        async with self._uow():
+            dialog = await self._dialogs.get_or_create(user_id, channel)
+            claim = await self._claims.claim(dialog.id, self._node_id)
         # only the hot slice lives in memory: everything up to the compaction
         # boundary is reachable through summaries and history_search. One
         # query — the boundary rides in as a subquery, because its value was
@@ -2683,10 +2696,13 @@ class ConversationManager:
         tries again.
         """
         dialog_id = runner.dialog_id
-        reopened, stranded = await self._reopen_and_list_stranded(dialog_id)
-        # both sets in one lookup: they are the same table under the same
-        # dialog, and asking twice costs a round trip that buys nothing
-        orphaned, undelivered = await self._for_recovery(dialog_id)
+        # side by side: the exchange reset and the task lookup touch different
+        # tables and neither reads what the other writes — and each helper
+        # already swallows its own failure, so the gather cannot reject
+        (reopened, stranded), (orphaned, undelivered) = await asyncio.gather(
+            self._reopen_and_list_stranded(dialog_id),
+            self._for_recovery(dialog_id),
+        )
         for task in orphaned:
             try:
                 await runner.restart_task(task)

@@ -123,8 +123,10 @@ class LlmContextCompactor(ContextCompactor):
         topics block covers at least everything the counter trimmed — the
         tail may then overlap the topics (harmless), never leave a gap.
         """
-        summaries = await self._store.list_for_dialog(dialog.id)
-        tail_count, counted_boundary = await self._archive.count_hot_tail(dialog.id)
+        summaries, (tail_count, counted_boundary) = await asyncio.gather(
+            self._store.list_for_dialog(dialog.id),
+            self._archive.count_hot_tail(dialog.id),
+        )
         max_seq_to = max((summary.seq_to for summary in summaries), default=NO_COMPACTED_SEQ)
         if counted_boundary != max_seq_to:
             summaries = await self._store.list_for_dialog(dialog.id)
