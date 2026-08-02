@@ -28,6 +28,7 @@ from octoforge_core.agent.runner import (
 from octoforge_core.domain import Attachment, MessageKind, MessageSource
 
 from octoforge_telegram.client import (
+    ACTIVITY_INTERVAL_SECONDS,
     CHAT_ACTION_TYPING,
     MAX_RICH_MESSAGE_LENGTH,
     TELEGRAM_CHANNEL,
@@ -119,6 +120,11 @@ class TelegramBridge:
         # evicted first) and lost on restart, which just falls back to the
         # router — never a correctness issue, only a routing-cost one
         self._reply_targets: OrderedDict[int, str] = OrderedDict()
+        # exchanges with an answer in flight; while non-empty, one pulse task
+        # keeps the chat-level typing indicator alive (it expires after ~5s,
+        # so a single action at submit time dies long before a slow answer)
+        self._typing_exchanges: set[str | None] = set()
+        self._typing_pulse: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         """Resolve the runner and start forwarding its events to the chat.
@@ -182,6 +188,8 @@ class TelegramBridge:
         runner = await self._ensure_runner()
         await self.start()
         if kind is MessageKind.OWN:
+            # instant feedback for the routing gap only; from ProcessStarted
+            # on, the pulse task keeps the indicator alive for the whole run
             await self._client.send_chat_action(self._chat_id, CHAT_ACTION_TYPING)
         reply_to_exchange_id = (
             self._reply_targets.get(reply_to_message_id)
@@ -197,6 +205,7 @@ class TelegramBridge:
 
     async def aclose(self) -> None:
         """Stop forwarding events (on app shutdown)."""
+        self._stop_typing()
         if self._forwarder is not None:
             self._forwarder.cancel()
             with suppress(asyncio.CancelledError):
@@ -226,6 +235,9 @@ class TelegramBridge:
                     return
                 await self._render_safely(event.payload, event.exchange_id)
         finally:
+            # whoever owns the dialog next shows their own indicator; ours
+            # must not keep promising an answer this process will not send
+            self._stop_typing()
             runner.unsubscribe(queue)
 
     async def _render_safely(self, event: LoopEvent, exchange_id: str | None) -> None:
@@ -297,6 +309,7 @@ class TelegramBridge:
         if isinstance(event, ProcessStarted):
             if draft.message_id is None:
                 draft.reply_to = _reply_target(event.source_client_message_id)
+            self._typing_on(exchange_id)
             return
         if isinstance(event, TextDelta):
             draft.buffer += event.text
@@ -313,6 +326,10 @@ class TelegramBridge:
     async def _render_terminal(
         self, event: Finished | Cancelled | Failed, exchange_id: str | None, draft: _Draft
     ) -> None:
+        # stop pulsing before the final flush, so the message that ends the
+        # answer is also the thing that clears the indicator — a pulse after
+        # it would show "typing" with nothing left to type
+        self._typing_off(exchange_id)
         if isinstance(event, Cancelled):
             self._append_line(draft, CANCELLED_LINE)
         elif isinstance(event, Failed):
@@ -396,6 +413,37 @@ class TelegramBridge:
         else:
             await self._client.edit_message_rich(self._chat_id, draft.message_id, markdown)
         draft.delivered_text = markdown
+
+    def _typing_on(self, exchange_id: str | None) -> None:
+        """An answer for this exchange is in flight: keep "typing" alive.
+
+        One pulse task serves however many exchanges are running — the
+        indicator is per chat, not per message, so there is nothing to gain
+        from more than one.
+        """
+        self._typing_exchanges.add(exchange_id)
+        if self._typing_pulse is None or self._typing_pulse.done():
+            self._typing_pulse = asyncio.create_task(self._pulse_typing())
+
+    def _typing_off(self, exchange_id: str | None) -> None:
+        self._typing_exchanges.discard(exchange_id)
+        if not self._typing_exchanges and self._typing_pulse is not None:
+            self._typing_pulse.cancel()
+            self._typing_pulse = None
+
+    def _stop_typing(self) -> None:
+        """Drop every in-flight exchange (shutdown or stand-down)."""
+        self._typing_exchanges.clear()
+        if self._typing_pulse is not None:
+            self._typing_pulse.cancel()
+            self._typing_pulse = None
+
+    async def _pulse_typing(self) -> None:
+        """Re-send the chat action until cancelled; a failed indicator is not fatal."""
+        while True:
+            with suppress(TelegramApiError, httpx.HTTPError):
+                await self._client.send_chat_action(self._chat_id, CHAT_ACTION_TYPING)
+            await asyncio.sleep(ACTIVITY_INTERVAL_SECONDS)
 
     def _record_reply_target(self, message_id: int, exchange_id: str) -> None:
         """Remember a sent message as a reply target for its exchange (bounded)."""

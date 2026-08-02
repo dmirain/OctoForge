@@ -54,6 +54,7 @@ from octoforge_telegram.bridge import (
     TelegramBridgeOptions,
 )
 from octoforge_telegram.client import (
+    CHAT_ACTION_TYPING,
     MAX_MESSAGE_LENGTH,
     MAX_RICH_MESSAGE_LENGTH,
     TELEGRAM_CHANNEL,
@@ -784,6 +785,50 @@ async def test_reply_target_map_is_bounded() -> None:
     assert len(bridge._reply_targets) == REPLY_TARGET_MAP_SIZE
     assert 0 not in bridge._reply_targets  # the oldest mappings were evicted
     assert overflow - 1 in bridge._reply_targets  # the newest survives
+
+
+async def test_typing_pulses_while_an_answer_is_in_flight() -> None:
+    """The indicator must survive a run longer than Telegram's ~5s action.
+
+    One chat action at submit time dies before a slow answer arrives, which
+    read as "sometimes the bot types, sometimes it doesn't": whether the
+    indicator was still alive depended on how fast the model was. From
+    ProcessStarted to the terminal event a pulse task re-sends it.
+    """
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge._render(
+        ProcessStarted(process_id="p1", title="one", source_client_message_id=None), "x1"
+    )
+    await wait_until(lambda: (CHAT_ID, CHAT_ACTION_TYPING) in client.actions)
+    assert bridge._typing_pulse is not None
+    assert not bridge._typing_pulse.done()
+
+    await bridge._render(Finished(message=reply()), "x1")
+
+    assert bridge._typing_pulse is None
+    assert not bridge._typing_exchanges
+
+
+async def test_typing_stops_only_when_the_last_answer_lands() -> None:
+    """With two answers in flight, the first Finished must not kill the pulse."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+
+    await bridge._render(
+        ProcessStarted(process_id="p1", title="one", source_client_message_id=None), "x1"
+    )
+    await bridge._render(
+        ProcessStarted(process_id="p2", title="two", source_client_message_id=None), "x2"
+    )
+    await bridge._render(Finished(message=reply("alpha")), "x1")
+    assert bridge._typing_pulse is not None  # the second answer is still being written
+
+    await bridge._render(Finished(message=reply("beta")), "x2")
+    assert bridge._typing_pulse is None
 
 
 async def test_concurrent_exchanges_render_into_separate_messages() -> None:

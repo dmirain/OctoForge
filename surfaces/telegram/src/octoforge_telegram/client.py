@@ -19,6 +19,9 @@ MAX_MESSAGE_LENGTH = 4096
 MAX_RICH_MESSAGE_LENGTH = 32768
 API_BASE_URL = "https://api.telegram.org"
 CHAT_ACTION_TYPING = "typing"
+# Telegram expires a chat action after ~5s, so anything slower than that
+# re-sends it on this interval to keep the indicator alive
+ACTIVITY_INTERVAL_SECONDS = 4.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 LONG_POLL_TIMEOUT_MARGIN_SECONDS = 10.0
 NOT_MODIFIED_MARKER = "message is not modified"

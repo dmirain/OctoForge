@@ -100,8 +100,7 @@ delivered. Scrollback comes from stored messages, not from replaying the stream.
 
 ### Surfaces
 
-- **Telegram: private chats only.** No groups, no forum topics, no channels. No status reactions, and the
-  typing indicator is sent once per answer rather than kept alive across a long run.
+- **Telegram: private chats only.** No groups, no forum topics, no channels. No status reactions.
 - **The Telegram update offset lives in memory**, so updates that arrive during a restart window can be missed.
 - **The web chat UI is a demo surface.** It streams the current session's events; it does not load past
   history, and it has no notion of accounts.

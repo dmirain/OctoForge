@@ -17,6 +17,7 @@ from octoforge_core.vision.api import ImageData, VisionClient
 
 from octoforge_telegram.bridge import RunnerProvider, TelegramBridge, TelegramBridgeOptions
 from octoforge_telegram.client import (
+    ACTIVITY_INTERVAL_SECONDS,
     CHAT_ACTION_TYPING,
     TELEGRAM_CHANNEL,
     USER_ID_PREFIX,
@@ -114,8 +115,6 @@ MAX_CONCURRENT_INGESTIONS = 4
 # a backlog this deep means a flood or a bug, not a person typing: no cap is
 # applied (the user's words are never dropped silently), it is only reported
 INBOX_BACKLOG_WARNING = 50
-# Telegram expires a chat action after ~5s, so slow work re-sends it
-ACTIVITY_INTERVAL_SECONDS = 4.0
 # marks a transcribed recording in the narrative: the agent must know the
 # words were heard, not typed — misheard words and false starts are expected,
 # and an ambiguous transcript is worth a question rather than a guess

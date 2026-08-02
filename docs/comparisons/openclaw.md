@@ -82,11 +82,12 @@ platform.
 
 **OctoForge.** One event stream, many renderers: a four-method surface rather than a contract with 25 of them.
 Telegram support covers throttled drafts, per-exchange reply threading, tag-safe chunking, native Rich Messages
-for tables and checklists, albums kept whole, voice transcribed as the user's own words, and an invite-based
-access gate with member attribution. Multi-user is native rather than an allowlist over a single owner.
+for tables and checklists, albums kept whole, voice transcribed as the user's own words, typing kept alive for
+as long as an answer is in flight, and an invite-based access gate with member attribution. Multi-user is
+native rather than an allowlist over a single owner.
 
-**Worth taking:** honouring `retry_after` explicitly; typing keepalive across long runs; status reactions
-instead of text status lines; persisting the last delivered draft so a restart can re-render it.
+**Worth taking:** honouring `retry_after` explicitly; status reactions instead of text status lines;
+persisting the last delivered draft so a restart can re-render it.
 
 **Deliberately not taking:** a WebSocket control plane, multi-account bots, the full channel-plugin contract.
 
