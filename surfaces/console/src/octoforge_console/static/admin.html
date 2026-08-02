@@ -202,9 +202,9 @@ const VIEWS = {
     filters: ["status"],
     statusOptions: ["", "collecting", "open", "in_progress", "awaiting_user", "answered",
       "cancelled", "failed"],
-    columns: ["user_id", "title", "статус", "вопрос", "task_id", "обновлён"],
+    columns: ["user_id", "title", "статус", "вопрос", "обновлён"],
     row: (e) => `${clip(e.user_id, "mono")}${clip(e.title)}<td>${esc(e.status)}</td>` +
-      `${clip(e.pending_question)}${clip(e.owner_task_id, "mono")}` +
+      `${clip(e.pending_question)}` +
       `<td class="mono">${time(e.updated_at)}</td>`,
   },
 };

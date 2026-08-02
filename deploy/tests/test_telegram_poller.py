@@ -40,7 +40,7 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.speech.api import AudioData, TranscriptionClient
-from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
 from octoforge_telegram.bridge import RunnerProvider
 from octoforge_telegram.client import USER_ID_PREFIX, TelegramApiError
@@ -347,7 +347,7 @@ async def make_manager(
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),
-            tasks=InMemoryTaskStore(),
+            tasks=SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
         ),

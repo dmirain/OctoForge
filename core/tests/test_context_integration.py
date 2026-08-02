@@ -33,7 +33,7 @@ from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
-from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolSpec
 from octoforge_core.tools.registry import ToolRegistry
@@ -125,7 +125,7 @@ def make_manager(
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),
-            tasks=InMemoryTaskStore(),
+            tasks=SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
         ),

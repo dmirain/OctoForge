@@ -749,9 +749,7 @@ class ConversationRunner:
         if exchange_id is not None:
             # the restarted run re-owns its obligation
             with suppress(ExchangeNotFoundError):
-                await self._exchanges.set_status(
-                    exchange_id, ExchangeStatus.IN_PROGRESS, owner_task_id=task.id
-                )
+                await self._exchanges.set_status(exchange_id, ExchangeStatus.IN_PROGRESS)
 
     async def _exchange_awaits_user(self, exchange_id: str) -> bool:
         try:
@@ -1339,7 +1337,6 @@ class ConversationRunner:
             await self._exchanges.set_status(
                 process.exchange_id,
                 ExchangeStatus.AWAITING_USER,
-                owner_task_id=process.task_id,
                 pending_question=question,
             )
         return True
@@ -1918,9 +1915,7 @@ class ConversationRunner:
                 exchange_id=exchange.id,
             ),
         )
-        await self._exchanges.set_status(
-            exchange.id, ExchangeStatus.IN_PROGRESS, owner_task_id=task.id
-        )
+        await self._exchanges.set_status(exchange.id, ExchangeStatus.IN_PROGRESS)
         narrative, watermark = await self._assemble_narrative(own_exchange_id=exchange.id)
         process = self._create_process(
             task=task,

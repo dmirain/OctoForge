@@ -68,7 +68,7 @@ from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
-from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolSpec
 from octoforge_server.prompts import FilePromptProvider
@@ -311,7 +311,7 @@ def build_third_party_root(
         http_client,
         guard,
         stores=ToolStores(
-            tasks=InMemoryTaskStore(),
+            tasks=SqlAlchemyTaskStore(session_factory),
             cron=SqlAlchemyCronStore(session_factory),
             archive=summary_store,
             summaries=summary_store,
@@ -349,7 +349,7 @@ def build_third_party_root(
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),
-            tasks=InMemoryTaskStore(),
+            tasks=SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
         ),

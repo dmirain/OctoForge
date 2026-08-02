@@ -50,7 +50,7 @@ from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import ToolSpec
 from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.registry import ToolRegistry
 
@@ -106,7 +106,7 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 def make_manager(
     session_factory: async_sessionmaker[AsyncSession],
     node_id: str = NODE,
-    tasks: InMemoryTaskStore | None = None,
+    tasks: SqlAlchemyTaskStore | None = None,
 ) -> ConversationManager:
     return ConversationManager(
         config=RunnerConfig(
@@ -119,7 +119,7 @@ def make_manager(
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),
-            tasks=tasks if tasks is not None else InMemoryTaskStore(),
+            tasks=tasks if tasks is not None else SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
         ),
@@ -161,14 +161,15 @@ async def test_recovery_leaves_alone_a_dialog_a_live_peer_is_running(
     other instance is answering, and the user's question dies mid-answer."""
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     dialog_id = await make_dialog(session_factory)
-    running = await exchanges.create(dialog_id, "peer is answering this", owner_task_id="task-1")
+    running = await exchanges.create(
+        dialog_id, "peer is answering this", status=ExchangeStatus.IN_PROGRESS
+    )
     await SqlAlchemyClaimRepository(session_factory).claim(dialog_id, PEER_NODE)
 
     await make_manager(session_factory).recover_interrupted()
 
     untouched = await exchanges.get(running.id)
     assert untouched.status is ExchangeStatus.IN_PROGRESS
-    assert untouched.owner_task_id == "task-1"
 
 
 async def test_recovery_takes_a_dialog_whose_owner_went_quiet(
@@ -176,7 +177,9 @@ async def test_recovery_takes_a_dialog_whose_owner_went_quiet(
 ) -> None:
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     dialog_id = await make_dialog(session_factory)
-    stranded = await exchanges.create(dialog_id, "its owner died", owner_task_id="task-1")
+    stranded = await exchanges.create(
+        dialog_id, "its owner died", status=ExchangeStatus.IN_PROGRESS
+    )
     await SqlAlchemyClaimRepository(session_factory).claim(dialog_id, PEER_NODE)
     await age_claim(session_factory, dialog_id, LONG_SILENCE)
 
@@ -188,7 +191,6 @@ async def test_recovery_takes_a_dialog_whose_owner_went_quiet(
 
     reopened = await exchanges.get(stranded.id)
     assert reopened.status is ExchangeStatus.OPEN
-    assert reopened.owner_task_id is None
 
 
 async def test_a_restart_recovers_its_own_work_without_waiting(
@@ -199,7 +201,9 @@ async def test_a_restart_recovers_its_own_work_without_waiting(
     wait out the staleness window would stall every restart."""
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     dialog_id = await make_dialog(session_factory)
-    stranded = await exchanges.create(dialog_id, "mine from before", owner_task_id="task-1")
+    stranded = await exchanges.create(
+        dialog_id, "mine from before", status=ExchangeStatus.IN_PROGRESS
+    )
     await SqlAlchemyClaimRepository(session_factory).claim(dialog_id, NODE)
 
     manager = make_manager(session_factory, node_id=NODE)
@@ -218,7 +222,7 @@ async def test_work_stranded_before_claims_existed_is_still_recovered(
     must not orphan whatever was already stranded in the database."""
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     dialog_id = await make_dialog(session_factory)
-    stranded = await exchanges.create(dialog_id, "no claim ever", owner_task_id="task-1")
+    stranded = await exchanges.create(dialog_id, "no claim ever", status=ExchangeStatus.IN_PROGRESS)
 
     manager = make_manager(session_factory)
     try:
@@ -237,8 +241,8 @@ async def test_recovery_splits_by_dialog_not_by_database(
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     mine_id = await make_dialog(session_factory, USER_ID)
     theirs_id = await make_dialog(session_factory, OTHER_USER_ID)
-    mine = await exchanges.create(mine_id, "mine", owner_task_id="task-1")
-    theirs = await exchanges.create(theirs_id, "theirs", owner_task_id="task-2")
+    mine = await exchanges.create(mine_id, "mine", status=ExchangeStatus.IN_PROGRESS)
+    theirs = await exchanges.create(theirs_id, "theirs", status=ExchangeStatus.IN_PROGRESS)
     await SqlAlchemyClaimRepository(session_factory).claim(theirs_id, PEER_NODE)
 
     manager = make_manager(session_factory)
@@ -255,7 +259,7 @@ async def test_an_orphaned_task_of_a_peers_dialog_is_not_restarted_here(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Restarting it would run the peer's background work a second time."""
-    tasks = InMemoryTaskStore()
+    tasks = SqlAlchemyTaskStore(session_factory)
     dialog_id = await make_dialog(session_factory)
     await tasks.add(
         Task(
@@ -360,7 +364,6 @@ async def test_a_run_refuses_to_start_once_the_dialog_has_moved(
 
         live = await exchanges.list_live(runner.dialog_id)
         assert [exchange.status for exchange in live] == [ExchangeStatus.OPEN]
-        assert all(exchange.owner_task_id is None for exchange in live)
     finally:
         await manager.stop_all()
 
@@ -411,7 +414,9 @@ async def test_taking_a_dialog_over_recovers_its_stranded_answer(
     """
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     dialog_id = await make_dialog(session_factory)
-    stranded = await exchanges.create(dialog_id, "answered by the old owner", owner_task_id="t-1")
+    stranded = await exchanges.create(
+        dialog_id, "answered by the old owner", status=ExchangeStatus.IN_PROGRESS
+    )
     await SqlAlchemyClaimRepository(session_factory).claim(dialog_id, PEER_NODE)
 
     manager = make_manager(session_factory)
@@ -483,7 +488,7 @@ async def test_a_dialog_recovered_at_startup_gets_its_surface(
     """
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     dialog_id = await make_dialog(session_factory)
-    await exchanges.create(dialog_id, "stranded by the restart", owner_task_id="task-1")
+    await exchanges.create(dialog_id, "stranded by the restart", status=ExchangeStatus.IN_PROGRESS)
 
     surface = RecordingSurface()
     manager = make_manager(session_factory)

@@ -74,7 +74,6 @@ class Exchange:
     title: str
     created_at: datetime
     updated_at: datetime
-    owner_task_id: str | None = None
     pending_question: str | None = None
 
 
@@ -88,12 +87,11 @@ class ExchangeRepository(Protocol):
         self,
         dialog_id: str,
         title: str,
-        owner_task_id: str | None = None,
         status: ExchangeStatus | None = None,
     ) -> Exchange:
-        """Open a new exchange; IN_PROGRESS when an owner is given, OPEN otherwise.
+        """Open a new exchange, OPEN unless told otherwise.
 
-        `status` overrides that default in one write: a collecting exchange
+        `status` sets the first state in the same write: a collecting exchange
         must never exist as OPEN-and-unowned, not even briefly, or the
         recovery sweep would grab it as work to do.
         """
@@ -171,21 +169,21 @@ class ExchangeRepository(Protocol):
         self,
         exchange_id: str,
         status: ExchangeStatus,
-        owner_task_id: str | None = None,
         pending_question: str | None = None,
     ) -> None:
-        """Move the exchange to `status`, replacing owner and pending question."""
+        """Move the exchange to `status`, replacing the pending question."""
         ...
 
     async def settle_owned(
         self,
         exchange_id: str,
-        owner_task_id: str,
+        task_id: str,
         status: ExchangeStatus,
         *,
         keep_if_awaiting: bool = False,
     ) -> Exchange | None:
-        """Set the status while `owner_task_id` still owns it; None when nothing was written."""
+        """Set the status while `task_id` is the exchange's newest task and it is
+        still live; None when nothing was written."""
         ...
 
     async def delete_for_dialog(self, dialog_id: str) -> None:

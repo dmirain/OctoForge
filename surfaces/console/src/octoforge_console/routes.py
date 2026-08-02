@@ -509,7 +509,6 @@ def _exchange_to_dict(item: ExchangeOverview) -> dict[str, Any]:
         "channel": item.channel,
         "status": item.status.value,
         "title": item.title,
-        "owner_task_id": item.owner_task_id,
         "pending_question": item.pending_question,
         "created_at": _iso(item.created_at),
         "updated_at": _iso(item.updated_at),

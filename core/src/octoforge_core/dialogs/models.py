@@ -104,25 +104,6 @@ class ExchangeRow(Base):
     dialog_id: Mapped[str] = mapped_column(ForeignKey("dialogs.id"), index=True)
     status: Mapped[str] = mapped_column(String, index=True)
     title: Mapped[str] = mapped_column(String)
-    # The run currently owning the exchange (NULL when nobody works on it).
-    # A real key, not a remembered string: `_settle_exchange` compares it
-    # against the settling task to tell "still mine" from "changed hands",
-    # and that comparison is only worth making if the value cannot dangle.
-    # ON DELETE SET NULL because a deleted run leaves the obligation unowned,
-    # which is what every other reader of this column already assumes.
-    owner_task_id: Mapped[str | None] = mapped_column(
-        # use_alter closes the cycle these two tables now form (a task names
-        # its exchange, an exchange names its live task): without it
-        # `create_all` cannot order the CREATEs and drops both keys from
-        # consideration with a warning.
-        ForeignKey(
-            "tasks.id",
-            ondelete="SET NULL",
-            name="fk_exchanges_owner_task_id",
-            use_alter=True,
-        ),
-        nullable=True,
-    )
     # the question the agent asked back, kept for the reminder text
     pending_question: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)

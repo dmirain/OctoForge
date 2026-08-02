@@ -95,7 +95,6 @@ class ExchangeOverview:
     channel: str
     status: ExchangeStatus
     title: str
-    owner_task_id: str | None
     pending_question: str | None
     created_at: datetime
     updated_at: datetime

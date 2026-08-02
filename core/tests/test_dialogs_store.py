@@ -708,7 +708,6 @@ async def _insert_exchange(  # noqa: PLR0913 — mirrors the ExchangeRow columns
     status: ExchangeStatus,
     created_at: datetime,
     updated_at: datetime | None = None,
-    owner_task_id: str | None = None,
     pending_question: str | None = None,
 ) -> str:
     """Insert an ExchangeRow directly, controlling `created_at`/`updated_at`.
@@ -725,7 +724,6 @@ async def _insert_exchange(  # noqa: PLR0913 — mirrors the ExchangeRow columns
                 dialog_id=dialog_id,
                 status=status.value,
                 title=title,
-                owner_task_id=owner_task_id,
                 pending_question=pending_question,
                 created_at=created_at,
                 updated_at=updated_at if updated_at is not None else created_at,
@@ -746,22 +744,20 @@ async def test_exchange_create_defaults_to_open_and_unowned(
     exchange = await repo.create(DIALOG_ID, EXCHANGE_TITLE)
 
     assert exchange.status is ExchangeStatus.OPEN
-    assert exchange.owner_task_id is None
     assert exchange.pending_question is None
     assert exchange.title == EXCHANGE_TITLE
     assert exchange.created_at.tzinfo == UTC
     assert exchange.updated_at.tzinfo == UTC
 
 
-async def test_exchange_create_with_an_owner_is_in_progress(
+async def test_exchange_create_with_an_explicit_status_starts_there(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repo = SqlAlchemyExchangeRepository(session_factory)
 
-    exchange = await repo.create(DIALOG_ID, EXCHANGE_TITLE, owner_task_id=OWNER_TASK_ID)
+    exchange = await repo.create(DIALOG_ID, EXCHANGE_TITLE, status=ExchangeStatus.IN_PROGRESS)
 
     assert exchange.status is ExchangeStatus.IN_PROGRESS
-    assert exchange.owner_task_id == OWNER_TASK_ID
 
 
 async def test_exchange_get_returns_the_created_row(
@@ -824,28 +820,23 @@ async def test_exchange_list_live_excludes_terminal_statuses_and_orders_oldest_f
     assert [item.id for item in live] == [open_id, in_progress_id, awaiting_id]
 
 
-async def test_exchange_set_status_clears_owner_and_question_when_omitted(
+async def test_exchange_set_status_clears_the_question_when_omitted(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repo = SqlAlchemyExchangeRepository(session_factory)
-    exchange = await repo.create(DIALOG_ID, EXCHANGE_TITLE, owner_task_id=OWNER_TASK_ID)
+    exchange = await repo.create(DIALOG_ID, EXCHANGE_TITLE, status=ExchangeStatus.IN_PROGRESS)
 
-    # a question is given but the owner is omitted: the owner must be cleared
     await repo.set_status(
         exchange.id, ExchangeStatus.AWAITING_USER, pending_question=PENDING_QUESTION
     )
     parked = await repo.get(exchange.id)
     assert parked.status is ExchangeStatus.AWAITING_USER
-    assert parked.owner_task_id is None
     assert parked.pending_question == PENDING_QUESTION
 
-    # a fresh owner is given but the question is omitted: the question must be cleared
-    await repo.set_status(
-        exchange.id, ExchangeStatus.IN_PROGRESS, owner_task_id=OTHER_OWNER_TASK_ID
-    )
+    # the question is omitted on resume: it must be cleared, not remembered
+    await repo.set_status(exchange.id, ExchangeStatus.IN_PROGRESS)
     resumed = await repo.get(exchange.id)
     assert resumed.status is ExchangeStatus.IN_PROGRESS
-    assert resumed.owner_task_id == OTHER_OWNER_TASK_ID
     assert resumed.pending_question is None
 
 
@@ -858,13 +849,46 @@ async def test_exchange_set_status_unknown_id_raises(
         await repo.set_status("missing", ExchangeStatus.ANSWERED)
 
 
+async def test_an_open_exchange_with_a_live_task_is_not_unowned(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """ "Unowned" is derived from the tasks: a run in PENDING/RUNNING owns its
+    exchange, a finished one does not. The window this closes is real — a
+    task is created before the exchange leaves OPEN, and the sweep must not
+    treat that instant as abandonment and spawn a second run.
+    """
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    tasks = SqlAlchemyTaskStore(session_factory)
+    owned = await repo.create(DIALOG_ID, "being started right now")
+    abandoned = await repo.create(DIALOG_ID, "its run is long done")
+    for exchange, status in ((owned, TaskStatus.RUNNING), (abandoned, TaskStatus.DONE)):
+        await tasks.add(
+            Task(
+                dialog_id=DIALOG_ID,
+                user_id=USER_ID,
+                channel=CHANNEL,
+                title=exchange.title,
+                kind=TaskKind.ANSWER,
+                exchange_id=exchange.id,
+                input={"prompt": exchange.title},
+                status=status,
+            )
+        )
+
+    unowned = await repo.list_unowned_open()
+    stranded = await repo.list_stranded_dialog_ids()
+
+    assert [item.id for item in unowned] == [abandoned.id]
+    assert stranded == [DIALOG_ID]  # via the abandoned one only
+
+
 async def test_exchange_reopen_in_progress_resets_only_those_rows(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repo = SqlAlchemyExchangeRepository(session_factory)
     open_exchange = await repo.create(DIALOG_ID, "open")
-    stranded_one = await repo.create(DIALOG_ID, "stranded one", owner_task_id=OWNER_TASK_ID)
-    stranded_two = await repo.create(DIALOG_ID, "stranded two", owner_task_id=OTHER_OWNER_TASK_ID)
+    stranded_one = await repo.create(DIALOG_ID, "stranded one", status=ExchangeStatus.IN_PROGRESS)
+    stranded_two = await repo.create(DIALOG_ID, "stranded two", status=ExchangeStatus.IN_PROGRESS)
     awaiting = await repo.create(DIALOG_ID, "awaiting")
     await repo.set_status(
         awaiting.id, ExchangeStatus.AWAITING_USER, pending_question=OTHER_PENDING_QUESTION
@@ -874,9 +898,7 @@ async def test_exchange_reopen_in_progress_resets_only_those_rows(
 
     assert reopened_count == EXPECTED_REOPENED_COUNT
     for exchange_id in (stranded_one.id, stranded_two.id):
-        reopened = await repo.get(exchange_id)
-        assert reopened.status is ExchangeStatus.OPEN
-        assert reopened.owner_task_id is None
+        assert (await repo.get(exchange_id)).status is ExchangeStatus.OPEN
     # untouched rows keep their status and fields
     assert (await repo.get(open_exchange.id)).status is ExchangeStatus.OPEN
     still_awaiting = await repo.get(awaiting.id)
@@ -890,8 +912,8 @@ async def test_exchange_reopen_in_progress_never_reaches_another_dialog(
     """The scope is the whole point: with more than one process alive, a
     global reset would reopen exchanges a peer is answering right now."""
     repo = SqlAlchemyExchangeRepository(session_factory)
-    mine = await repo.create(DIALOG_ID, "mine", owner_task_id=OWNER_TASK_ID)
-    theirs = await repo.create(OTHER_DIALOG_ID, "theirs", owner_task_id=OTHER_OWNER_TASK_ID)
+    mine = await repo.create(DIALOG_ID, "mine", status=ExchangeStatus.IN_PROGRESS)
+    theirs = await repo.create(OTHER_DIALOG_ID, "theirs", status=ExchangeStatus.IN_PROGRESS)
 
     reopened_count = await repo.reopen_in_progress(DIALOG_ID)
 
@@ -899,7 +921,6 @@ async def test_exchange_reopen_in_progress_never_reaches_another_dialog(
     assert (await repo.get(mine.id)).status is ExchangeStatus.OPEN
     untouched = await repo.get(theirs.id)
     assert untouched.status is ExchangeStatus.IN_PROGRESS
-    assert untouched.owner_task_id == OTHER_OWNER_TASK_ID
 
 
 async def test_exchange_delete_for_dialog_scopes_to_one_dialog(
@@ -950,7 +971,7 @@ async def test_exchange_set_title_on_a_missing_row_is_a_noop(
     await repo.set_title("no-such-exchange", "a name")
 
 
-async def test_exchange_create_with_collecting_status_has_no_owner(
+async def test_exchange_create_with_collecting_status_starts_collecting(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """A `status=` override wins over the owner-based default: COLLECTING must
@@ -961,7 +982,6 @@ async def test_exchange_create_with_collecting_status_has_no_owner(
     exchange = await repo.create(DIALOG_ID, COLLECTING_TITLE, status=ExchangeStatus.COLLECTING)
 
     assert exchange.status is ExchangeStatus.COLLECTING
-    assert exchange.owner_task_id is None
     assert exchange.title == COLLECTING_TITLE
 
 

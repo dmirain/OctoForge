@@ -321,7 +321,7 @@ async def test_exchanges_join_dialog_identity_and_filter(
     alice = await dialogs.get_or_create(USER_A, CHANNEL)
     bob = await dialogs.get_or_create(USER_B, TELEGRAM)
     await exchanges.create(alice.id, "alice question")
-    waiting = await exchanges.create(bob.id, "bob question", owner_task_id="t1")
+    waiting = await exchanges.create(bob.id, "bob question", status=ExchangeStatus.IN_PROGRESS)
     await exchanges.set_status(
         waiting.id,
         ExchangeStatus.AWAITING_USER,
@@ -343,4 +343,3 @@ async def test_exchanges_join_dialog_identity_and_filter(
     assert awaiting_only.total == 1
     assert awaiting_only.items[0].pending_question == "which one?"
     assert awaiting_only.items[0].status == ExchangeStatus.AWAITING_USER
-    assert awaiting_only.items[0].owner_task_id is None

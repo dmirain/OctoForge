@@ -10,13 +10,14 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import ColumnElement, case, delete, func, insert, select, update
+from sqlalchemy import ColumnElement, Exists, case, delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.dml import ReturningInsert
+from sqlalchemy.sql.selectable import ScalarSelect
 
 from octoforge_core.context.api import NO_COMPACTED_SEQ
 from octoforge_core.context.models import SummaryRow
@@ -44,6 +45,8 @@ from octoforge_core.domain import (
     ToolCall,
 )
 from octoforge_core.llm.usage import Usage
+from octoforge_core.tasks.api import TaskStatus
+from octoforge_core.tasks.models import TaskRow
 from octoforge_core.time import utc_now
 
 # A lost seq race (concurrent writers reading the same MAX(seq) before either
@@ -391,6 +394,42 @@ class SqlAlchemyMessageRepository:
             ]
 
 
+def _has_live_task() -> Exists:
+    """Correlated EXISTS: a run of this exchange is still pending or running.
+
+    This is what "somebody owns it" now means. The exchange used to carry an
+    `owner_task_id` pointer kept true by hand at every start, reopen and
+    cancel; the tasks already record the same fact in the direction the
+    schema runs (a task names its exchange), so the pointer was a second
+    copy of an answer the database had. It was also wrong in one window this
+    is right in: a task is created before the exchange flips to IN_PROGRESS,
+    and in that instant the column said "free" while a run was starting.
+    """
+    return (
+        select(TaskRow.id)
+        .where(
+            TaskRow.exchange_id == ExchangeRow.id,
+            TaskRow.status.in_((TaskStatus.PENDING.value, TaskStatus.RUNNING.value)),
+        )
+        .exists()
+    )
+
+
+def _newest_task_of(exchange_id: str) -> ScalarSelect[str]:
+    """Scalar subquery: the id of the exchange's most recent task.
+
+    The tiebreak on id makes the order total; two tasks of one exchange born
+    in the same clock tick would otherwise leave "newest" to chance.
+    """
+    return (
+        select(TaskRow.id)
+        .where(TaskRow.exchange_id == exchange_id)
+        .order_by(TaskRow.created_at.desc(), TaskRow.id.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+
+
 class SqlAlchemyExchangeRepository:
     """Exchanges of a dialog: the durable obligation state."""
 
@@ -401,18 +440,16 @@ class SqlAlchemyExchangeRepository:
         self,
         dialog_id: str,
         title: str,
-        owner_task_id: str | None = None,
         status: ExchangeStatus | None = None,
     ) -> Exchange:
-        """Open a new exchange; IN_PROGRESS when an owner is given, OPEN otherwise."""
-        resolved = status or (ExchangeStatus.IN_PROGRESS if owner_task_id else ExchangeStatus.OPEN)
+        """Open a new exchange, OPEN unless told otherwise."""
+        resolved = status or ExchangeStatus.OPEN
         async with self._session_factory() as session:
             row = ExchangeRow(
                 id=uuid.uuid4().hex,
                 dialog_id=dialog_id,
                 status=resolved.value,
                 title=title[:TITLE_MAX_LENGTH],
-                owner_task_id=owner_task_id,
             )
             session.add(row)
             await session.commit()
@@ -493,7 +530,7 @@ class SqlAlchemyExchangeRepository:
             select(ExchangeRow)
             .where(
                 ExchangeRow.status == ExchangeStatus.OPEN.value,
-                ExchangeRow.owner_task_id.is_(None),
+                ~_has_live_task(),
             )
             .order_by(ExchangeRow.created_at)
         )
@@ -510,10 +547,7 @@ class SqlAlchemyExchangeRepository:
                 select(ExchangeRow.dialog_id)
                 .where(
                     (ExchangeRow.status == ExchangeStatus.IN_PROGRESS.value)
-                    | (
-                        (ExchangeRow.status == ExchangeStatus.OPEN.value)
-                        & ExchangeRow.owner_task_id.is_(None)
-                    )
+                    | ((ExchangeRow.status == ExchangeStatus.OPEN.value) & ~_has_live_task())
                 )
                 .distinct()
             )
@@ -530,7 +564,7 @@ class SqlAlchemyExchangeRepository:
                         ExchangeRow.dialog_id == dialog_id,
                         ExchangeRow.status == ExchangeStatus.IN_PROGRESS.value,
                     )
-                    .values(status=ExchangeStatus.OPEN.value, owner_task_id=None)
+                    .values(status=ExchangeStatus.OPEN.value)
                 ),
             )
             await session.commit()
@@ -540,7 +574,6 @@ class SqlAlchemyExchangeRepository:
         self,
         exchange_id: str,
         status: ExchangeStatus,
-        owner_task_id: str | None = None,
         pending_question: str | None = None,
     ) -> None:
         """Write the exchange's status; raise if there is no such exchange.
@@ -557,7 +590,6 @@ class SqlAlchemyExchangeRepository:
                     .where(ExchangeRow.id == exchange_id)
                     .values(
                         status=status.value,
-                        owner_task_id=owner_task_id,
                         pending_question=pending_question,
                     )
                 ),
@@ -569,32 +601,44 @@ class SqlAlchemyExchangeRepository:
     async def settle_owned(
         self,
         exchange_id: str,
-        owner_task_id: str,
+        task_id: str,
         status: ExchangeStatus,
         *,
         keep_if_awaiting: bool = False,
     ) -> Exchange | None:
-        """Move the exchange to `status`, but only while `owner_task_id` still owns it.
+        """Move the exchange to `status`, but only if `task_id` still owns it.
 
         Returns the settled exchange, or None when nothing was written — the
-        exchange is gone, it changed hands, or it is parked on the user's
-        answer and this settle was told to leave that alone.
+        exchange is gone, it changed hands, it is already settled, or it is
+        parked on the user's answer and this settle was told to leave that
+        alone.
 
-        The guard belongs in the WHERE clause, not in a preceding SELECT.
-        Read-then-write left a window in which a follow-up could take the
-        exchange over between the check and the write, and the write would
-        then clobber a live run's ownership — the very thing the check was
-        there to prevent. One statement closes it, and saves a round trip
-        while doing so.
+        "Still owns it" is two conditions, and both carry weight:
+
+        - **`task_id` is the exchange's newest task.** Ownership used to be a
+          pointer on the exchange; the tasks record the same fact in the
+          direction the schema runs. It has to be an identity comparison, not
+          "is anything live" — a run that finished still owns an exchange
+          parked on the user's answer, and a stale termination arriving after
+          a follow-up spawned a fresh task must find itself outvoted.
+        - **The exchange is still live.** A user cancel settles the exchange
+          directly, on the user's authority, without touching any task; the
+          cancelled run's own termination then still holds the newest task,
+          and without this condition it would resurrect what the user closed.
+          The old pointer encoded this by being cleared on cancel.
+
+        Both ride in the WHERE clause. Read-then-write left a window in which
+        a follow-up could take the exchange over between the check and the
+        write; inside one statement there is none.
 
         `keep_if_awaiting` is the AWAITING_USER carve-out: a run that asked
         the user something leaves the obligation open, and overwriting it
-        would drop the pending question. A predicate rather than a branch,
-        because deciding it in Python is what needed the read.
+        would drop the pending question.
         """
         conditions = [
             ExchangeRow.id == exchange_id,
-            ExchangeRow.owner_task_id == owner_task_id,
+            _newest_task_of(exchange_id) == task_id,
+            ExchangeRow.status.in_(tuple(item.value for item in LIVE_EXCHANGE_STATUSES)),
         ]
         if keep_if_awaiting:
             conditions.append(ExchangeRow.status != ExchangeStatus.AWAITING_USER.value)
@@ -603,7 +647,7 @@ class SqlAlchemyExchangeRepository:
                 await session.scalars(
                     update(ExchangeRow)
                     .where(*conditions)
-                    .values(status=status.value, owner_task_id=None, pending_question=None)
+                    .values(status=status.value, pending_question=None)
                     .returning(ExchangeRow)
                 )
             ).first()
@@ -732,7 +776,6 @@ def _to_exchange(row: ExchangeRow) -> Exchange:
         dialog_id=row.dialog_id,
         status=ExchangeStatus(row.status),
         title=row.title,
-        owner_task_id=row.owner_task_id,
         pending_question=row.pending_question,
         created_at=row.created_at,
         updated_at=row.updated_at,

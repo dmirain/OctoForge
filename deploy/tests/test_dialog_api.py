@@ -37,7 +37,7 @@ from octoforge_core.domain import Attachment, AttachmentKind, MessageKind, Messa
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
-from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_server.api.dialog import SSE_MEDIA_TYPE, STATUS_ACCEPTED
 from octoforge_server.api.dialog import cancel as cancel_endpoint
 from octoforge_server.api.dialog import events as events_endpoint
@@ -140,7 +140,7 @@ async def make_manager(
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),
-            tasks=InMemoryTaskStore(),
+            tasks=SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
         ),

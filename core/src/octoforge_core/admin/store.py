@@ -444,7 +444,6 @@ def _to_exchange_overview(row: ExchangeRow, user_id: str, channel: str) -> Excha
         channel=channel,
         status=ExchangeStatus(row.status),
         title=row.title,
-        owner_task_id=row.owner_task_id,
         pending_question=row.pending_question,
         created_at=row.created_at,
         updated_at=row.updated_at,

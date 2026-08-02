@@ -40,7 +40,7 @@ from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
 from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
-from octoforge_core.tasks.store import InMemoryTaskStore
+from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 from octoforge_telegram import bridge as bridge_module
@@ -316,7 +316,7 @@ async def make_manager(
     llm_client: LLMClient,
     session_factory: async_sessionmaker[AsyncSession],
     registry: ToolRegistry | None = None,
-    tasks: InMemoryTaskStore | None = None,
+    tasks: SqlAlchemyTaskStore | None = None,
 ) -> ConversationManager:
     loop = AgentLoop(
         llm_client=llm_client,
@@ -334,7 +334,7 @@ async def make_manager(
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),
-            tasks=tasks if tasks is not None else InMemoryTaskStore(),
+            tasks=tasks if tasks is not None else SqlAlchemyTaskStore(session_factory),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
         ),
@@ -376,7 +376,7 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     down is silently stamped delivered and never shown.
     """
     client = FakeTelegramClient()
-    tasks = InMemoryTaskStore()
+    tasks = SqlAlchemyTaskStore(session_factory)
     manager = await make_manager(ScriptedLLM([]), session_factory, tasks=tasks)
     dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(
         TELEGRAM_USER_ID, TELEGRAM_CHANNEL
@@ -398,14 +398,22 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     await asyncio.sleep(POLL_SECONDS * 5)
 
     assert client.sent == []
-    assert task.delivered_at is None
+    assert (await tasks.get(task.id)).delivered_at is None
 
     bridge = make_bridge(client, manager)
     await bridge.start()  # what the manager's attach does once the actor exists
 
     await wait_until(lambda: client.sent != [])
     assert client.sent == [(CHAT_ID, CRON_RESULT)]
-    await wait_until(lambda: task.delivered_at is not None)
+
+    async def stamped() -> bool:
+        return (await tasks.get(task.id)).delivered_at is not None
+
+    # the SQL store hands out fresh rows, not aliases: poll it, not the object
+    deadline = asyncio.get_running_loop().time() + WAIT_TIMEOUT_SECONDS
+    while not await stamped():
+        assert asyncio.get_running_loop().time() < deadline, "never stamped delivered"
+        await asyncio.sleep(POLL_SECONDS)
     await bridge.aclose()
     await manager.stop_all()
 
