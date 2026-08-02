@@ -127,8 +127,8 @@ With one instance this changes nothing — `held_elsewhere()` never returns your
 - **Background work never takes a dialog.** A cron firing or a settled collection is acted on by
   the instance that already owns the dialog, or by anyone if nobody does. Only a message moves a
   conversation, because only a message was routed.
-- **`reopen_in_progress` is scoped to one dialog.** There is no way to express the global reset that
-  a single-process world could afford.
+- **`reopen_and_list_stranded` is scoped to one dialog.** There is no way to express the global
+  reset that a single-process world could afford.
 - **A stand-down is not a failure and not a user cancellation.** No error reaches the user; the work
   moved, and the new owner's recovery picks it up.
 - **A stood-down runner never speaks again.** Subscribing to one hands back an already-closed queue

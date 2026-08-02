@@ -114,13 +114,21 @@ class LlmContextCompactor(ContextCompactor):
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
         """Return `[topics block?] + hot tail`; trigger compaction on overflow.
 
-        The summaries are read once. The boundary used to be a second query
-        against the same table for `max(seq_to)` — the same fact these rows
-        already carry, bought with a round trip.
+        The two reads are independent: the summaries carry their own boundary
+        and the tail counter derives the same boundary in a subquery, so
+        neither waits for the other. The counter reports which boundary it
+        counted against — when a background compaction commits between the
+        reads the boundaries disagree, and the summaries are read again. One
+        re-read is enough: the boundary only moves forward, so afterwards the
+        topics block covers at least everything the counter trimmed — the
+        tail may then overlap the topics (harmless), never leave a gap.
         """
         summaries = await self._store.list_for_dialog(dialog.id)
+        tail_count, counted_boundary = await self._archive.count_hot_tail(dialog.id)
         max_seq_to = max((summary.seq_to for summary in summaries), default=NO_COMPACTED_SEQ)
-        tail_count = await self._archive.count_after(dialog.id, max_seq_to)
+        if counted_boundary != max_seq_to:
+            summaries = await self._store.list_for_dialog(dialog.id)
+            max_seq_to = max((summary.seq_to for summary in summaries), default=NO_COMPACTED_SEQ)
         # the snapshot moment: everything below is computed from `tail` and
         # `snapshot_len`, never from the live list again — the awaits that
         # follow may interleave with appends to `history`

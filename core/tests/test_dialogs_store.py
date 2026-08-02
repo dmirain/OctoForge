@@ -876,7 +876,7 @@ async def test_an_open_exchange_with_a_live_task_is_not_unowned(
     assert stranded == [DIALOG_ID]  # via the abandoned one only
 
 
-async def test_exchange_reopen_in_progress_resets_only_those_rows(
+async def test_exchange_reopen_resets_only_those_rows_and_lists_them(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repo = SqlAlchemyExchangeRepository(session_factory)
@@ -888,9 +888,12 @@ async def test_exchange_reopen_in_progress_resets_only_those_rows(
         awaiting.id, ExchangeStatus.AWAITING_USER, pending_question=OTHER_PENDING_QUESTION
     )
 
-    reopened_count = await repo.reopen_in_progress(DIALOG_ID)
+    reopened_count, stranded = await repo.reopen_and_list_stranded(DIALOG_ID)
 
     assert reopened_count == EXPECTED_REOPENED_COUNT
+    # the just-reopened rows come back in the stranded list, beside the
+    # already-open unowned one — the same fact recovery would query for
+    assert {item.id for item in stranded} == {open_exchange.id, stranded_one.id, stranded_two.id}
     for exchange_id in (stranded_one.id, stranded_two.id):
         assert (await repo.get(exchange_id)).status is ExchangeStatus.OPEN
     # untouched rows keep their status and fields
@@ -900,7 +903,31 @@ async def test_exchange_reopen_in_progress_resets_only_those_rows(
     assert still_awaiting.pending_question == OTHER_PENDING_QUESTION
 
 
-async def test_exchange_reopen_in_progress_never_reaches_another_dialog(
+async def test_exchange_reopen_skips_an_open_exchange_with_a_live_task(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The stranded list is ownership-aware: an exchange somebody's live run
+    is already answering must not be handed to the revive sweep."""
+    repo = SqlAlchemyExchangeRepository(session_factory)
+    tasks = SqlAlchemyTaskStore(session_factory)
+    being_answered = await repo.create(DIALOG_ID, "being answered")
+    await tasks.add(
+        Task(
+            dialog_id=DIALOG_ID,
+            title=being_answered.title,
+            kind=TaskKind.ANSWER,
+            exchange_id=being_answered.id,
+            input={"prompt": being_answered.title},
+            status=TaskStatus.RUNNING,
+        )
+    )
+
+    _, stranded = await repo.reopen_and_list_stranded(DIALOG_ID)
+
+    assert stranded == []
+
+
+async def test_exchange_reopen_never_reaches_another_dialog(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """The scope is the whole point: with more than one process alive, a
@@ -909,9 +936,10 @@ async def test_exchange_reopen_in_progress_never_reaches_another_dialog(
     mine = await repo.create(DIALOG_ID, "mine", status=ExchangeStatus.IN_PROGRESS)
     theirs = await repo.create(OTHER_DIALOG_ID, "theirs", status=ExchangeStatus.IN_PROGRESS)
 
-    reopened_count = await repo.reopen_in_progress(DIALOG_ID)
+    reopened_count, stranded = await repo.reopen_and_list_stranded(DIALOG_ID)
 
     assert reopened_count == 1
+    assert [item.id for item in stranded] == [mine.id]
     assert (await repo.get(mine.id)).status is ExchangeStatus.OPEN
     untouched = await repo.get(theirs.id)
     assert untouched.status is ExchangeStatus.IN_PROGRESS

@@ -101,16 +101,29 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
         summaries = await self.list_for_dialog(dialog_id)
         return [s for s in summaries if needle in {tag.lower() for tag in s.topics}]
 
-    async def count_after(self, dialog_id: str, seq: int) -> int:
-        """Return how many messages the dialog has with `seq >` the given one."""
+    async def count_hot_tail(self, dialog_id: str) -> tuple[int, int]:
+        """`(count, boundary)`: messages past the compaction boundary, and that boundary.
+
+        Same shape as `list_hot_slice` on the messages store: the boundary is
+        a subquery, not a second round trip, and both facts come from the one
+        statement.
+        """
+        boundary = (
+            select(func.coalesce(func.max(SummaryRow.seq_to), NO_COMPACTED_SEQ))
+            .where(SummaryRow.dialog_id == dialog_id)
+            .scalar_subquery()
+        )
         async with read_session(self._session_factory) as session:
-            count = await session.scalar(
-                select(func.count(MessageRow.id)).where(
-                    MessageRow.dialog_id == dialog_id,
-                    MessageRow.seq > seq,
+            row = (
+                await session.execute(
+                    select(
+                        func.count(MessageRow.id).filter(MessageRow.seq > boundary),
+                        boundary,
+                    ).where(MessageRow.dialog_id == dialog_id)
                 )
-            )
-            return int(count or 0)
+            ).one()
+            count, counted_boundary = row
+            return int(count or 0), int(counted_boundary)
 
     async def tail_after(
         self, dialog_id: str, seq: int, limit: int | None = None

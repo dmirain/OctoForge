@@ -165,8 +165,15 @@ class ArchiveFilter:
 class MessageArchive(Protocol):
     """Read port over the full message archive (level 1), scoped to one dialog."""
 
-    async def count_after(self, dialog_id: str, seq: int) -> int:
-        """Return how many messages the dialog has with `seq >` the given one."""
+    async def count_hot_tail(self, dialog_id: str) -> tuple[int, int]:
+        """`(count, boundary)`: messages past the compaction boundary, and that boundary.
+
+        The boundary rides in a subquery rather than a parameter, so this
+        read does not depend on a summaries read and the two can run side by
+        side. It comes back with the count because the caller pairs this
+        with its own summaries read: seeing which boundary was counted
+        against is what lets it detect a compaction landing in between.
+        """
         ...
 
     async def tail_after(

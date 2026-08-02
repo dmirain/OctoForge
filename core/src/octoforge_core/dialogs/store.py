@@ -563,8 +563,14 @@ class SqlAlchemyExchangeRepository:
             )
             return list(result.all())
 
-    async def reopen_in_progress(self, dialog_id: str) -> int:
-        """Reset the dialog's IN_PROGRESS exchanges to OPEN; return how many."""
+    async def reopen_and_list_stranded(self, dialog_id: str) -> tuple[int, ExchangeList]:
+        """Reset the dialog's IN_PROGRESS exchanges to OPEN; return `(reopened, stranded)`.
+
+        One transaction, two statements — SQLite has no data-modifying CTE,
+        so they cannot be one. The SELECT runs on the same session and sees
+        the uncommitted UPDATE, so the just-reopened exchanges are in
+        `stranded` (they have no live task — that is why they were reset).
+        """
         async with write_session(self._session_factory) as session:
             result = cast(
                 "CursorResult[Any]",
@@ -577,7 +583,16 @@ class SqlAlchemyExchangeRepository:
                     .values(status=ExchangeStatus.OPEN.value)
                 ),
             )
-            return result.rowcount or 0
+            stranded = await session.scalars(
+                select(ExchangeRow)
+                .where(
+                    ExchangeRow.dialog_id == dialog_id,
+                    ExchangeRow.status == ExchangeStatus.OPEN.value,
+                    ~_has_live_task(),
+                )
+                .order_by(ExchangeRow.created_at)
+            )
+            return result.rowcount or 0, [_to_exchange(row) for row in stranded.all()]
 
     async def set_status(
         self,

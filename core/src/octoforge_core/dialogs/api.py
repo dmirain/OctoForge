@@ -153,15 +153,19 @@ class ExchangeRepository(Protocol):
         """
         ...
 
-    async def reopen_in_progress(self, dialog_id: str) -> int:
-        """Reset the dialog's IN_PROGRESS exchanges to OPEN; return how many.
+    async def reopen_and_list_stranded(self, dialog_id: str) -> tuple[int, ExchangeList]:
+        """Reset the dialog's IN_PROGRESS exchanges to OPEN; return `(reopened, stranded)`.
 
-        Scoped to one dialog on purpose. This used to reset every row in the
-        database on the reasoning that a restart kills every process — true
-        of one process, and catastrophic with two: a starting instance would
-        reset exchanges its peers are running right now. The caller must
-        establish that nobody live owns the dialog (`held_elsewhere`) before
-        calling this.
+        `stranded` is the dialog's OPEN exchanges without a live task, the
+        just-reopened ones included — recovery always asks both questions
+        together, so they share one transaction.
+
+        Scoped to one dialog on purpose. The reset used to touch every row in
+        the database on the reasoning that a restart kills every process —
+        true of one process, and catastrophic with two: a starting instance
+        would reset exchanges its peers are running right now. The caller
+        must establish that nobody live owns the dialog (`held_elsewhere`)
+        before calling this.
         """
         ...
 

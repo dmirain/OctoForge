@@ -1042,8 +1042,10 @@ class ConversationRunner:
         if message.kind is MessageKind.MATERIAL:
             await self._collect_material(message, command)
             return
-        decision = await self._route(message, command)
-        await self._apply_route(message, decision, command)
+        # one read serves both the routing decision and the nudge after it
+        live = await self._exchanges.list_live(self._dialog.id)
+        decision = await self._route(message, command, live)
+        await self._apply_route(message, decision, command, live)
 
     async def _collect_material(self, message: ChatMessage, command: _Submit) -> None:
         """Take in forwarded material: it owes nothing, so nothing starts.
@@ -1225,7 +1227,9 @@ class ConversationRunner:
         await self._exchanges.set_status(target.id, ExchangeStatus.OPEN)
         await self._resume_open_exchange(target.id, notify_limit=False)
 
-    async def _route(self, message: ChatMessage, command: _Submit) -> RouteDecision:
+    async def _route(
+        self, message: ChatMessage, command: _Submit, live: ExchangeList
+    ) -> RouteDecision:
         """Decide which exchange the message belongs to (deterministic first).
 
         Three shortcuts skip the LLM entirely: an explicit transport-level
@@ -1234,8 +1238,10 @@ class ConversationRunner:
         forward is that forward's ("forward, then ask" — see
         `_sole_fresh_collection`). Everything else goes to the router, which
         sees exchanges (user-visible obligations), not process ids.
+
+        `live` comes from the caller: the same read serves this decision and
+        the nudge that follows it.
         """
-        live = await self._exchanges.list_live(self._dialog.id)
         live_ids = {item.id for item in live}
         if command.reply_to_exchange_id in live_ids:
             logger.info(
@@ -1687,7 +1693,11 @@ class ConversationRunner:
                         self._pending_deliveries.remove(delivery)
 
     async def _apply_route(
-        self, message: ChatMessage, decision: RouteDecision, command: _Submit
+        self,
+        message: ChatMessage,
+        decision: RouteDecision,
+        command: _Submit,
+        live: ExchangeList,
     ) -> None:
         """Attach the message to its exchange and make sure someone owes an answer.
 
@@ -1732,7 +1742,7 @@ class ConversationRunner:
                 cancel_epoch=command.cancel_epoch,
                 known=created,
             )
-        await self._nudge_stale_exchanges(exchange_id)
+        await self._nudge_stale_exchanges(exchange_id, live, cancelled)
 
     async def _retitle(self, exchange_id: str, title: str | None) -> None:
         """Rename an exchange a message just joined; never fatal.
@@ -1810,17 +1820,31 @@ class ConversationRunner:
                     return
                 await self._start_answer(exchange, message, client_key, cancel_epoch=cancel_epoch)
 
-    async def _nudge_stale_exchanges(self, current_exchange_id: str | None) -> None:
+    async def _nudge_stale_exchanges(
+        self,
+        current_exchange_id: str | None,
+        live: ExchangeList,
+        cancelled: set[str],
+    ) -> None:
         """Remind the user about a question they left hanging (event-driven).
 
         Fires when a new message arrives while some other exchange has been
         waiting for a reply longer than `NUDGE_AFTER_SECONDS` — as its own
         message, quoting the agent's own pending question.
+
+        `live` is this intake's routing read, not a fresh one: between the
+        two moments the set changes only through this coroutine's own hands
+        (`cancelled` and the current exchange, both excluded here), and a
+        cosmetic reminder does not get a round trip of its own. A run
+        settling an AWAITING_USER exchange concurrently could slip a stale
+        reminder through — exactly as it could with a fresh read a
+        millisecond older.
         """
         now = utc_now()
-        for exchange in await self._exchanges.list_live(self._dialog.id):
+        for exchange in live:
             if (
                 exchange.id == current_exchange_id
+                or exchange.id in cancelled
                 or exchange.status is not ExchangeStatus.AWAITING_USER
                 or exchange.pending_question is None
                 or (now - exchange.updated_at).total_seconds() < NUDGE_AFTER_SECONDS
@@ -2630,7 +2654,7 @@ class ConversationManager:
         tries again.
         """
         dialog_id = runner.dialog_id
-        reopened = await self._reopen_stranded_exchanges(dialog_id)
+        reopened, stranded = await self._reopen_and_list_stranded(dialog_id)
         # both sets in one lookup: they are the same table under the same
         # dialog, and asking twice costs a round trip that buys nothing
         orphaned, undelivered = await self._for_recovery(dialog_id)
@@ -2639,7 +2663,18 @@ class ConversationManager:
                 await runner.restart_task(task)
             except Exception:
                 logger.exception("orphaned task restart failed: task=%s", task.id)
-        revived = await self._revive_unowned_open(runner)
+        # after the orphan restarts on purpose: the sweep re-derives what is
+        # still unowned at revive time, so restarted work is not re-answered.
+        # `stranded` (read before the restarts) only decides whether to sweep
+        # at all — a restart never makes a new exchange unowned, so an empty
+        # list stays empty.
+        revived = 0
+        if stranded:
+            try:
+                await runner.resume_stranded()
+                revived = len(stranded)
+            except Exception:
+                logger.exception("stranded exchange revive failed: dialog=%s", dialog_id)
         for task in undelivered:
             runner.request_result_delivery(task.id)
         if reopened or revived:
@@ -2852,41 +2887,22 @@ class ConversationManager:
             logger.exception("undelivered task sweep failed: dialog=%s", dialog_id)
             return []
 
-    async def _revive_unowned_open(self, runner: ConversationRunner) -> int:
-        """Give the dialog's unowned OPEN exchanges back to its own sweep.
-
-        Runs after the orphan restarts (which re-own their exchanges), so
-        whatever is still unowned here is a genuine leftover: an exchange
-        created whose run never came to exist, or one its owner abandoned.
-        """
-        try:
-            stranded = await self._exchanges.list_unowned_open(runner.dialog_id)
-        except Exception:
-            logger.exception("unowned-open sweep failed: dialog=%s", runner.dialog_id)
-            return 0
-        revived = 0
-        for exchange in stranded:
-            try:
-                await runner.resume_stranded()
-                revived += 1
-            except Exception:
-                logger.exception("stranded exchange revive failed: exchange=%s", exchange.id)
-        return revived
-
-    async def _reopen_stranded_exchanges(self, dialog_id: str) -> int:
-        """Reset the dialog's obligations whose owner died; return how many.
+    async def _reopen_and_list_stranded(self, dialog_id: str) -> tuple[int, ExchangeList]:
+        """Reset the dialog's obligations whose owner died; return `(reopened, stranded)`.
 
         An IN_PROGRESS exchange of a dialog nobody live owns is stale: its
         executor lived in a process that is gone. A settle that failed
         mid-write would otherwise strand it forever, invisible to the
         OPEN-based predicate. AWAITING_USER is left alone: that one waits for
-        a human.
+        a human. `stranded` — the OPEN exchanges without a live task, the
+        just-reopened ones included — comes from the same transaction,
+        because recovery always asks both questions together.
         """
         try:
-            return await self._exchanges.reopen_in_progress(dialog_id)
+            return await self._exchanges.reopen_and_list_stranded(dialog_id)
         except Exception:  # recovery must never take the app down
             logger.exception("stranded exchange sweep failed: dialog=%s", dialog_id)
-            return 0
+            return 0, []
 
     async def evict(self, user_id: str, channel: str) -> None:
         """Stop and deregister the dialog's runner, if any (admin dialog deletion).

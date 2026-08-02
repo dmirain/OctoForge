@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.context.api import ArchiveFilter, DialogueSummary
+from octoforge_core.context.api import NO_COMPACTED_SEQ, ArchiveFilter, DialogueSummary
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import MessageRow
@@ -162,7 +162,11 @@ async def test_count_and_tail_after_the_boundary(
     for seq in (1, 2, 3):
         await add_message(session_factory, dialog_id, seq, f"message {seq}")
 
-    assert await store.count_after(dialog_id, 1) == TWO_MESSAGES
+    # nothing compacted: the whole dialog is the tail, boundary is the sentinel
+    assert await store.count_hot_tail(dialog_id) == (3, NO_COMPACTED_SEQ)
+    # the counter derives the boundary from the summaries on its own
+    await store.create(make_summary(dialog_id, 1, 1))
+    assert await store.count_hot_tail(dialog_id) == (TWO_MESSAGES, 1)
     tail = await store.tail_after(dialog_id, 1)
     assert [(m.seq, m.content) for m in tail] == [(2, "message 2"), (3, "message 3")]
     assert tail[0].role is MessageRole.USER
