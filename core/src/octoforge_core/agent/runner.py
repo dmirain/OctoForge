@@ -1086,7 +1086,7 @@ class ConversationRunner:
         answering = [
             item
             for item in await self._exchanges.list_live(self._dialog.id)
-            if item.owner_task_id in self._processes
+            if self._live_process_for(item.id) is not None
         ]
         if answering:
             return max(answering, key=lambda item: item.updated_at)
@@ -1224,7 +1224,7 @@ class ConversationRunner:
                 await self._messages.set_exchange(message.id, target.id)
         await self._exchanges.set_status(collection.id, ExchangeStatus.CANCELLED)
         await self._exchanges.touch(target.id)
-        if target.owner_task_id in self._processes:
+        if self._live_process_for(target.id) is not None:
             return  # a live run pulls the material in at its next sync
         await self._exchanges.set_status(target.id, ExchangeStatus.OPEN)
         await self._resume_open_exchange(target.id, notify_limit=False)
@@ -1410,7 +1410,7 @@ class ConversationRunner:
         for exchange in await self._exchanges.list_live(self._dialog.id):
             parked = (
                 exchange.status is ExchangeStatus.AWAITING_USER
-                and exchange.owner_task_id not in self._processes
+                and self._live_process_for(exchange.id) is None
             )
             # a stop also drops material waiting for a reaction: the user
             # said "never mind", so the collection must not fire later
@@ -1545,7 +1545,10 @@ class ConversationRunner:
                 # re-read INSIDE the lock: a sweep and a settle may both try
                 # to revive the same exchange — the second must see the first
                 exchange = await self._exchanges.get(exchange_id)
-                if exchange.status is not ExchangeStatus.OPEN or exchange.owner_task_id is not None:
+                if (
+                    exchange.status is not ExchangeStatus.OPEN
+                    or self._live_process_for(exchange_id) is not None
+                ):
                     return
                 if self._exceeds_limit(set()):
                     if notify_limit:
@@ -1760,13 +1763,19 @@ class ConversationRunner:
             )
 
     async def _cancel_exchanges(self, exchange_ids: tuple[str, ...]) -> set[str]:
-        """Cancel the named exchanges and their live runs; return what was cancelled."""
+        """Cancel the named exchanges and their live runs; return what was cancelled.
+
+        The exchange is no longer read first: it was read for its owner, and
+        the run answering it is something this process knows without asking.
+        A missing row still surfaces — from the write, which raises the same
+        error the read did.
+        """
         cancelled: set[str] = set()
         for exchange_id in exchange_ids:
             with suppress(ExchangeNotFoundError):
-                exchange = await self._exchanges.get(exchange_id)
-                if exchange.owner_task_id is not None:
-                    self._cancel_process(exchange.owner_task_id)
+                answering = self._live_process_for(exchange_id)
+                if answering is not None:
+                    self._cancel_process(answering.task_id)
                 await self._exchanges.set_status(exchange_id, ExchangeStatus.CANCELLED)
                 cancelled.add(exchange_id)
         return cancelled
@@ -1798,9 +1807,9 @@ class ConversationRunner:
             async with self._spawn_lock:
                 # read the exchange INSIDE the lock: a check-then-act across
                 # the lock await is how a second owner slips in
-                exchange = known if known is not None else await self._exchanges.get(exchange_id)
-                if exchange.owner_task_id is not None and exchange.owner_task_id in self._processes:
+                if self._live_process_for(exchange_id) is not None:
                     return
+                exchange = known if known is not None else await self._exchanges.get(exchange_id)
                 if self._exceeds_limit(self._cancelled_tasks(cancelled or set())):
                     await self._reject_for_limit(message)
                     return
@@ -1829,6 +1838,20 @@ class ConversationRunner:
     def _exceeds_limit(self, cancelled: set[str]) -> bool:
         """Whether a NEW process would exceed the limit, counting pending cancellations."""
         return len(self._processes) - len(cancelled) + 1 > self._max_processes
+
+    def _live_process_for(self, exchange_id: str | None) -> _Process | None:
+        """The run this actor has going for the exchange, if any.
+
+        Asked of memory, not of a column. This process holds the dialog's
+        claim, so a run of one of its exchanges is a run here — the stored
+        owner was only ever used as a key into this very dict.
+        """
+        if exchange_id is None:
+            return None
+        return next(
+            (process for process in self._processes.values() if process.exchange_id == exchange_id),
+            None,
+        )
 
     def _cancelled_tasks(self, cancelled: set[str]) -> set[str]:
         """The just-cancelled exchanges whose runs still occupy a slot.
