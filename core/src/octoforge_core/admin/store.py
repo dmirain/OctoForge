@@ -28,6 +28,7 @@ from octoforge_core.cron.models import CronJobRow
 from octoforge_core.datasets.api import Dataset, DatasetRecord
 from octoforge_core.datasets.models import DatasetRecordRow, DatasetRow
 from octoforge_core.datasets.validation import parse_schema
+from octoforge_core.db.unit_of_work import read_session
 from octoforge_core.dialogs.api import ExchangeStatus
 from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
 from octoforge_core.instructions.api import Instruction, InstructionType
@@ -44,7 +45,7 @@ class SqlAlchemyAdminStore:
         self._session_factory = session_factory
 
     async def totals(self) -> Totals:
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             counts = {
                 name: await _count(session, select(func.count()).select_from(model))
                 for name, model in (
@@ -112,7 +113,7 @@ class SqlAlchemyAdminStore:
             .limit(limit)
             .offset(offset)
         )
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (await session.execute(statement)).all()
             total = await _count(session, select(func.count()).select_from(DialogRow))
         items = tuple(
@@ -170,7 +171,7 @@ class SqlAlchemyAdminStore:
             .offset(offset)
         )
         counter = select(func.count()).select_from(TaskRow).where(*filters)
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (await session.execute(statement)).all()
             total = await _count(session, counter)
         return Page(
@@ -311,7 +312,7 @@ class SqlAlchemyAdminStore:
             .join(DialogRow, DialogRow.id == ExchangeRow.dialog_id)
             .where(*filters)
         )
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (await session.execute(statement)).all()
             total = await _count(session, counter)
         items = tuple(_to_exchange_overview(row[0], row[1], row[2]) for row in rows)
@@ -323,7 +324,7 @@ class SqlAlchemyAdminStore:
         counter: Select[Any],
     ) -> tuple[Sequence[Any], int]:
         """Run a listing and its counter on one session."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (await session.scalars(statement)).all()
             total = await _count(session, counter)
         return rows, total

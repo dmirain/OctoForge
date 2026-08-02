@@ -16,6 +16,7 @@ from sqlalchemy import select
 from octoforge_core.datasets.api import EmbeddedDataset
 from octoforge_core.datasets.models import DatasetRow
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore, to_embedded_dataset
+from octoforge_core.db.unit_of_work import read_session
 
 DESCRIPTION_BM25_INDEX = "ix_datasets_bm25_description"
 # `<@>` scores a document sharing no term with the query as exactly 0 and every
@@ -44,6 +45,6 @@ class PostgresDatasetStore(SqlAlchemyDatasetStore):
             .order_by(relevance)
             .limit(limit)
         )
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (await session.scalars(statement)).all()
             return [to_embedded_dataset(row) for row in rows]

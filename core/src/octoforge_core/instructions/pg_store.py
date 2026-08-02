@@ -24,6 +24,7 @@ import asyncio
 import sqlalchemy as sa
 from sqlalchemy import Select, select
 
+from octoforge_core.db.unit_of_work import read_session
 from octoforge_core.instructions.api import EmbeddedInstruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.instructions.ranking import fuse_rankings
@@ -164,7 +165,7 @@ class PostgresInstructionStore(SqlAlchemyInstructionStore):
 
     async def _fetch(self, statement: Select[tuple[InstructionRow]]) -> list[EmbeddedInstruction]:
         """Run the query and map the rows to DTOs off the event loop."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (await session.scalars(statement)).all()
         # a shortlist rather than the whole table, but mapping still allocates
         # one tuple of floats per row: off the loop, as brute force already is

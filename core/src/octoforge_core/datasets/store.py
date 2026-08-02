@@ -24,6 +24,7 @@ from octoforge_core.datasets.api import (
 )
 from octoforge_core.datasets.models import DatasetRecordRow, DatasetRow
 from octoforge_core.datasets.validation import dump_schema, parse_schema
+from octoforge_core.db.unit_of_work import read_session, write_session
 
 FIRST_VERSION = 1
 
@@ -44,7 +45,12 @@ class SqlAlchemyDatasetStore:
         retention: str,
         embedding: tuple[float, ...],
     ) -> Dataset:
-        """Insert the descriptor; the (owner, name) unique constraint guards races."""
+        """Insert the descriptor; the (owner, name) unique constraint guards races.
+
+        Deliberately NOT unit-of-work aware (raw `_session_factory`): the
+        commit itself is the uniqueness-race detector, which inside a shared
+        transaction would report the clash against the unit's other writes.
+        """
         async with self._session_factory() as session:
             row = DatasetRow(
                 id=uuid.uuid4().hex,
@@ -66,7 +72,7 @@ class SqlAlchemyDatasetStore:
 
     async def get(self, owner_user_id: str, name: str) -> Dataset | None:
         """Return the descriptor of this owner by name, or None."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             row = await _find_row(session, owner_user_id, name)
             return None if row is None else _to_dataset(row)
 
@@ -77,7 +83,7 @@ class SqlAlchemyDatasetStore:
         payload: dict[str, Any],
     ) -> DatasetRecord:
         """Append a record row to the dataset."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = DatasetRecordRow(
                 id=uuid.uuid4().hex,
                 dataset_id=dataset_id,
@@ -85,7 +91,7 @@ class SqlAlchemyDatasetStore:
                 payload=payload,
             )
             session.add(row)
-            await session.commit()
+            await session.flush()
             return _to_record(row)
 
     async def delete(self, owner_user_id: str, name: str) -> int | None:
@@ -95,7 +101,7 @@ class SqlAlchemyDatasetStore:
         PRAGMA foreign_keys, so the FK alone would not remove the records.
         Returns the number of deleted records, or None when no such dataset.
         """
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await _find_row(session, owner_user_id, name)
             if row is None:
                 return None
@@ -110,12 +116,11 @@ class SqlAlchemyDatasetStore:
                 delete(DatasetRecordRow).where(DatasetRecordRow.dataset_id == row.id)
             )
             await session.delete(row)
-            await session.commit()
             return records_count
 
     async def list_with_embeddings(self, owner_user_id: str) -> list[EmbeddedDataset]:
         """Return every descriptor of this owner with its embedding (search input)."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (
                 await session.scalars(
                     select(DatasetRow).where(DatasetRow.owner_user_id == owner_user_id)
@@ -131,7 +136,7 @@ class SqlAlchemyDatasetStore:
         scan_limit: int,
     ) -> list[DatasetRecord]:
         """Return records in the created_at range, newest first, capped at scan_limit."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = select(DatasetRecordRow).where(DatasetRecordRow.dataset_id == dataset_id)
             if date_from is not None:
                 statement = statement.where(DatasetRecordRow.created_at >= date_from)

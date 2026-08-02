@@ -60,6 +60,7 @@ from octoforge_core.db.engine import (
     create_session_factory,
     init_db,
 )
+from octoforge_core.db.unit_of_work import UnitOfWork, outside_uow
 from octoforge_core.dialogs.api import (
     ClaimRepository,
     DialogNotFoundError,
@@ -207,6 +208,7 @@ __all__ = [
     "ToolSpec",
     "ToolStores",
     "TransportError",
+    "UnitOfWork",
     "Usage",
     "bootstrap_schema",
     "build_agent_loop",
@@ -228,5 +230,6 @@ __all__ = [
     "create_engine",
     "create_session_factory",
     "init_db",
+    "outside_uow",
     "utc_now",
 ]

@@ -16,6 +16,7 @@ import sqlalchemy as sa
 from sqlalchemy import select
 
 from octoforge_core.db.sqlite_fts import FTS_TABLES, match_expression, rank_expression
+from octoforge_core.db.unit_of_work import read_session
 from octoforge_core.instructions.api import EmbeddedInstruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore, to_instruction
@@ -40,7 +41,7 @@ class SqliteInstructionStore(SqlAlchemyInstructionStore):
         ids = await self._matching_ids(expression, limit, user_id, kinds)
         if not ids:
             return []
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (
                 await session.scalars(select(InstructionRow).where(InstructionRow.id.in_(ids)))
             ).all()
@@ -87,6 +88,6 @@ class SqliteInstructionStore(SqlAlchemyInstructionStore):
             f"WHERE {' AND '.join(clauses)} "
             f"ORDER BY {rank_expression(INSTRUCTIONS_FTS)} LIMIT :limit"
         )
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = await session.execute(statement, params)
             return [str(row[0]) for row in rows]

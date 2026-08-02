@@ -13,6 +13,7 @@ from octoforge_core.datasets.api import EmbeddedDataset
 from octoforge_core.datasets.models import DatasetRow
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore, to_embedded_dataset
 from octoforge_core.db.sqlite_fts import FTS_TABLES, match_expression, rank_expression
+from octoforge_core.db.unit_of_work import read_session
 
 DATASETS_FTS = FTS_TABLES[2]
 
@@ -36,7 +37,7 @@ class SqliteDatasetStore(SqlAlchemyDatasetStore):
             f"WHERE {DATASETS_FTS.name} MATCH :expression AND d.owner_user_id = :owner "
             f"ORDER BY {rank_expression(DATASETS_FTS)} LIMIT :limit"
         )
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             ids = [
                 str(row[0])
                 for row in await session.execute(

@@ -21,6 +21,7 @@ from sqlalchemy.sql.selectable import ScalarSelect
 
 from octoforge_core.context.api import NO_COMPACTED_SEQ
 from octoforge_core.context.models import SummaryRow
+from octoforge_core.db.unit_of_work import read_session, write_session
 from octoforge_core.dialogs.api import (
     LIVE_EXCHANGE_STATUSES,
     TITLE_MAX_LENGTH,
@@ -96,18 +97,25 @@ class SqlAlchemyDialogRepository:
         self._session_factory = session_factory
 
     async def get_or_create(self, user_id: str, channel: str) -> Dialog:
-        """Return the dialog for (user_id, channel), creating it on first contact."""
-        async with self._session_factory() as session:
+        """Return the dialog for (user_id, channel), creating it on first contact.
+
+        The find and the create are separate sessions on purpose: the find is
+        the hot path (every actor build), and a shared write-or-read session
+        would buy it a no-op COMMIT round trip on every hit.
+        """
+        async with read_session(self._session_factory) as session:
             row = await self._find_row(session, user_id, channel)
-            if row is None:
-                row = DialogRow(id=uuid.uuid4().hex, user_id=user_id, channel=channel)
-                session.add(row)
-                await session.commit()
-            return _to_dialog(row)
+            if row is not None:
+                return _to_dialog(row)
+        async with write_session(self._session_factory) as session:
+            created = DialogRow(id=uuid.uuid4().hex, user_id=user_id, channel=channel)
+            session.add(created)
+            await session.flush()  # applies the client-side timestamp defaults
+            return _to_dialog(created)
 
     async def get(self, dialog_id: str) -> Dialog:
         """Return the dialog by id or raise DialogNotFoundError."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             row = await session.get(DialogRow, dialog_id)
             if row is None:
                 raise DialogNotFoundError(dialog_id)
@@ -115,19 +123,18 @@ class SqlAlchemyDialogRepository:
 
     async def list_by_channel(self, channel: str) -> list[Dialog]:
         """Return the full dialogs of the given channel (activity timestamps included)."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(select(DialogRow).where(DialogRow.channel == channel))
             return [_to_dialog(row) for row in result.all()]
 
     async def delete(self, dialog_id: str) -> None:
         """Delete the dialog and its message log in one transaction."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await session.get(DialogRow, dialog_id)
             if row is None:
                 raise DialogNotFoundError(dialog_id)
             await session.execute(delete(MessageRow).where(MessageRow.dialog_id == dialog_id))
             await session.delete(row)
-            await session.commit()
 
     @staticmethod
     async def _find_row(session: AsyncSession, user_id: str, channel: str) -> DialogRow | None:
@@ -161,6 +168,12 @@ class SqlAlchemyMessageRepository:
         messages. `client_message_id` is the idempotency key of client
         submits; the unique (dialog_id, client_message_id) constraint rejects
         duplicates (raised on the final attempt, not silently retried away).
+
+        Deliberately NOT unit-of-work aware (raw `_session_factory`, like
+        `append_pair`): the retry loop rolls the session back on a lost seq
+        race, and inside a shared transaction that would discard every earlier
+        write of the unit. Joining a unit takes a SAVEPOINT around the INSERT
+        attempt; until that exists, appends keep their own transaction.
         """
         for attempt in range(MESSAGE_SEQ_RETRY_ATTEMPTS):
             row_id = uuid.uuid4().hex
@@ -260,7 +273,7 @@ class SqlAlchemyMessageRepository:
 
     async def find_by_client_id(self, dialog_id: str, client_message_id: str) -> bool:
         """Return True when a message with this idempotency key already exists."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             value = await session.scalar(
                 select(MessageRow.id)
                 .where(
@@ -279,7 +292,7 @@ class SqlAlchemyMessageRepository:
         it from the messages themselves costs nothing on the answer path and
         cannot drift from what actually happened.
         """
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (
                 await session.execute(
                     select(DialogRow.user_id, func.max(MessageRow.created_at))
@@ -303,7 +316,7 @@ class SqlAlchemyMessageRepository:
             .where(SummaryRow.dialog_id == dialog_id)
             .scalar_subquery()
         )
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(MessageRow)
                 .where(MessageRow.dialog_id == dialog_id, MessageRow.seq > boundary)
@@ -320,7 +333,7 @@ class SqlAlchemyMessageRepository:
         method shadows the builtin in the class scope, breaking annotations
         below it.)
         """
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(MessageRow)
                 .where(MessageRow.dialog_id == dialog_id, MessageRow.seq > after_seq)
@@ -330,7 +343,7 @@ class SqlAlchemyMessageRepository:
 
     async def list(self, dialog_id: str) -> list[ChatMessage]:
         """Return the dialog messages ordered by seq."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(MessageRow).where(MessageRow.dialog_id == dialog_id).order_by(MessageRow.seq)
             )
@@ -344,13 +357,12 @@ class SqlAlchemyMessageRepository:
         beside the database and 11 ms across a tunnel to one. A message that
         is not there is still not an error here — same as before.
         """
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(
                 update(MessageRow)
                 .where(MessageRow.id == message_id)
                 .values(exchange_id=exchange_id)
             )
-            await session.commit()
 
     async def stats_by_channel(self, channel: str) -> MessageStatsList:
         """Return per-user message counters of the channel, split by author.
@@ -368,7 +380,7 @@ class SqlAlchemyMessageRepository:
                 0,
             )
 
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = (
                 select(
                     DialogRow.user_id,
@@ -444,7 +456,7 @@ class SqlAlchemyExchangeRepository:
     ) -> Exchange:
         """Open a new exchange, OPEN unless told otherwise."""
         resolved = status or ExchangeStatus.OPEN
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = ExchangeRow(
                 id=uuid.uuid4().hex,
                 dialog_id=dialog_id,
@@ -452,12 +464,12 @@ class SqlAlchemyExchangeRepository:
                 title=title[:TITLE_MAX_LENGTH],
             )
             session.add(row)
-            await session.commit()
+            await session.flush()
             return _to_exchange(row)
 
     async def find_collecting(self, dialog_id: str) -> Exchange | None:
         """Return the dialog's collecting exchange, None when there is none."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(ExchangeRow)
                 .where(
@@ -473,7 +485,7 @@ class SqlAlchemyExchangeRepository:
     async def list_stale_collecting(self, quiet_seconds: float) -> ExchangeList:
         """Collecting exchanges untouched for longer than `quiet_seconds`."""
         threshold = utc_now() - timedelta(seconds=quiet_seconds)
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(ExchangeRow)
                 .where(
@@ -486,26 +498,24 @@ class SqlAlchemyExchangeRepository:
 
     async def touch(self, exchange_id: str) -> None:
         """Bump `updated_at`; a missing row is a no-op (it may have been deleted)."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(
                 update(ExchangeRow)
                 .where(ExchangeRow.id == exchange_id)
                 .values(updated_at=utc_now())
             )
-            await session.commit()
 
     async def set_title(self, exchange_id: str, title: str) -> None:
         """Rename the exchange; a missing row is a no-op (it may have been deleted)."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(
                 update(ExchangeRow)
                 .where(ExchangeRow.id == exchange_id)
                 .values(title=title[:TITLE_MAX_LENGTH])
             )
-            await session.commit()
 
     async def get(self, exchange_id: str) -> Exchange:
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             row = await session.get(ExchangeRow, exchange_id)
             if row is None:
                 raise ExchangeNotFoundError(exchange_id)
@@ -513,7 +523,7 @@ class SqlAlchemyExchangeRepository:
 
     async def list_live(self, dialog_id: str) -> ExchangeList:
         """Return the dialog's non-terminal exchanges, oldest first."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(ExchangeRow)
                 .where(
@@ -536,13 +546,13 @@ class SqlAlchemyExchangeRepository:
         )
         if dialog_id is not None:
             query = query.where(ExchangeRow.dialog_id == dialog_id)
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(query)
             return [_to_exchange(row) for row in result.all()]
 
     async def list_stranded_dialog_ids(self) -> list[str]:
         """Dialog ids holding an IN_PROGRESS or an OPEN-and-unowned exchange."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(ExchangeRow.dialog_id)
                 .where(
@@ -555,7 +565,7 @@ class SqlAlchemyExchangeRepository:
 
     async def reopen_in_progress(self, dialog_id: str) -> int:
         """Reset the dialog's IN_PROGRESS exchanges to OPEN; return how many."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -567,7 +577,6 @@ class SqlAlchemyExchangeRepository:
                     .values(status=ExchangeStatus.OPEN.value)
                 ),
             )
-            await session.commit()
             return result.rowcount or 0
 
     async def set_status(
@@ -582,7 +591,7 @@ class SqlAlchemyExchangeRepository:
         same question the SELECT was asked (does this exchange exist), and
         the condition rides in the WHERE clause instead of a round trip.
         """
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -596,7 +605,6 @@ class SqlAlchemyExchangeRepository:
             )
             if result.rowcount == 0:
                 raise ExchangeNotFoundError(exchange_id)
-            await session.commit()
 
     async def settle_owned(
         self,
@@ -642,7 +650,7 @@ class SqlAlchemyExchangeRepository:
         ]
         if keep_if_awaiting:
             conditions.append(ExchangeRow.status != ExchangeStatus.AWAITING_USER.value)
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = (
                 await session.scalars(
                     update(ExchangeRow)
@@ -654,13 +662,11 @@ class SqlAlchemyExchangeRepository:
             if row is None:
                 return None
             exchange = _to_exchange(row)
-            await session.commit()
         return exchange
 
     async def delete_for_dialog(self, dialog_id: str) -> None:
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(delete(ExchangeRow).where(ExchangeRow.dialog_id == dialog_id))
-            await session.commit()
 
 
 class SqlAlchemyClaimRepository:
@@ -687,9 +693,8 @@ class SqlAlchemyClaimRepository:
         value that has already moved.
         """
         now = utc_now()
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             generation = await session.scalar(_claim_upsert(session, dialog_id, owner, now))
-            await session.commit()
         return DialogClaim(
             dialog_id=dialog_id,
             owner=owner,
@@ -703,7 +708,7 @@ class SqlAlchemyClaimRepository:
             return frozenset()
         held = {claim.dialog_id: claim for claim in claims}
         now = utc_now()
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             rows = (
                 await session.execute(
                     select(
@@ -722,12 +727,11 @@ class SqlAlchemyClaimRepository:
                     .where(DialogClaimRow.dialog_id.in_(kept))
                     .values(heartbeat_at=now)
                 )
-                await session.commit()
             return kept
 
     async def release(self, dialog_id: str, owner: str, generation: int) -> None:
         """Drop the claim if it is still this exact one; otherwise a no-op."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(
                 delete(DialogClaimRow).where(
                     DialogClaimRow.dialog_id == dialog_id,
@@ -735,7 +739,6 @@ class SqlAlchemyClaimRepository:
                     DialogClaimRow.generation == generation,
                 )
             )
-            await session.commit()
 
     async def held_elsewhere(
         self, dialog_ids: frozenset[str], owner: str, stale_before: datetime
@@ -743,7 +746,7 @@ class SqlAlchemyClaimRepository:
         """Of `dialog_ids`, those a different owner holds with a fresh heartbeat."""
         if not dialog_ids:
             return frozenset()
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(DialogClaimRow.dialog_id).where(
                     DialogClaimRow.dialog_id.in_(dialog_ids),
@@ -755,7 +758,7 @@ class SqlAlchemyClaimRepository:
 
     async def current_generation(self, dialog_id: str) -> int | None:
         """The stored generation, or None when nobody holds the dialog."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             generation: int | None = await session.scalar(
                 select(DialogClaimRow.generation).where(DialogClaimRow.dialog_id == dialog_id)
             )
@@ -763,11 +766,10 @@ class SqlAlchemyClaimRepository:
 
     async def delete_for_dialog(self, dialog_id: str) -> None:
         """Drop the dialog's claim (admin dialog deletion)."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(
                 delete(DialogClaimRow).where(DialogClaimRow.dialog_id == dialog_id)
             )
-            await session.commit()
 
 
 def _to_exchange(row: ExchangeRow) -> Exchange:

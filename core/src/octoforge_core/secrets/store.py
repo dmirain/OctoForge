@@ -15,6 +15,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from octoforge_core.db.unit_of_work import read_session, write_session
 from octoforge_core.secrets.api import (
     InvalidSecretError,
     SecretHostMismatchError,
@@ -55,7 +56,7 @@ class SqlAlchemySecretStore:
                 "secret value must be printable ASCII (it is sent as an HTTP header)"
             )
         ciphertext = self._fernet.encrypt(value.encode()).decode()
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await _find_row(session, user_id, code)
             if row is None:
                 row = SecretRow(
@@ -71,12 +72,12 @@ class SqlAlchemySecretStore:
                 row.allowed_host = host
                 row.created_at = utc_now()  # a replaced secret is a new secret
                 row.last_used_at = None
-            await session.commit()
+            await session.flush()
             return _to_info(row)
 
     async def list(self, user_id: str) -> list[SecretInfo]:
         """Return the user's secrets metadata, newest first. Never the values."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = (
                 await session.scalars(
                     select(SecretRow)
@@ -89,18 +90,17 @@ class SqlAlchemySecretStore:
     async def delete(self, user_id: str, code: str) -> None:
         """Delete the user's secret by code; raise `SecretNotFoundError`."""
         code = normalize_code(code)
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await _find_row(session, user_id, code)
             if row is None:
                 raise SecretNotFoundError(code)
             await session.delete(row)
-            await session.commit()
 
     async def resolve(self, user_id: str, code: str, host: str) -> str:
         """Return the decrypted value for a request going to `host`."""
         code = normalize_code(code)
         target = normalize_host(host)
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await _find_row(session, user_id, code)
             if row is None:
                 raise SecretNotFoundError(code)
@@ -120,7 +120,6 @@ class SqlAlchemySecretStore:
                 )
                 raise SecretNotFoundError(code) from None
             row.last_used_at = utc_now()
-            await session.commit()
             return value
 
 

@@ -7,6 +7,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from octoforge_core.db.unit_of_work import read_session, write_session
 from octoforge_core.identity.api import (
     IdentityNotFoundError,
     IdentityTakenError,
@@ -28,7 +29,7 @@ class SqlAlchemyIdentityStore:
 
     async def resolve(self, surface: str, external_id: str) -> str | None:
         """The user this account belongs to, or None when nobody active claims it."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             user_id: str | None = await session.scalar(
                 select(UserIdentityRow.user_id).where(
                     UserIdentityRow.surface == surface,
@@ -61,13 +62,13 @@ class SqlAlchemyIdentityStore:
     async def create_user(self, email: str = "") -> User:
         """Mint a person with an id of their own."""
         row = UserRow(id=uuid.uuid4().hex, email=email or None)
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             session.add(row)
-            await session.commit()
+            await session.flush()
             return _to_user(row)
 
     async def get_user(self, user_id: str) -> User:
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             row = await session.get(UserRow, user_id)
             if row is None:
                 raise UserNotFoundError(user_id)
@@ -80,6 +81,11 @@ class SqlAlchemyIdentityStore:
 
         A previously revoked identity of the SAME person is revived rather
         than refused: coming back is not a conflict.
+
+        Deliberately NOT unit-of-work aware (raw `_session_factory`): the
+        insert branch uses the commit itself as the uniqueness-race detector
+        and rolls the session back on the clash, which inside a shared
+        transaction would discard the unit's earlier writes.
         """
         async with self._session_factory() as session:
             existing = await self._find(session, surface, external_id)
@@ -109,7 +115,7 @@ class SqlAlchemyIdentityStore:
 
     async def reseat(self, surface: str, user_id: str, external_id: str) -> UserIdentity:
         """Point this person's identity on a surface at a different account."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             taken = await self._find(session, surface, external_id)
             if taken is not None and taken.user_id != user_id:
                 raise IdentityTakenError(f"{surface}:{external_id}")
@@ -124,12 +130,11 @@ class SqlAlchemyIdentityStore:
             row.external_id = external_id
             row.active = True
             row.updated_at = utc_now()
-            await session.commit()
             return _to_identity(row)
 
     async def deactivate(self, surface: str, external_id: str) -> None:
         """Revoke an account without erasing that it was once used."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(
                 update(UserIdentityRow)
                 .where(
@@ -138,17 +143,16 @@ class SqlAlchemyIdentityStore:
                 )
                 .values(active=False, updated_at=utc_now())
             )
-            await session.commit()
 
     async def list_users(self) -> UserList:
         """Everyone the installation knows, newest first."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = await session.scalars(select(UserRow).order_by(UserRow.created_at.desc()))
             return [_to_user(row) for row in rows.all()]
 
     async def identities_of(self, user_id: str) -> UserIdentityList:
         """Every surface this person is known on, revoked ones included."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             rows = await session.scalars(
                 select(UserIdentityRow)
                 .where(UserIdentityRow.user_id == user_id)
@@ -157,7 +161,7 @@ class SqlAlchemyIdentityStore:
             return [_to_identity(row) for row in rows.all()]
 
     async def find_by_identity(self, surface: str, external_id: str) -> UserIdentity | None:
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             row = await self._find(session, surface, external_id)
             return _to_identity(row) if row is not None else None
 

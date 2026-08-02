@@ -16,6 +16,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from octoforge_core.db.unit_of_work import read_session, write_session
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
     Instruction,
@@ -35,7 +36,13 @@ class SqlAlchemyInstructionStore:
         self._session_factory = session_factory
 
     async def upsert(self, draft: InstructionDraft) -> Instruction:
-        """Create the record or replace content/tags/embedding, bumping the version."""
+        """Create the record or replace content/tags/embedding, bumping the version.
+
+        Deliberately NOT unit-of-work aware (raw `_session_factory`): the
+        insert branch uses the commit itself as the uniqueness-race detector
+        and rolls the session back on the clash, which inside a shared
+        transaction would discard the unit's earlier writes.
+        """
         async with self._session_factory() as session:
             row = await self._find_row(session, draft.kind, draft.title, draft.owner_id)
             if row is not None:
@@ -102,7 +109,7 @@ class SqlAlchemyInstructionStore:
         owner_id: str | None = None,
     ) -> Instruction | None:
         """Return the record by (title, kind, owner), oldest first on collisions."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = select(InstructionRow).where(
                 InstructionRow.title == title,
                 _owner_clause(owner_id),
@@ -115,13 +122,13 @@ class SqlAlchemyInstructionStore:
 
     async def get(self, instruction_id: str) -> Instruction | None:
         """Return the record by id, or None when the id is unknown."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             row = await session.get(InstructionRow, instruction_id)
             return None if row is None else to_instruction(row)
 
     async def list_with_embeddings(self, user_id: str | None) -> list[EmbeddedInstruction]:
         """Return records visible to `user_id` (None = the whole table)."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = select(InstructionRow).order_by(InstructionRow.id)
             if user_id is not None:
                 statement = statement.where(
@@ -142,7 +149,7 @@ class SqlAlchemyInstructionStore:
 
     async def list_system(self) -> list[Instruction]:
         """Return every system (registry-owned) record, oldest first."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = (
                 select(InstructionRow)
                 .where(InstructionRow.system.is_(True))
@@ -155,24 +162,22 @@ class SqlAlchemyInstructionStore:
         """Increment usage_count of the given records (search hits proved useful)."""
         if not instruction_ids:
             return
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(
                 update(InstructionRow)
                 .where(InstructionRow.id.in_(instruction_ids))
                 .values(usage_count=InstructionRow.usage_count + 1)
             )
-            await session.commit()
 
     async def delete_by_id(self, instruction_id: str, owner_id: str) -> bool:
         """Delete the owner's private record by id; return True when removed."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             statement = delete(InstructionRow).where(
                 InstructionRow.id == instruction_id,
                 InstructionRow.owner_id == owner_id,
             )
             # DML executes into a CursorResult at runtime; narrow for rowcount.
             result = cast(CursorResult[Any], await session.execute(statement))
-            await session.commit()
             return result.rowcount > 0
 
     async def publish(self, instruction_id: str) -> Instruction | None:
@@ -181,7 +186,7 @@ class SqlAlchemyInstructionStore:
         A memory-type record also answers None: memories are never published,
         and the admin surface treats an unpublishable record as a missing one.
         """
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await session.get(InstructionRow, instruction_id)
             if row is None or row.type == InstructionType.MEMORY.value:
                 return None
@@ -191,7 +196,6 @@ class SqlAlchemyInstructionStore:
                 row.author_id = row.owner_id
             row.owner_id = None
             row.updated_at = utc_now()
-            await session.commit()
             return to_instruction(row)
 
     async def list_stale_embeddings(self, model: str, limit: int) -> list[Instruction]:
@@ -205,7 +209,7 @@ class SqlAlchemyInstructionStore:
         """
         if limit <= 0:
             return []
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = (
                 select(InstructionRow)
                 .where(
@@ -221,7 +225,7 @@ class SqlAlchemyInstructionStore:
 
     async def count_stale_embeddings(self, model: str) -> int:
         """How many records still need `model` to embed them (for the startup log)."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = select(func.count()).where(
                 (func.json_array_length(InstructionRow.embedding) == 0)
                 | InstructionRow.embedding_model.is_(None)
@@ -237,7 +241,7 @@ class SqlAlchemyInstructionStore:
     ) -> bool:
         """Store the embedding and its model; no version bump, no updated_at touch."""
         vector = list(embedding)
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             statement = (
                 update(InstructionRow)
                 .where(InstructionRow.id == instruction_id)
@@ -251,12 +255,11 @@ class SqlAlchemyInstructionStore:
                 )
             )
             result = cast(CursorResult[Any], await session.execute(statement))
-            await session.commit()
             return result.rowcount > 0
 
     async def delete_by_title(self, title: str, kind: InstructionType) -> bool:
         """Delete the public/system record (kind, title); registry sync only."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             statement = delete(InstructionRow).where(
                 InstructionRow.type == kind.value,
                 InstructionRow.title == title,
@@ -264,7 +267,6 @@ class SqlAlchemyInstructionStore:
             )
             # DML executes into a CursorResult at runtime; narrow for rowcount.
             result = cast(CursorResult[Any], await session.execute(statement))
-            await session.commit()
             return result.rowcount > 0
 
     @staticmethod

@@ -13,6 +13,7 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from octoforge_core.db.unit_of_work import read_session, write_session
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.models import TaskRow
 from octoforge_core.time import utc_now
@@ -175,19 +176,18 @@ class SqlAlchemyTaskStore:
         self._session_factory = session_factory
 
     async def add(self, task: Task) -> None:
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             session.add(_to_task_row(task))
-            await session.commit()
 
     async def get(self, task_id: str) -> Task:
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             row = await session.get(TaskRow, task_id)
             if row is None:
                 raise TaskNotFoundError(task_id)
             return _to_task(row)
 
     async def list(self, dialog_id: str) -> list[Task]:
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(TaskRow).where(TaskRow.dialog_id == dialog_id).order_by(TaskRow.created_at)
             )
@@ -210,21 +210,19 @@ class SqlAlchemyTaskStore:
         return await self._finish(task_id, status=TaskStatus.CANCELLED)
 
     async def delete(self, task_id: str) -> None:
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await session.get(TaskRow, task_id)
             if row is None:
                 raise TaskNotFoundError(task_id)
             await session.delete(row)
-            await session.commit()
 
     async def delete_for_dialog(self, dialog_id: str) -> int:
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             # DML executes into a CursorResult at runtime; narrow for rowcount.
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(delete(TaskRow).where(TaskRow.dialog_id == dialog_id)),
             )
-            await session.commit()
             return result.rowcount or 0
 
     async def list_orphaned(self, dialog_id: str | None = None) -> TaskList:
@@ -259,7 +257,7 @@ class SqlAlchemyTaskStore:
         if dialog_id is not None:
             query = query.where(TaskRow.dialog_id == dialog_id)
         active = (TaskStatus.PENDING, TaskStatus.RUNNING)
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             tasks = [_to_task(row) for row in (await session.scalars(query)).all()]
         return (
             [task for task in tasks if task.status in active],
@@ -268,7 +266,7 @@ class SqlAlchemyTaskStore:
 
     async def mark_delivered(self, task_id: str) -> None:
         """Stamp delivery. One UPDATE: `rowcount` says whether the task exists."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -277,7 +275,6 @@ class SqlAlchemyTaskStore:
             )
             if result.rowcount == 0:
                 raise TaskNotFoundError(task_id)
-            await session.commit()
 
     async def _finish(
         self,
@@ -303,7 +300,7 @@ class SqlAlchemyTaskStore:
             values["error"] = error
         if delivered:
             values["delivered_at"] = now
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = (
                 await session.scalars(
                     update(TaskRow).where(TaskRow.id == task_id).values(**values).returning(TaskRow)
@@ -312,7 +309,6 @@ class SqlAlchemyTaskStore:
             if row is None:
                 raise TaskNotFoundError(task_id)
             task = _to_task(row)
-            await session.commit()
         return task
 
 

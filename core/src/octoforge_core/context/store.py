@@ -19,6 +19,7 @@ from octoforge_core.context.api import (
     SummaryStore,
 )
 from octoforge_core.context.models import SummaryRow
+from octoforge_core.db.unit_of_work import read_session, write_session
 from octoforge_core.dialogs.models import MessageRow
 from octoforge_core.domain import MessageRole
 
@@ -33,7 +34,7 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
 
     async def create(self, summary: DialogueSummary) -> DialogueSummary:
         """Persist a fully populated summary; return the stored copy."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             session.add(
                 SummaryRow(
                     id=summary.id,
@@ -45,12 +46,11 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
                     created_at=summary.created_at,
                 )
             )
-            await session.commit()
         return summary
 
     async def list_for_dialog(self, dialog_id: str) -> list[DialogueSummary]:
         """Return all summaries of the dialog, ordered by seq_from."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(SummaryRow)
                 .where(SummaryRow.dialog_id == dialog_id)
@@ -60,7 +60,7 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
 
     async def replace_for_dialog(self, dialog_id: str, summary: DialogueSummary) -> None:
         """Replace all summaries of the dialog with the one (rolling merge)."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(delete(SummaryRow).where(SummaryRow.dialog_id == dialog_id))
             session.add(
                 SummaryRow(
@@ -73,17 +73,15 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
                     created_at=summary.created_at,
                 )
             )
-            await session.commit()
 
     async def delete_for_dialog(self, dialog_id: str) -> None:
         """Delete every summary of the dialog (admin dialog deletion); missing is a no-op."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             await session.execute(delete(SummaryRow).where(SummaryRow.dialog_id == dialog_id))
-            await session.commit()
 
     async def max_seq_to(self, dialog_id: str) -> int:
         """Return the highest covered seq; NO_COMPACTED_SEQ when nothing was compacted."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             value = await session.scalar(
                 select(func.coalesce(func.max(SummaryRow.seq_to), NO_COMPACTED_SEQ)).where(
                     SummaryRow.dialog_id == dialog_id
@@ -105,7 +103,7 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
 
     async def count_after(self, dialog_id: str, seq: int) -> int:
         """Return how many messages the dialog has with `seq >` the given one."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             count = await session.scalar(
                 select(func.count(MessageRow.id)).where(
                     MessageRow.dialog_id == dialog_id,
@@ -118,7 +116,7 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
         self, dialog_id: str, seq: int, limit: int | None = None
     ) -> list[ArchivedMessage]:
         """Return the dialog messages with `seq >` the given one, ordered by seq."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = (
                 select(MessageRow)
                 .where(MessageRow.dialog_id == dialog_id, MessageRow.seq > seq)
@@ -131,7 +129,7 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
 
     async def latest_prompt_tokens(self, dialog_id: str, after_seq: int) -> int | None:
         """Return prompt_tokens of the newest tail assistant message with usage."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             value = await session.scalar(
                 select(MessageRow.prompt_tokens)
                 .where(
@@ -175,7 +173,7 @@ class SqlAlchemySummaryStore(SummaryStore, MessageArchive):
             clauses.append(MessageRow.created_at >= restriction.date_from)
         if restriction.date_to is not None:
             clauses.append(MessageRow.created_at < restriction.date_to)
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             result = await session.scalars(
                 select(MessageRow).where(*clauses).order_by(MessageRow.seq).limit(limit)
             )

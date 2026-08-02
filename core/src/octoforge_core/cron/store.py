@@ -16,6 +16,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError, CronStore
 from octoforge_core.cron.models import CronJobRow
+from octoforge_core.db.unit_of_work import read_session, write_session
 from octoforge_core.tasks.api import TaskStatus
 
 
@@ -27,7 +28,7 @@ class SqlAlchemyCronStore(CronStore):
 
     async def create(self, job: CronJob) -> CronJob:
         """Persist a fully populated job; return the stored copy."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = CronJobRow(
                 id=job.id,
                 user_id=job.user_id,
@@ -48,12 +49,11 @@ class SqlAlchemyCronStore(CronStore):
                 retry_count=job.retry_count,
             )
             session.add(row)
-            await session.commit()
             return _to_cron_job(row)
 
     async def get(self, job_id: str) -> CronJob:
         """Return the job by id regardless of owner; raise `CronJobNotFoundError`."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             row = await session.get(CronJobRow, job_id)
             if row is None:
                 raise CronJobNotFoundError(f"cron job '{job_id}' not found")
@@ -61,7 +61,7 @@ class SqlAlchemyCronStore(CronStore):
 
     async def list_for_user(self, user_id: str) -> list[CronJob]:
         """Return all jobs of this owner, oldest first."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = (
                 select(CronJobRow)
                 .where(CronJobRow.user_id == user_id)
@@ -72,10 +72,9 @@ class SqlAlchemyCronStore(CronStore):
 
     async def delete_for_user(self, user_id: str, job_id: str) -> None:
         """Delete the owner's job; raise `CronJobNotFoundError` for foreign/missing ids."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await _find_owned_row(session, user_id, job_id)
             await session.delete(row)
-            await session.commit()
 
     async def set_enabled(
         self,
@@ -85,17 +84,16 @@ class SqlAlchemyCronStore(CronStore):
         next_fire_at: datetime | None = None,
     ) -> CronJob:
         """Pause/resume the owner's job, optionally moving `next_fire_at`."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             row = await _find_owned_row(session, user_id, job_id)
             row.enabled = enabled
             if next_fire_at is not None:
                 row.next_fire_at = next_fire_at
-            await session.commit()
             return _to_cron_job(row)
 
     async def list_due(self, now: datetime, stale_before: datetime, limit: int) -> list[CronJob]:
         """Return enabled claimable jobs due at `now`, earliest first."""
-        async with self._session_factory() as session:
+        async with read_session(self._session_factory) as session:
             statement = (
                 select(CronJobRow)
                 .where(
@@ -118,7 +116,7 @@ class SqlAlchemyCronStore(CronStore):
         stale_before: datetime,
     ) -> bool:
         """Take the lease with one conditional UPDATE; False means the race was lost."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             statement = (
                 update(CronJobRow)
                 .where(
@@ -133,23 +131,21 @@ class SqlAlchemyCronStore(CronStore):
             # DML executes into a CursorResult at runtime; the stubs type
             # AsyncSession.execute loosely, so narrow it for rowcount.
             result = cast(CursorResult[Any], await session.execute(statement))
-            await session.commit()
             return result.rowcount > 0
 
     async def release_claim(self, job_id: str) -> None:
         """Drop the lease without firing (the wake delivery failed)."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             statement = (
                 update(CronJobRow)
                 .where(CronJobRow.id == job_id)
                 .values(claimed_by=None, claimed_at=None)
             )
             await session.execute(statement)
-            await session.commit()
 
     async def complete_fire(self, job_id: str, fired_at: datetime, next_fire_at: datetime) -> None:
         """Record a successful fire: bump last/next fire times and drop the lease."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             statement = (
                 update(CronJobRow)
                 .where(CronJobRow.id == job_id)
@@ -161,7 +157,6 @@ class SqlAlchemyCronStore(CronStore):
                 )
             )
             await session.execute(statement)
-            await session.commit()
 
     async def record_fire_result(
         self,
@@ -171,7 +166,7 @@ class SqlAlchemyCronStore(CronStore):
         retry_at: datetime | None,
     ) -> None:
         """Apply the fired process outcome and the retry decision in one UPDATE."""
-        async with self._session_factory() as session:
+        async with write_session(self._session_factory) as session:
             if retry_at is not None:
                 statement = (
                     update(CronJobRow)
@@ -194,7 +189,6 @@ class SqlAlchemyCronStore(CronStore):
                     )
                 )
             await session.execute(statement)
-            await session.commit()
 
 
 def _claimable_clause(stale_before: datetime) -> ColumnElement[bool]:
