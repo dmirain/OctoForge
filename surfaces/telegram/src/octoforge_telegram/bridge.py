@@ -144,7 +144,8 @@ class _Draft:
     # until the pause ended
     flush_timer: asyncio.Task[None] | None = None
     # the status line above the answer: the agent's actions (thinking
-    # included) with progress dots, plus notices, in arrival order
+    # included) with progress dots, plus notices — NEWEST FIRST, so the
+    # active entry is visible without scrolling the line
     status: list[_StatusEntry] = field(default_factory=list)
     # the exchange this draft belongs to, carried alongside so a fresh
     # message id can be recorded into the reply-target map at send time
@@ -394,7 +395,7 @@ class TelegramBridge:
             return
         line = _notice_line(event)
         if line is not None:
-            draft.status.append(_StatusEntry(label=line, counted=False))
+            draft.status.insert(0, _StatusEntry(label=line, counted=False))
             await self._flush_throttled(draft)
 
     async def _render_terminal(
@@ -636,12 +637,16 @@ def _tool_group(name: str) -> str:
 
 
 def _count_status(draft: _Draft, label: str) -> None:
-    """Add a counted status entry; a back-to-back repeat only grows the dots."""
-    last = draft.status[-1] if draft.status else None
-    if last is not None and last.counted and last.label == label:
-        last.count += 1
+    """Prepend a counted status entry; a back-to-back repeat only grows the dots.
+
+    The head of the list is the newest — the entry currently in progress —
+    so that is where a repeat is looked for and where a new entry lands.
+    """
+    head = draft.status[0] if draft.status else None
+    if head is not None and head.counted and head.label == label:
+        head.count += 1
         return
-    draft.status.append(_StatusEntry(label=label))
+    draft.status.insert(0, _StatusEntry(label=label))
 
 
 def _progress_dots(count: int) -> str:
@@ -654,9 +659,10 @@ def _progress_dots(count: int) -> str:
 def _compose(draft: _Draft) -> str:
     """The full visible message: one monospaced status line, then the text.
 
-    The agent narrates what it does in a single line — entries flow one
-    after another, never one per row — and the record stays in the finished
-    message: thinking phases are history, not a spinner.
+    The agent narrates what it does in a single line, newest entry first —
+    Telegram clips a long code line at the right, so the head is the part
+    that stays visible — and the record stays in the finished message:
+    thinking phases are history, not a spinner.
     """
     entries = [
         f"{entry.label} {_progress_dots(entry.count)}" if entry.counted else entry.label

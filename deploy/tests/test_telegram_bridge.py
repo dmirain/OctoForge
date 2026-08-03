@@ -825,7 +825,7 @@ async def test_thinking_stays_in_the_record_when_text_arrives() -> None:
 
 async def test_repeated_calls_of_a_group_grow_dots_then_a_count() -> None:
     """Calls of one tool group collapse into one entry (· ·· ··· ··4); a
-    call of another group continues on the same line, not a new row."""
+    call of another group lands at the HEAD of the line — newest first."""
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
@@ -841,11 +841,11 @@ async def test_repeated_calls_of_a_group_grow_dots_then_a_count() -> None:
     assert client.current_text() == mono(f"{echo_line} ··4")
 
     await bridge._render(ToolCallRequested(call=other), "x1")
-    assert client.current_text() == mono(f"{echo_line} ··4", f"{TOOL_GROUPS['web_search']} ·")
+    assert client.current_text() == mono(f"{TOOL_GROUPS['web_search']} ·", f"{echo_line} ··4")
 
 
 async def test_a_second_thinking_phase_gets_its_own_entry() -> None:
-    """Thinking, a tool, thinking again: two 💭 entries, in order, one line."""
+    """Thinking, a tool, thinking again: two 💭 entries, newest first."""
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
@@ -857,7 +857,7 @@ async def test_a_second_thinking_phase_gets_its_own_entry() -> None:
     await bridge._render(ReasoningDelta(), "x1")
 
     assert client.current_text() == mono(
-        f"{THINKING_LABEL} ·", f"{TOOL_GROUPS['web_search']} ·", f"{THINKING_LABEL} ··"
+        f"{THINKING_LABEL} ··", f"{TOOL_GROUPS['web_search']} ·", f"{THINKING_LABEL} ·"
     )
 
 
