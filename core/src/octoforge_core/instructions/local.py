@@ -225,6 +225,45 @@ class LocalInstructionService:
         )
         return await self._store.upsert(draft)
 
+    async def save_public(
+        self,
+        kind: InstructionType,
+        title: str,
+        content: str,
+        tags: tuple[str, ...] = (),
+    ) -> Instruction:
+        """Upsert a public non-system record (integration syncs, e.g. MCP mirrors).
+
+        An unchanged record is returned as-is — re-embedding identical
+        content on every sweep is a wasted (paid with an HTTP backend) call.
+        A system record holding the (kind, title) slot refuses the write:
+        the startup registry sync owns it.
+        """
+        existing = await self._store.get_by_title(title, kind)
+        if existing is not None:
+            if existing.system:
+                raise SystemInstructionError(SYSTEM_RECORD_MESSAGE.format(title=title))
+            if existing.owner_id is None and existing.content == content and existing.tags == tags:
+                return existing
+        embedding = await self._embed_lenient(title, content)
+        draft = InstructionDraft(
+            kind=kind,
+            title=title,
+            content=content,
+            tags=tags,
+            embedding=embedding,
+            # no vector means no model claim: the record reads as stale and the
+            # startup sweep finishes what the failed backend could not
+            embedding_model=self._embedding_model if embedding else None,
+            system=False,
+            owner_id=None,
+        )
+        return await self._store.upsert(draft)
+
+    async def list_public_by_prefix(self, kind: InstructionType, prefix: str) -> list[Instruction]:
+        """Public records of the kind titled under `prefix` (a sync's namespace)."""
+        return await self._store.list_public_by_prefix(kind, prefix)
+
     async def save_system(
         self,
         kind: InstructionType,

@@ -85,8 +85,16 @@ from octoforge_core.llm.errors import LLMError
 from octoforge_core.llm.http_reranker import HttpRerankerClient
 from octoforge_core.llm.local_embeddings import SentenceTransformerEmbedder
 from octoforge_core.llm.reranker import CrossEncoderReranker, RerankerClient
+from octoforge_core.mcp.api import MIRROR_KIND
+from octoforge_core.mcp.client import StreamableHttpMcpClient
+from octoforge_core.mcp.executor import McpMirrorCallExecutor
+from octoforge_core.mcp.skills import McpSkillGenerator
+from octoforge_core.mcp.store import SqlAlchemyMcpServerStore
+from octoforge_core.mcp.sync import McpSyncLoop, McpToolSync
+from octoforge_core.mcp.tools import McpAddTool
 from octoforge_core.net.external import CallCredentials, ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.ports import LLMClient
 from octoforge_core.retention_sweep import RetentionSweeper
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.serper import SerperSearchProvider
@@ -251,6 +259,16 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             # target our loopback HTTP API (cron jobs) past the SSRF guard.
             guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
             summary_store = build_summary_store(session_factory, lexical_search=lexical_backend)
+            mcp = _build_mcp(
+                _McpDeps(
+                    session_factory=session_factory,
+                    outbound_http=outbound_http,
+                    guard=guard,
+                    instructions=instructions,
+                    secret_store=secret_store,
+                    llm=llm_client,
+                )
+            )
             registry = build_tool_registry(
                 outbound_http,
                 guard,
@@ -271,8 +289,10 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                             auth_whitelist=_external_call_whitelist(settings),
                             secrets=secret_store,
                         ),
+                        delegates={MIRROR_KIND: mcp.call_delegate},
                     ),
                     search_provider=_build_search_provider(settings, outbound_http),
+                    mcp_add=mcp.add_tool,
                 ),
                 limits=_tool_limits(settings),
             )
@@ -365,8 +385,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             # the claim heartbeat starts after recovery: until it has run,
             # this process holds no dialogs worth advertising as live
             manager.start()
-            scheduler_task = _start_cron_scheduler(cron_store, manager, settings)
-            sweeper_task = _start_collecting_sweeper(exchanges, dialogs, manager, settings)
+            background_tasks = (
+                _start_cron_scheduler(cron_store, manager, settings),
+                _start_collecting_sweeper(exchanges, dialogs, manager, settings),
+                _start_mcp_sync(mcp.sync, settings),
+            )
             await _start_surfaces(surfaces)
             try:
                 yield Runtime(
@@ -389,7 +412,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     surface_state=_surface_state(telegram_stores),
                 )
             finally:
-                await _stop_background_tasks(scheduler_task, sweeper_task)
+                await _stop_background_tasks(*background_tasks)
                 for surface in surfaces:
                     await _close_surface(surface)
                 await manager.stop_all()
@@ -769,6 +792,59 @@ def _start_collecting_sweeper(
 
 
 @dataclass(frozen=True, slots=True)
+class _McpRuntime:
+    """The MCP module assembled: the sync loop's engine and the two hooks."""
+
+    sync: McpToolSync
+    call_delegate: McpMirrorCallExecutor
+    add_tool: McpAddTool
+
+
+@dataclass(frozen=True, slots=True)
+class _McpDeps:
+    """What the MCP module borrows from the rest of the runtime."""
+
+    session_factory: async_sessionmaker[AsyncSession]
+    outbound_http: httpx.AsyncClient
+    guard: SsrfGuard
+    instructions: InstructionService
+    secret_store: SecretStore | None
+    # the group-skill generator's model: the crawler that turns a server's
+    # tool list into one usage skill (or logs the shape it cannot classify)
+    llm: LLMClient
+
+
+def _build_mcp(deps: _McpDeps) -> _McpRuntime:
+    """Assemble the MCP module: shared servers, mirror sync, call delegate."""
+    store = SqlAlchemyMcpServerStore(deps.session_factory)
+    client = StreamableHttpMcpClient(deps.outbound_http, deps.guard)
+    sync = McpToolSync(
+        store,
+        client,
+        deps.instructions,
+        secrets=deps.secret_store,
+        skills=McpSkillGenerator(deps.llm, deps.instructions),
+    )
+    return _McpRuntime(
+        sync=sync,
+        call_delegate=McpMirrorCallExecutor(store, client, deps.secret_store),
+        add_tool=McpAddTool(store, sync, deps.guard, secrets=deps.secret_store),
+    )
+
+
+def _start_mcp_sync(sync: McpToolSync, settings: Settings) -> asyncio.Task[None]:
+    """Start the periodic MCP mirror refresh.
+
+    The protocol offers no version of a server's tool list, so freshness is
+    this sweep: cheap by construction (the diff is in memory, only changed
+    content re-embeds), and the first interval's delay is fine — mcp_add
+    already ran the first sync inline.
+    """
+    loop = McpSyncLoop(sync, interval_seconds=settings.mcp_sync_interval_seconds)
+    return asyncio.create_task(loop.run_forever())
+
+
+@dataclass(frozen=True, slots=True)
 class _TelegramStores:
     """The Telegram surface's own database: invites plus member profiles."""
 
@@ -933,12 +1009,9 @@ def _build_telegram_surface(
     )
 
 
-async def _stop_background_tasks(
-    scheduler_task: asyncio.Task[None],
-    sweeper_task: asyncio.Task[None],
-) -> None:
+async def _stop_background_tasks(*tasks: asyncio.Task[None]) -> None:
     """Stop the service's own background loops. Surfaces close themselves."""
-    for task in (scheduler_task, sweeper_task):
+    for task in tasks:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task

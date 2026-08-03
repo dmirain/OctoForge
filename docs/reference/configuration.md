@@ -128,6 +128,7 @@ and dataset search are unavailable — the system-record sync is skipped too.
 | `OF_EXTERNAL_CALL_AUTH_WHITELIST` | `[]` | JSON list of `{base_url_prefix, header_name, header_value}`: infrastructure auth injected by `external_call` for matching prefixes |
 | `OF_DATASETS_QUERY_DEFAULT_LIMIT` | `50` | Default `data_query` page size |
 | `OF_DATASETS_QUERY_MAX_LIMIT` | `200` | Maximum it will return |
+| `OF_MCP_SYNC_INTERVAL_SECONDS` | `3600.0` | How often the MCP mirror sync re-lists every registered server's tools — see [mcp.md](mcp.md) |
 
 ## Secrets
 

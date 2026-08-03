@@ -17,8 +17,12 @@ tool means a deploy.
 **No agent-to-agent orchestration.** No graphs, crews or role-playing sub-agents. Concurrency is one process
 per obligation; capability is one stored record. Anything more has to justify itself against those two.
 
-**No MCP.** Tools are ports and records, not an external protocol. Interoperability with the MCP ecosystem is
-not available.
+**MCP: remote servers only, as records.** External MCP servers connect over Streamable HTTP: `mcp_add`
+registers one (deduplicated by URL for the whole installation) and mirrors its tools into endpoint
+records that `recall` finds — there is no global tool list in any prompt. stdio transport is a
+decision, not a gap: a local MCP server is an arbitrary executable, and "no shell, no runtime code
+loading" stays true. OAuth-flow MCP servers are not supported (static tokens via `/secrets` only),
+and removing a registered server is not implemented yet. See [reference/mcp.md](reference/mcp.md).
 
 **One shared operator credential for the HTTP surface** rather than a user system. The agent's users are
 identified per surface (Telegram's identity, or your proxy's header), not by accounts in this application.

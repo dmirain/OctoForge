@@ -50,6 +50,8 @@ failure modes, code anchors.
   ranking, ownership, the system registry and its overlay
 - [reference/datasets.md](reference/datasets.md) — user datasets with JSON-schema validation
 - [reference/memory.md](reference/memory.md) — per-user memories
+- [reference/mcp.md](reference/mcp.md) — external MCP servers as records: `mcp_add`, tool mirrors,
+  the periodic sync
 - [reference/endpoints-and-net.md](reference/endpoints-and-net.md) — outbound HTTP: `http_request`,
   `endpoint_get`, `external_call`, the SSRF guard
 - [reference/secrets.md](reference/secrets.md) — the encrypted per-user secret store

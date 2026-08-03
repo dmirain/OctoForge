@@ -63,6 +63,13 @@ parameter schema, and optionally which stored secret authenticates it. `external
 `endpoint_get` fetches its contract first (*late binding*). Not to be confused with an HTTP route of
 this application's own API.
 
+### MCP mirror
+
+A public endpoint record (`mcp/{server}/{tool}`, `kind: "mcp"` in its content) representing one tool
+of a registered external MCP server. Written only by the MCP sync; executed by `external_call`
+through the MCP delegate. The mirror exists because the MCP protocol has no search — it is a
+persistent, embedded cache of `tools/list`. See [reference/mcp.md](reference/mcp.md).
+
 ### Exchange
 
 One durable obligation to a user: their question, its clarifications, and the answer that settles it.

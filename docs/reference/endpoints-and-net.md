@@ -41,15 +41,19 @@ store at request time and injects it as a header. See [secrets.md](secrets.md).
 
 1. read the record through the instruction service (owner-scoped: another user's private endpoint is
    invisible);
-2. parse the JSON contract (`ToolSpecError` when malformed);
-3. validate the given parameters against `params_schema` — required present, unknown rejected. **A
-   validation error returns the declared contract**, so a blind call can self-correct in one step;
-4. render the URL template with `urllib.parse.quote`-escaped values;
-5. check the URL with the SSRF guard;
-6. inject infrastructure auth if the origin matches `OF_EXTERNAL_CALL_AUTH_WHITELIST`, and resolve the
+2. sniff the content's `kind` discriminator — a record carrying one belongs to another protocol's
+   delegate (`kind: "mcp"` hands off to the MCP executor with params passed through as structured
+   values; see [mcp.md](mcp.md)), while the classic contract below stays strings-only;
+3. parse the JSON contract (`ToolSpecError` when malformed);
+4. validate the given parameters against `params_schema` — required present, unknown rejected,
+   values must be strings. **A validation error returns the declared contract**, so a blind call can
+   self-correct in one step;
+5. render the URL template with `urllib.parse.quote`-escaped values;
+6. check the URL with the SSRF guard;
+7. inject infrastructure auth if the origin matches `OF_EXTERNAL_CALL_AUTH_WHITELIST`, and resolve the
    per-user secret if the record declares one;
-7. perform the request with `follow_redirects=False`;
-8. truncate the response body to 8000 characters and scrub any echo of a secret value before returning
+8. perform the request with `follow_redirects=False`;
+9. truncate the response body to 8000 characters and scrub any echo of a secret value before returning
    it.
 
 Substitution of secret values happens **only** in the record's own template — never in

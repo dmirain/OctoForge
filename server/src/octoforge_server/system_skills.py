@@ -40,6 +40,25 @@ WEB_SYSTEM_SKILLS: tuple[SystemSkill, ...] = (
     ),
     SystemSkill(
         kind=InstructionType.SKILL,
+        title="mcp_integration",
+        content=(
+            "Scenario: connect an external MCP server and use its tools.\n"
+            "1. Register the server: mcp_add with its Streamable HTTP url. The same "
+            "url added by anyone stays one shared server; its tools become endpoint "
+            "records named mcp/<server>/<tool>.\n"
+            '2. If the server needs a token, pass auth={"secret": "<code>"} to '
+            "mcp_add and tell the user to add THEIR OWN token via /secrets — every "
+            "user's token is their own, there are no shared credentials.\n"
+            "3. Discover tools with recall(type=endpoint, query=...), read a "
+            "contract with endpoint_get, execute with external_call — arguments "
+            "may be structured (objects, arrays) exactly as the input_schema says.\n"
+            "4. Mirrored tools refresh on a periodic sync; if a call answers that "
+            "the mirror is stale, re-run mcp_add with the same url to force it."
+        ),
+        tags=("mcp", "scenario"),
+    ),
+    SystemSkill(
+        kind=InstructionType.SKILL,
         title="compare_weather_two_cities",
         content=(
             "Scenario: compare the weather in two cities.\n"

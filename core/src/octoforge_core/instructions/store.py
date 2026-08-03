@@ -158,6 +158,23 @@ class SqlAlchemyInstructionStore:
             rows = (await session.scalars(statement)).all()
             return [to_instruction(row) for row in rows]
 
+    async def list_public_by_prefix(self, kind: InstructionType, prefix: str) -> list[Instruction]:
+        """Return public non-system records of the kind titled under `prefix`."""
+        async with read_session(self._session_factory) as session:
+            statement = (
+                select(InstructionRow)
+                .where(
+                    InstructionRow.type == kind.value,
+                    InstructionRow.owner_id.is_(None),
+                    InstructionRow.system.is_(False),
+                    # autoescape: a literal prefix, even one carrying % or _
+                    InstructionRow.title.startswith(prefix, autoescape=True),
+                )
+                .order_by(InstructionRow.title)
+            )
+            rows = (await session.scalars(statement)).all()
+            return [to_instruction(row) for row in rows]
+
     async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
         """Increment usage_count of the given records (search hits proved useful)."""
         if not instruction_ids:

@@ -37,6 +37,11 @@ code review — and a user can do it for themselves without affecting anyone els
 in [reference/instructions.md](reference/instructions.md) and
 [reference/endpoints-and-net.md](reference/endpoints-and-net.md).
 
+The MCP ecosystem plugs into the same position rather than the rejected one: an external MCP server
+becomes a record (`mcp_add`), its tools become endpoint records found by search, and nothing global
+enters any prompt. What the plugin stance was rejected for — deployed artifacts, one descriptor list
+for everyone — stays rejected; see [reference/mcp.md](reference/mcp.md).
+
 The trade is explicit: retrieval quality now matters as much as prompt quality. If search does not
 surface the right record, the agent behaves as if the capability did not exist. That is why ranking
 is a first-class concern — cosine over embeddings, an exact-title boost, an optional cross-encoder

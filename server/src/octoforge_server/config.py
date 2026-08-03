@@ -54,6 +54,9 @@ DEFAULT_MATERIAL_QUIET_SECONDS = 30.0
 DEFAULT_MATERIAL_SWEEP_INTERVAL_SECONDS = 10.0
 DEFAULT_CRON_LEASE_TTL_SECONDS = 60.0
 DEFAULT_CRON_REPLAY_LIMIT = 5
+# how often the MCP mirror sync refreshes every registered server's tools;
+# the protocol has no list version, so freshness is a periodic sweep
+DEFAULT_MCP_SYNC_INTERVAL_SECONDS = 3600.0
 DEFAULT_RERANKER_MODEL = ""
 DEFAULT_RERANKER_API_URL = "https://api.siliconflow.cn/v1/rerank"
 DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
@@ -149,6 +152,7 @@ class Settings(BaseSettings):
     material_sweep_interval_seconds: float = DEFAULT_MATERIAL_SWEEP_INTERVAL_SECONDS
     cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
     cron_replay_limit: int = DEFAULT_CRON_REPLAY_LIMIT
+    mcp_sync_interval_seconds: float = DEFAULT_MCP_SYNC_INTERVAL_SECONDS
     # Origins the raw `http_request` tool may call, comma-separated. Empty is
     # the open web: the SSRF guard still blocks private space, but nothing stops
     # an agent that read a prompt-injected page from posting a dialog's contents

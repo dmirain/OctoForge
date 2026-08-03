@@ -23,7 +23,14 @@ SYNC_WARNING = "System skill registry sync failed"
 
 def test_web_pack_declares_the_weather_endpoint_and_scenarios() -> None:
     by_title = {entry.title: entry for entry in WEB_SYSTEM_SKILLS}
-    assert set(by_title) == {"wttr_in_weather", "get_current_weather", "compare_weather_two_cities"}
+    assert set(by_title) == {
+        "wttr_in_weather",
+        "get_current_weather",
+        "compare_weather_two_cities",
+        "mcp_integration",
+    }
+    assert by_title["mcp_integration"].kind is InstructionType.SKILL
+    assert "mcp_add" in by_title["mcp_integration"].content
     endpoint = by_title["wttr_in_weather"]
     assert endpoint.kind is InstructionType.ENDPOINT
     spec = json.loads(endpoint.content)

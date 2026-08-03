@@ -7,6 +7,7 @@ The builders depend on ports and primitives only — no FastAPI, no
 application settings, no surface adapters (those stay in the web layer).
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -66,7 +67,7 @@ from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.memory.tools import MemoryDeleteTool, MemoryStoreTool
-from octoforge_core.net.external import CallCredentials, ExternalCallExecutor
+from octoforge_core.net.external import CallCredentials, ExternalCallExecutor, KindCallDelegate
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool, HttpRequestTool
 from octoforge_core.ports import LLMClient
@@ -74,6 +75,7 @@ from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.tools import WebSearchTool
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool, TaskListTool
+from octoforge_core.tools.base import Tool
 from octoforge_core.tools.registry import ToolRegistry
 from octoforge_core.vision.api import ImageResolver, VisionClient
 from octoforge_core.vision.tools import ImageLookTool
@@ -128,6 +130,8 @@ class ToolServices:
     datasets: DatasetService
     executor: ExternalCallExecutor
     search_provider: SearchProvider | None = None
+    # the one MCP verb; None in assemblies that do not wire the mcp module
+    mcp_add: Tool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,13 +256,19 @@ def build_external_executor(
     http_client: httpx.AsyncClient,
     guard: SsrfGuard,
     credentials: CallCredentials | None = None,
+    delegates: Mapping[str, KindCallDelegate] | None = None,
 ) -> ExternalCallExecutor:
-    """Build the executor of external calls described by tool records."""
+    """Build the executor of external calls described by tool records.
+
+    `delegates` maps a record content `kind` to its executor (today: the MCP
+    mirror delegate); records without a kind take the classic HTTP path.
+    """
     return ExternalCallExecutor(
         service=service,
         http_client=http_client,
         guard=guard,
         credentials=credentials,
+        delegates=delegates,
     )
 
 
@@ -283,6 +293,8 @@ def build_tool_registry(
     registry.register(ImageLookTool())
     if services.search_provider is not None:
         registry.register(WebSearchTool(provider=services.search_provider))
+    if services.mcp_add is not None:
+        registry.register(services.mcp_add)
     _register_instruction_tools(registry, services, limits)
     _register_dataset_tools(registry, services.datasets, limits)
     _register_memory_tools(registry, services.instructions)

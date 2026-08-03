@@ -171,6 +171,14 @@ def _tool_capabilities(settings: Settings) -> tuple[Capability, ...]:
                 else "OF_SECRETS_KEY is empty — endpoints declaring auth.secret fail"
             ),
         ),
+        Capability(
+            name="mcp",
+            enabled=True,
+            detail=(
+                "servers are user-added records (mcp_add); mirrored tools refresh "
+                f"every {settings.mcp_sync_interval_seconds:.0f}s"
+            ),
+        ),
     )
 
 

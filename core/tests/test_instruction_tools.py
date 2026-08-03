@@ -468,7 +468,9 @@ async def test_external_call_tool_propagates_unknown_tool() -> None:
         {},
         {"name": ""},
         {"name": 42},
-        {"name": TOOL_NAME, "params": {"city": 1}},
+        # NOTE: non-string param VALUES are legal here since MCP mirrors take
+        # structured arguments; classic endpoints reject them executor-side,
+        # where the contract is at hand for the self-correction message
         {"name": TOOL_NAME, "params": ["city"]},
     ],
 )

@@ -45,7 +45,10 @@ CALL_DESCRIPTION = (
     "Skills name the endpoints they use; before the FIRST call of an endpoint in "
     "this process, resolve its contract with endpoint_get and pass exactly the "
     "params it declares — never guess them. When no skill names an endpoint, "
-    "discover candidates with recall(type=endpoint, ...)."
+    "discover candidates with recall(type=endpoint, ...). Records under the "
+    "mcp/ namespace are MCP tools: their contract is a JSON Schema and params "
+    "may carry structured values (objects, arrays, numbers) exactly as the "
+    "schema declares."
 )
 
 ENDPOINT_GET_NAME = "endpoint_get"
@@ -105,8 +108,10 @@ CALL_SCHEMA: dict[str, Any] = {
         "name": {"type": "string", "description": "Title of the endpoint instruction to execute"},
         "params": {
             "type": "object",
-            "additionalProperties": {"type": "string"},
-            "description": "Parameters declared by the endpoint's params_schema",
+            "description": (
+                "Parameters declared by the endpoint's contract: string values "
+                "for classic endpoints, schema-shaped values for mcp/ records"
+            ),
         },
     },
     "required": ["name"],
@@ -278,14 +283,19 @@ class ExternalCallTool:
             raise ToolArgumentsError("name must be a non-empty string")
         params = _parse_params(arguments.get("params"))
         result = await self._executor.execute(name, params, user_id=context.user_id)
-        return f"HTTP {result.status}\n{result.body}"
+        # status 0: the transport carried no HTTP status (a kind delegate)
+        return f"HTTP {result.status}\n{result.body}" if result.status else result.body
 
 
-def _parse_params(raw: object) -> dict[str, str]:
+def _parse_params(raw: object) -> dict[str, Any]:
+    """Accept any object: value shapes belong to the record's own contract.
+
+    A classic endpoint rejects non-string values with its contract attached
+    (executor-side, where the contract is at hand); an MCP mirror takes the
+    structured values its schema declares.
+    """
     if raw is None:
         return {}
-    if isinstance(raw, dict) and all(
-        isinstance(key, str) and isinstance(value, str) for key, value in raw.items()
-    ):
+    if isinstance(raw, dict) and all(isinstance(key, str) for key in raw):
         return dict(raw)
-    raise ToolArgumentsError("params must be an object of strings")
+    raise ToolArgumentsError("params must be an object")

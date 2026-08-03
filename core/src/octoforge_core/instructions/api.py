@@ -167,6 +167,15 @@ class InstructionStore(Protocol):
         """Return every system (registry-owned) record, oldest first."""
         ...
 
+    async def list_public_by_prefix(self, kind: InstructionType, prefix: str) -> list[Instruction]:
+        """Return public records of the kind whose title starts with `prefix`.
+
+        How an integration sync enumerates its own title namespace to diff
+        it against the upstream state; system records are excluded — a sync
+        must never treat a registry-owned record as its own.
+        """
+        ...
+
     async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
         """Increment usage_count of the given records (search hits proved useful)."""
         ...
@@ -387,6 +396,31 @@ class InstructionService(Protocol):
 
         Raises `InstructionNotFoundError` when the id is unknown — or when it
         names a memory record: a user's memory is never publishable.
+        """
+        ...
+
+    async def save_public(
+        self,
+        kind: InstructionType,
+        title: str,
+        content: str,
+        tags: tuple[str, ...] = (),
+    ) -> Instruction:
+        """Create or replace a public non-system record (integration syncs).
+
+        Management surface for syncs that mirror external capabilities into
+        records (MCP tools), not for agent-facing tools. An unchanged record
+        is returned as-is — re-embedding identical content on every sweep is
+        a wasted call. Raises `SystemInstructionError` when the public
+        (kind, title) slot is held by a system record: the registry owns it.
+        """
+        ...
+
+    async def list_public_by_prefix(self, kind: InstructionType, prefix: str) -> list[Instruction]:
+        """Public records of the kind whose title starts with `prefix`.
+
+        How a sync enumerates its own namespace (e.g. ``mcp/{server}/``) to
+        diff it against the upstream state.
         """
         ...
 

@@ -4,9 +4,18 @@ Core-side execution: the instructions module only stores/searches/ranks
 endpoint records; this executor reads them through the `InstructionService`
 facade, validates and renders the URL, applies the SSRF guard and the
 composition-root auth whitelist, and performs the HTTP request.
+
+An endpoint record's content may declare a `kind`, marking a contract some
+other protocol executes (today: MCP tool mirrors). The executor only sniffs
+the discriminator and hands the record to the delegate registered for that
+kind — it knows nothing about the protocols behind them, which keeps the
+dependency arrow pointing at this module.
 """
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -90,22 +99,38 @@ class CallCredentials:
 
 @dataclass(frozen=True, slots=True)
 class ExternalCallResult:
-    """Outcome of an external call; error statuses are data, not exceptions."""
+    """Outcome of an external call; error statuses are data, not exceptions.
+
+    `status` 0 means the transport carried no HTTP status worth showing
+    (a kind delegate that is not plain HTTP); the tool then renders the
+    body alone.
+    """
 
     status: int
     body: str
 
 
+class KindCallDelegate(Protocol):
+    """Executes endpoint records of one content `kind` (e.g. MCP mirrors)."""
+
+    async def execute(
+        self, content: str, params: dict[str, Any], user_id: str | None
+    ) -> ExternalCallResult:
+        """Run the call the record's content describes, params as given."""
+        ...
+
+
 class ExternalCallExecutor:
     """Executes endpoint records fetched through the instructions facade."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917 — the executor's full credential/delegate surface
         self,
         service: InstructionService,
         http_client: httpx.AsyncClient,
         guard: SsrfGuard,
         credentials: CallCredentials | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        delegates: Mapping[str, KindCallDelegate] | None = None,
     ) -> None:
         resolved = credentials if credentials is not None else CallCredentials()
         self._service = service
@@ -114,11 +139,12 @@ class ExternalCallExecutor:
         self._auth_whitelist = resolved.auth_whitelist
         self._timeout = timeout_seconds
         self._secrets = resolved.secrets
+        self._delegates = dict(delegates or {})
 
     async def execute(
         self,
         name: str,
-        params: dict[str, str],
+        params: dict[str, Any],
         user_id: str | None = None,
     ) -> ExternalCallResult:
         """Run the endpoint call `name` with validated params and return status + body.
@@ -129,6 +155,15 @@ class ExternalCallExecutor:
         instruction = await self._service.get_by_name(
             name, InstructionType.ENDPOINT, user_id=user_id
         )
+        kind = _content_kind(instruction.content)
+        if kind is not None:
+            delegate = self._delegates.get(kind)
+            if delegate is None:
+                raise ExternalCallError(
+                    f"endpoint '{name}' declares kind {kind!r}, which this "
+                    "installation has no executor for"
+                )
+            return await delegate.execute(instruction.content, params, user_id)
         spec = parse_tool_spec(instruction.content)
         try:
             validated = _validate_params(spec, params)
@@ -204,7 +239,19 @@ def _render_auth_header(entry: ExternalCallAuth, user_id: str | None) -> dict[st
     return {entry.header_name: entry.header_value.replace(USER_ID_PLACEHOLDER, user_id)}
 
 
-def _validate_params(spec: ToolSpec, params: dict[str, str]) -> dict[str, str]:
+def _content_kind(content: str) -> str | None:
+    """The record's `kind` discriminator; None for classic endpoint contracts."""
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return None  # not even JSON: let parse_tool_spec produce its own error
+    if not isinstance(data, dict):
+        return None
+    kind = data.get("kind")
+    return kind if isinstance(kind, str) and kind else None
+
+
+def _validate_params(spec: ToolSpec, params: dict[str, Any]) -> dict[str, str]:
     unknown = sorted(set(params) - set(spec.params))
     if unknown:
         raise ExternalCallError(f"unknown params: {', '.join(unknown)}")
@@ -213,6 +260,12 @@ def _validate_params(spec: ToolSpec, params: dict[str, str]) -> dict[str, str]:
     )
     if missing:
         raise ExternalCallError(f"missing required params: {', '.join(missing)}")
+    not_strings = sorted(name for name, value in params.items() if not isinstance(value, str))
+    if not_strings:
+        # structured values belong to kind-delegated records (MCP); a classic
+        # endpoint renders params into a URL and takes strings only
+        joined = ", ".join(not_strings)
+        raise ExternalCallError(f"params must be strings for this endpoint: {joined}")
     return dict(params)
 
 
