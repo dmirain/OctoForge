@@ -91,6 +91,31 @@ async def test_post_request_sends_body_and_headers() -> None:
     assert captured[0].headers["X-Token"] == "abc"
 
 
+async def test_webdav_methods_pass_through() -> None:
+    """CalDAV needs PROPFIND/REPORT; the method list must not block them."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.MULTI_STATUS, text="<multistatus/>")
+
+    tool = make_tool(handler)
+    result = await tool.execute(
+        {
+            "method": "PROPFIND",
+            "url": TARGET_URL,
+            "headers": {"Depth": "0"},
+            "body": "<propfind/>",
+        },
+        CTX,
+    )
+
+    assert result.startswith(f"HTTP {HTTPStatus.MULTI_STATUS}")
+    assert captured[0].method == "PROPFIND"
+    assert captured[0].headers["Depth"] == "0"
+    assert captured[0].content == b"<propfind/>"
+
+
 async def test_error_status_returned_not_raised() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(HTTPStatus.NOT_FOUND, text="nope")

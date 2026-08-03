@@ -176,7 +176,10 @@ class ExternalCallExecutor:
             ) from exc
         url = _render_url(spec, validated)
         await self._guard.check(url)
-        headers = self._auth_headers_for(url, user_id)
+        # record-declared static headers first, so the credential sources
+        # below always win a name collision
+        headers = dict(spec.headers)
+        headers.update(self._auth_headers_for(url, user_id))
         secret_value = await self._resolve_secret(spec.secret_auth, url, user_id)
         if secret_value is not None and spec.secret_auth is not None:
             headers[spec.secret_auth.header] = spec.secret_auth.format.format(value=secret_value)
@@ -185,6 +188,7 @@ class ExternalCallExecutor:
                 spec.method,
                 url,
                 headers=headers,
+                content=_render_body(spec, validated),
                 follow_redirects=False,  # a redirect would bypass the guard's URL check
                 timeout=self._timeout,
             ) as response:
@@ -272,6 +276,18 @@ def _validate_params(spec: ToolSpec, params: dict[str, Any]) -> dict[str, str]:
 def _render_url(spec: ToolSpec, params: dict[str, str]) -> str:
     quoted = {name: quote(value, safe="") for name, value in params.items()}
     return spec.url_template.format(**quoted)
+
+
+def _render_body(spec: ToolSpec, params: dict[str, str]) -> str | None:
+    """Render the request body, when the record declares one.
+
+    Values go in verbatim — URL-escaping would corrupt an XML or JSON
+    payload; format-appropriate escaping is the record author's concern.
+    Secrets are never substituted here: headers only, by construction.
+    """
+    if spec.body_template is None:
+        return None
+    return spec.body_template.format(**params)
 
 
 def _scrub(body: str, secret_value: str | None) -> str:

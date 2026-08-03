@@ -63,6 +63,20 @@ INTERNAL_TOOL_CONTENT = json.dumps(
         "auth": "none",
     }
 )
+CALDAV_TOOL_NAME = "caldav_query"
+CALDAV_TOOL_CONTENT = json.dumps(
+    {
+        "method": "REPORT",
+        "url_template": "https://cal.example.com/dav/{calendar}/",
+        "body_template": '<c:calendar-query><c:time-range start="{start}"/></c:calendar-query>',
+        "headers": {"Depth": "1", "Content-Type": "application/xml"},
+        "params_schema": {
+            "calendar": {"type": "string", "required": True},
+            "start": {"type": "string", "required": True},
+        },
+        "auth": "none",
+    }
+)
 
 
 class StubResolver:
@@ -230,6 +244,33 @@ def test_parse_allows_optional_params_outside_the_template() -> None:
     assert spec.params["verbose"].required is False
 
 
+def test_parse_webdav_spec_with_body_and_headers() -> None:
+    """CalDAV lives on WebDAV verbs plus an XML body and a Depth header."""
+    spec = parse_tool_spec(CALDAV_TOOL_CONTENT)
+
+    assert spec.method == "REPORT"
+    assert spec.body_template is not None and "{start}" in spec.body_template
+    assert spec.headers == {"Depth": "1", "Content-Type": "application/xml"}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"body_template": ""},
+        {"body_template": ["<xml/>"]},
+        {"body_template": "<q>{undeclared}</q>"},
+        {"headers": {"Depth": 1}},
+        {"headers": {"": "1"}},
+        {"headers": ["Depth: 1"]},
+    ],
+)
+def test_parse_rejects_malformed_body_and_headers(extra: dict[str, object]) -> None:
+    content = json.dumps({"method": "REPORT", "url_template": "https://x.test/", **extra})
+
+    with pytest.raises(ToolSpecError):
+        parse_tool_spec(content)
+
+
 # --- execute ---------------------------------------------------------------
 
 
@@ -261,6 +302,44 @@ async def test_execute_quotes_param_values() -> None:
     await executor.execute(TOOL_NAME, {"city": "New York&co"})
 
     assert "New%20York%26co" in str(captured[0].url)
+
+
+async def test_execute_sends_the_rendered_body_and_declared_headers() -> None:
+    """The CalDAV shape: a WebDAV verb, an XML body, a Depth header. Body
+    values go in verbatim — URL-escaping would corrupt the payload."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.MULTI_STATUS, text="<multistatus/>")
+
+    executor = make_executor(handler, {CALDAV_TOOL_NAME: CALDAV_TOOL_CONTENT})
+    result = await executor.execute(
+        CALDAV_TOOL_NAME, {"calendar": "work", "start": "20260801T000000Z"}
+    )
+
+    assert result.status == HTTPStatus.MULTI_STATUS
+    (request,) = captured
+    assert request.method == "REPORT"
+    assert str(request.url) == "https://cal.example.com/dav/work/"
+    assert request.content == (
+        b'<c:calendar-query><c:time-range start="20260801T000000Z"/></c:calendar-query>'
+    )
+    assert request.headers["Depth"] == "1"
+    assert request.headers["Content-Type"] == "application/xml"
+
+
+async def test_a_record_without_a_body_template_sends_no_body() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK)
+
+    executor = make_executor(handler)
+    await executor.execute(TOOL_NAME, {"city": "London"})
+
+    assert captured[0].content == b""
 
 
 async def test_execute_rejects_missing_required_param() -> None:
@@ -633,6 +712,35 @@ async def test_secret_is_injected_as_the_declared_header() -> None:
 
     assert captured[0].headers["X-Api-Key"] == f"Key {SECRET_VALUE}"
     assert store.resolutions == [("user-test", SECRET_CODE, SECRET_HOST)]
+
+
+async def test_a_record_header_never_shadows_the_secret_header() -> None:
+    """A poisoned record declaring the secret's own header name must lose:
+    credential sources are applied after the record's static headers."""
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": f"https://{SECRET_HOST}/v1/inbox",
+            "headers": {"X-Api-Key": "record-supplied"},
+            "params_schema": {},
+            "auth": {"secret": SECRET_CODE, "header": "X-Api-Key", "format": "Key {value}"},
+        }
+    )
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="{}")
+
+    executor = make_executor(
+        handler,
+        records={SECRET_TOOL_NAME: content},
+        options=ExecutorOptions(secrets=FakeSecretStore()),
+    )
+
+    await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+
+    assert captured[0].headers["X-Api-Key"] == f"Key {SECRET_VALUE}"
 
 
 async def test_secret_echo_is_scrubbed_from_the_response() -> None:

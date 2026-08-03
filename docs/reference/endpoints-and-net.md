@@ -26,6 +26,24 @@ An endpoint is an instruction record whose content is a small JSON document:
  "auth": "none"}
 ```
 
+The method may be any of the classic verbs or the WebDAV family (`PROPFIND`, `PROPPATCH`, `REPORT`,
+`MKCOL`, `MKCALENDAR`, `COPY`, `MOVE`, plus `HEAD`/`OPTIONS`) — what CalDAV/CardDAV servers speak.
+`LOCK`/`UNLOCK` are deliberately not allowed: an agent cannot manage a lock's lifetime and would
+leave servers with dangling locks. A record may also declare a request body template and static
+headers, which those protocols need:
+
+```json
+{"method": "REPORT",
+ "url_template": "https://cal.example.com/dav/{calendar}/",
+ "body_template": "<c:calendar-query>...{start}...</c:calendar-query>",
+ "headers": {"Depth": "1", "Content-Type": "application/xml"}}
+```
+
+Body values are substituted **verbatim** (URL-escaping would corrupt an XML or JSON payload;
+format-appropriate escaping is the record author's concern), and secrets are never substituted into
+bodies — headers only, as below. Static record headers are applied first, so the credential sources
+below always win a header-name collision.
+
 `auth` may instead declare a per-user secret:
 
 ```json
@@ -48,10 +66,12 @@ store at request time and injects it as a header. See [secrets.md](secrets.md).
 4. validate the given parameters against `params_schema` — required present, unknown rejected,
    values must be strings. **A validation error returns the declared contract**, so a blind call can
    self-correct in one step;
-5. render the URL template with `urllib.parse.quote`-escaped values;
+5. render the URL template with `urllib.parse.quote`-escaped values, and the body template (if any)
+   with verbatim values;
 6. check the URL with the SSRF guard;
-7. inject infrastructure auth if the origin matches `OF_EXTERNAL_CALL_AUTH_WHITELIST`, and resolve the
-   per-user secret if the record declares one;
+7. apply the record's static headers, then inject infrastructure auth if the origin matches
+   `OF_EXTERNAL_CALL_AUTH_WHITELIST`, and resolve the per-user secret if the record declares one —
+   in that order, so a record header never shadows a credential;
 8. perform the request with `follow_redirects=False`;
 9. truncate the response body to 8000 characters and scrub any echo of a secret value before returning
    it.
@@ -86,7 +106,8 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 - **Endpoint records are owner-scoped.** A private endpoint of another user cannot be executed.
 - **Parameters are validated before the URL is rendered**, and unknown parameters are refused.
 - **A parameter-validation error carries the contract** back to the model.
-- **Secrets are substituted only into headers, only from the record's template.**
+- **Secrets are substituted only into headers, only from the record's template** — never into a
+  request body, and a record's static header cannot shadow a credential header.
 - **Secret values are scrubbed from responses** before they reach the context or the logs.
 - **Redirects are never followed.**
 - **Every outbound URL goes through the guard**, except explicitly allowlisted origins.

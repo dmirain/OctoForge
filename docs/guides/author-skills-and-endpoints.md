@@ -56,6 +56,11 @@ An endpoint record makes a system callable. Its content is a small JSON document
 ```
 
 - `url_template` — placeholders are filled from validated parameters and URL-escaped.
+- `body_template` (optional) — a request body with the same placeholders, filled **verbatim** (no
+  URL-escaping; escape for the body's own format yourself). Secrets never go into bodies.
+- `headers` (optional) — static headers the call always carries (e.g. `Depth`, `Content-Type` for
+  WebDAV/CalDAV). A credential header from `auth` or the installation whitelist always wins a name
+  collision.
 - `params_schema` — declared parameters, `required` per parameter. Unknown parameters are refused, and a
   validation error hands the model this contract back, so a wrong call corrects itself in one step.
 - `auth` — `"none"`, or a per-user secret **by code**. The value never appears in the record, the prompt or
@@ -77,9 +82,10 @@ Users add their own secrets themselves: `/secrets` in Telegram returns a one-tim
   this installation's own API (`OF_SELF_BASE_URL`).
 - Redirects are not followed.
 - Response bodies are truncated at 8000 characters — return JSON, not HTML pages.
-- Only `http`/`https`, and only the five usual methods.
-- Parameters are strings; complex bodies are not expressible in an endpoint record today. That is where a
-  [code tool](add-a-tool.md) starts making sense.
+- Only `http`/`https`. Methods: the classic five plus the WebDAV family (`PROPFIND`, `PROPPATCH`,
+  `REPORT`, `MKCOL`, `MKCALENDAR`, `COPY`, `MOVE`, `HEAD`, `OPTIONS`) — but not `LOCK`/`UNLOCK`.
+- Parameters are strings. A body is a template with string placeholders; logic that must *compute* a
+  body is where a [code tool](add-a-tool.md) starts making sense.
 
 ## Sharing and lifecycle
 

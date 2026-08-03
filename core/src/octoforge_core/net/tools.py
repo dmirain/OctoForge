@@ -74,13 +74,28 @@ ENDPOINT_GET_SCHEMA: dict[str, Any] = {
 
 
 class HttpMethod(StrEnum):
-    """HTTP methods allowed for the tool."""
+    """HTTP methods allowed for the tool.
+
+    Includes the WebDAV verbs (CalDAV/CardDAV need PROPFIND, REPORT,
+    MKCALENDAR): the SSRF guard checks the address, not the method, and
+    write verbs were always allowed, so they add no new risk class.
+    LOCK/UNLOCK stay out — an agent cannot manage a lock's lifetime.
+    """
 
     GET = "GET"
     POST = "POST"
     PUT = "PUT"
     PATCH = "PATCH"
     DELETE = "DELETE"
+    HEAD = "HEAD"
+    OPTIONS = "OPTIONS"
+    PROPFIND = "PROPFIND"
+    PROPPATCH = "PROPPATCH"
+    REPORT = "REPORT"
+    MKCOL = "MKCOL"
+    MKCALENDAR = "MKCALENDAR"
+    COPY = "COPY"
+    MOVE = "MOVE"
 
 
 REQUEST_SCHEMA: dict[str, Any] = {
