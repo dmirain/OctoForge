@@ -461,4 +461,8 @@ welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[Business Source License 1.1](LICENSE) © [Dmitry Prokofyev (dmirain)](https://github.com/dmirain)
+[Business Source License 1.1](LICENSE) © [Dmitry Prokofyev (dmirain)](https://github.com/dmirain).
+
+Free to use, modify and self-host — including in production — except for
+offering OctoForge itself to third parties as a hosted or managed service.
+On 2030-03-03 the license automatically converts to AGPL-3.0-only.

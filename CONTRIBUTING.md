@@ -26,4 +26,7 @@ English, [Conventional Commits](https://www.conventionalcommits.org/)-style (`fe
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the project's [Business Source License 1.1](LICENSE).
+By contributing, you agree that your contributions are licensed under the project's
+[Business Source License 1.1](LICENSE), and you grant the Licensor
+([Dmitry Prokofyev](https://github.com/dmirain)) the right to relicense them, including
+under the Change License (AGPL-3.0-only) and commercial licenses.
