@@ -55,7 +55,7 @@ from octoforge_telegram import bridge as bridge_module
 from octoforge_telegram.bridge import (
     CANCELLED_LINE,
     REPLY_TARGET_MAP_SIZE,
-    STATUS_DIVIDER,
+    STATUS_SEPARATOR,
     THINKING_LABEL,
     TOOL_GROUPS,
     TOOL_LINE_TEMPLATE,
@@ -636,7 +636,7 @@ async def test_tool_call_renders_status_line_before_the_answer(
 
     await bridge.handle_text("hi")
     status_block = f"```\n{TOOL_LINE_TEMPLATE.format(name=ECHO_TOOL)} ·\n```"
-    expected = f"{status_block}\n{STATUS_DIVIDER}\n{REPLY}"
+    expected = f"{status_block}\n{REPLY}"
     await wait_until(lambda: client.current_text() == expected if client.sent else False)
 
     assert client.sent == [(CHAT_ID, status_block)]
@@ -799,14 +799,14 @@ async def test_reply_target_map_is_bounded() -> None:
     assert overflow - 1 in bridge._reply_targets  # the newest survives
 
 
-def mono(*lines: str) -> str:
-    """The status block as the chat sees it: a fenced monospace section."""
-    return "```\n" + "\n".join(lines) + "\n```"
+def mono(*entries: str) -> str:
+    """The status line as the chat sees it: one fenced monospace row."""
+    return "```\n" + STATUS_SEPARATOR.join(entries) + "\n```"
 
 
-async def test_thinking_renders_dots_that_give_way_to_text() -> None:
-    """While the model reasons, the status block ends with 💭 and growing
-    dots; the first real output replaces it instead of stacking under it."""
+async def test_thinking_stays_in_the_record_when_text_arrives() -> None:
+    """Thinking is history, not a spinner: the 💭 entry keeps its dots and
+    the answer text lands under the same status line."""
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
@@ -817,14 +817,15 @@ async def test_thinking_renders_dots_that_give_way_to_text() -> None:
     assert client.current_text() == mono(f"{THINKING_LABEL} ··")
 
     await bridge._render(TextDelta(text="Ответ"), "x1")
-    assert client.current_text() == "Ответ"
+    expected = mono(f"{THINKING_LABEL} ··") + "\n" + "Ответ"
+    assert client.current_text() == expected
     await bridge._render(Finished(message=reply("Ответ")), "x1")
-    assert client.current_text() == "Ответ"
+    assert client.current_text() == expected
 
 
 async def test_repeated_calls_of_a_group_grow_dots_then_a_count() -> None:
-    """Calls of one tool group collapse into a single line: · ·· ··· ··4,
-    and a call of another group starts its own line."""
+    """Calls of one tool group collapse into one entry (· ·· ··· ··4); a
+    call of another group continues on the same line, not a new row."""
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
@@ -841,6 +842,23 @@ async def test_repeated_calls_of_a_group_grow_dots_then_a_count() -> None:
 
     await bridge._render(ToolCallRequested(call=other), "x1")
     assert client.current_text() == mono(f"{echo_line} ··4", f"{TOOL_GROUPS['web_search']} ·")
+
+
+async def test_a_second_thinking_phase_gets_its_own_entry() -> None:
+    """Thinking, a tool, thinking again: two 💭 entries, in order, one line."""
+    client = FakeTelegramClient()
+    runner = FakeRunner()
+    bridge = make_fake_bridge(client, runner)
+    call = ToolCall(id=CALL_ID, name="web_search", arguments={})
+
+    await bridge._render(ReasoningDelta(), "x1")
+    await bridge._render(ToolCallRequested(call=call), "x1")
+    await bridge._render(ReasoningDelta(), "x1")
+    await bridge._render(ReasoningDelta(), "x1")
+
+    assert client.current_text() == mono(
+        f"{THINKING_LABEL} ·", f"{TOOL_GROUPS['web_search']} ·", f"{THINKING_LABEL} ··"
+    )
 
 
 SHORT_THROTTLE_SECONDS = 0.05

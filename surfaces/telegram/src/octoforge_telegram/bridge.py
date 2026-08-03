@@ -49,36 +49,36 @@ TOOL_FAIL_LINE_TEMPLATE = "⚠️ {name}: {error}"
 CANCELLED_LINE = "🛑 Отменено"
 FAILED_LINE_TEMPLATE = "❌ Ошибка: {error}"
 RETRY_LINE_TEMPLATE = "🔁 Провайдер недоступен ({reason}), повтор {attempt} через {delay:.0f} сек"
-# the label shown while the model reasons; its progress dots count the
-# reasoning chunks received so far
-THINKING_LABEL = "💭 думает"
-# what the user reads instead of raw tool names: one emoji + one short
-# Russian word per tool GROUP, so consecutive calls of a kind collapse into
-# a single line with progress dots
+# the label for a reasoning phase; a persistent entry like any other, its
+# progress dots counting the reasoning chunks of that phase
+THINKING_LABEL = "💭 думаю"
+# what the user reads instead of raw tool names: the agent narrating its own
+# actions — first-person verbs, one per tool. Consecutive calls of one kind
+# collapse into a single entry with progress dots.
 TOOL_GROUPS: dict[str, str] = {
-    "recall": "🧠 память",
-    "memory_store": "🧠 память",
-    "memory_delete": "🧠 память",
-    "history_search": "💬 история",
-    "web_search": "🔎 поиск",
-    "http_request": "🌐 сеть",
-    "external_call": "🔌 сервис",
-    "endpoint_get": "🔌 сервис",
-    "image_look": "🖼 фото",
-    "cron_pause": "⏰ крон",
-    "cron_resume": "⏰ крон",
-    "data_put": "📊 данные",
-    "data_query": "📊 данные",
-    "data_forget": "📊 данные",
-    "instruction_save": "📚 знания",
-    "instruction_delete": "📚 знания",
-    "task_create": "🗂 задачи",
-    "task_delete": "🗂 задачи",
-    "task_list": "🗂 задачи",
-    "ask_user": "❓ вопрос",
+    "recall": "🧠 вспоминаю",
+    "memory_store": "🧠 запоминаю",
+    "memory_delete": "🧠 забываю",
+    "history_search": "💬 читаю историю",
+    "web_search": "🔎 ищу",
+    "http_request": "🌐 запрашиваю",
+    "external_call": "🔌 вызываю",
+    "endpoint_get": "🔌 вызываю",
+    "image_look": "🖼 смотрю",
+    "cron_pause": "⏰ планирую",
+    "cron_resume": "⏰ планирую",
+    "data_put": "📊 записываю",
+    "data_query": "📊 выбираю",
+    "data_forget": "📊 стираю",
+    "instruction_save": "📚 сохраняю",
+    "instruction_delete": "📚 удаляю",
+    "task_create": "🗂 запускаю",
+    "task_delete": "🗂 отменяю",
+    "task_list": "🗂 сверяюсь",
+    "ask_user": "❓ спрашиваю",
 }
-# the line between the monospaced status block and the answer text
-STATUS_DIVIDER = "──────────"
+# separates entries within the single status line
+STATUS_SEPARATOR = "  "
 # progress dots grow one per call up to this; then the last dot becomes the
 # count itself: · ·· ··· ··4 ··5 …
 MAX_PLAIN_DOTS = 3
@@ -143,12 +143,8 @@ class _Draft:
     # without it, a model pausing mid-answer left text sitting undelivered
     # until the pause ended
     flush_timer: asyncio.Task[None] | None = None
-    # the model is reasoning: render a transient 💭 tail with progress dots
-    # instead of silence; cleared by the next visible output
-    thinking: bool = False
-    reasoning_chunks: int = 0
-    # the status block above the answer: tool groups with progress dots and
-    # standalone notices, in arrival order
+    # the status line above the answer: the agent's actions (thinking
+    # included) with progress dots, plus notices, in arrival order
     status: list[_StatusEntry] = field(default_factory=list)
     # the exchange this draft belongs to, carried alongside so a fresh
     # message id can be recorded into the reply-target map at send time
@@ -382,12 +378,10 @@ class TelegramBridge:
             self._typing_on(exchange_id)
             return
         if isinstance(event, ReasoningDelta):
-            draft.thinking = True
-            draft.reasoning_chunks += 1
+            _count_status(draft, THINKING_LABEL)
             await self._flush_throttled(draft)
             return
         if isinstance(event, TextDelta):
-            draft.thinking = False
             draft.buffer += event.text
             await self._flush_throttled(draft)
             return
@@ -395,13 +389,11 @@ class TelegramBridge:
             await self._render_terminal(event, exchange_id, draft)
             return
         if isinstance(event, ToolCallRequested):
-            draft.thinking = False
             _count_status(draft, _tool_group(event.call.name))
             await self._flush_throttled(draft)
             return
         line = _notice_line(event)
         if line is not None:
-            draft.thinking = False
             draft.status.append(_StatusEntry(label=line, counted=False))
             await self._flush_throttled(draft)
 
@@ -414,7 +406,6 @@ class TelegramBridge:
         # deferred flush timer: the terminal flush below is the last word,
         # nothing may fire after it.
         self._typing_off(exchange_id)
-        draft.thinking = False
         draft.pending_since = None
         self._cancel_flush_timer(draft)
         if isinstance(event, Cancelled):
@@ -507,13 +498,12 @@ class TelegramBridge:
     async def _flush_draft(self, draft: _Draft) -> None:
         """Push the draft to the chat as the Rich Message(s) it renders into.
 
-        The visible message is composed on every flush: the monospaced
-        status block (tool groups with progress dots, the transient 💭 line
-        while the model reasons), a divider, then the answer text — the
-        agent's Markdown, which Telegram renders natively. The limit that
-        applies is the Rich Message one, eight times the plain-text budget;
-        an answer that still outgrows it is sealed and continued in a fresh
-        message.
+        The visible message is composed on every flush: one monospaced
+        status line (the agent's actions with progress dots, thinking
+        included), then the answer text — the agent's Markdown, which
+        Telegram renders natively. The limit that applies is the Rich
+        Message one, eight times the plain-text budget; an answer that
+        still outgrows it is sealed and continued in a fresh message.
         """
         raw = _compose(draft)
         if not raw:
@@ -662,24 +652,20 @@ def _progress_dots(count: int) -> str:
 
 
 def _compose(draft: _Draft) -> str:
-    """The full visible message: status block, divider, answer text.
+    """The full visible message: one monospaced status line, then the text.
 
-    The status block is monospaced (a fenced code block) so its lines and
-    dots stay aligned; the divider marks where the answer begins and only
-    appears once there is text to divide from.
+    The agent narrates what it does in a single line — entries flow one
+    after another, never one per row — and the record stays in the finished
+    message: thinking phases are history, not a spinner.
     """
-    lines = [
+    entries = [
         f"{entry.label} {_progress_dots(entry.count)}" if entry.counted else entry.label
         for entry in draft.status
     ]
-    if draft.thinking:
-        lines.append(f"{THINKING_LABEL} {_progress_dots(draft.reasoning_chunks)}")
     text = draft.buffer.rstrip("\n")
     parts: list[str] = []
-    if lines:
-        parts.append("```\n" + "\n".join(lines) + "\n```")
-        if text:
-            parts.append(STATUS_DIVIDER)
+    if entries:
+        parts.append("```\n" + STATUS_SEPARATOR.join(entries) + "\n```")
     if text:
         parts.append(text)
     return "\n".join(parts)
