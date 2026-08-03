@@ -41,6 +41,9 @@ class User:
     """A person, independent of any surface they talk from."""
 
     id: str
+    #: The person's canonical name. Seeded from the first surface that reports
+    #: one and thereafter the person's own; empty only until any surface has.
+    name: str = ""
     #: The cross-cutting identifier once registration exists. Empty until then;
     #: it is the account itself, not a surface, which is why it lives here.
     email: str = ""
@@ -54,6 +57,12 @@ class UserIdentity:
     user_id: str
     surface: str
     external_id: str
+    #: The display name the surface currently shows for them — a living
+    #: mirror, refreshed on contact; empty only until the surface reports one.
+    name: str = ""
+    #: The surface handle (@username and its kin). A luxury: not every
+    #: surface has one, and a user may drop theirs, hence optional.
+    username: str | None = None
     #: Surface-specific extras. A JSON column is right *here* — nothing about
     #: it needs enforcing — and wrong for the identity itself, which needs a
     #: unique constraint.
@@ -124,6 +133,22 @@ class IdentityStore(Protocol):
 
     async def deactivate(self, surface: str, external_id: str) -> None:
         """Revoke an account without erasing that it was once used."""
+        ...
+
+    async def update_profile(
+        self, surface: str, external_id: str, name: str, username: str | None
+    ) -> None:
+        """Mirror what the surface currently calls this person.
+
+        The identity's name and username follow the surface — people rename
+        themselves, and the mirror must not go stale. The person's own
+        `User.name` is seeded from here only while still empty: the first
+        surface to report a name christens them, and nothing afterwards
+        overwrites the canonical name from a transport.
+
+        A no-op for an unknown account: recording a profile is a courtesy,
+        not a way to create an identity.
+        """
         ...
 
     async def list_users(self) -> "UserList":

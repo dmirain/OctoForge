@@ -39,6 +39,15 @@ class TelegramUser(BaseModel):
     username: str | None = None
 
 
+def display_name(user: TelegramUser) -> str:
+    """The name Telegram shows for this user, as one string.
+
+    `first_name` is mandatory on the Telegram side, `last_name` is not; the
+    join has to survive either being empty without leaking a stray space.
+    """
+    return " ".join(part for part in (user.first_name, user.last_name) if part)
+
+
 class TelegramChat(BaseModel):
     """A chat an update message was sent to."""
 

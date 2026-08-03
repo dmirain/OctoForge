@@ -866,6 +866,51 @@ async def test_gated_member_profile_is_recorded_on_contact(
     await manager.stop_all()
 
 
+async def test_gated_member_profile_reaches_the_identity(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The identity's name/username follow the Telegram profile, and a person
+    still unnamed is christened by it."""
+    manager = await make_manager(
+        [ChatMessage(role=MessageRole.ASSISTANT, content=REPLY)], session_factory
+    )
+    client = FakeTelegramClient()
+    identities = SqlAlchemyIdentityStore(session_factory)
+    person = await identities.resolve_or_create(CHANNEL, str(TELEGRAM_USER_ID))
+    registry = TelegramBridgeRegistry(
+        runner_provider=manager.get_or_create_runner,
+        client=client,
+        edit_throttle_seconds=NO_THROTTLE,
+        identities=identities,
+    )
+    poller = TelegramPoller(
+        client=client,
+        registry=registry,
+        options=TelegramPollerOptions(
+            poll_timeout_seconds=POLL_TIMEOUT,
+            error_backoff_seconds=NO_BACKOFF,
+            identities=identities,
+        ),
+    )
+    update = TelegramUpdate(
+        update_id=1,
+        message=TelegramMessage(
+            message_id=1,
+            from_user=TelegramUser(
+                id=TELEGRAM_USER_ID, first_name="Alice", last_name="Smith", username="alice"
+            ),
+            chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
+            text="hello",
+        ),
+    )
+    await deliver(poller, update)
+    identity = await identities.find_by_identity(CHANNEL, str(TELEGRAM_USER_ID))
+    assert identity is not None
+    assert (identity.name, identity.username) == ("Alice Smith", "alice")
+    assert (await identities.get_user(person)).name == "Alice Smith"
+    await manager.stop_all()
+
+
 async def test_stranger_denied_by_the_gate_is_not_recorded(
     invite_store: SqlAlchemyInviteStore,
 ) -> None:

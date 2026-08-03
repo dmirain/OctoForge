@@ -17,6 +17,9 @@ class UserRow(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    # the person's canonical name: seeded from the first surface that reports
+    # one, thereafter the person's own ("" only until any surface has)
+    name: Mapped[str] = mapped_column(String, default="")
     # The cross-cutting identifier once registration exists. Unique so two
     # people cannot claim one address, nullable because nobody has one yet —
     # "" would collide on the second row.
@@ -40,6 +43,11 @@ class UserIdentityRow(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     surface: Mapped[str] = mapped_column(String)
     external_id: Mapped[str] = mapped_column(String)
+    # living mirror of the surface profile: the display name the surface
+    # currently shows for them ("" until the surface reports one) and the
+    # optional handle — a username is a surface luxury, hence nullable
+    name: Mapped[str] = mapped_column(String, default="")
+    username: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     # surface-specific extras; nothing here needs enforcing, which is exactly
     # why JSON is right here and wrong for the identity itself
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

@@ -218,6 +218,57 @@ async def test_two_first_messages_at_once_make_one_person(
     assert len(set(ids)) == 1
 
 
+async def test_the_identity_mirrors_what_the_surface_calls_them(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    """People rename themselves on a surface; the mirror must not go stale."""
+    user = await store.create_user()
+    await store.link(user.id, TELEGRAM, ACCOUNT)
+
+    await store.update_profile(TELEGRAM, ACCOUNT, "Alice Smith", "alice")
+
+    found = await store.find_by_identity(TELEGRAM, ACCOUNT)
+    assert found is not None
+    assert (found.name, found.username) == ("Alice Smith", "alice")
+
+
+async def test_the_first_surface_to_report_a_name_christens_the_person(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    user = await store.create_user()
+    await store.link(user.id, TELEGRAM, ACCOUNT)
+
+    await store.update_profile(TELEGRAM, ACCOUNT, "Alice Smith", None)
+
+    assert (await store.get_user(user.id)).name == "Alice Smith"
+
+
+async def test_a_named_person_is_not_renamed_by_a_surface(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    """The canonical name is the person's own once set; only the identity's
+    mirror follows a surface rename."""
+    user = await store.create_user()
+    await store.link(user.id, TELEGRAM, ACCOUNT)
+    await store.update_profile(TELEGRAM, ACCOUNT, "Alice Smith", "alice")
+
+    await store.update_profile(TELEGRAM, ACCOUNT, "A. Smith", "alice2")
+
+    found = await store.find_by_identity(TELEGRAM, ACCOUNT)
+    assert found is not None
+    assert (found.name, found.username) == ("A. Smith", "alice2")
+    assert (await store.get_user(user.id)).name == "Alice Smith"
+
+
+async def test_a_profile_for_an_unknown_account_is_dropped(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    """Recording a profile is a courtesy, not a way to create an identity."""
+    await store.update_profile(TELEGRAM, ACCOUNT, "Alice Smith", "alice")
+
+    assert await store.find_by_identity(TELEGRAM, ACCOUNT) is None
+
+
 async def test_first_contact_never_attaches_itself_to_somebody(
     store: SqlAlchemyIdentityStore,
 ) -> None:

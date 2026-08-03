@@ -110,6 +110,10 @@ and no Alembic chain — invites are a Telegram-specific concept and core knows 
 
 Past the gate, every message upserts the sender's profile (name, `@username`) into a members table, so the
 console and the `admin_manage` tool can show who a `tg:<id>` actually is and which invite they came through.
+When the poller runs in-process it also pushes that profile into the identity store: the identity's
+`name`/`username` follow the Telegram profile, and a person whose `users.name` is still empty is christened
+by it. The standalone ingestion node cannot do this — it has no identity store — so in the split
+arrangement identity names refresh only from the pod side.
 
 ### Commands and the admin tool
 

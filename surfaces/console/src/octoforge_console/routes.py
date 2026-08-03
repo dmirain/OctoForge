@@ -533,12 +533,15 @@ async def users(identities: IdentityStoreDep) -> dict[str, Any]:
     items = [
         {
             "user_id": person.id,
+            "name": person.name,
             "email": person.email,
             "created_at": person.created_at.isoformat() if person.created_at else None,
             "identities": [
                 {
                     "surface": item.surface,
                     "external_id": item.external_id,
+                    "name": item.name,
+                    "username": item.username,
                     "active": item.active,
                 }
                 for item in await identities.identities_of(person.id)

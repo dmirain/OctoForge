@@ -919,6 +919,7 @@ def _build_telegram_surface(
             membership=membership,
             secrets_link=resolved.secrets_link,
             directory=resolved.stores.directory if resolved.stores is not None else None,
+            identities=resolved.identities,
             vision=resolved.vision,
             speech=resolved.speech,
             voice_max_seconds=settings.voice_max_seconds,

@@ -144,6 +144,24 @@ class SqlAlchemyIdentityStore:
                 .values(active=False, updated_at=utc_now())
             )
 
+    async def update_profile(
+        self, surface: str, external_id: str, name: str, username: str | None
+    ) -> None:
+        """Mirror the surface profile; seed the person's name while empty."""
+        async with write_session(self._session_factory) as session:
+            identity = await self._find(session, surface, external_id)
+            if identity is None:
+                return
+            if identity.name != name or identity.username != username:
+                identity.name = name
+                identity.username = username
+                identity.updated_at = utc_now()
+            if not name:
+                return
+            user = await session.get(UserRow, identity.user_id)
+            if user is not None and not user.name:
+                user.name = name
+
     async def list_users(self) -> UserList:
         """Everyone the installation knows, newest first."""
         async with read_session(self._session_factory) as session:
@@ -178,7 +196,7 @@ class SqlAlchemyIdentityStore:
 
 
 def _to_user(row: UserRow) -> User:
-    return User(id=row.id, email=row.email or "", created_at=row.created_at)
+    return User(id=row.id, name=row.name, email=row.email or "", created_at=row.created_at)
 
 
 def _to_identity(row: UserIdentityRow) -> UserIdentity:
@@ -186,6 +204,8 @@ def _to_identity(row: UserIdentityRow) -> UserIdentity:
         user_id=row.user_id,
         surface=row.surface,
         external_id=row.external_id,
+        name=row.name,
+        username=row.username,
         details=dict(row.details or {}),
         active=row.active,
         created_at=row.created_at,

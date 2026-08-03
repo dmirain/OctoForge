@@ -42,6 +42,7 @@ from octoforge_telegram.models import (
     TelegramMessage,
     TelegramUpdate,
     TelegramUser,
+    display_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -328,6 +329,9 @@ class TelegramPollerOptions:
     secrets_link: Callable[[str], str] | None = None
     # who-is-who mirror: profiles of gated users, refreshed on every contact
     directory: MemberDirectory | None = None
+    # the same mirror pushed into core: the identity's name/username follow
+    # the Telegram profile, and a person still unnamed is christened by it
+    identities: IdentityStore | None = None
     vision: VisionClient | None = None
     # transcribes voice messages; None turns the feature off entirely (a
     # recording keeps today's "text only" notice, zero extra cost)
@@ -353,6 +357,7 @@ class TelegramPoller:
         self._membership = options.membership
         self._secrets_link = options.secrets_link
         self._directory = options.directory
+        self._identities = options.identities
         self._vision = options.vision
         self._speech = options.speech
         self._album_quiet_seconds = options.album_quiet_seconds
@@ -887,12 +892,23 @@ class TelegramPoller:
 
     async def _record_member(self, user_id: str, user: TelegramUser) -> None:
         """Mirror the sender's profile; recording must never break dispatch."""
-        if self._directory is None:
-            return
-        try:
-            await self._directory.record(user_id, user.first_name, user.last_name, user.username)
-        except Exception:
-            logger.exception("member profile record failed: user=%s", user_id)
+        if self._directory is not None:
+            try:
+                await self._directory.record(
+                    user_id, user.first_name, user.last_name, user.username
+                )
+            except Exception:
+                logger.exception("member profile record failed: user=%s", user_id)
+        if self._identities is not None:
+            try:
+                await self._identities.update_profile(
+                    TELEGRAM_CHANNEL,
+                    user_id.removeprefix(USER_ID_PREFIX),
+                    display_name(user),
+                    user.username,
+                )
+            except Exception:
+                logger.exception("identity profile update failed: user=%s", user_id)
 
     async def _check_membership(self, user_id: str, chat_id: int, text: str) -> bool:
         """Apply the invite gate (no gate configured = everyone passes)."""

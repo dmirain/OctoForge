@@ -420,4 +420,6 @@ def test_the_console_shows_people_and_the_accounts_they_answer_on(
     assert body["total"] == 1
     person = body["items"][0]
     assert person["user_id"] != "alice"  # the person, not what the surface calls them
-    assert person["identities"] == [{"surface": "web", "external_id": "alice", "active": True}]
+    assert person["identities"] == [
+        {"surface": "web", "external_id": "alice", "name": "", "username": None, "active": True}
+    ]
