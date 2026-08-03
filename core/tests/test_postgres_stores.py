@@ -58,6 +58,7 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.instructions.pg_store import PostgresInstructionStore
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
+from octoforge_core.time import utc_now
 
 DATABASE_URL_ENV = "OF_TEST_DATABASE_URL"
 DATABASE_URL = os.environ.get(DATABASE_URL_ENV, "")
@@ -291,6 +292,24 @@ async def test_datetimes_round_trip_as_aware_utc(
     assert row.created_at.tzinfo is not None
     assert row.created_at.utcoffset() == timedelta(0)
     assert stored_dialog.created_at.tzinfo is not None
+
+
+async def test_user_activity_aggregate_comes_back_as_aware_utc(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The `max(case(...))` aggregate must survive this dialect too: asyncpg
+    hands the timestamptz back aware, `_as_utc` only normalizes it."""
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+
+    activity = await messages.user_activity_by_channel(CHANNEL, utc_now() - timedelta(hours=24))
+
+    (entry,) = activity
+    assert entry.user_messages_since == 1  # the agent's reply is not the user's writing
+    assert entry.last_user_message_at is not None
+    assert entry.last_user_message_at.utcoffset() == timedelta(0)
 
 
 async def test_concurrent_appends_get_distinct_seq(

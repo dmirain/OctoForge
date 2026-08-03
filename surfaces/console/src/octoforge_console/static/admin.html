@@ -115,10 +115,12 @@ function open(text) {
 const VIEWS = {
   dialogs: {
     title: "Диалоги", path: () => "/api/admin/dialogs",
-    columns: ["пользователь", "канал", "юзер / агент", "задач", "последнее", "создан", ""],
+    columns: ["пользователь", "канал", "юзер / агент", "за сутки", "задач", "посл. от юзера", "последнее", "создан", ""],
     row: (d) => `${person(d.user_id, d.user_name)}<td>${esc(d.channel)}</td>` +
       `<td>${d.user_message_count} / ${d.agent_message_count}</td>` +
-      `<td>${d.task_count}</td><td class="mono">${time(d.last_message_at)}</td>` +
+      `<td>${d.user_messages_24h}</td>` +
+      `<td>${d.task_count}</td><td class="mono">${time(d.last_user_message_at)}</td>` +
+      `<td class="mono">${time(d.last_message_at)}</td>` +
       `<td class="mono">${time(d.created_at)}</td>` +
       `<td><button class="act" data-open-dialog="${esc(d.id)}">сообщения</button> ` +
       `<button class="act danger" data-delete="/api/admin/dialogs/${esc(d.id)}">удалить</button></td>`,

@@ -7,7 +7,7 @@ objects (`Dialog`, `ChatMessage` from the shared kernel) at the boundary.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import ColumnElement, Exists, Insert, case, delete, func, insert, select, update
@@ -39,6 +39,8 @@ from octoforge_core.dialogs.api import (
     ExchangeStatus,
     MessageStats,
     MessageStatsList,
+    UserActivity,
+    UserActivityList,
 )
 from octoforge_core.dialogs.models import DialogClaimRow, DialogRow, ExchangeRow, MessageRow
 from octoforge_core.domain import (
@@ -430,6 +432,32 @@ class SqlAlchemyMessageRepository:
                 for user_id, user_count, user_chars, agent_count, agent_chars in rows
             ]
 
+    async def user_activity_by_channel(self, channel: str, since: datetime) -> UserActivityList:
+        """Per person: their last own message, and how many they wrote since `since`.
+
+        Same conditional-aggregation shape as `stats_by_channel`; only the
+        user's own messages count — see `UserActivity`.
+        """
+        is_user = MessageRow.role == MessageRole.USER.value
+        last_written = func.max(case((is_user, MessageRow.created_at)))
+        written_since = func.count(case(((is_user) & (MessageRow.created_at >= since), 1)))
+        async with read_session(self._session_factory) as session:
+            statement = (
+                select(DialogRow.user_id, last_written, written_since)
+                .join(DialogRow, MessageRow.dialog_id == DialogRow.id)
+                .where(DialogRow.channel == channel)
+                .group_by(DialogRow.user_id)
+            )
+            rows = (await session.execute(statement)).all()
+            return [
+                UserActivity(
+                    user_id=user_id,
+                    last_user_message_at=_as_utc(last),
+                    user_messages_since=count,
+                )
+                for user_id, last, count in rows
+            ]
+
 
 def _has_live_task() -> Exists:
     """Correlated EXISTS: a run of this exchange is still pending or running.
@@ -810,6 +838,21 @@ class SqlAlchemyClaimRepository:
             await session.execute(
                 delete(DialogClaimRow).where(DialogClaimRow.dialog_id == dialog_id)
             )
+
+
+def _as_utc(value: datetime | str | None) -> datetime | None:
+    """Normalize a datetime that came out of an aggregate.
+
+    A plain column read goes through `UTCDateTime` and needs none of this,
+    but an aggregate wrapped in `case()` can lose the decorator: SQLite may
+    hand the ISO text back raw, and a naive value must be re-stamped as the
+    UTC it was stored in.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _to_exchange(row: ExchangeRow) -> Exchange:

@@ -262,8 +262,10 @@ async def test_list_users_reports_access_stats_and_cron(
     assert "telegram users: 1" in result
     assert f"telegram 111, user {person}" in result
     assert "access=claimed" in result
-    assert "wrote 1 messages (5 chars)" in result
+    assert "wrote 1 messages (5 chars, 1 in last 24h)" in result
     assert "agent replied 0 (0 chars)" in result
+    assert "last_wrote=" in result
+    assert "last_wrote=never" not in result  # they just wrote
     assert "cron=1/2 enabled" in result
     # the same human must not also appear as an unlinked account
     assert "not yet linked" not in result

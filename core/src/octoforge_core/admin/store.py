@@ -29,13 +29,14 @@ from octoforge_core.datasets.api import Dataset, DatasetRecord
 from octoforge_core.datasets.models import DatasetRecordRow, DatasetRow
 from octoforge_core.datasets.validation import parse_schema
 from octoforge_core.db.unit_of_work import read_session
-from octoforge_core.dialogs.api import ExchangeStatus
+from octoforge_core.dialogs.api import ACTIVITY_WINDOW, ExchangeStatus
 from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
 from octoforge_core.instructions.api import Instruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.memory.api import Memory
 from octoforge_core.tasks.api import TaskKind, TaskStatus
 from octoforge_core.tasks.models import TaskRow
+from octoforge_core.time import utc_now
 
 
 class SqlAlchemyAdminStore:
@@ -104,8 +105,31 @@ class SqlAlchemyAdminStore:
             .where(MessageRow.dialog_id == DialogRow.id)
             .scalar_subquery()
         )
+        last_user_message_at = (
+            select(func.max(MessageRow.created_at))
+            .where(MessageRow.dialog_id == DialogRow.id, MessageRow.role == "user")
+            .scalar_subquery()
+        )
+        user_messages_24h = (
+            select(func.count())
+            .select_from(MessageRow)
+            .where(
+                MessageRow.dialog_id == DialogRow.id,
+                MessageRow.role == "user",
+                MessageRow.created_at >= utc_now() - ACTIVITY_WINDOW,
+            )
+            .scalar_subquery()
+        )
         statement = (
-            select(DialogRow, user_message_count, agent_message_count, task_count, last_message_at)
+            select(
+                DialogRow,
+                user_message_count,
+                agent_message_count,
+                task_count,
+                last_message_at,
+                last_user_message_at,
+                user_messages_24h,
+            )
             # by what actually happened, not by when the row was last written:
             # the dialog row is no longer touched per message (that was two
             # writes a turn for this ordering alone)
@@ -126,6 +150,8 @@ class SqlAlchemyAdminStore:
                 agent_message_count=row[2],
                 task_count=row[3],
                 last_message_at=row[4],
+                last_user_message_at=row[5],
+                user_messages_24h=row[6],
             )
             for row in rows
         )

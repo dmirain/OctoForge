@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.admin.api import MAX_PAGE_SIZE, clamp_page
@@ -16,6 +17,7 @@ from octoforge_core.datasets.api import DatasetSchema
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.api import ExchangeStatus
+from octoforge_core.dialogs.models import MessageRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
@@ -148,6 +150,31 @@ async def test_dialogs_carry_counters_and_newest_activity_first(
     assert newest.task_count == 1
     assert newest.last_message_at is not None
     assert (page.items[1].user_message_count, page.items[1].agent_message_count) == (1, 0)
+
+
+async def test_dialogs_split_the_users_last_day_of_writing(
+    session_factory: async_sessionmaker[AsyncSession],
+    store: SqlAlchemyAdminStore,
+) -> None:
+    """ "Wrote today" and "last wrote" are about the person's own messages:
+    agent replies move neither, and older writing falls out of the window."""
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_A, CHANNEL)
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="old"))
+    async with session_factory() as session:  # push the first message out of the day window
+        await session.execute(sql_update(MessageRow).values(created_at=NOW - timedelta(days=365)))
+        await session.commit()
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="fresh"))
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+
+    page = await store.list_dialogs(DEFAULT_LIMIT, 0)
+
+    item = page.items[0]
+    assert item.user_messages_24h == 1  # "old" left the window, the reply is not theirs
+    assert item.last_user_message_at is not None
+    assert item.last_message_at is not None
+    assert item.last_user_message_at < item.last_message_at  # the reply came after
 
 
 async def test_messages_are_paginated_by_seq(

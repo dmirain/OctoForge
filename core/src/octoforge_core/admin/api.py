@@ -58,6 +58,11 @@ class DialogOverview:
     agent_message_count: int
     task_count: int
     last_message_at: datetime | None
+    # the person's own writing: when they last wrote, and how many messages
+    # in the trailing day — agent replies and cron chatter say nothing about
+    # whether the person is around
+    last_user_message_at: datetime | None
+    user_messages_24h: int
 
 
 @dataclass(frozen=True, slots=True)

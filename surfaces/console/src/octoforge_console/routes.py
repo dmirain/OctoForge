@@ -410,6 +410,8 @@ def _dialog_to_dict(item: DialogOverview, names: dict[str, str]) -> dict[str, An
         "agent_message_count": item.agent_message_count,
         "task_count": item.task_count,
         "last_message_at": _iso(item.last_message_at),
+        "last_user_message_at": _iso(item.last_user_message_at),
+        "user_messages_24h": item.user_messages_24h,
         "created_at": _iso(item.created_at),
     }
 

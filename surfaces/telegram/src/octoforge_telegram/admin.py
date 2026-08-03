@@ -12,13 +12,19 @@ from datetime import datetime
 from typing import Any
 
 from octoforge_core.cron.api import CronStore
-from octoforge_core.dialogs.api import MessageRepository, MessageStats
+from octoforge_core.dialogs.api import (
+    ACTIVITY_WINDOW,
+    MessageRepository,
+    MessageStats,
+    UserActivity,
+)
 from octoforge_core.identity.api import IdentityStore, UserIdentity
 from octoforge_core.instructions.api import (
     InstructionNotFoundError,
     InstructionService,
     SearchHit,
 )
+from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_server import audit
 
@@ -232,6 +238,12 @@ class AdminManageTool:
         # touched per message, and a timestamp read off the log cannot drift
         # from what actually happened
         last_activity = await self._messages.last_activity_by_channel(TELEGRAM_CHANNEL)
+        activity = {
+            entry.user_id: entry
+            for entry in await self._messages.user_activity_by_channel(
+                TELEGRAM_CHANNEL, utc_now() - ACTIVITY_WINDOW
+            )
+        }
         profiles = await self._member_profiles()
         lines = [f"telegram users: {len(identities)}, invites: {len(invites)}"]
         linked: set[str] = set()
@@ -244,6 +256,7 @@ class AdminManageTool:
                     handle,
                     stats.get(identity.user_id),
                     last_activity.get(identity.user_id),
+                    activity.get(identity.user_id),
                     invites,
                     profiles.get(handle),
                 )
@@ -284,6 +297,7 @@ class AdminManageTool:
         handle: str,
         stats: MessageStats | None,
         activity: datetime | None,
+        writing: UserActivity | None,
         invites: list[Invite],
         profile: MemberProfile | None,
     ) -> str:
@@ -295,13 +309,20 @@ class AdminManageTool:
         user_chars = stats.user_chars if stats is not None else 0
         agent_messages = stats.agent_messages if stats is not None else 0
         agent_chars = stats.agent_chars if stats is not None else 0
+        wrote_24h = writing.user_messages_since if writing is not None else 0
+        last_wrote = (
+            writing.last_user_message_at.isoformat()
+            if writing is not None and writing.last_user_message_at is not None
+            else "never"
+        )
         last_active = activity.isoformat() if activity is not None else "never"
         return (
             f"- {who}{revoked} — telegram {identity.external_id}, user {identity.user_id}: "
             f"access={_access(handle, invites)}, "
-            f"wrote {user_messages} messages ({user_chars} chars), "
+            f"wrote {user_messages} messages ({user_chars} chars, {wrote_24h} in last 24h), "
             f"agent replied {agent_messages} ({agent_chars} chars), "
-            f"last_active={last_active}, cron={enabled_jobs}/{len(jobs)} enabled"
+            f"last_wrote={last_wrote}, last_active={last_active}, "
+            f"cron={enabled_jobs}/{len(jobs)} enabled"
         )
 
     def _stray_line(self, handle: str, invites: list[Invite], profile: MemberProfile | None) -> str:

@@ -8,7 +8,7 @@ repositories were the last concrete-only dependencies in the actor).
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
 
@@ -289,6 +289,26 @@ class MessageStats:
 MessageStatsList = list[MessageStats]
 
 
+#: What "recently" means for operator listings: the trailing day.
+ACTIVITY_WINDOW = timedelta(hours=24)
+
+
+@dataclass(frozen=True, slots=True)
+class UserActivity:
+    """When a person last wrote, and how much they wrote since a cutoff.
+
+    Only the person's own messages count: agent replies and cron chatter say
+    nothing about whether the person is actually around.
+    """
+
+    user_id: str
+    last_user_message_at: datetime | None
+    user_messages_since: int
+
+
+UserActivityList = list[UserActivity]
+
+
 # `list`-shadowing alias for signatures declared after a `list` method
 ChatMessageList = list[ChatMessage]
 
@@ -364,4 +384,8 @@ class MessageRepository(Protocol):
 
     async def stats_by_channel(self, channel: str) -> MessageStatsList:
         """Return per-user message counters of the channel."""
+        ...
+
+    async def user_activity_by_channel(self, channel: str, since: datetime) -> "UserActivityList":
+        """Per person: their last own message, and how many they wrote since `since`."""
         ...

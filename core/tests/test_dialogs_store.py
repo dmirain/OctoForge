@@ -217,6 +217,32 @@ async def test_message_stats_by_channel(
     assert stats[OTHER_USER_ID].agent_messages == 0
 
 
+async def test_user_activity_counts_only_the_persons_own_recent_writing(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Last own message plus the count since a cutoff: agent replies move
+    neither, and what came before the cutoff is not "recent"."""
+    dialogs = SqlAlchemyDialogRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(session_factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="old"))
+    cutoff = utc_now()  # everything above is before it, everything below after
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="fresh"))
+    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+
+    activity = {
+        entry.user_id: entry for entry in await messages.user_activity_by_channel(CHANNEL, cutoff)
+    }
+
+    entry = activity[USER_ID]
+    assert entry.user_messages_since == 1  # "old" predates the cutoff, the reply is not theirs
+    assert entry.last_user_message_at is not None
+    assert entry.last_user_message_at.tzinfo == UTC
+    assert entry.last_user_message_at >= cutoff
+    latest = (await messages.last_activity_by_channel(CHANNEL))[USER_ID]
+    assert entry.last_user_message_at < latest  # the agent's reply came after
+
+
 async def test_messages_get_monotonic_seq_and_order(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
