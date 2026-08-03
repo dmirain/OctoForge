@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "octoforge-deploy"
-version = "0.9.0"
+version = "0.10.0"
 description = "OctoForge assembled deployment: the service plus its interfaces"
 license = { text = "BUSL-1.1" }
 requires-python = ">=3.11"
