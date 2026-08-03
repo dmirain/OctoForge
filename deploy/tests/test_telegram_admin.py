@@ -11,6 +11,7 @@ from octoforge_core.db.engine import create_engine, create_session_factory, init
 from octoforge_core.dialogs.api import DialogRepository, MessageRepository
 from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
+from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.instructions.api import InstructionService, InstructionType
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
@@ -31,7 +32,7 @@ from octoforge_telegram.admin import (
     AdminStores,
 )
 from octoforge_telegram.client import TELEGRAM_CHANNEL
-from octoforge_telegram.invites.api import InviteStatus, MemberProfile
+from octoforge_telegram.invites.api import InviteStatus, MemberDirectory, MemberProfile
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore
 from octoforge_telegram.schema import TelegramSurfaceBase
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -64,6 +65,7 @@ StoresTuple = tuple[
     MessageRepository,
     DialogRepository,
     InstructionService,
+    SqlAlchemyIdentityStore,
 ]
 
 
@@ -89,6 +91,7 @@ async def stores() -> AsyncIterator[StoresTuple]:
         SqlAlchemyMessageRepository(core_sessions),
         SqlAlchemyDialogRepository(core_sessions),
         LocalInstructionService(SqlAlchemyInstructionStore(core_sessions), LenientEmbedder()),
+        SqlAlchemyIdentityStore(core_sessions),
     )
     await core_engine.dispose()
     await telegram_engine.dispose()
@@ -97,15 +100,17 @@ async def stores() -> AsyncIterator[StoresTuple]:
 def make_tool(
     stores: StoresTuple,
     bot_username: str = "",
+    directory: MemberDirectory | None = None,
 ) -> AdminManageTool:
-    invites, cron_store, messages, dialogs, instructions = stores
+    invites, cron_store, messages, _, instructions, identities = stores
     access = AdminAccess(admin_user_ids=frozenset({ADMIN_USER_ID}), bot_username=bot_username)
     backends = AdminStores(
         invites=invites,
         cron_store=cron_store,
         messages=messages,
-        dialogs=dialogs,
         instructions=instructions,
+        identities=identities,
+        directory=directory,
     )
     return AdminManageTool(backends, access)
 
@@ -240,21 +245,28 @@ async def test_pending_invites_are_listed_as_links_when_the_handle_is_known(
 async def test_list_users_reports_access_stats_and_cron(
     stores: StoresTuple,
 ) -> None:
-    _, cron_store, messages, dialogs, _ = stores
+    """The identity row is the spine of the line: stats, dialogs and cron are
+    filed under the person, the invite under the `tg:` handle — one line must
+    join both without listing the same human twice."""
+    _, cron_store, messages, dialogs, _, identities = stores
     await claim_invite(stores)
-    dialog = await dialogs.get_or_create(USER_ID, TELEGRAM_CHANNEL)
+    person = await identities.resolve_or_create(TELEGRAM_CHANNEL, "111")
+    dialog = await dialogs.get_or_create(person, TELEGRAM_CHANNEL)
     await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hello"))
-    await cron_store.create(make_cron_job("job-1", USER_ID))
-    await cron_store.create(replace(make_cron_job("job-2", USER_ID), enabled=False))
+    await cron_store.create(make_cron_job("job-1", person))
+    await cron_store.create(replace(make_cron_job("job-2", person), enabled=False))
     tool = make_tool(stores)
 
     result = await tool.execute({"action": ACTION_LIST_USERS}, ADMIN_CONTEXT)
 
-    assert USER_ID in result
+    assert "telegram users: 1" in result
+    assert f"telegram 111, user {person}" in result
     assert "access=claimed" in result
     assert "wrote 1 messages (5 chars)" in result
     assert "agent replied 0 (0 chars)" in result
     assert "cron=1/2 enabled" in result
+    # the same human must not also appear as an unlinked account
+    assert "not yet linked" not in result
 
 
 async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
@@ -323,7 +335,7 @@ async def test_revoke_without_target_is_an_error(
 async def test_search_instructions_finds_records_of_everyone(
     stores: StoresTuple,
 ) -> None:
-    _, _, _, _, instructions = stores
+    instructions = stores[4]
     await instructions.save(USER_ID, InstructionType.SKILL, "weather scenario", "call wttr.in")
     tool = make_tool(stores)
 
@@ -349,7 +361,7 @@ async def test_search_instructions_requires_a_query(
 async def test_publish_instruction_makes_a_private_record_public(
     stores: StoresTuple,
 ) -> None:
-    _, _, _, _, instructions = stores
+    instructions = stores[4]
     saved = await instructions.save(USER_ID, InstructionType.SKILL, "weather scenario", "steps")
     tool = make_tool(stores)
 
@@ -402,10 +414,31 @@ class OneProfileDirectory:
 
 
 async def test_list_users_shows_name_and_invite_attribution(stores: StoresTuple) -> None:
-    invites, cron_store, messages, dialogs, instructions = stores
+    """The name and @username the bot answers with come from the identity —
+    the row the poller keeps fresh on every gated message."""
+    invites, identities = stores[0], stores[5]
     invite_id = await claim_invite(stores)
     invite = await invites.get_by_id(invite_id)
     assert invite is not None
+    await identities.resolve_or_create(TELEGRAM_CHANNEL, "111")
+    await identities.update_profile(TELEGRAM_CHANNEL, "111", "Alice Smith", "alice")
+    tool = make_tool(stores)
+
+    output = await tool.execute({"action": ACTION_LIST_USERS}, ADMIN_CONTEXT)
+
+    assert "Alice Smith (@alice)" in output
+    assert f"claimed via invite {invite.code}" in output
+    assert NOTE in output
+
+
+async def test_list_users_falls_back_to_the_member_mirror_for_an_unnamed_identity(
+    stores: StoresTuple,
+) -> None:
+    """The split arrangement: the standalone ingestion node has no identity
+    store, so the identity may stay unnamed while the members table knows
+    exactly who this is."""
+    identities = stores[5]
+    await identities.resolve_or_create(TELEGRAM_CHANNEL, "111")
     profile = MemberProfile(
         user_id=USER_ID,
         first_name="Alice",
@@ -414,18 +447,23 @@ async def test_list_users_shows_name_and_invite_attribution(stores: StoresTuple)
         first_seen_at=utc_now(),
         last_seen_at=utc_now(),
     )
-    tool = AdminManageTool(
-        AdminStores(
-            invites=invites,
-            cron_store=cron_store,
-            messages=messages,
-            dialogs=dialogs,
-            instructions=instructions,
-            directory=OneProfileDirectory(profile),
-        ),
-        AdminAccess(admin_user_ids=frozenset({ADMIN_USER_ID})),
-    )
-    output = await tool.execute({"action": "list_users"}, ADMIN_CONTEXT)
+    tool = make_tool(stores, directory=OneProfileDirectory(profile))
+
+    output = await tool.execute({"action": ACTION_LIST_USERS}, ADMIN_CONTEXT)
+
     assert "Alice Smith (@alice)" in output
-    assert f"claimed via invite {invite.code}" in output
-    assert NOTE in output
+
+
+async def test_list_users_keeps_sight_of_accounts_without_a_person(
+    stores: StoresTuple,
+) -> None:
+    """A claimed invite whose owner has not written since identities exist:
+    no identity row yet, but the admin must still see who came through."""
+    await claim_invite(stores)  # claimed under tg:111, no identity created
+    tool = make_tool(stores)
+
+    output = await tool.execute({"action": ACTION_LIST_USERS}, ADMIN_CONTEXT)
+
+    assert "not yet linked to a person" in output
+    assert USER_ID in output
+    assert "access=claimed" in output

@@ -260,6 +260,25 @@ async def test_a_named_person_is_not_renamed_by_a_surface(
     assert (await store.get_user(user.id)).name == "Alice Smith"
 
 
+async def test_a_surface_lists_everyone_it_knows_revoked_included(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    """The operator's roll call: one row per account, each naming its person."""
+    first = await store.create_user()
+    second = await store.create_user()
+    await store.link(first.id, TELEGRAM, ACCOUNT)
+    await store.link(second.id, TELEGRAM, OTHER_ACCOUNT)
+    await store.link(second.id, WEB, "dmirain")
+    await store.deactivate(TELEGRAM, OTHER_ACCOUNT)
+
+    listed = await store.list_identities(TELEGRAM)
+
+    assert [(item.external_id, item.user_id, item.active) for item in listed] == [
+        (ACCOUNT, first.id, True),
+        (OTHER_ACCOUNT, second.id, False),
+    ]
+
+
 async def test_a_profile_for_an_unknown_account_is_dropped(
     store: SqlAlchemyIdentityStore,
 ) -> None:

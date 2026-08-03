@@ -12,7 +12,8 @@ from datetime import datetime
 from typing import Any
 
 from octoforge_core.cron.api import CronStore
-from octoforge_core.dialogs.api import DialogRepository, MessageRepository, MessageStats
+from octoforge_core.dialogs.api import MessageRepository, MessageStats
+from octoforge_core.identity.api import IdentityStore, UserIdentity
 from octoforge_core.instructions.api import (
     InstructionNotFoundError,
     InstructionService,
@@ -125,8 +126,9 @@ class AdminStores:
     invites: InviteStore
     cron_store: CronStore
     messages: MessageRepository
-    dialogs: DialogRepository
     instructions: InstructionService
+    # the spine of list_users: one row per Telegram account, naming its person
+    identities: IdentityStore
     # who-is-who profiles recorded by the poller (None: not configured)
     directory: MemberDirectory | None = None
 
@@ -151,8 +153,8 @@ class AdminManageTool:
         self._invites = stores.invites
         self._cron = stores.cron_store
         self._messages = stores.messages
-        self._dialogs = stores.dialogs
         self._instructions = stores.instructions
+        self._identities = stores.identities
         self._directory = stores.directory
         self._access = access
         self._handlers: dict[str, ActionHandler] = {
@@ -211,32 +213,51 @@ class AdminManageTool:
         return context.user_id in self._access.admin_user_ids
 
     async def _list_users(self, arguments: dict[str, Any]) -> str:
+        """One line per identity row: who they are, then what they did.
+
+        The identity table is the spine on purpose. Stats, dialogs and cron
+        are filed under the person's core id; invites and member profiles
+        under the `tg:<id>` handle — and this used to list the union of both
+        namespaces, so every human appeared twice, each half-described. An
+        identity row names both ids, which is what makes one whole line per
+        person possible.
+        """
         invites = await self._invites.list_all()
+        identities = await self._identities.list_identities(TELEGRAM_CHANNEL)
         stats = {
             entry.user_id: entry
             for entry in await self._messages.stats_by_channel(TELEGRAM_CHANNEL)
         }
-        dialogs = await self._dialogs.list_by_channel(TELEGRAM_CHANNEL)
         # from the messages, not from the dialog row: that row is no longer
         # touched per message, and a timestamp read off the log cannot drift
         # from what actually happened
         last_activity = await self._messages.last_activity_by_channel(TELEGRAM_CHANNEL)
         profiles = await self._member_profiles()
-        user_ids = sorted(
-            {invite.claimed_by for invite in invites if invite.claimed_by}
-            | {dialog.user_id for dialog in dialogs}
-            | set(profiles)
-        )
-        lines = [f"telegram users: {len(user_ids)}, invites: {len(invites)}"]
-        for user_id in user_ids:
+        lines = [f"telegram users: {len(identities)}, invites: {len(invites)}"]
+        linked: set[str] = set()
+        for identity in identities:
+            handle = f"{USER_ID_PREFIX}{identity.external_id}"
+            linked.add(handle)
             lines.append(
-                await self._user_line(
-                    user_id,
-                    stats.get(user_id),
-                    last_activity.get(user_id),
+                await self._identity_line(
+                    identity,
+                    handle,
+                    stats.get(identity.user_id),
+                    last_activity.get(identity.user_id),
                     invites,
-                    profiles.get(user_id),
+                    profiles.get(handle),
                 )
+            )
+        # accounts the surface knows (a claimed invite, a mirrored profile)
+        # whose owner has not written since identities exist: no person yet
+        strays = sorted(
+            ({invite.claimed_by for invite in invites if invite.claimed_by} | set(profiles))
+            - linked
+        )
+        if strays:
+            lines.append("accounts not yet linked to a person (first message links them):")
+            lines.extend(
+                self._stray_line(handle, invites, profiles.get(handle)) for handle in strays
             )
         pending = [invite for invite in invites if invite.status is InviteStatus.PENDING]
         if pending:
@@ -257,22 +278,18 @@ class AdminManageTool:
             return {}
         return {profile.user_id: profile for profile in await self._directory.list_all()}
 
-    async def _user_line(
+    async def _identity_line(  # noqa: PLR0913, PLR0917 — one row, its lookups
         self,
-        user_id: str,
+        identity: UserIdentity,
+        handle: str,
         stats: MessageStats | None,
         activity: datetime | None,
         invites: list[Invite],
         profile: MemberProfile | None,
     ) -> str:
-        invite = next((item for item in invites if item.claimed_by == user_id), None)
-        if invite is not None:
-            note = f", note: {invite.note}" if invite.note else ""
-            access = f"{invite.status.value} via invite {invite.code}{note}"
-        else:
-            access = "no-invite (admin or pre-gate)"
-        who = f" ({profile.display_name})" if profile is not None else ""
-        jobs = await self._cron.list_for_user(user_id)
+        who = _who(identity, profile) or handle
+        revoked = "" if identity.active else " [identity revoked]"
+        jobs = await self._cron.list_for_user(identity.user_id)
         enabled_jobs = sum(1 for job in jobs if job.enabled)
         user_messages = stats.user_messages if stats is not None else 0
         user_chars = stats.user_chars if stats is not None else 0
@@ -280,11 +297,16 @@ class AdminManageTool:
         agent_chars = stats.agent_chars if stats is not None else 0
         last_active = activity.isoformat() if activity is not None else "never"
         return (
-            f"- {user_id}{who}: access={access}, "
+            f"- {who}{revoked} — telegram {identity.external_id}, user {identity.user_id}: "
+            f"access={_access(handle, invites)}, "
             f"wrote {user_messages} messages ({user_chars} chars), "
             f"agent replied {agent_messages} ({agent_chars} chars), "
             f"last_active={last_active}, cron={enabled_jobs}/{len(jobs)} enabled"
         )
+
+    def _stray_line(self, handle: str, invites: list[Invite], profile: MemberProfile | None) -> str:
+        who = profile.display_name if profile is not None else handle
+        return f"- {who} — {handle}: access={_access(handle, invites)}"
 
     async def _generate_invite(self, arguments: dict[str, Any]) -> str:
         invite = await self._invites.create(str(arguments.get("note") or ""))
@@ -388,6 +410,34 @@ class AdminManageTool:
         chat_id = chat_id_from_user_id(invite.claimed_by)
         if chat_id is not None:
             await self._access.telegram.send_message(chat_id, REVOKED_NOTICE_TEXT)
+
+
+def _who(identity: UserIdentity, profile: MemberProfile | None) -> str:
+    """ "Name (@username)" from the identity, member mirror filling the gaps.
+
+    The identity is the source of truth once the poller has pushed a profile
+    into it; the members table catches deployments (the split arrangement)
+    where it could not.
+    """
+    name = identity.name or (
+        " ".join(part for part in (profile.first_name, profile.last_name) if part)
+        if profile is not None
+        else ""
+    )
+    username = identity.username or (profile.username if profile is not None else None)
+    handle = f"@{username}" if username else ""
+    if name and handle:
+        return f"{name} ({handle})"
+    return name or handle
+
+
+def _access(handle: str, invites: list[Invite]) -> str:
+    """How this account got in, read off its claimed invite."""
+    invite = next((item for item in invites if item.claimed_by == handle), None)
+    if invite is None:
+        return "no-invite (admin or pre-gate)"
+    note = f", note: {invite.note}" if invite.note else ""
+    return f"{invite.status.value} via invite {invite.code}{note}"
 
 
 def _instruction_line(index: int, hit: SearchHit) -> str:

@@ -869,9 +869,9 @@ async def _build_telegram_admin_tool(
         AdminStores(
             invites=stores.invites,
             cron_store=services.cron_store,
-            dialogs=services.dialogs,
             messages=services.messages,
             instructions=services.instructions,
+            identities=services.identities,
             directory=stores.directory,
         ),
         AdminAccess(

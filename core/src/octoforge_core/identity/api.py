@@ -159,6 +159,14 @@ class IdentityStore(Protocol):
         """Every surface this person is known on, revoked ones included."""
         ...
 
+    async def list_identities(self, surface: str) -> UserIdentityList:
+        """Everyone one surface knows, revoked included, oldest first.
+
+        The operator's roll call: one row per account, each naming its
+        person — the join point for anything filed under either id.
+        """
+        ...
+
     async def find_by_identity(self, surface: str, external_id: str) -> UserIdentity | None:
         """The identity row itself, active or not (None when unknown)."""
         ...

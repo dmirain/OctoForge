@@ -178,6 +178,16 @@ class SqlAlchemyIdentityStore:
             )
             return [_to_identity(row) for row in rows.all()]
 
+    async def list_identities(self, surface: str) -> UserIdentityList:
+        """Everyone one surface knows, revoked included, oldest first."""
+        async with read_session(self._session_factory) as session:
+            rows = await session.scalars(
+                select(UserIdentityRow)
+                .where(UserIdentityRow.surface == surface)
+                .order_by(UserIdentityRow.created_at, UserIdentityRow.id)
+            )
+            return [_to_identity(row) for row in rows.all()]
+
     async def find_by_identity(self, surface: str, external_id: str) -> UserIdentity | None:
         async with read_session(self._session_factory) as session:
             row = await self._find(session, surface, external_id)
