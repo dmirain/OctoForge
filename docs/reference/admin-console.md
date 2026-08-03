@@ -30,6 +30,11 @@ that boundary intact — enforced by `core/tests/test_boundaries.py`.
 
 Page size defaults to 50 and is capped at 500.
 
+Every listing that names an owner also carries their name (`user_name` / `owner_name` /
+`author_name`), resolved from the identity module in one query per page. The console renders the
+person column by name with the opaque id in the tooltip; an unnamed person (no surface has reported
+a name yet) falls back to the id.
+
 `GET /api/admin/users` lists people and the accounts each one answers on. A person is the unit here,
 not a handle: the same human may arrive from Telegram and from a browser, and everything they own is
 filed under them. Revoked identities are listed rather than hidden — that an account was once theirs

@@ -100,6 +100,13 @@ function clip(value, cls) {
   return `<td class="${cls || ""}"><span class="clip" title="${esc(value)}">${esc(short(value))}</span></td>`;
 }
 
+// Один способ показать человека везде: имя, когда оно известно, иначе id;
+// сам id остаётся в тултипе. fallback — подпись для строк без владельца.
+function person(id, name, fallback) {
+  if (!id) return `<td class="mono">${esc(fallback || "—")}</td>`;
+  return `<td class="${name ? "" : "mono"}"><span class="clip" title="${esc(id)}">${esc(name || id)}</span></td>`;
+}
+
 function open(text) {
   document.getElementById("viewer-body").textContent = text;
   document.getElementById("viewer").showModal();
@@ -108,8 +115,8 @@ function open(text) {
 const VIEWS = {
   dialogs: {
     title: "Диалоги", path: () => "/api/admin/dialogs",
-    columns: ["user_id", "канал", "юзер / агент", "задач", "последнее", "создан", ""],
-    row: (d) => `${clip(d.user_id, "mono")}<td>${esc(d.channel)}</td>` +
+    columns: ["пользователь", "канал", "юзер / агент", "задач", "последнее", "создан", ""],
+    row: (d) => `${person(d.user_id, d.user_name)}<td>${esc(d.channel)}</td>` +
       `<td>${d.user_message_count} / ${d.agent_message_count}</td>` +
       `<td>${d.task_count}</td><td class="mono">${time(d.last_message_at)}</td>` +
       `<td class="mono">${time(d.created_at)}</td>` +
@@ -127,20 +134,20 @@ const VIEWS = {
   tasks: {
     title: "Задачи", path: () => "/api/admin/tasks",
     filters: ["status"],
-    columns: ["title", "вид", "статус", "user_id", "доставлено", "результат", "создана", ""],
+    columns: ["title", "вид", "статус", "пользователь", "доставлено", "результат", "создана", ""],
     row: (t) => `${clip(t.title)}<td>${esc(t.kind)}</td><td>${esc(t.status)}</td>` +
-      `${clip(t.user_id, "mono")}<td>${flag(t.delivered_at)}</td>` +
+      `${person(t.user_id, t.user_name)}<td>${flag(t.delivered_at)}</td>` +
       `<td><button class="link" data-view="${esc(t.result || t.error || "")}">открыть</button></td>` +
       `<td class="mono">${time(t.created_at)}</td>` +
       `<td><button class="act danger" data-delete="/api/admin/tasks/${esc(t.id)}">удалить</button></td>`,
   },
   cron: {
     title: "Cron", path: () => "/api/admin/cron",
-    columns: ["title", "расписание", "tz", "вкл", "следующий", "последний", "итог", "user_id", ""],
+    columns: ["title", "расписание", "tz", "вкл", "следующий", "последний", "итог", "пользователь", ""],
     row: (c) => `${clip(c.title)}<td class="mono">${esc(c.schedule)}</td><td>${esc(c.timezone)}</td>` +
       `<td>${flag(c.enabled)}</td><td class="mono">${time(c.next_fire_at)}</td>` +
       `<td class="mono">${time(c.last_fire_at)}</td><td>${esc(short(c.last_status))}</td>` +
-      `${clip(c.user_id, "mono")}` +
+      `${person(c.user_id, c.user_name)}` +
       `<td><button class="act" data-post="/api/admin/cron/${esc(c.id)}/enabled?enabled=${!c.enabled}">` +
       `${c.enabled ? "пауза" : "включить"}</button> ` +
       `<button class="act danger" data-delete="/api/admin/cron/${esc(c.id)}">удалить</button></td>`,
@@ -149,8 +156,8 @@ const VIEWS = {
     title: "Инструкции", path: () => "/api/admin/instructions",
     filters: ["query"],
     columns: ["тип", "title", "владелец", "автор", "system", "версия", "теги", "текст", ""],
-    row: (i) => `<td>${esc(i.type)}</td>${clip(i.title)}${clip(i.owner_id || "public", "mono")}` +
-      `${clip(i.author_id || "—", "mono")}` +
+    row: (i) => `<td>${esc(i.type)}</td>${clip(i.title)}${person(i.owner_id, i.owner_name, "public")}` +
+      `${person(i.author_id, i.author_name)}` +
       `<td>${flag(i.system)}</td><td>${i.version}</td><td>${tags(i.tags)}</td>` +
       `<td><button class="link" data-view="${esc(i.content)}">открыть</button></td>` +
       `<td>${i.owner_id ? `<button class="act" data-post="/api/admin/instructions/${esc(i.id)}/publish">опубликовать</button> ` : ""}` +
@@ -160,21 +167,21 @@ const VIEWS = {
   datasets: {
     title: "Датасеты", path: () => "/api/admin/datasets",
     columns: ["name", "владелец", "описание", "поля", "версия", ""],
-    row: (d) => `${clip(d.name)}${clip(d.owner_user_id, "mono")}${clip(d.description)}` +
+    row: (d) => `${clip(d.name)}${person(d.owner_user_id, d.owner_name)}${clip(d.description)}` +
       `<td>${tags(d.fields)}</td><td>${d.version}</td>` +
       `<td><button class="act" data-open-dataset="${esc(d.id)}">записи</button></td>`,
   },
   records: {
     title: "Записи датасета", path: () => `/api/admin/datasets/${state.datasetId}/records`,
     columns: ["id", "владелец", "payload", "создана"],
-    row: (r) => `${clip(r.id, "mono")}${clip(r.owner_user_id, "mono")}` +
+    row: (r) => `${clip(r.id, "mono")}${person(r.owner_user_id, r.owner_name)}` +
       `<td><button class="link" data-view="${esc(JSON.stringify(r.payload, null, 2))}">открыть</button></td>` +
       `<td class="mono">${time(r.created_at)}</td>`,
   },
   memories: {
     title: "Память", path: () => "/api/admin/memories",
     columns: ["key", "владелец", "содержимое", "теги", "обновлена", ""],
-    row: (m) => `${clip(m.key)}${clip(m.user_id || "global", "mono")}${clip(m.content)}` +
+    row: (m) => `${clip(m.key)}${person(m.user_id, m.user_name, "global")}${clip(m.content)}` +
       `<td>${tags(m.tags)}</td><td class="mono">${time(m.updated_at)}</td>` +
       `<td><button class="act danger" data-delete="/api/admin/memories/${encodeURIComponent(m.key)}` +
       `${m.user_id ? `?user_id=${encodeURIComponent(m.user_id)}` : ""}">удалить</button></td>`,
@@ -202,8 +209,8 @@ const VIEWS = {
     filters: ["status"],
     statusOptions: ["", "collecting", "open", "in_progress", "awaiting_user", "answered",
       "cancelled", "failed"],
-    columns: ["user_id", "title", "статус", "вопрос", "обновлён"],
-    row: (e) => `${clip(e.user_id, "mono")}${clip(e.title)}<td>${esc(e.status)}</td>` +
+    columns: ["пользователь", "title", "статус", "вопрос", "обновлён"],
+    row: (e) => `${person(e.user_id, e.user_name)}${clip(e.title)}<td>${esc(e.status)}</td>` +
       `${clip(e.pending_question)}` +
       `<td class="mono">${time(e.updated_at)}</td>`,
   },

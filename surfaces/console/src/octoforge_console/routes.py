@@ -112,6 +112,16 @@ def _page_payload(page: Page[T], to_dict: Callable[[T], dict[str, Any]]) -> dict
     }
 
 
+async def _names(identities: IdentityStore) -> dict[str, str]:
+    """user_id -> canonical name, for the person column of every listing.
+
+    One query for the whole page rather than one per row; users whose name is
+    still empty are dropped so the UI falls back to the id instead of
+    rendering blank cells.
+    """
+    return {user.id: user.name for user in await identities.list_users() if user.name}
+
+
 @router.get("/totals")
 async def totals(read_model: ReadModelDep) -> dict[str, int]:
     """Row count per entity — the console's landing page."""
@@ -122,12 +132,14 @@ async def totals(read_model: ReadModelDep) -> dict[str, int]:
 @router.get("/dialogs")
 async def dialogs(
     read_model: ReadModelDep,
+    identities: IdentityStoreDep,
     limit: LimitDep = None,
     offset: OffsetDep = None,
 ) -> dict[str, Any]:
     resolved_limit, resolved_offset = clamp_page(limit, offset)
     page = await read_model.list_dialogs(resolved_limit, resolved_offset)
-    return _page_payload(page, _dialog_to_dict)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _dialog_to_dict(item, names))
 
 
 @router.get("/dialogs/{dialog_id}/messages")
@@ -175,8 +187,9 @@ async def delete_dialog(
 
 
 @router.get("/tasks")
-async def tasks(
+async def tasks(  # noqa: PLR0913, PLR0917 — FastAPI dependencies plus query filters
     read_model: ReadModelDep,
+    identities: IdentityStoreDep,
     limit: LimitDep = None,
     offset: OffsetDep = None,
     status: str | None = None,
@@ -184,7 +197,8 @@ async def tasks(
 ) -> dict[str, Any]:
     resolved_limit, resolved_offset = clamp_page(limit, offset)
     page = await read_model.list_tasks(resolved_limit, resolved_offset, status=status, kind=kind)
-    return _page_payload(page, _task_to_dict)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _task_to_dict(item, names))
 
 
 @router.delete("/tasks/{task_id}")
@@ -201,12 +215,14 @@ async def delete_task(task_id: str, operator: OperatorDep, store: TaskStoreDep) 
 @router.get("/cron")
 async def cron_jobs(
     read_model: ReadModelDep,
+    identities: IdentityStoreDep,
     limit: LimitDep = None,
     offset: OffsetDep = None,
 ) -> dict[str, Any]:
     resolved_limit, resolved_offset = clamp_page(limit, offset)
     page = await read_model.list_cron_jobs(resolved_limit, resolved_offset)
-    return _page_payload(page, _cron_to_dict)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _cron_to_dict(item, names))
 
 
 @router.post("/cron/{job_id}/enabled")
@@ -242,13 +258,15 @@ async def delete_cron_job(
 @router.get("/instructions")
 async def instructions(
     read_model: ReadModelDep,
+    identities: IdentityStoreDep,
     limit: LimitDep = None,
     offset: OffsetDep = None,
     query: str | None = None,
 ) -> dict[str, Any]:
     resolved_limit, resolved_offset = clamp_page(limit, offset)
     page = await read_model.list_instructions(resolved_limit, resolved_offset, query=query)
-    return _page_payload(page, _instruction_to_dict)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _instruction_to_dict(item, names))
 
 
 @router.post("/instructions/{instruction_id}/publish")
@@ -293,35 +311,41 @@ async def delete_instruction(
 @router.get("/datasets")
 async def datasets(
     read_model: ReadModelDep,
+    identities: IdentityStoreDep,
     limit: LimitDep = None,
     offset: OffsetDep = None,
 ) -> dict[str, Any]:
     resolved_limit, resolved_offset = clamp_page(limit, offset)
     page = await read_model.list_datasets(resolved_limit, resolved_offset)
-    return _page_payload(page, _dataset_to_dict)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _dataset_to_dict(item, names))
 
 
 @router.get("/datasets/{dataset_id}/records")
 async def dataset_records(
     dataset_id: str,
     read_model: ReadModelDep,
+    identities: IdentityStoreDep,
     limit: LimitDep = None,
     offset: OffsetDep = None,
 ) -> dict[str, Any]:
     resolved_limit, resolved_offset = clamp_page(limit, offset)
     page = await read_model.list_dataset_records(dataset_id, resolved_limit, resolved_offset)
-    return _page_payload(page, _record_to_dict)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _record_to_dict(item, names))
 
 
 @router.get("/memories")
 async def memories(
     read_model: ReadModelDep,
+    identities: IdentityStoreDep,
     limit: LimitDep = None,
     offset: OffsetDep = None,
 ) -> dict[str, Any]:
     resolved_limit, resolved_offset = clamp_page(limit, offset)
     page = await read_model.list_memories(resolved_limit, resolved_offset)
-    return _page_payload(page, _memory_to_dict)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _memory_to_dict(item, names))
 
 
 @router.delete("/memories/{key}")
@@ -360,8 +384,9 @@ async def summaries(
 
 
 @router.get("/exchanges")
-async def exchanges(
+async def exchanges(  # noqa: PLR0913, PLR0917 — FastAPI dependencies plus query filters
     read_model: ReadModelDep,
+    identities: IdentityStoreDep,
     limit: LimitDep = None,
     offset: OffsetDep = None,
     user_id: str | None = None,
@@ -371,13 +396,15 @@ async def exchanges(
     page = await read_model.list_exchanges(
         resolved_limit, resolved_offset, user_id=user_id, status=status
     )
-    return _page_payload(page, _exchange_to_dict)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _exchange_to_dict(item, names))
 
 
-def _dialog_to_dict(item: DialogOverview) -> dict[str, Any]:
+def _dialog_to_dict(item: DialogOverview, names: dict[str, str]) -> dict[str, Any]:
     return {
         "id": item.id,
         "user_id": item.user_id,
+        "user_name": names.get(item.user_id, ""),
         "channel": item.channel,
         "user_message_count": item.user_message_count,
         "agent_message_count": item.agent_message_count,
@@ -400,11 +427,12 @@ def _message_to_dict(item: MessageRecord) -> dict[str, Any]:
     }
 
 
-def _task_to_dict(item: TaskOverview) -> dict[str, Any]:
+def _task_to_dict(item: TaskOverview, names: dict[str, str]) -> dict[str, Any]:
     return {
         "id": item.id,
         "dialog_id": item.dialog_id,
         "user_id": item.user_id,
+        "user_name": names.get(item.user_id, ""),
         "channel": item.channel,
         "kind": item.kind.value,
         "title": item.title,
@@ -418,10 +446,11 @@ def _task_to_dict(item: TaskOverview) -> dict[str, Any]:
     }
 
 
-def _cron_to_dict(item: CronJob) -> dict[str, Any]:
+def _cron_to_dict(item: CronJob, names: dict[str, str]) -> dict[str, Any]:
     return {
         "id": item.id,
         "user_id": item.user_id,
+        "user_name": names.get(item.user_id, ""),
         "channel": item.channel,
         "title": item.title,
         "schedule": item.schedule,
@@ -437,7 +466,8 @@ def _cron_to_dict(item: CronJob) -> dict[str, Any]:
     }
 
 
-def _instruction_to_dict(item: Instruction) -> dict[str, Any]:
+def _instruction_to_dict(item: Instruction, names: dict[str, str] | None = None) -> dict[str, Any]:
+    resolved = names or {}
     return {
         "id": item.id,
         "type": item.type.value,
@@ -445,7 +475,9 @@ def _instruction_to_dict(item: Instruction) -> dict[str, Any]:
         "content": item.content,
         "tags": list(item.tags),
         "owner_id": item.owner_id,
+        "owner_name": resolved.get(item.owner_id or "", ""),
         "author_id": item.author_id,
+        "author_name": resolved.get(item.author_id or "", ""),
         "system": item.system,
         "version": item.version,
         "usage_count": item.usage_count,
@@ -454,10 +486,11 @@ def _instruction_to_dict(item: Instruction) -> dict[str, Any]:
     }
 
 
-def _dataset_to_dict(item: Dataset) -> dict[str, Any]:
+def _dataset_to_dict(item: Dataset, names: dict[str, str]) -> dict[str, Any]:
     return {
         "id": item.id,
         "owner_user_id": item.owner_user_id,
+        "owner_name": names.get(item.owner_user_id, ""),
         "name": item.name,
         "description": item.description,
         "usage_notes": item.usage_notes,
@@ -468,20 +501,22 @@ def _dataset_to_dict(item: Dataset) -> dict[str, Any]:
     }
 
 
-def _record_to_dict(item: DatasetRecord) -> dict[str, Any]:
+def _record_to_dict(item: DatasetRecord, names: dict[str, str]) -> dict[str, Any]:
     return {
         "id": item.id,
         "dataset_id": item.dataset_id,
         "owner_user_id": item.owner_user_id,
+        "owner_name": names.get(item.owner_user_id, ""),
         "payload": item.payload,
         "created_at": _iso(item.created_at),
     }
 
 
-def _memory_to_dict(item: Memory) -> dict[str, Any]:
+def _memory_to_dict(item: Memory, names: dict[str, str]) -> dict[str, Any]:
     return {
         "id": item.id,
         "user_id": item.user_id,
+        "user_name": names.get(item.user_id or "", ""),
         "key": item.key,
         "content": item.content,
         "tags": list(item.tags),
@@ -502,11 +537,12 @@ def _summary_to_dict(item: DialogueSummary) -> dict[str, Any]:
     }
 
 
-def _exchange_to_dict(item: ExchangeOverview) -> dict[str, Any]:
+def _exchange_to_dict(item: ExchangeOverview, names: dict[str, str]) -> dict[str, Any]:
     return {
         "id": item.id,
         "dialog_id": item.dialog_id,
         "user_id": item.user_id,
+        "user_name": names.get(item.user_id, ""),
         "channel": item.channel,
         "status": item.status.value,
         "title": item.title,

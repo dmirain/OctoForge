@@ -1,5 +1,6 @@
 """Tests for the operator console: the credential gate and the entity endpoints."""
 
+import asyncio
 import base64
 import logging
 from collections.abc import Iterator
@@ -11,6 +12,7 @@ from typing import cast
 import pytest
 from fastapi.testclient import TestClient
 from octoforge_core.dialogs.api import DialogRepository, ExchangeRepository, ExchangeStatus
+from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import (
     InstructionDraft,
     InstructionService,
@@ -406,6 +408,18 @@ def test_telegram_users_join_profile_with_invite(client: TestClient) -> None:
     assert item["invite_code"] == "SECRETCODE"
     assert item["invite_note"] == "for Alice"
     assert item["invite_status"] == "claimed"
+
+
+def test_listings_name_the_person_not_just_the_id(client: TestClient) -> None:
+    """Every table names who a row belongs to: the operator reads a person,
+    the opaque id stays for machines (and for rows whose person is unnamed)."""
+    client.post("/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "alice"})
+    store = cast(IdentityStore, client.app.state.identity_store)
+    asyncio.run(store.update_profile("web", "alice", "Alice Smith", None))
+
+    dialogs = client.get("/api/admin/dialogs").json()
+
+    assert dialogs["items"][0]["user_name"] == "Alice Smith"
 
 
 def test_the_console_shows_people_and_the_accounts_they_answer_on(
