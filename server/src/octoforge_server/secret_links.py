@@ -38,6 +38,7 @@ from dataclasses import dataclass
 
 from cryptography.fernet import Fernet, InvalidToken
 from octoforge_core.secrets.api import (
+    SecretFormLinkStore,
     SecretFormPrefill,
     normalize_placements,
     normalize_transform,
@@ -90,7 +91,12 @@ class RedeemedLink:
 class SecretLinkService:
     """Issues and validates the tokens of the secrets form."""
 
-    def __init__(self, key: str = "", ttl_seconds: float = TOKEN_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        key: str = "",
+        ttl_seconds: float = TOKEN_TTL_SECONDS,
+        codes: SecretFormLinkStore | None = None,
+    ) -> None:
         # An installation with no secrets key has the whole surface disabled:
         # the store is None and every endpoint answers 503. Tokens are still
         # minted so the code path is uniform, but under a throwaway key — a
@@ -98,6 +104,16 @@ class SecretLinkService:
         # tokens forgeable from it are worse than tokens nobody can redeem.
         self._fernet = Fernet(derive_link_key(key) if key else Fernet.generate_key())
         self.ttl_seconds = ttl_seconds
+        # None where no database is reachable (the Telegram ingestion node):
+        # such a process can still mint account tokens, which carry their own
+        # claim, but not the short codes that need a row
+        self._codes = codes
+
+    async def issue_code(self, user_id: str, prefill: SecretFormPrefill | None = None) -> str:
+        """Return a fresh short code for a known person, with its prefill."""
+        if self._codes is None:
+            raise RuntimeError("short form codes need a link store")
+        return await self._codes.issue(user_id, prefill, self.ttl_seconds)
 
     def issue(self, subject: LinkSubject) -> str:
         """Return a fresh token authorizing secret management for that account."""
@@ -115,8 +131,38 @@ class SecretLinkService:
         payload = json.dumps({"p": user_id, "f": _prefill_to_payload(prefill)})
         return self._fernet.encrypt(payload.encode()).decode()
 
+    async def redeem_any(self, token: str) -> RedeemedLink | None:
+        """Redeem either link shape: a stored short code or an account token.
+
+        Two shapes exist for one reason each. A surface hands out the
+        stateless account token because the Telegram ingestion node runs
+        outside this service and has no database to write to. The agent's
+        tool hands out a short stored code, because whatever it mints has to
+        survive being copied into a chat message by a language model.
+        """
+        if self._codes is not None:
+            session = await self._codes.redeem(token)
+            if session is not None:
+                return RedeemedLink(user_id=session.user_id, prefill=session.prefill)
+        return self.redeem(token)
+
+    async def expired(self, token: str) -> bool:
+        """Whether this link existed and has run out, rather than never existing.
+
+        Worth the extra lookup: "the link expired" sent to somebody holding a
+        link that was never real (a model invented it once) is a message that
+        sends them looking in the wrong place.
+        """
+        if self._codes is not None and await self._codes.is_expired(token):
+            return True
+        try:
+            self._fernet.decrypt(token.encode())  # no ttl: shape, not freshness
+        except (InvalidToken, ValueError):
+            return False
+        return True
+
     def redeem(self, token: str) -> RedeemedLink | None:
-        """Return what a valid token buys; None otherwise.
+        """Return what a valid account/person token buys; None otherwise.
 
         Deliberately not single-use: the form makes several calls (list, add,
         delete) within one session; the TTL bounds the exposure instead.
@@ -175,19 +221,23 @@ def secrets_link_builder(
 class PersonSecretsLinkBuilder:
     """`SecretFormLinkFactory` port implementation for the agent's secret_link tool.
 
-    Same URL shape (token in the fragment) and the same reasons as
-    `secrets_link_builder`; the difference is the subject — a person the
-    service already resolved — and the prefill riding in the token.
+    Same URL shape (the capability in the fragment) and the same reasons as
+    `secrets_link_builder`; the differences are the subject — a person the
+    service already resolved — and that the capability is a short stored
+    code rather than a self-contained token. The agent has to copy this URL
+    into a chat message, and a ~700-character token is precisely what a
+    language model retypes wrong: on 2026-08-04 it twice invented one that
+    merely looked right, once looping for 30 000 characters.
     """
 
     def __init__(self, settings: Settings, links: SecretLinkService) -> None:
         self._base = settings.resolved_public_base_url()
         self._links = links
 
-    def build_prefilled(self, user_id: str, prefill: SecretFormPrefill) -> str:
+    async def build_prefilled(self, user_id: str, prefill: SecretFormPrefill) -> str:
         """Return a short-lived form URL with everything but the value filled."""
-        token = self._links.issue_for_person(user_id, prefill)
-        return f"{self._base}/secrets.html#token={token}"
+        code = await self._links.issue_code(user_id, prefill)
+        return f"{self._base}/secrets.html#t={code}"
 
 
 def _prefill_to_payload(prefill: SecretFormPrefill) -> dict[str, object]:

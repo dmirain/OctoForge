@@ -28,7 +28,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/secrets")
 
 SECRETS_DISABLED_DETAIL = "secrets are not configured on this installation"
-BAD_TOKEN_DETAIL = "the link has expired; run /secrets in Telegram to get a fresh one"
+EXPIRED_TOKEN_DETAIL = "the link has expired; ask the assistant or run /secrets for a fresh one"
+UNKNOWN_TOKEN_DETAIL = (
+    "this link is not valid — it was never issued by this installation, or it has "
+    "already been cleaned up. Ask the assistant for a new one (or run /secrets)"
+)
 
 StoreDep = Annotated[SecretStore | None, Depends(get_secret_store)]
 LinksDep = Annotated[SecretLinkService, Depends(get_secret_links)]
@@ -90,9 +94,13 @@ async def _authorize(
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=SECRETS_DISABLED_DETAIL
         )
-    redeemed = links.redeem(token)
+    redeemed = await links.redeem_any(token)
     if redeemed is None:
-        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=BAD_TOKEN_DETAIL)
+        # "expired" and "never existed" are different situations for whoever
+        # holds the link: one is fixed by asking again, the other means the
+        # link they were given was not real
+        detail = EXPIRED_TOKEN_DETAIL if await links.expired(token) else UNKNOWN_TOKEN_DETAIL
+        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=detail)
     if redeemed.user_id is not None:
         return redeemed
     assert redeemed.subject is not None  # redeem sets exactly one of the two

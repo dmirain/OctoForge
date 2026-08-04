@@ -81,10 +81,23 @@ sequenceDiagram
 
 The manual fallback is `/secrets` in Telegram, which mints the same kind of link with an empty form.
 
-The token is a capability, valid for ten minutes. It carries its own claim rather than naming a
-stored row, encrypted under a key derived from `OF_SECRETS_KEY`, with the expiry stamped inside it.
-Nothing about pending links is kept anywhere, so a restart no longer invalidates a link somebody is
-about to open, and any process holding the key can issue one. There are two claim shapes:
+A link is a capability, valid for ten minutes, and comes in two shapes for one reason each:
+
+| Shape | Minted by | Why |
+|---|---|---|
+| `#t=<code>` — a short opaque code, its payload in `secret_form_links` | the agent's `secret_link` tool, inside the service | the agent has to **copy the URL into a chat message**, and a ~700-character token is what a language model rewrites rather than copies |
+| `#token=<fernet>` — self-contained, encrypted under a key derived from `OF_SECRETS_KEY` | a surface (`/secrets` in Telegram) | the Telegram ingestion node runs outside this service and has no database to write a row to |
+
+The short code exists because of a real failure: on 2026-08-04 the agent twice invented a
+plausible-looking token instead of pasting the minted one — right `gAAAAAB` prefix, plausible
+timestamp, then a repetition loop 30 000 characters long that the user had to interrupt. Twelve
+url-safe characters (~72 bits) are unguessable within a ten-minute life and survive being retyped.
+
+Neither shape stores anything a restart invalidates for the stateless one, and the stored one lives
+in the shared database, so both are redeemable on any pod. Expired rows are swept opportunistically
+when the next code is issued — the table only ever holds a handful of live rows.
+
+The self-contained token carries one of two claims:
 
 - **An account** — surface and external id — for links minted by a surface (`/secrets` in Telegram).
   Whoever hands out that link may not know who the account belongs to — the Telegram ingestion node
@@ -94,14 +107,19 @@ about to open, and any process holding the key can issue one. There are two clai
   so everything saved after the identity migration was invisible with no error at the point of
   writing. Resolution is `resolve_or_create`, because `/secrets` is intercepted before the dialog
   pipeline: for somebody whose first message is that command, the person does not exist yet.
-- **A person**, for links minted by the agent's `secret_link` tool — that code runs inside the
-  service and already knows the person, so the token names the user id directly and carries the
-  pre-filled fields (never the value).
+- **A person** — the legacy shape of the agent's links, still redeemed so a link minted before the
+  short codes existed does not break mid-flight.
 
-That self-contained claim is what makes the form work behind a balancer. The form sends no
-`X-User-Id`; the token *is* its identity, so nothing can route it back to whichever process issued
-it, and a token held in one process's memory would be refused on every other pod. It is also why the
-Telegram ingestion node can hand out the link without asking the service for one.
+Short codes name the person directly: that code runs inside the service, which already resolved
+them, and the prefill (never the value) lives in the row.
+
+Either way the link carries its own identity, which is what makes the form work behind a balancer.
+The form sends no `X-User-Id`, so nothing can route it back to whichever process issued it — and a
+capability held in one process's memory would be refused on every other pod. It is also why the
+Telegram ingestion node can hand out a link without asking the service for one.
+
+A link that fails is told apart from one that expired: "expired" sent to somebody holding a link
+that was never real would send them asking for a fresh one instead of at whoever handed them a fake.
 
 The form and its endpoints are outside the operator's HTTP Basic gate — dialog users have no operator
 credential — and are authorized by that token alone.
@@ -188,6 +206,7 @@ host and instructs the model to mint a `secret_link` with a meaningful descripti
 | Stored transform unknown to this version | The call fails loudly — substituting the raw value where a hash was promised would *send* the plain secret |
 | Master key lost | Every stored value becomes unreadable; users must re-enter their secrets |
 | Link expired | The form says so and tells the user to request a fresh one |
+| Link was never issued (a model invented one) | The form says the link is not valid, not that it expired |
 | Response echoes the secret | Scrubbed before the text reaches the context or the log |
 
 ## Code anchors
@@ -198,6 +217,8 @@ host and instructs the model to mint a `secret_link` with a meaningful descripti
 - `core/src/octoforge_core/secrets/tools.py` — `secret_list`, `secret_link`
 - `core/src/octoforge_core/net/external.py` — resolution, placement enforcement, substitution, scrubbing
 - `core/src/octoforge_core/net/tool_spec.py` — the `{secret.*}` namespace and the `auth` sugar
-- `server/src/octoforge_server/secret_links.py` — one-time tokens (account and person claims, prefill)
+- `core/src/octoforge_core/secrets/link_store.py` — the short form codes and their payload
+- `server/src/octoforge_server/secret_links.py` — link minting and redemption (short codes plus the
+  self-contained account tokens)
 - `server/src/octoforge_server/api/secrets.py`, `server/src/octoforge_server/static/secrets.html` — the form and its API
 - `core/tests/test_secrets_store.py`, `core/tests/test_secret_tools.py`, `deploy/tests/test_secrets_api.py`

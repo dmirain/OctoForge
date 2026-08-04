@@ -135,7 +135,7 @@ class SecretLinkTool:
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate the prefill and return the minted URL with instructions."""
         prefill = _parse_prefill(arguments)
-        url = self._links.build_prefilled(context.user_id, prefill)
+        url = await self._links.build_prefilled(context.user_id, prefill)
         return LINK_MESSAGE_TEMPLATE.format(url=url)
 
 

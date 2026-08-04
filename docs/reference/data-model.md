@@ -20,6 +20,7 @@ and no ORM object ever crosses a module boundary — stores map rows to their mo
 | `cron_jobs` | `cron/` | Schedules, next/last fire, claim fields, last status |
 | `secrets` | `secrets/` | Encrypted per-user values with their host binding, required description, allowed placements and optional transform |
 | `user_params` | `params/` | Plaintext per-user values endpoint templates reference as `{user.code}` (timezone, account ids); set by the operator in the console |
+| `secret_form_links` | `secrets/` | Short-lived capability codes for the secrets form, with the prefill the agent put in them; swept when the next code is issued |
 
 The Telegram invite store is separate: its own declarative base and its own database
 (`OF_TELEGRAM_DATABASE_URL`), holding invite codes and member profiles. On Postgres that is a second

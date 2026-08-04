@@ -1,5 +1,6 @@
 """Tests for the self-service secrets surface: token gate, form API, openness."""
 
+import asyncio
 import sqlite3
 from collections.abc import Iterator
 from http import HTTPStatus
@@ -24,6 +25,8 @@ CODE = "mail_token"
 VALUE = "tok-123"
 HOST = "api.mail.example.com"
 DESCRIPTION = "test mailbox token"
+# what a model has to copy verbatim into a chat message
+MAX_COPYABLE_CHARS = 24
 
 
 def make_settings(tmp_path: Path, *, with_key: bool = True) -> Settings:
@@ -220,8 +223,13 @@ def test_an_installation_without_a_key_mints_nothing_another_can_redeem() -> Non
     assert two.redeem(one.issue(SUBJECT)) is None
 
 
-def test_person_token_carries_prefill_and_writes_under_the_person(client: TestClient) -> None:
-    """The agent's secret_link tool: token names the person, form is pre-filled."""
+def test_short_code_carries_prefill_and_writes_under_the_person(client: TestClient) -> None:
+    """The agent's secret_link tool: a code names the person, form is pre-filled.
+
+    Short on purpose: the agent has to copy this into a chat message, and a
+    ~700-character token is what it retypes wrong (2026-08-04: two invented
+    links, one a 30 000-character loop).
+    """
     links = link_service(client)
     prefill = SecretFormPrefill(
         code=CODE,
@@ -230,7 +238,8 @@ def test_person_token_carries_prefill_and_writes_under_the_person(client: TestCl
         placements=frozenset({SecretPlacement.HEADER, SecretPlacement.URL}),
         transform=SecretTransform.BASE64,
     )
-    token = links.issue_for_person("person-1", prefill)
+    token = asyncio.run(links.issue_code("person-1", prefill))
+    assert len(token) <= MAX_COPYABLE_CHARS
 
     session = client.post("/api/secrets/session", json={"token": token}).json()
     stored = client.post(
@@ -276,3 +285,23 @@ def test_set_without_description_is_rejected(client: TestClient) -> None:
     )
 
     assert response.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_a_link_that_was_never_issued_says_so(client: TestClient) -> None:
+    """An invented link must not read as "expired" — that sends the holder
+    looking for a fresh one instead of at whoever handed them a fake."""
+    response = client.post("/api/secrets/session", json={"token": "gAAAAABqckh0QJ0QJ0QJ0"})
+
+    assert response.status_code == HTTPStatus.FORBIDDEN
+    assert "not valid" in response.json()["detail"]
+
+
+def test_an_expired_link_says_expired(client: TestClient) -> None:
+    links = link_service(client)
+    links.ttl_seconds = -1.0
+    token = links.issue(SUBJECT)
+
+    response = client.post("/api/secrets/session", json={"token": token})
+
+    assert response.status_code == HTTPStatus.FORBIDDEN
+    assert "expired" in response.json()["detail"]

@@ -260,12 +260,44 @@ class SecretFormLinkFactory(Protocol):
     """Mints one-time secrets-form URLs bound to a person.
 
     Implemented by the composition root's web layer (the link embeds the
-    installation's public base URL and a capability token); core only knows
+    installation's public base URL and a capability code); core only knows
     the port, so the secret_link tool exists exactly when a web surface does.
     """
 
-    def build_prefilled(self, user_id: str, prefill: SecretFormPrefill) -> str:
+    async def build_prefilled(self, user_id: str, prefill: SecretFormPrefill) -> str:
         """Return a short-lived form URL with everything but the value filled."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class SecretFormSession:
+    """What a redeemed form code opens: whose secrets, and any prefill."""
+
+    user_id: str
+    prefill: SecretFormPrefill | None = None
+
+
+class SecretFormLinkStore(Protocol):
+    """Short capability codes for the secrets form, with their payload.
+
+    The code is what a person (or an agent) has to carry into a chat, so it
+    is deliberately short; everything else about the link lives here. Codes
+    are opaque and unguessable — a code IS the authorization to manage that
+    person's secrets until it expires.
+    """
+
+    async def issue(
+        self, user_id: str, prefill: SecretFormPrefill | None, ttl_seconds: float
+    ) -> str:
+        """Store a fresh code for that person and return it."""
+        ...
+
+    async def redeem(self, code: str) -> SecretFormSession | None:
+        """Return what a live code opens; None when unknown or expired."""
+        ...
+
+    async def is_expired(self, code: str) -> bool:
+        """Whether this code existed and has run out — for an honest message."""
         ...
 
 

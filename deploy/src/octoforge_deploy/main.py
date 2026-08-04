@@ -100,6 +100,7 @@ from octoforge_core.retention_sweep import RetentionSweeper
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.serper import SerperSearchProvider
 from octoforge_core.secrets.api import SecretStore
+from octoforge_core.secrets.link_store import SqlAlchemySecretFormLinkStore
 from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.secrets.tools import SecretLinkTool, SecretListTool
 from octoforge_core.speech.api import TranscriptionClient
@@ -236,7 +237,9 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
         _build_secret_store(settings, session_factory),
         SqlAlchemyUserParamStore(session_factory),
     )
-    secret_links = SecretLinkService(settings.secrets_key)
+    secret_links = SecretLinkService(
+        settings.secrets_key, codes=SqlAlchemySecretFormLinkStore(session_factory)
+    )
     telegram_stores = await _build_telegram_stores(telegram_settings)
     try:
         async with (

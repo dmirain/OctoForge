@@ -55,9 +55,9 @@ class RecordingLinkFactory:
     def __init__(self) -> None:
         self.calls: list[tuple[str, SecretFormPrefill]] = []
 
-    def build_prefilled(self, user_id: str, prefill: SecretFormPrefill) -> str:
+    async def build_prefilled(self, user_id: str, prefill: SecretFormPrefill) -> str:
         self.calls.append((user_id, prefill))
-        return "https://forge.example.com/secrets.html#token=abc"
+        return "https://forge.example.com/secrets.html#t=Ab3xK9pQ"
 
 
 def info(code: str, description: str) -> SecretInfo:
@@ -115,7 +115,7 @@ async def test_secret_link_mints_a_prefilled_url_for_the_calling_user() -> None:
     assert prefill.description == "token for the mailbox"
     assert prefill.placements == frozenset({SecretPlacement.HEADER, SecretPlacement.URL})
     assert prefill.transform is SecretTransform.BASE64
-    assert "https://forge.example.com/secrets.html#token=abc" in output
+    assert "https://forge.example.com/secrets.html#t=Ab3xK9pQ" in output
 
 
 @pytest.mark.parametrize(
