@@ -130,6 +130,12 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 ## Invariants
 
 - **Endpoint records are owner-scoped.** A private endpoint of another user cannot be executed.
+- **Unknown document fields are refused**, and a string `auth` may only be `"none"`. An ignored
+  field is how a record ends up sending no credential and no body while looking authenticated —
+  three production records had drifted into `{"auth": "bearer", "secret_key": "…"}`, which attaches
+  nothing. `notes` and `description` stay allowed as free-form documentation.
+- **A 401/403 answered to a call that carried no secret says so**, so the model fixes the record
+  instead of guessing at the credential's value or encoding.
 - **Parameters are validated before anything is rendered**, and unknown parameters are refused.
 - **A parameter-validation error carries the contract** back to the model.
 - **`user.*` and `secret.*` values are substituted only from the record's templates** — never from
@@ -164,6 +170,9 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 | Endpoint record content is not valid JSON | `ToolSpecError`, reported to the model |
 | Missing or unknown parameter | Validation error including the declared contract |
 | Template references an unknown namespace or a dotted param name | `ToolSpecError` at parse time |
+| Document carries an invented field (`secret_key`, `body`, …) | `ToolSpecError` naming the allowed fields and how a secret is actually declared |
+| `auth` is a scheme word (`"basic"`, `"bearer"`) | `ToolSpecError`: it promises a credential and attaches none |
+| Upstream answers 401/403 and no secret was attached | The body carries an explicit "this request carried NO credential" note |
 | `{user.*}` value not set for this user | Message naming the code(s); an operator sets them in the console |
 | Secret not set for this user | Message with the code and host, telling the agent to mint a `secret_link` |
 | Secret asked for a host it is not bound to | `SecretHostMismatchError` — the value is not sent |

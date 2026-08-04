@@ -84,6 +84,14 @@ PLACEMENT_BLOCKED_TEMPLATE = (
     "secret '{code}' may not be substituted into the {part} of a request "
     "(it allows: {allowed}); the user can extend its placements in the secrets form"
 )
+UNAUTHENTICATED_STATUSES = frozenset({401, 403})
+NO_CREDENTIAL_HINT = (
+    "\n\n[octoforge] This request carried NO credential: the endpoint record "
+    "references no secret, so nothing was attached. Do not guess at the secret's "
+    "value or encoding — fix the record. Declare the secret as "
+    'auth: {"secret": "<code>"} or reference it as {secret.<code>} in a header '
+    "template, and check secret_list for the codes this user actually has."
+)
 
 
 async def read_capped_text(response: httpx.Response, limit: int) -> tuple[str, bool]:
@@ -271,6 +279,11 @@ class ExternalCallExecutor:
         result = _truncate(_scrub(raw, secrets.values()))
         if truncated and not result.endswith(TRUNCATED_SUFFIX):
             result += TRUNCATED_SUFFIX
+        if status in UNAUTHENTICATED_STATUSES and not secrets:
+            # a bare 401/403 reads as "wrong credential" and sends the model
+            # guessing at the value; when the record attached none at all,
+            # say so — that is a one-step fix in the record, not a mystery
+            result += NO_CREDENTIAL_HINT
         return ExternalCallResult(status=status, body=result)
 
     async def _user_values(self, plan: _RenderPlan, user_id: str | None) -> dict[str, str]:

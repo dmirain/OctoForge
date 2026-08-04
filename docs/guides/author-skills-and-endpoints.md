@@ -64,6 +64,10 @@ An endpoint record makes a system callable. Its content is a small JSON document
 - `params_schema` — declared parameters, `required` per parameter. Unknown parameters are refused, and a
   validation error hands the model this contract back, so a wrong call corrects itself in one step.
 - `auth` — `"none"`, or a per-user secret **by code**: sugar for a `{secret.code}` header template.
+  A scheme word like `"basic"`/`"bearer"` is refused: it reads as authenticated and attaches
+  nothing. Fields outside this list are refused too — only `notes` and `description` are allowed
+  next to the contract as free-form documentation. (Records that invented `secret_key` and `body`
+  spent months sending unauthenticated requests and bare 401s; hence the strictness.)
 
 Every template part also takes two server-side namespaces, substituted at call time and never seen
 by the model as values:

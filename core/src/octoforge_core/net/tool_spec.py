@@ -83,6 +83,16 @@ DEFAULT_SECRET_FORMAT = "Bearer {value}"
 SECRET_VALUE_FIELD = "{value}"
 USER_NAMESPACE = "user"
 SECRET_NAMESPACE = "secret"
+# Fields this parser implements. Anything else is refused: an ignored field
+# is how a record ends up sending no credential and no body (see
+# `_reject_unknown_keys`).
+SPEC_KEYS = frozenset(
+    {"method", "url_template", "params_schema", "body_template", "headers", "auth"}
+)
+# Free-form documentation the author may keep next to the contract. Ignored
+# by execution, allowed by name so a note never has to look like a feature.
+ANNOTATION_KEYS = frozenset({"notes", "description"})
+KNOWN_KEYS = SPEC_KEYS | ANNOTATION_KEYS
 # same grammar as the secrets and params modules' codes
 REF_CODE_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 
@@ -201,6 +211,7 @@ def _validate_ref_code(field_name: str, code: str) -> None:
 def parse_tool_spec(content: str) -> ToolSpec:
     """Parse and validate an endpoint record's JSON content."""
     data = _load_json(content)
+    _reject_unknown_keys(data)
     method = _parse_method(data.get("method"))
     url_template = _parse_url_template(data.get("url_template"))
     params = _parse_params_schema(data.get("params_schema"))
@@ -214,7 +225,7 @@ def parse_tool_spec(content: str) -> ToolSpec:
         # record author wrote both, and the auth block is the specific one
         headers[header_name] = header_template
     elif isinstance(raw_auth, str):
-        auth = raw_auth
+        auth = _parse_auth_word(raw_auth)
     else:
         raise ToolSpecError("auth must be a string or a secret declaration object")
     _validate_template_fields("url_template", url_template, params)
@@ -231,6 +242,41 @@ def parse_tool_spec(content: str) -> ToolSpec:
         body_template=body_template,
         headers=headers,
     )
+
+
+def _reject_unknown_keys(data: dict[str, Any]) -> None:
+    """Refuse a document with fields this parser does not implement.
+
+    Silence here is how a call ends up with no credential and no body: a
+    record author (often the model itself) invents `secret_key` or `body`,
+    every invented field is ignored, and the only symptom is a bare 401 from
+    the far side. Naming the allowed keys turns that into a one-step fix.
+    """
+    unknown = sorted(set(data) - KNOWN_KEYS)
+    if unknown:
+        raise ToolSpecError(
+            f"unknown field(s) in the endpoint document: {', '.join(unknown)}; "
+            f"allowed: {', '.join(sorted(KNOWN_KEYS))}. A secret is declared as "
+            'auth: {"secret": "<code>"} or referenced as {secret.<code>} inside a '
+            "header/url/body template; the request body is body_template"
+        )
+
+
+def _parse_auth_word(raw: str) -> str:
+    """Validate a string-valued `auth`: only "none" says nothing.
+
+    Any other word ("basic", "bearer") reads as a declaration that the call
+    is authenticated, while a string `auth` injects exactly nothing — the
+    request goes out bare and the far side answers 401.
+    """
+    auth = raw.strip().lower()
+    if auth != DEFAULT_AUTH:
+        raise ToolSpecError(
+            f"auth: {raw!r} declares an authentication scheme but attaches no "
+            'credential. Use auth: {"secret": "<code>", "format": "Basic {value}"} '
+            'for a per-user secret, or auth: "none" for a public endpoint'
+        )
+    return auth
 
 
 def _expand_secret_auth(raw: dict[str, object]) -> tuple[str, str]:

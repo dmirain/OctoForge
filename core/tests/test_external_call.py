@@ -1114,3 +1114,84 @@ def test_tool_spec_rejects_dotted_param_names() -> None:
 
     with pytest.raises(ToolSpecError, match="reserved"):
         parse_tool_spec(content)
+
+
+def test_tool_spec_rejects_invented_fields() -> None:
+    """The shape three production records drifted into: invented field names.
+
+    `secret_key` and `body` were never part of the document; ignoring them
+    sent the request with no credential and no body, and the only symptom
+    was a bare 401 from the far side.
+    """
+    content = json.dumps(
+        {
+            "method": "PROPFIND",
+            "url_template": "https://caldav.icloud.com/",
+            "auth": "basic",
+            "secret_key": "caldavicloud",
+            "body": "<D:propfind/>",
+        }
+    )
+
+    with pytest.raises(ToolSpecError, match="unknown field") as refused:
+        parse_tool_spec(content)
+
+    message = str(refused.value)
+    assert "secret_key" in message and "body" in message
+    assert "body_template" in message  # the error names the real field
+
+
+def test_tool_spec_rejects_an_auth_word_that_promises_a_credential() -> None:
+    content = json.dumps(
+        {"method": "GET", "url_template": "https://api.github.com/user", "auth": "bearer"}
+    )
+
+    with pytest.raises(ToolSpecError, match="attaches no credential"):
+        parse_tool_spec(content)
+
+
+def test_tool_spec_keeps_free_form_notes() -> None:
+    """Documentation next to the contract must not look like a broken feature."""
+    spec = parse_tool_spec(
+        json.dumps(
+            {
+                "method": "GET",
+                "url_template": "https://api.song.link/v1",
+                "auth": "none",
+                "notes": "public API, no key needed",
+                "description": "resolves a track across services",
+            }
+        )
+    )
+
+    assert spec.auth == "none"
+
+
+async def test_a_401_without_any_secret_says_no_credential_was_sent() -> None:
+    """Otherwise the model reads 401 as "wrong value" and guesses at encodings."""
+    content = json.dumps(
+        {"method": "GET", "url_template": "https://api.example.com/v1", "auth": "none"}
+    )
+    executor = make_executor(
+        lambda request: httpx.Response(HTTPStatus.UNAUTHORIZED, text="denied"),
+        records={"bare": content},
+    )
+
+    result = await executor.execute("bare", {}, user_id="user-test")
+
+    assert result.status == HTTPStatus.UNAUTHORIZED
+    assert "NO credential" in result.body
+    assert "secret_list" in result.body
+
+
+async def test_a_401_with_a_secret_attached_keeps_the_body_alone() -> None:
+    """When a credential WAS sent, 401 means what it says — no hint to add."""
+    executor = make_executor(
+        lambda request: httpx.Response(HTTPStatus.UNAUTHORIZED, text="denied"),
+        records={SECRET_TOOL_NAME: SECRET_TOOL_CONTENT},
+        options=ExecutorOptions(secrets=FakeSecretStore()),
+    )
+
+    result = await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+
+    assert "NO credential" not in result.body
