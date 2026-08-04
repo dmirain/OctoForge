@@ -16,6 +16,8 @@ from octoforge_core.secrets.api import (
     SecretPlacement,
     SecretTransform,
     apply_transform,
+    host_matches,
+    normalize_host,
 )
 from octoforge_core.secrets.models import SecretRow
 from octoforge_core.secrets.store import SqlAlchemySecretStore
@@ -177,3 +179,38 @@ def test_malformed_key_fails_at_construction(
 ) -> None:
     with pytest.raises(ValueError):
         SqlAlchemySecretStore(session_factory, "not-a-fernet-key")
+
+
+@pytest.mark.parametrize(
+    ("binding", "host", "covered"),
+    [
+        ("*.icloud.com", "caldav.icloud.com", True),
+        # the case the pattern exists for: iCloud shards after discovery
+        ("*.icloud.com", "p54-caldav.icloud.com", True),
+        ("*.icloud.com", "icloud.com", False),  # the apex is not a match, as in TLS
+        ("*.icloud.com", "a.b.icloud.com", False),  # one label, never two
+        ("*.icloud.com", "evilicloud.com", False),  # the dot is part of the suffix
+        ("*.icloud.com", "icloud.com.evil.net", False),  # suffix, not substring
+        ("*.icloud.com", "*.icloud.com", False),  # a request host is never a pattern
+        ("caldav.icloud.com", "caldav.icloud.com", True),
+        ("caldav.icloud.com", "p54-caldav.icloud.com", False),
+    ],
+)
+def test_host_matching(binding: str, host: str, covered: bool) -> None:
+    assert host_matches(binding, host) is covered
+
+
+@pytest.mark.parametrize("raw", ["*.com", "*", "p*.icloud.com", "*..com", "a*b.example.com"])
+def test_host_patterns_that_are_too_broad_or_malformed_are_refused(raw: str) -> None:
+    with pytest.raises(InvalidSecretError):
+        normalize_host(raw)
+
+
+async def test_a_pattern_binding_serves_sibling_hosts(store: SqlAlchemySecretStore) -> None:
+    """One credential for a sharded service, still refused everywhere else."""
+    await store.put(USER_A, CODE, VALUE, "*.icloud.com", DESCRIPTION)
+
+    assert (await store.resolve(USER_A, CODE, "p54-caldav.icloud.com")).value == VALUE
+    assert (await store.resolve(USER_A, CODE, "caldav.icloud.com")).value == VALUE
+    with pytest.raises(SecretHostMismatchError):
+        await store.resolve(USER_A, CODE, "evil.example.com")

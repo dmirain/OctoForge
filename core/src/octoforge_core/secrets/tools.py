@@ -58,9 +58,11 @@ LINK_SCHEMA: dict[str, Any] = {
         "host": {
             "type": "string",
             "description": (
-                "Bare hostname the secret is bound to (the only host it may be "
-                "sent to), e.g. 'api.example.com' — take it from the endpoint's "
-                "URL or its missing-secret message"
+                "The only host the secret may be sent to, e.g. 'api.example.com' — "
+                "take it from the endpoint's URL or its missing-secret message. "
+                "For a service that shards across sibling hosts (iCloud answers on "
+                "p54-caldav.icloud.com after discovery) use a one-level pattern "
+                "like '*.icloud.com'; keep it as narrow as the service allows"
             ),
         },
         "description": {

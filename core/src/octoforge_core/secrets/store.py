@@ -27,6 +27,7 @@ from octoforge_core.secrets.api import (
     SecretPlacement,
     SecretTransform,
     apply_transform,
+    host_matches,
     normalize_code,
     normalize_description,
     normalize_host,
@@ -129,7 +130,7 @@ class SqlAlchemySecretStore:
             row = await _find_row(session, user_id, code)
             if row is None:
                 raise SecretNotFoundError(code)
-            if row.allowed_host != target:
+            if not host_matches(row.allowed_host, target):
                 raise SecretHostMismatchError(
                     HOST_MISMATCH_MESSAGE.format(code=code, allowed=row.allowed_host, host=target)
                 )

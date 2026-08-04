@@ -31,6 +31,9 @@ from typing import Protocol
 
 CODE_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 MAX_DESCRIPTION_CHARS = 256
+WILDCARD_PREFIX = "*."
+# what follows `*.` must have a dot of its own: '*.com' would be every host
+MIN_PATTERN_SUFFIX_DOTS = 1
 
 
 class SecretNotFoundError(Exception):
@@ -140,11 +143,66 @@ def normalize_code(raw: str) -> str:
 
 
 def normalize_host(raw: str) -> str:
-    """Validate and normalize the host a secret is bound to (exact hostname)."""
+    """Validate and normalize the host binding: a hostname or a `*.` pattern.
+
+    A pattern covers services that shard across sibling hosts — iCloud hands
+    out `p54-caldav.icloud.com` after discovery, S3 answers on
+    `<bucket>.s3.amazonaws.com` — where an exact binding would mean one
+    stored copy of the same credential per shard.
+
+    Deliberately narrow, because this binding is the exfiltration guard:
+
+    - only a leading `*.`, never mid-label (`p*.icloud.com`) and never bare;
+    - it stands for exactly ONE label, as in TLS certificates, so
+      `*.icloud.com` covers `caldav.icloud.com` but not `a.b.icloud.com`;
+    - what follows must itself have at least two labels, so `*.com` — every
+      host on the internet — cannot be written at all.
+
+    What it cannot know is where a registry boundary sits: `*.co.uk` passes
+    the two-label rule and is far broader than it looks. That is why the
+    surfaces spell out what a pattern grants.
+    """
     host = raw.strip().lower().rstrip(".")
     if not host or "/" in host or ":" in host or " " in host:
-        raise InvalidSecretError("allowed_host must be a bare hostname, e.g. 'api.example.com'")
+        raise InvalidSecretError(
+            "allowed_host must be a bare hostname ('api.example.com') or a "
+            "one-level pattern ('*.example.com')"
+        )
+    if not host.startswith(WILDCARD_PREFIX):
+        if "*" in host:
+            raise InvalidSecretError(
+                "a wildcard is only allowed as the leading label, e.g. '*.example.com'"
+            )
+        return host
+    suffix = host[len(WILDCARD_PREFIX) :]
+    if "*" in suffix:
+        raise InvalidSecretError("only one wildcard label is allowed, e.g. '*.example.com'")
+    if suffix.count(".") < MIN_PATTERN_SUFFIX_DOTS or "" in suffix.split("."):
+        raise InvalidSecretError(
+            f"'{host}' is too broad: a pattern must name at least a domain and a "
+            "suffix, e.g. '*.example.com'"
+        )
     return host
+
+
+def host_matches(binding: str, host: str) -> bool:
+    """Whether a request host is covered by a secret's binding.
+
+    Exact bindings compare equal; a `*.` pattern replaces exactly one label
+    (never the apex, never two), which is the TLS wildcard rule.
+    """
+    target = host.strip().lower().rstrip(".")
+    if "*" in target:
+        # a request host is never a pattern; a URL literally containing one
+        # must not be able to satisfy a pattern binding
+        return False
+    if not binding.startswith(WILDCARD_PREFIX):
+        return binding == target
+    suffix = binding[len(WILDCARD_PREFIX) :]
+    if not target.endswith(f".{suffix}"):
+        return False
+    label = target[: -(len(suffix) + 1)]
+    return bool(label) and "." not in label
 
 
 def normalize_description(raw: str) -> str:

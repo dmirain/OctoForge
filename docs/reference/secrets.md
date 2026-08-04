@@ -7,7 +7,7 @@ host, transformed if the secret says so, and scrubbed from anything coming back.
 ## How it works
 
 A secret row holds the user id, a code (`[a-z0-9_]`, up to 64 characters), the encrypted value, the
-host it is allowed to be sent to, a **required description** (what the secret is for — it is how the
+host binding (an exact hostname or a `*.` pattern, see below), a **required description** (what the secret is for — it is how the
 model tells two secrets for one host apart), the request parts it may be substituted into
 (`placements`), an optional static `transform`, and timestamps. Encryption is Fernet with the master
 key from `OF_SECRETS_KEY`; without that key the whole feature is off and endpoints requiring it fail
@@ -21,6 +21,25 @@ is unknown, and raises if `host` differs from the binding — the error text nev
 It also stamps `last_used_at`. What it returns (`ResolvedSecret`) carries the value with the
 transform already applied, the stored plain value (only so scrubbing can mask both forms), and the
 allowed placements the executor enforces.
+
+### The host binding
+
+`allowed_host` is either an exact hostname or a one-level pattern, `*.example.com`. The pattern
+exists for services that shard across sibling hosts — iCloud hands out `p54-caldav.icloud.com` after
+principal discovery, S3 answers on `<bucket>.s3.amazonaws.com` — where an exact binding would mean
+storing the same credential once per shard.
+
+It is deliberately narrow, because this binding is the last line of defence:
+
+- only a leading `*.`, never mid-label (`p*.icloud.com`) and never bare `*`;
+- it stands for **exactly one** label, as in TLS certificates: `*.icloud.com` covers
+  `caldav.icloud.com` and `p54-caldav.icloud.com`, but neither `icloud.com` itself nor
+  `a.b.icloud.com`;
+- what follows must have at least two labels of its own, so `*.com` cannot be written at all.
+
+What the check cannot know is where a registry boundary sits: `*.co.uk` passes the two-label rule
+and grants far more than it looks like — hence the wording on the form. Prefer the exact host, and
+reach for a pattern only when the service genuinely moves between siblings.
 
 ### Placements
 
@@ -136,7 +155,8 @@ host and instructs the model to mint a `secret_link` with a meaningful descripti
 
 - **The model only ever sees codes and metadata** — descriptions included, values never.
 - **The store's DTO carries no value**, so no listing can leak one by accident.
-- **A value leaves the store only through `resolve`**, and only for the host it is bound to.
+- **A value leaves the store only through `resolve`**, and only for a host its binding covers —
+  exactly equal, or one label under a `*.` pattern.
 - **A description is required** — by the store on every write and by the schema (`NOT NULL`); rows
   from before the requirement were backfilled by migration with a placeholder that itself tells the
   agent to ask the user and update it.
