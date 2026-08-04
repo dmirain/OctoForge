@@ -37,6 +37,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from cryptography.fernet import Fernet, InvalidToken
+from octoforge_core.secrets.api import (
+    SecretFormPrefill,
+    normalize_placements,
+    normalize_transform,
+)
 
 from octoforge_server.config import Settings
 
@@ -66,6 +71,22 @@ class LinkSubject:
     external_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class RedeemedLink:
+    """What a valid token buys: whose secrets it opens, plus form prefill.
+
+    Exactly one of `subject`/`user_id` is set. A surface that hands out
+    links knows only its own account id (`subject`, resolved to a person by
+    the service); the agent's `secret_link` tool runs inside the service and
+    already knows the person, so its tokens name the `user_id` directly and
+    carry the pre-filled fields.
+    """
+
+    subject: LinkSubject | None = None
+    user_id: str | None = None
+    prefill: SecretFormPrefill | None = None
+
+
 class SecretLinkService:
     """Issues and validates the tokens of the secrets form."""
 
@@ -83,8 +104,19 @@ class SecretLinkService:
         payload = json.dumps({"s": subject.surface, "e": subject.external_id})
         return self._fernet.encrypt(payload.encode()).decode()
 
-    def redeem(self, token: str) -> LinkSubject | None:
-        """Return the account a valid token is bound to; None otherwise.
+    def issue_for_person(self, user_id: str, prefill: SecretFormPrefill) -> str:
+        """Return a fresh token for a known person, carrying the form prefill.
+
+        Only code that already resolved the person may mint these (the
+        agent's secret_link tool); the prefill rides inside the encrypted
+        token, so it is tamper-proof and stays out of query strings and logs
+        just like the identity.
+        """
+        payload = json.dumps({"p": user_id, "f": _prefill_to_payload(prefill)})
+        return self._fernet.encrypt(payload.encode()).decode()
+
+    def redeem(self, token: str) -> RedeemedLink | None:
+        """Return what a valid token buys; None otherwise.
 
         Deliberately not single-use: the form makes several calls (list, add,
         delete) within one session; the TTL bounds the exposure instead.
@@ -97,7 +129,14 @@ class SecretLinkService:
         try:
             raw = self._fernet.decrypt(token.encode(), ttl=int(self.ttl_seconds))
             payload = json.loads(raw)
-            return LinkSubject(surface=str(payload["s"]), external_id=str(payload["e"]))
+            if "p" in payload:
+                return RedeemedLink(
+                    user_id=str(payload["p"]),
+                    prefill=_prefill_from_payload(payload.get("f")),
+                )
+            return RedeemedLink(
+                subject=LinkSubject(surface=str(payload["s"]), external_id=str(payload["e"]))
+            )
         except (InvalidToken, ValueError, KeyError, TypeError):
             # invalid, expired, not a Fernet token, or a payload this version
             # does not understand — to the caller these are one situation:
@@ -131,3 +170,47 @@ def secrets_link_builder(
         return f"{base}/secrets.html#token={token}"
 
     return build
+
+
+class PersonSecretsLinkBuilder:
+    """`SecretFormLinkFactory` port implementation for the agent's secret_link tool.
+
+    Same URL shape (token in the fragment) and the same reasons as
+    `secrets_link_builder`; the difference is the subject — a person the
+    service already resolved — and the prefill riding in the token.
+    """
+
+    def __init__(self, settings: Settings, links: SecretLinkService) -> None:
+        self._base = settings.resolved_public_base_url()
+        self._links = links
+
+    def build_prefilled(self, user_id: str, prefill: SecretFormPrefill) -> str:
+        """Return a short-lived form URL with everything but the value filled."""
+        token = self._links.issue_for_person(user_id, prefill)
+        return f"{self._base}/secrets.html#token={token}"
+
+
+def _prefill_to_payload(prefill: SecretFormPrefill) -> dict[str, object]:
+    return {
+        "c": prefill.code,
+        "h": prefill.allowed_host,
+        "d": prefill.description,
+        "pl": sorted(member.value for member in prefill.placements),
+        "t": prefill.transform.value if prefill.transform is not None else None,
+    }
+
+
+def _prefill_from_payload(raw: object) -> SecretFormPrefill | None:
+    if not isinstance(raw, dict):
+        return None
+    placements = raw.get("pl")
+    transform = raw.get("t")
+    return SecretFormPrefill(
+        code=str(raw["c"]),
+        allowed_host=str(raw["h"]),
+        description=str(raw["d"]),
+        placements=normalize_placements(
+            [str(item) for item in placements] if isinstance(placements, list) else []
+        ),
+        transform=normalize_transform(str(transform) if transform is not None else None),
+    )

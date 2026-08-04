@@ -94,12 +94,14 @@ from octoforge_core.mcp.sync import McpSyncLoop, McpToolSync
 from octoforge_core.mcp.tools import McpAddTool
 from octoforge_core.net.external import CallCredentials, ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.params.store import SqlAlchemyUserParamStore
 from octoforge_core.ports import LLMClient
 from octoforge_core.retention_sweep import RetentionSweeper
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.serper import SerperSearchProvider
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.secrets.store import SqlAlchemySecretStore
+from octoforge_core.secrets.tools import SecretLinkTool, SecretListTool
 from octoforge_core.speech.api import TranscriptionClient
 from octoforge_core.speech.client import OpenAITranscriptionClient
 from octoforge_core.tools.base import Tool
@@ -112,7 +114,11 @@ from octoforge_server.channels import WEB_CHANNEL
 from octoforge_server.config import Settings
 from octoforge_server.prompts import FilePromptProvider
 from octoforge_server.runtime_state import Runtime
-from octoforge_server.secret_links import SecretLinkService, secrets_link_builder
+from octoforge_server.secret_links import (
+    PersonSecretsLinkBuilder,
+    SecretLinkService,
+    secrets_link_builder,
+)
 from octoforge_server.skill_overlay import apply_overlay, load_overlay
 from octoforge_server.surfaces import Surface, SurfaceRoutes
 from octoforge_server.system_skills import WEB_SYSTEM_SKILLS
@@ -226,7 +232,10 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
         SqlAlchemyIdentityStore(session_factory),
     )
     cron_store = SqlAlchemyCronStore(session_factory)
-    secret_store = _build_secret_store(settings, session_factory)
+    secret_store, user_params = (
+        _build_secret_store(settings, session_factory),
+        SqlAlchemyUserParamStore(session_factory),
+    )
     secret_links = SecretLinkService(settings.secrets_key)
     telegram_stores = await _build_telegram_stores(telegram_settings)
     try:
@@ -288,11 +297,20 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         credentials=CallCredentials(
                             auth_whitelist=_external_call_whitelist(settings),
                             secrets=secret_store,
+                            user_params=user_params,
                         ),
                         delegates={MIRROR_KIND: mcp.call_delegate},
                     ),
                     search_provider=_build_search_provider(settings, outbound_http),
                     mcp_add=mcp.add_tool,
+                    secret_list=(
+                        SecretListTool(secret_store) if secret_store is not None else None
+                    ),
+                    secret_link=(
+                        SecretLinkTool(PersonSecretsLinkBuilder(settings, secret_links))
+                        if secret_store is not None
+                        else None
+                    ),
                 ),
                 limits=_tool_limits(settings),
             )
@@ -403,6 +421,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     admin_read_model=SqlAlchemyAdminStore(session_factory),
                     secret_store=secret_store,
                     secret_links=secret_links,
+                    user_params=user_params,
                     dialogs=dialogs,
                     summary_store=summary_store,
                     exchanges=exchanges,

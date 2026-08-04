@@ -333,3 +333,43 @@ def _owner_of_identity(connection: Connection, surface: str, external_id: str) -
     ).first()
     assert row is not None, f"no identity for {surface}:{external_id}"
     return str(row[0])
+
+
+def _downgrade_below_secrets_description(connection: Connection) -> None:
+    command.downgrade(_alembic_config(connection), "f1b9d4e8c257")
+
+
+async def test_legacy_secrets_get_a_description_backfilled(tmp_path: Path) -> None:
+    """Rows from before the requirement must not stay NULL: the column tightens
+    to NOT NULL, and the placeholder itself tells the agent to ask the user."""
+    engine = create_engine(_database_url(tmp_path))
+    stamp = utc_now().isoformat()
+    try:
+        await bootstrap_schema(engine)
+        async with engine.begin() as connection:
+            await connection.run_sync(_downgrade_below_secrets_description)
+            await connection.execute(
+                sa.text(
+                    "insert into secrets (id, user_id, code, ciphertext, allowed_host, "
+                    "created_at) values ('s-1', 'u-1', 'old_token', 'cipher', "
+                    "'api.example.com', :now)"
+                ),
+                {"now": stamp},
+            )
+        async with engine.begin() as connection:
+            await connection.run_sync(_upgrade_to_head)
+        async with engine.connect() as connection:
+            (description,) = (
+                await connection.execute(sa.text("select description from secrets"))
+            ).one()
+            nullable = (
+                await connection.run_sync(
+                    lambda sync: {
+                        c["name"]: c["nullable"] for c in sa.inspect(sync).get_columns("secrets")
+                    }
+                )
+            )["description"]
+    finally:
+        await engine.dispose()
+    assert description is not None and "secret_link" in description
+    assert nullable is False

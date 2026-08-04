@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from octoforge_core.secrets.api import SecretFormPrefill, SecretPlacement, SecretTransform
 from octoforge_server.config import Settings
 from octoforge_server.secret_links import LinkSubject, SecretLinkService
 
@@ -22,6 +23,7 @@ ACCOUNT = "100500"
 CODE = "mail_token"
 VALUE = "tok-123"
 HOST = "api.mail.example.com"
+DESCRIPTION = "test mailbox token"
 
 
 def make_settings(tmp_path: Path, *, with_key: bool = True) -> Settings:
@@ -63,7 +65,13 @@ def test_full_form_flow(client: TestClient) -> None:
 
     stored = client.post(
         "/api/secrets/set",
-        json={"token": token, "code": CODE, "value": VALUE, "allowed_host": HOST},
+        json={
+            "token": token,
+            "code": CODE,
+            "value": VALUE,
+            "allowed_host": HOST,
+            "description": DESCRIPTION,
+        },
     )
     listed = client.post("/api/secrets/session", json={"token": token}).json()
     deleted = client.post("/api/secrets/delete", json={"token": token, "code": CODE})
@@ -91,7 +99,13 @@ def test_the_form_writes_where_the_agent_reads(client: TestClient, tmp_path: Pat
     """
     client.post(
         "/api/secrets/set",
-        json={"token": issue_token(client), "code": CODE, "value": VALUE, "allowed_host": HOST},
+        json={
+            "token": issue_token(client),
+            "code": CODE,
+            "value": VALUE,
+            "allowed_host": HOST,
+            "description": DESCRIPTION,
+        },
     )
 
     with sqlite3.connect(tmp_path / "secrets-test.db") as db:
@@ -114,7 +128,13 @@ def test_expired_or_foreign_token_is_rejected(client: TestClient) -> None:
 
     response = client.post(
         "/api/secrets/set",
-        json={"token": token, "code": CODE, "value": VALUE, "allowed_host": HOST},
+        json={
+            "token": token,
+            "code": CODE,
+            "value": VALUE,
+            "allowed_host": HOST,
+            "description": DESCRIPTION,
+        },
     )
 
     assert response.status_code == HTTPStatus.FORBIDDEN
@@ -125,7 +145,13 @@ def test_invalid_secret_is_a_400(client: TestClient) -> None:
 
     response = client.post(
         "/api/secrets/set",
-        json={"token": token, "code": "Bad Code!", "value": VALUE, "allowed_host": HOST},
+        json={
+            "token": token,
+            "code": "Bad Code!",
+            "value": VALUE,
+            "allowed_host": HOST,
+            "description": DESCRIPTION,
+        },
     )
 
     assert response.status_code == HTTPStatus.BAD_REQUEST
@@ -152,8 +178,8 @@ def test_tokens_name_one_account_and_expire() -> None:
     service = SecretLinkService(ttl_seconds=600)
     other = LinkSubject(surface="telegram", external_id="2")
 
-    assert service.redeem(service.issue(SUBJECT)) == SUBJECT
-    assert service.redeem(service.issue(other)) == other
+    assert service.redeem(service.issue(SUBJECT)).subject == SUBJECT
+    assert service.redeem(service.issue(other)).subject == other
     assert service.redeem("garbage") is None
     service.ttl_seconds = -1.0
     assert service.redeem(service.issue(SUBJECT)) is None
@@ -171,7 +197,7 @@ def test_a_token_is_redeemed_by_a_pod_that_did_not_issue_it() -> None:
     issued_on = SecretLinkService(key)
     redeemed_on = SecretLinkService(key)
 
-    assert redeemed_on.redeem(issued_on.issue(SUBJECT)) == SUBJECT
+    assert redeemed_on.redeem(issued_on.issue(SUBJECT)).subject == SUBJECT
 
 
 def test_another_installations_token_is_worthless_here() -> None:
@@ -192,3 +218,61 @@ def test_an_installation_without_a_key_mints_nothing_another_can_redeem() -> Non
     two = SecretLinkService()
 
     assert two.redeem(one.issue(SUBJECT)) is None
+
+
+def test_person_token_carries_prefill_and_writes_under_the_person(client: TestClient) -> None:
+    """The agent's secret_link tool: token names the person, form is pre-filled."""
+    links = link_service(client)
+    prefill = SecretFormPrefill(
+        code=CODE,
+        allowed_host=HOST,
+        description=DESCRIPTION,
+        placements=frozenset({SecretPlacement.HEADER, SecretPlacement.URL}),
+        transform=SecretTransform.BASE64,
+    )
+    token = links.issue_for_person("person-1", prefill)
+
+    session = client.post("/api/secrets/session", json={"token": token}).json()
+    stored = client.post(
+        "/api/secrets/set",
+        json={
+            "token": token,
+            "code": CODE,
+            "value": VALUE,
+            "allowed_host": HOST,
+            "description": DESCRIPTION,
+            "placements": ["header", "url"],
+            "transform": "base64",
+        },
+    )
+    listed = client.post("/api/secrets/session", json={"token": token}).json()
+
+    assert session["prefill"] == {
+        "code": CODE,
+        "allowed_host": HOST,
+        "description": DESCRIPTION,
+        "placements": ["header", "url"],
+        "transform": "base64",
+    }
+    assert stored.status_code == HTTPStatus.OK
+    assert listed["secrets"][0]["description"] == DESCRIPTION
+    assert listed["secrets"][0]["placements"] == ["header", "url"]
+    assert listed["secrets"][0]["transform"] == "base64"
+    assert VALUE not in str(listed)
+
+
+def test_set_without_description_is_rejected(client: TestClient) -> None:
+    token = issue_token(client)
+
+    response = client.post(
+        "/api/secrets/set",
+        json={
+            "token": token,
+            "code": CODE,
+            "value": VALUE,
+            "allowed_host": HOST,
+            "description": "   ",
+        },
+    )
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST

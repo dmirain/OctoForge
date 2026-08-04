@@ -1,7 +1,7 @@
 """Tests for the tool spec parser and the external call executor."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -26,10 +26,17 @@ from octoforge_core.net.external import (
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tool_spec import parse_tool_spec
 from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool
+from octoforge_core.params.api import UserParam, UserParamStore
 from octoforge_core.secrets.api import (
+    DEFAULT_PLACEMENTS,
+    ResolvedSecret,
     SecretHostMismatchError,
+    SecretInfo,
     SecretNotFoundError,
+    SecretPlacement,
     SecretStore,
+    SecretTransform,
+    apply_transform,
 )
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
@@ -138,6 +145,25 @@ class FakeInstructionService:
         raise NotImplementedError
 
 
+class FakeUserParamStore:
+    """UserParamStore stub with scripted values for one user."""
+
+    def __init__(self, values: dict[str, str] | None = None) -> None:
+        self._values = values or {}
+
+    async def put(self, user_id: str, code: str, value: str) -> UserParam:
+        raise NotImplementedError
+
+    async def get_for_user(self, user_id: str) -> dict[str, str]:
+        return dict(self._values)
+
+    async def list(self, user_id: str) -> list[UserParam]:
+        raise NotImplementedError
+
+    async def delete(self, user_id: str, code: str) -> None:
+        raise NotImplementedError
+
+
 @dataclass(frozen=True)
 class ExecutorOptions:
     """Optional knobs of make_executor bundled to appease the arg-count limit."""
@@ -147,6 +173,7 @@ class ExecutorOptions:
     whitelist: tuple[ExternalCallAuth, ...] = ()
     allowed_prefixes: tuple[str, ...] = ()
     secrets: SecretStore | None = None
+    user_params: UserParamStore | None = None
 
 
 def make_executor(
@@ -164,7 +191,11 @@ def make_executor(
         guard=SsrfGuard(
             resolver=StubResolver(resolved.ips), allowed_prefixes=resolved.allowed_prefixes
         ),
-        credentials=CallCredentials(auth_whitelist=resolved.whitelist, secrets=resolved.secrets),
+        credentials=CallCredentials(
+            auth_whitelist=resolved.whitelist,
+            secrets=resolved.secrets,
+            user_params=resolved.user_params,
+        ),
     )
 
 
@@ -671,27 +702,48 @@ SECRET_TOOL_CONTENT = json.dumps(
 class FakeSecretStore:
     """SecretStore stub with one scripted secret and recorded resolutions."""
 
-    def __init__(self, code: str = SECRET_CODE, host: str = SECRET_HOST) -> None:
+    def __init__(
+        self,
+        code: str = SECRET_CODE,
+        host: str = SECRET_HOST,
+        placements: frozenset[SecretPlacement] = DEFAULT_PLACEMENTS,
+        transform: SecretTransform | None = None,
+    ) -> None:
         self._code = code
         self._host = host
+        self._placements = placements
+        self._transform = transform
         self.resolutions: list[tuple[str, str, str]] = []
 
-    async def put(self, user_id: str, code: str, value: str, allowed_host: str) -> object:
+    async def put(  # noqa: PLR0913, PLR0917 — mirrors the port
+        self,
+        user_id: str,
+        code: str,
+        value: str,
+        allowed_host: str,
+        description: str,
+        placements: Iterable[str] = (),
+        transform: str | None = None,
+    ) -> SecretInfo:
         raise NotImplementedError
 
-    async def list(self, user_id: str) -> list[object]:
+    async def list(self, user_id: str) -> list[SecretInfo]:
         raise NotImplementedError
 
     async def delete(self, user_id: str, code: str) -> None:
         raise NotImplementedError
 
-    async def resolve(self, user_id: str, code: str, host: str) -> str:
+    async def resolve(self, user_id: str, code: str, host: str) -> ResolvedSecret:
         self.resolutions.append((user_id, code, host))
         if code != self._code:
             raise SecretNotFoundError(code)
         if host != self._host:
             raise SecretHostMismatchError(f"secret '{code}' is bound to '{self._host}'")
-        return SECRET_VALUE
+        return ResolvedSecret(
+            value=apply_transform(SECRET_VALUE, self._transform),
+            plain=SECRET_VALUE,
+            placements=self._placements,
+        )
 
 
 async def test_secret_is_injected_as_the_declared_header() -> None:
@@ -798,7 +850,7 @@ async def test_host_mismatch_error_reaches_the_agent_without_the_value() -> None
     assert SECRET_VALUE not in str(denied.value)
 
 
-def test_tool_spec_parses_secret_auth_with_defaults() -> None:
+def test_tool_spec_expands_secret_auth_into_a_header_template() -> None:
     spec = parse_tool_spec(
         json.dumps(
             {
@@ -809,10 +861,7 @@ def test_tool_spec_parses_secret_auth_with_defaults() -> None:
         )
     )
 
-    assert spec.secret_auth is not None
-    assert spec.secret_auth.code == "mail_token"
-    assert spec.secret_auth.header == "Authorization"
-    assert spec.secret_auth.format == "Bearer {value}"
+    assert spec.headers["Authorization"] == "Bearer {secret.mail_token}"
     assert spec.auth == "secret"
 
 
@@ -831,4 +880,237 @@ def test_tool_spec_rejects_malformed_secret_auth(auth: object) -> None:
     )
 
     with pytest.raises(ToolSpecError):
+        parse_tool_spec(content)
+
+
+# --- namespaced templates: {user.*} and {secret.*} ---------------------------
+
+PARAMS_TOOL_NAME = "calendar_api"
+PARAMS_TOOL_CONTENT = json.dumps(
+    {
+        "method": "GET",
+        "url_template": "https://cal.example.com/{user.account_id}/events?tz={user.timezone}",
+        "params_schema": {},
+        "auth": "none",
+    }
+)
+
+
+async def test_user_params_are_substituted_into_the_url() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="{}")
+
+    executor = make_executor(
+        handler,
+        records={PARAMS_TOOL_NAME: PARAMS_TOOL_CONTENT},
+        options=ExecutorOptions(
+            user_params=FakeUserParamStore({"account_id": "acc-1", "timezone": "Europe/Berlin"})
+        ),
+    )
+
+    await executor.execute(PARAMS_TOOL_NAME, {}, user_id="user-test")
+
+    assert str(captured[0].url) == "https://cal.example.com/acc-1/events?tz=Europe%2FBerlin"
+
+
+async def test_missing_user_param_guides_the_agent() -> None:
+    executor = make_executor(
+        ok_handler(),
+        records={PARAMS_TOOL_NAME: PARAMS_TOOL_CONTENT},
+        options=ExecutorOptions(user_params=FakeUserParamStore({"account_id": "acc-1"})),
+    )
+
+    with pytest.raises(ExternalCallError, match="admin console") as denied:
+        await executor.execute(PARAMS_TOOL_NAME, {}, user_id="user-test")
+
+    assert "'timezone'" in str(denied.value)
+
+
+async def test_user_params_unwired_is_a_clear_error() -> None:
+    executor = make_executor(ok_handler(), records={PARAMS_TOOL_NAME: PARAMS_TOOL_CONTENT})
+
+    with pytest.raises(ExternalCallError, match="not wired"):
+        await executor.execute(PARAMS_TOOL_NAME, {}, user_id="user-test")
+
+
+QUERY_SECRET_TOOL_NAME = "query_key_api"
+QUERY_SECRET_TOOL_CONTENT = json.dumps(
+    {
+        "method": "GET",
+        "url_template": f"https://{SECRET_HOST}/v1/data?api_key={{secret.{SECRET_CODE}}}",
+        "params_schema": {},
+        "auth": "none",
+    }
+)
+
+
+async def test_secret_in_url_requires_the_url_placement() -> None:
+    executor = make_executor(
+        ok_handler(),
+        records={QUERY_SECRET_TOOL_NAME: QUERY_SECRET_TOOL_CONTENT},
+        options=ExecutorOptions(secrets=FakeSecretStore()),  # header-only default
+    )
+
+    with pytest.raises(ExternalCallError, match="url") as denied:
+        await executor.execute(QUERY_SECRET_TOOL_NAME, {}, user_id="user-test")
+
+    assert SECRET_VALUE not in str(denied.value)
+
+
+async def test_secret_in_url_is_injected_when_the_placement_allows() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="{}")
+
+    executor = make_executor(
+        handler,
+        records={QUERY_SECRET_TOOL_NAME: QUERY_SECRET_TOOL_CONTENT},
+        options=ExecutorOptions(
+            secrets=FakeSecretStore(
+                placements=frozenset({SecretPlacement.HEADER, SecretPlacement.URL})
+            )
+        ),
+    )
+
+    await executor.execute(QUERY_SECRET_TOOL_NAME, {}, user_id="user-test")
+
+    assert captured[0].url.params["api_key"] == SECRET_VALUE
+
+
+async def test_secret_in_body_is_injected_when_the_placement_allows() -> None:
+    content = json.dumps(
+        {
+            "method": "POST",
+            "url_template": f"https://{SECRET_HOST}/v1/rpc",
+            "body_template": f'{{{{"token": "{{secret.{SECRET_CODE}}}", "q": "{{query}}"}}}}',
+            "params_schema": {"query": {"type": "string", "required": True}},
+            "auth": "none",
+        }
+    )
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="{}")
+
+    executor = make_executor(
+        handler,
+        records={"rpc": content},
+        options=ExecutorOptions(
+            secrets=FakeSecretStore(
+                placements=frozenset({SecretPlacement.HEADER, SecretPlacement.BODY})
+            )
+        ),
+    )
+
+    await executor.execute("rpc", {"query": "hello"}, user_id="user-test")
+
+    assert json.loads(captured[0].content) == {"token": SECRET_VALUE, "q": "hello"}
+
+
+async def test_transform_applies_before_substitution() -> None:
+    """base64 for HTTP Basic: the stored value is user:password."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="{}")
+
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": f"https://{SECRET_HOST}/v1/inbox",
+            "params_schema": {},
+            "auth": {"secret": SECRET_CODE, "format": "Basic {value}"},
+        }
+    )
+    executor = make_executor(
+        handler,
+        records={SECRET_TOOL_NAME: content},
+        options=ExecutorOptions(secrets=FakeSecretStore(transform=SecretTransform.BASE64)),
+    )
+
+    await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+
+    expected = apply_transform(SECRET_VALUE, SecretTransform.BASE64)
+    assert captured[0].headers["Authorization"] == f"Basic {expected}"
+
+
+async def test_scrub_masks_both_the_sent_and_the_plain_value() -> None:
+    """An API that inverts the transform can echo the plain value back."""
+    encoded = apply_transform(SECRET_VALUE, SecretTransform.BASE64)
+    executor = make_executor(
+        lambda request: httpx.Response(
+            HTTPStatus.OK, text=f'{{"sent": "{encoded}", "decoded": "{SECRET_VALUE}"}}'
+        ),
+        records={SECRET_TOOL_NAME: SECRET_TOOL_CONTENT},
+        options=ExecutorOptions(secrets=FakeSecretStore(transform=SecretTransform.BASE64)),
+    )
+
+    result = await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+
+    assert SECRET_VALUE not in result.body
+    assert encoded not in result.body
+
+
+async def test_model_param_in_header_must_render_header_safe() -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://api.example.com/v1",
+            "headers": {"X-Trace": "{trace}"},
+            "params_schema": {"trace": {"type": "string", "required": True}},
+            "auth": "none",
+        }
+    )
+    executor = make_executor(ok_handler(), records={"traced": content})
+
+    with pytest.raises(ExternalCallError, match="illegal value"):
+        await executor.execute("traced", {"trace": "evil\r\nX-Injected: 1"}, user_id="user-test")
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "https://api.example.com/{unknown.code}",
+        "https://api.example.com/{user.BAD-CODE}",
+        "https://api.example.com/{}",
+        "https://api.example.com/{city:>10}",
+    ],
+)
+def test_tool_spec_rejects_malformed_placeholders(template: str) -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": template,
+            "params_schema": {"city": {"type": "string", "required": True}},
+        }
+    )
+
+    with pytest.raises(ToolSpecError):
+        parse_tool_spec(content)
+
+
+def test_tool_spec_rejects_a_secret_in_the_url_host() -> None:
+    content = json.dumps({"method": "GET", "url_template": "https://{secret.tok}.example.com/x"})
+
+    with pytest.raises(ToolSpecError, match="host"):
+        parse_tool_spec(content)
+
+
+def test_tool_spec_rejects_dotted_param_names() -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://api.example.com/x",
+            "params_schema": {"user.tz": {"type": "string", "required": True}},
+        }
+    )
+
+    with pytest.raises(ToolSpecError, match="reserved"):
         parse_tool_spec(content)

@@ -132,6 +132,10 @@ class ToolServices:
     search_provider: SearchProvider | None = None
     # the one MCP verb; None in assemblies that do not wire the mcp module
     mcp_add: Tool | None = None
+    # secrets metadata listing; None when secrets are disabled
+    secret_list: Tool | None = None
+    # pre-filled secrets-form links; None without secrets or a web surface
+    secret_link: Tool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +299,10 @@ def build_tool_registry(
         registry.register(WebSearchTool(provider=services.search_provider))
     if services.mcp_add is not None:
         registry.register(services.mcp_add)
+    if services.secret_list is not None:
+        registry.register(services.secret_list)
+    if services.secret_link is not None:
+        registry.register(services.secret_link)
     _register_instruction_tools(registry, services, limits)
     _register_dataset_tools(registry, services.datasets, limits)
     _register_memory_tools(registry, services.instructions)

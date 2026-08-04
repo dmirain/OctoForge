@@ -6,14 +6,31 @@ secret *codes*: an endpoint record declares which code it needs, and the call
 executor resolves the value at request time — nothing else ever reads it.
 The store DTO deliberately carries no value field: every listing surface
 (web form, admin, tools) is metadata-only by construction.
+
+A secret also carries:
+
+- a required `description` — what the value is for, written by the person who
+  stored it; it is what lets the model tell two secrets for one host apart;
+- `placements` — the request parts a record template may substitute it into
+  (`header` is the only default; `url` and `body` are opt-in, because a URL
+  leaks into the remote side's logs and history);
+- an optional `transform` — a static function applied to the value before
+  substitution (e.g. `base64` for HTTP Basic, where the stored value is
+  `user:password`). Dynamic schemes (request signing, OAuth refresh) are
+  deliberately out of scope: they are code, not a value filter.
 """
 
+import base64
+import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Protocol
 
 CODE_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
+MAX_DESCRIPTION_CHARS = 256
 
 
 class SecretNotFoundError(Exception):
@@ -33,14 +50,83 @@ class InvalidSecretError(Exception):
     """Raised when a secret being stored is malformed (code, value or host)."""
 
 
+class SecretPlacement(StrEnum):
+    """A request part a secret value may be substituted into."""
+
+    HEADER = "header"
+    URL = "url"
+    BODY = "body"
+
+
+# Headers only unless the person storing the secret opted into more: a URL
+# carries the value into the remote side's access logs and the browser-ish
+# parts of the world, a body into whatever the endpoint does with payloads.
+DEFAULT_PLACEMENTS: frozenset[SecretPlacement] = frozenset({SecretPlacement.HEADER})
+
+
+class SecretTransform(StrEnum):
+    """A static transform applied to the stored value before substitution.
+
+    Every member is a pure function of the value alone — anything needing
+    per-request inputs (timestamps, nonces, request signing) is not a
+    transform and does not belong here.
+    """
+
+    BASE64 = "base64"
+    BASE64URL = "base64url"
+    MD5_HEX = "md5_hex"
+    SHA1_HEX = "sha1_hex"
+    SHA256_HEX = "sha256_hex"
+
+
+def apply_transform(value: str, transform: SecretTransform | None) -> str:
+    """Return the value as it must appear in the request."""
+    match transform:
+        case None:
+            return value
+        case SecretTransform.BASE64:
+            return base64.b64encode(value.encode()).decode()
+        case SecretTransform.BASE64URL:
+            return base64.urlsafe_b64encode(value.encode()).decode()
+        case SecretTransform.MD5_HEX:
+            return hashlib.md5(value.encode(), usedforsecurity=False).hexdigest()
+        case SecretTransform.SHA1_HEX:
+            return hashlib.sha1(value.encode(), usedforsecurity=False).hexdigest()
+        case SecretTransform.SHA256_HEX:
+            return hashlib.sha256(value.encode()).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class SecretInfo:
-    """Metadata of one stored secret; the value is intentionally absent."""
+    """Metadata of one stored secret; the value is intentionally absent.
+
+    `description` is always present: the store requires it, and rows from
+    before the requirement were backfilled by migration `a1c8e5f3b972` with
+    a placeholder that tells the agent to ask the user.
+    """
 
     code: str
     allowed_host: str
+    description: str
+    placements: frozenset[SecretPlacement]
+    transform: SecretTransform | None
     created_at: datetime
     last_used_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSecret:
+    """A secret the executor is about to substitute into one request.
+
+    `value` is what goes into the request (transform already applied);
+    `plain` is the stored value, carried ONLY so response scrubbing can mask
+    both forms — an API that inverts the transform (Basic auth decodes the
+    base64) could otherwise echo the plain value back into model context.
+    """
+
+    value: str
+    plain: str
+    placements: frozenset[SecretPlacement]
 
 
 def normalize_code(raw: str) -> str:
@@ -61,10 +147,83 @@ def normalize_host(raw: str) -> str:
     return host
 
 
+def normalize_description(raw: str) -> str:
+    """Validate the required human/LLM-facing purpose of a secret."""
+    description = " ".join(raw.split())
+    if not description:
+        raise InvalidSecretError(
+            "description is required: say what the secret is for, e.g. "
+            "'read-only token for the work calendar'"
+        )
+    if len(description) > MAX_DESCRIPTION_CHARS:
+        raise InvalidSecretError(f"description must be at most {MAX_DESCRIPTION_CHARS} characters")
+    return description
+
+
+def normalize_placements(raw: Iterable[str]) -> frozenset[SecretPlacement]:
+    """Validate a placements selection; empty means the header-only default."""
+    placements = set()
+    for item in raw:
+        try:
+            placements.add(SecretPlacement(str(item).strip().lower()))
+        except ValueError:
+            allowed = ", ".join(member.value for member in SecretPlacement)
+            raise InvalidSecretError(f"unknown placement {item!r}; allowed: {allowed}") from None
+    return frozenset(placements) if placements else DEFAULT_PLACEMENTS
+
+
+def normalize_transform(raw: str | None) -> SecretTransform | None:
+    """Validate a transform selection; None or empty means no transform."""
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return SecretTransform(str(raw).strip().lower())
+    except ValueError:
+        allowed = ", ".join(member.value for member in SecretTransform)
+        raise InvalidSecretError(f"unknown transform {raw!r}; allowed: {allowed}") from None
+
+
+@dataclass(frozen=True, slots=True)
+class SecretFormPrefill:
+    """Everything of one secret except the value, for a pre-filled form link.
+
+    The agent fills these from the failing endpoint's contract; the user
+    opens the link and pastes only the value.
+    """
+
+    code: str
+    allowed_host: str
+    description: str
+    placements: frozenset[SecretPlacement] = DEFAULT_PLACEMENTS
+    transform: SecretTransform | None = None
+
+
+class SecretFormLinkFactory(Protocol):
+    """Mints one-time secrets-form URLs bound to a person.
+
+    Implemented by the composition root's web layer (the link embeds the
+    installation's public base URL and a capability token); core only knows
+    the port, so the secret_link tool exists exactly when a web surface does.
+    """
+
+    def build_prefilled(self, user_id: str, prefill: SecretFormPrefill) -> str:
+        """Return a short-lived form URL with everything but the value filled."""
+        ...
+
+
 class SecretStore(Protocol):
     """Port of the secrets module: encrypted at rest, value readable only via resolve."""
 
-    async def put(self, user_id: str, code: str, value: str, allowed_host: str) -> SecretInfo:
+    async def put(  # noqa: PLR0913, PLR0917 — the full shape of one stored secret
+        self,
+        user_id: str,
+        code: str,
+        value: str,
+        allowed_host: str,
+        description: str,
+        placements: Iterable[str] = (),
+        transform: str | None = None,
+    ) -> SecretInfo:
         """Store or replace the user's secret under `code`, bound to `allowed_host`."""
         ...
 
@@ -76,12 +235,14 @@ class SecretStore(Protocol):
         """Delete the user's secret by code; raise `SecretNotFoundError`."""
         ...
 
-    async def resolve(self, user_id: str, code: str, host: str) -> str:
-        """Return the decrypted value for a request going to `host`.
+    async def resolve(self, user_id: str, code: str, host: str) -> ResolvedSecret:
+        """Return the value for a request going to `host`, transform applied.
 
         The single place a value leaves the store. Raises
         `SecretNotFoundError` for an unknown code and
         `SecretHostMismatchError` when `host` differs from the binding
         (the error text never contains the value). Stamps `last_used_at`.
+        Placement enforcement is the caller's: the store does not know which
+        request part the value is headed for.
         """
         ...

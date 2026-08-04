@@ -24,6 +24,7 @@ from octoforge_core.net.external import (
     ExternalCallResult,
 )
 from octoforge_core.secrets.api import (
+    ResolvedSecret,
     SecretHostMismatchError,
     SecretNotFoundError,
     SecretStore,
@@ -68,10 +69,10 @@ class McpMirrorCallExecutor:
         except ExternalCallError as exc:
             # same self-correction contract as the classic endpoint path
             raise ExternalCallError(f"{exc}; the tool declares this contract: {content}") from exc
-        secret_value = await self._resolve_secret(server, user_id)
+        secret = await self._resolve_secret(server, user_id)
         headers = (
-            {server.auth_header: server.auth_format.format(value=secret_value)}
-            if secret_value is not None
+            {server.auth_header: server.auth_format.format(value=secret.value)}
+            if secret is not None
             else {}
         )
         try:
@@ -81,13 +82,15 @@ class McpMirrorCallExecutor:
                 f"MCP call failed: {exc}; {STALE_MIRROR_HINT}; "
                 f"the tool declares this contract: {content}"
             ) from exc
-        body = _truncate(_scrub(result.text, secret_value))
+        body = _truncate(_scrub(result.text, secret))
         if result.is_error:
             body = TOOL_ERROR_TEMPLATE.format(text=body, contract=content)
         # status 0: no HTTP status worth showing — the tool renders body alone
         return ExternalCallResult(status=0, body=body)
 
-    async def _resolve_secret(self, server: McpServer, user_id: str | None) -> str | None:
+    async def _resolve_secret(
+        self, server: McpServer, user_id: str | None
+    ) -> ResolvedSecret | None:
         """The caller's own token for this server, host-bound as everywhere."""
         if server.auth_secret_code is None:
             return None
@@ -102,7 +105,7 @@ class McpMirrorCallExecutor:
             return await self._secrets.resolve(user_id, server.auth_secret_code, host)
         except SecretNotFoundError:
             raise ExternalCallError(
-                SECRET_MISSING_TEMPLATE.format(code=server.auth_secret_code)
+                SECRET_MISSING_TEMPLATE.format(code=server.auth_secret_code, host=host)
             ) from None
         except SecretHostMismatchError as exc:
             raise ExternalCallError(str(exc)) from None
@@ -122,10 +125,12 @@ def _validate_arguments(schema: dict[str, Any], params: dict[str, Any]) -> None:
             raise ExternalCallError(f"unknown arguments: {', '.join(unknown)}")
 
 
-def _scrub(body: str, secret_value: str | None) -> str:
-    if not secret_value:
+def _scrub(body: str, secret: ResolvedSecret | None) -> str:
+    if secret is None:
         return body
-    return body.replace(secret_value, SECRET_SCRUBBED)
+    # both forms: an API that inverts the transform (Basic auth decodes the
+    # base64) can echo the plain value, not just what was sent
+    return body.replace(secret.value, SECRET_SCRUBBED).replace(secret.plain, SECRET_SCRUBBED)
 
 
 def _truncate(body: str) -> str:

@@ -21,7 +21,11 @@ from octoforge_core.net.errors import ExternalCallError
 from octoforge_core.net.external import ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import ExternalCallTool
-from octoforge_core.secrets.api import SecretNotFoundError
+from octoforge_core.secrets.api import (
+    DEFAULT_PLACEMENTS,
+    ResolvedSecret,
+    SecretNotFoundError,
+)
 from octoforge_core.tools.base import ToolContext
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -73,9 +77,11 @@ class OneSecretStore:
     def __init__(self, code: str, host: str, value: str) -> None:
         self._code, self._host, self._value = code, host, value
 
-    async def resolve(self, user_id: str, code: str, host: str) -> str:
+    async def resolve(self, user_id: str, code: str, host: str) -> ResolvedSecret:
         if code == self._code and host == self._host:
-            return self._value
+            return ResolvedSecret(
+                value=self._value, plain=self._value, placements=DEFAULT_PLACEMENTS
+            )
         raise SecretNotFoundError(code)
 
 

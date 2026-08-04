@@ -160,9 +160,10 @@ class McpAddTool:
             return None
         host = (urlsplit(server.url).hostname or "").lower()
         try:
-            return await self._secrets.resolve(user_id, server.auth_secret_code, host)
+            resolved = await self._secrets.resolve(user_id, server.auth_secret_code, host)
         except SecretNotFoundError:
             return None
+        return resolved.value
 
 
 def _normalize_url(raw: object) -> str:

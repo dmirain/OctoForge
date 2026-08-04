@@ -46,8 +46,8 @@ same registry serves different tool lists per dialog:
 - `admin_manage` hides itself from non-admins.
 
 Tools whose *existence* depends on configuration rather than on the caller are simply not registered —
-`web_search` without a token, for example. Both mechanisms keep the prompt free of tools that would only
-fail.
+`web_search` without a token, `secret_list`/`secret_link` without `OF_SECRETS_KEY`, for example. Both
+mechanisms keep the prompt free of tools that would only fail.
 
 ### Errors are data
 

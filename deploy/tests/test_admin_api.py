@@ -43,6 +43,8 @@ LISTING_PATHS = (
     "/api/admin/memories",
     "/api/admin/summaries",
     "/api/admin/exchanges",
+    "/api/admin/params",
+    "/api/admin/secrets",
 )
 EMPTY_TOTALS = 0
 
@@ -437,3 +439,37 @@ def test_the_console_shows_people_and_the_accounts_they_answer_on(
     assert person["identities"] == [
         {"surface": "web", "external_id": "alice", "name": "", "username": None, "active": True}
     ]
+
+
+def test_user_params_crud_via_the_console(client: TestClient) -> None:
+    """The operator sets a param; the executor's {user.code} reads the same row."""
+    created = client.post(
+        "/api/admin/params",
+        json={"user_id": "person-1", "code": "timezone", "value": "Europe/Berlin"},
+    )
+    listed = client.get("/api/admin/params").json()
+    deleted = client.delete("/api/admin/params/timezone", params={"user_id": "person-1"})
+    empty = client.get("/api/admin/params").json()
+
+    assert created.status_code == HTTPStatus.OK
+    assert created.json()["code"] == "timezone"
+    assert [(p["user_id"], p["code"], p["value"]) for p in listed["items"]] == [
+        ("person-1", "timezone", "Europe/Berlin")
+    ]
+    assert deleted.status_code == HTTPStatus.OK
+    assert empty["items"] == []
+
+
+def test_invalid_user_param_is_a_400(client: TestClient) -> None:
+    response = client.post(
+        "/api/admin/params",
+        json={"user_id": "person-1", "code": "Bad Code!", "value": "x"},
+    )
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_deleting_a_missing_user_param_is_a_404(client: TestClient) -> None:
+    response = client.delete("/api/admin/params/absent", params={"user_id": "person-1"})
+
+    assert response.status_code == HTTPStatus.NOT_FOUND

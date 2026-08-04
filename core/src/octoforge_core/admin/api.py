@@ -129,6 +129,30 @@ class ExchangeOverview:
 
 
 @dataclass(frozen=True, slots=True)
+class UserParamOverview:
+    """A per-user parameter with its owner: what `{user.code}` substitutes."""
+
+    user_id: str
+    code: str
+    value: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SecretOverview:
+    """Secret *metadata* with its owner; the value never reaches this model."""
+
+    user_id: str
+    code: str
+    allowed_host: str
+    description: str
+    placements: tuple[str, ...]
+    transform: str | None
+    created_at: datetime
+    last_used_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class Totals:
     """Row counts per entity: the console's landing page."""
 
@@ -214,6 +238,14 @@ class AdminReadModel(Protocol):
 
         `user_id` and `status` narrow the listing; both are optional.
         """
+        ...
+
+    async def list_user_params(self, limit: int, offset: int) -> Page[UserParamOverview]:
+        """Per-user params of every user, ordered by user then code."""
+        ...
+
+    async def list_secrets(self, limit: int, offset: int) -> Page[SecretOverview]:
+        """Secret metadata of every user, never the values."""
         ...
 
 

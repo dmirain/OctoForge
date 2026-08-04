@@ -21,6 +21,7 @@ from octoforge_core.cron.api import CronStore
 from octoforge_core.dialogs.api import ExchangeRepository
 from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import InstructionService
+from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -43,6 +44,7 @@ class Runtime:
     admin_read_model: AdminReadModel
     secret_store: SecretStore | None
     secret_links: SecretLinkService
+    user_params: UserParamStore
     dialogs: DialogRepository
     summary_store: SummaryStore
     exchanges: ExchangeRepository

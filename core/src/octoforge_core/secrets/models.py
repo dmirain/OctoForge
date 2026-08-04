@@ -21,5 +21,10 @@ class SecretRow(Base):
     code: Mapped[str] = mapped_column(String)
     ciphertext: Mapped[str] = mapped_column(String)
     allowed_host: Mapped[str] = mapped_column(String)
+    description: Mapped[str] = mapped_column(String)
+    # comma-joined SecretPlacement values; NULL = the header-only default
+    placements: Mapped[str | None] = mapped_column(String, default=None)
+    # a SecretTransform value; NULL = substitute the value as stored
+    transform: Mapped[str | None] = mapped_column(String, default=None)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
     last_used_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)

@@ -206,6 +206,22 @@ const VIEWS = {
       `<td class="mono">${time(u.first_seen_at)}</td>` +
       `<td class="mono">${time(u.last_seen_at)}</td>`,
   },
+  params: {
+    title: "Параметры", path: () => "/api/admin/params",
+    columns: ["пользователь", "код", "значение", "обновлён", ""],
+    row: (p) => `${person(p.user_id, p.user_name)}<td class="mono">${esc(p.code)}</td>` +
+      `${clip(p.value)}<td class="mono">${time(p.updated_at)}</td>` +
+      `<td><button class="act danger" data-delete="/api/admin/params/${encodeURIComponent(p.code)}` +
+      `?user_id=${encodeURIComponent(p.user_id)}">удалить</button></td>`,
+  },
+  secrets: {
+    title: "Секреты", path: () => "/api/admin/secrets",
+    columns: ["пользователь", "код", "хост", "описание", "куда", "преобразование", "использован"],
+    row: (s) => `${person(s.user_id, s.user_name)}<td class="mono">${esc(s.code)}</td>` +
+      `<td class="mono">${esc(s.allowed_host)}</td>${clip(s.description)}` +
+      `<td>${tags(s.placements)}</td><td>${esc(short(s.transform))}</td>` +
+      `<td class="mono">${time(s.last_used_at)}</td>`,
+  },
   exchanges: {
     title: "Обмены", path: () => "/api/admin/exchanges",
     filters: ["status"],
@@ -222,7 +238,7 @@ const NAV = [
   ["dialogs", "Диалоги"], ["tgusers", "Пользователи"], ["exchanges", "Обмены"],
   ["tasks", "Задачи"], ["cron", "Cron"],
   ["instructions", "Инструкции"], ["datasets", "Датасеты"], ["memories", "Память"],
-  ["summaries", "Сводки"],
+  ["params", "Параметры"], ["secrets", "Секреты"], ["summaries", "Сводки"],
 ];
 
 function renderNav() {
@@ -244,6 +260,12 @@ function renderToolbar(view) {
       .map((s) => `<option value="${s}" ${s === state.status ? "selected" : ""}>${s || "любой статус"}</option>`);
     parts.push(`<select id="f-status">${options.join("")}</select>`);
   }
+  if (state.view === "params") {
+    parts.push(`<select id="p-user"><option value="">пользователь…</option></select>` +
+      `<input id="p-code" placeholder="код: например timezone" pattern="[a-z0-9_]{1,64}">` +
+      `<input id="p-value" placeholder="значение">` +
+      `<button class="act" id="p-save">сохранить</button>`);
+  }
   parts.push(`<span class="spacer"></span><span class="count" id="title">${esc(view.title)}</span>`);
   document.getElementById("toolbar").innerHTML = parts.join(" ");
   document.getElementById("f-query")?.addEventListener("change", (e) => {
@@ -251,6 +273,35 @@ function renderToolbar(view) {
   });
   document.getElementById("f-status")?.addEventListener("change", (e) => {
     state.status = e.target.value; state.offset = 0; load();
+  });
+  if (state.view === "params") setupParamForm();
+}
+
+async function setupParamForm() {
+  const userSelect = document.getElementById("p-user");
+  try {
+    const { items } = await api("/api/admin/users");
+    userSelect.innerHTML = `<option value="">пользователь…</option>` + items
+      .map((u) => `<option value="${esc(u.user_id)}">${esc(u.name || u.user_id)}</option>`)
+      .join("");
+  } catch (error) { fail(`не удалось получить пользователей: ${error.message}`); }
+  document.getElementById("p-save").addEventListener("click", async () => {
+    const body = {
+      user_id: userSelect.value,
+      code: document.getElementById("p-code").value.trim(),
+      value: document.getElementById("p-value").value.trim(),
+    };
+    if (!body.user_id || !body.code || !body.value) { fail("заполните пользователя, код и значение"); return; }
+    try {
+      await api("/api/admin/params", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      document.getElementById("p-code").value = "";
+      document.getElementById("p-value").value = "";
+      await load();
+    } catch (error) { fail(`сохранение не удалось: ${error.message}`); }
   });
 }
 

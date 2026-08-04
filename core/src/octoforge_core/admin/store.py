@@ -18,8 +18,10 @@ from octoforge_core.admin.api import (
     ExchangeOverview,
     MessageRecord,
     Page,
+    SecretOverview,
     TaskOverview,
     Totals,
+    UserParamOverview,
 )
 from octoforge_core.context.api import DialogueSummary
 from octoforge_core.context.models import SummaryRow
@@ -34,6 +36,9 @@ from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
 from octoforge_core.instructions.api import Instruction, InstructionType
 from octoforge_core.instructions.models import InstructionRow
 from octoforge_core.memory.api import Memory
+from octoforge_core.params.models import UserParamRow
+from octoforge_core.secrets.api import DEFAULT_PLACEMENTS
+from octoforge_core.secrets.models import SecretRow
 from octoforge_core.tasks.api import TaskKind, TaskStatus
 from octoforge_core.tasks.models import TaskRow
 from octoforge_core.time import utc_now
@@ -344,6 +349,40 @@ class SqlAlchemyAdminStore:
         items = tuple(_to_exchange_overview(row[0], row[1], row[2]) for row in rows)
         return Page(items=items, total=total, limit=limit, offset=offset)
 
+    async def list_user_params(self, limit: int, offset: int) -> Page[UserParamOverview]:
+        """Per-user params of every user, ordered by user then code."""
+        statement = (
+            select(UserParamRow)
+            .order_by(UserParamRow.user_id, UserParamRow.code)
+            .limit(limit)
+            .offset(offset)
+        )
+        counter = select(func.count()).select_from(UserParamRow)
+        rows, total = await self._page(statement, counter)
+        items = tuple(
+            UserParamOverview(
+                user_id=row.user_id,
+                code=row.code,
+                value=row.value,
+                updated_at=row.updated_at,
+            )
+            for row in rows
+        )
+        return Page(items=items, total=total, limit=limit, offset=offset)
+
+    async def list_secrets(self, limit: int, offset: int) -> Page[SecretOverview]:
+        """Secret metadata of every user; the ciphertext column is never selected."""
+        statement = (
+            select(SecretRow)
+            .order_by(SecretRow.user_id, SecretRow.code)
+            .limit(limit)
+            .offset(offset)
+        )
+        counter = select(func.count()).select_from(SecretRow)
+        rows, total = await self._page(statement, counter)
+        items = tuple(_to_secret_overview(row) for row in rows)
+        return Page(items=items, total=total, limit=limit, offset=offset)
+
     async def _page(
         self,
         statement: Select[Any],
@@ -358,6 +397,26 @@ class SqlAlchemyAdminStore:
 
 async def _count(session: AsyncSession, statement: Select[Any]) -> int:
     return int((await session.execute(statement)).scalar_one())
+
+
+def _to_secret_overview(row: SecretRow) -> SecretOverview:
+    # mirrors the secrets store's column reading (see module docstring on
+    # why these mappings are duplicated rather than exported)
+    placements = (
+        tuple(sorted(member.value for member in DEFAULT_PLACEMENTS))
+        if row.placements is None
+        else tuple(row.placements.split(","))
+    )
+    return SecretOverview(
+        user_id=row.user_id,
+        code=row.code,
+        allowed_host=row.allowed_host,
+        description=row.description,
+        placements=placements,
+        transform=row.transform,
+        created_at=row.created_at,
+        last_used_at=row.last_used_at,
+    )
 
 
 def _to_message_record(row: MessageRow) -> MessageRecord:

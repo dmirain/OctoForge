@@ -22,7 +22,9 @@ from octoforge_core.admin.api import (
     ExchangeOverview,
     MessageRecord,
     Page,
+    SecretOverview,
     TaskOverview,
+    UserParamOverview,
     clamp_page,
 )
 from octoforge_core.context.api import DialogueSummary, SummaryStore
@@ -43,6 +45,11 @@ from octoforge_core.instructions.api import (
     SystemInstructionError,
 )
 from octoforge_core.memory.api import Memory
+from octoforge_core.params.api import (
+    InvalidUserParamError,
+    UserParamNotFoundError,
+    UserParamStore,
+)
 from octoforge_core.tasks.api import TaskNotFoundError
 from octoforge_core.tasks.store import TaskStore
 from octoforge_server import audit
@@ -58,8 +65,10 @@ from octoforge_server.deps import (
     get_operator,
     get_summary_store,
     get_task_store,
+    get_user_param_store,
     require_admin,
 )
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_admin)])
 
@@ -74,6 +83,7 @@ ExchangesDep = Annotated[ExchangeRepository, Depends(get_exchange_repository)]
 IdentityStoreDep = Annotated[IdentityStore, Depends(get_identity_store)]
 ClaimsDep = Annotated[ClaimRepository, Depends(get_claim_repository)]
 SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
+UserParamsDep = Annotated[UserParamStore, Depends(get_user_param_store)]
 LimitDep = Annotated[int | None, Query(ge=1)]
 OffsetDep = Annotated[int | None, Query(ge=0)]
 
@@ -556,6 +566,98 @@ def _exchange_to_dict(item: ExchangeOverview, names: dict[str, str]) -> dict[str
 
 def _iso(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
+
+
+class SetUserParamRequest(BaseModel):
+    """Payload of the params upsert: which user, which code, which value."""
+
+    user_id: str
+    code: str
+    value: str
+
+
+@router.get("/params")
+async def user_params(
+    read_model: ReadModelDep,
+    identities: IdentityStoreDep,
+    limit: LimitDep = None,
+    offset: OffsetDep = None,
+) -> dict[str, Any]:
+    """Per-user params of every user — what `{user.code}` substitutes."""
+    resolved_limit, resolved_offset = clamp_page(limit, offset)
+    page = await read_model.list_user_params(resolved_limit, resolved_offset)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _user_param_to_dict(item, names))
+
+
+@router.post("/params")
+async def set_user_param(
+    request: SetUserParamRequest,
+    operator: OperatorDep,
+    store: UserParamsDep,
+) -> dict[str, Any]:
+    """Store or replace one param through the same store the executor reads."""
+    try:
+        param = await store.put(request.user_id, request.code, request.value)
+    except InvalidUserParamError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    audit.record("param.set", operator, f"{request.user_id}/{param.code}")
+    return {"user_id": request.user_id, "code": param.code, "value": param.value}
+
+
+@router.delete("/params/{code}")
+async def delete_user_param(
+    code: str,
+    user_id: str,
+    operator: OperatorDep,
+    store: UserParamsDep,
+) -> dict[str, str]:
+    try:
+        await store.delete(user_id, code)
+    except UserParamNotFoundError as exc:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    except InvalidUserParamError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    audit.record("param.delete", operator, f"{user_id}/{code}")
+    return DELETED_STATUS
+
+
+@router.get("/secrets")
+async def secrets(
+    read_model: ReadModelDep,
+    identities: IdentityStoreDep,
+    limit: LimitDep = None,
+    offset: OffsetDep = None,
+) -> dict[str, Any]:
+    """Secret metadata of every user; values never reach the read model."""
+    resolved_limit, resolved_offset = clamp_page(limit, offset)
+    page = await read_model.list_secrets(resolved_limit, resolved_offset)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _secret_to_dict(item, names))
+
+
+def _user_param_to_dict(item: UserParamOverview, names: dict[str, str]) -> dict[str, Any]:
+    return {
+        "user_id": item.user_id,
+        "user_name": names.get(item.user_id, ""),
+        "code": item.code,
+        "value": item.value,
+        "updated_at": _iso(item.updated_at),
+    }
+
+
+def _secret_to_dict(item: SecretOverview, names: dict[str, str]) -> dict[str, Any]:
+    return {
+        "user_id": item.user_id,
+        "user_name": names.get(item.user_id, ""),
+        "code": item.code,
+        "allowed_host": item.allowed_host,
+        "description": item.description,
+        "placements": list(item.placements),
+        "transform": item.transform,
+        "created_at": _iso(item.created_at),
+        "last_used_at": _iso(item.last_used_at),
+    }
 
 
 @router.get("/users")

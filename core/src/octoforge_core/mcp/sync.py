@@ -198,9 +198,10 @@ class McpToolSync:
         host = (urlsplit(server.url).hostname or "").lower()
         for user_id in await self._store.list_user_ids(server.id):
             try:
-                return await self._secrets.resolve(user_id, server.auth_secret_code, host)
+                resolved = await self._secrets.resolve(user_id, server.auth_secret_code, host)
             except SecretNotFoundError:
                 continue
+            return resolved.value
         return None
 
 

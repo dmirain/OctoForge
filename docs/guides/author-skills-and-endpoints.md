@@ -57,14 +57,25 @@ An endpoint record makes a system callable. Its content is a small JSON document
 
 - `url_template` — placeholders are filled from validated parameters and URL-escaped.
 - `body_template` (optional) — a request body with the same placeholders, filled **verbatim** (no
-  URL-escaping; escape for the body's own format yourself). Secrets never go into bodies.
-- `headers` (optional) — static headers the call always carries (e.g. `Depth`, `Content-Type` for
-  WebDAV/CalDAV). A credential header from `auth` or the installation whitelist always wins a name
-  collision.
+  URL-escaping; escape for the body's own format yourself).
+- `headers` (optional) — headers the call carries (e.g. `Depth`, `Content-Type` for WebDAV/CalDAV);
+  their values are templates too. A credential header from `auth` or the installation whitelist
+  always wins a name collision with a plain record header.
 - `params_schema` — declared parameters, `required` per parameter. Unknown parameters are refused, and a
   validation error hands the model this contract back, so a wrong call corrects itself in one step.
-- `auth` — `"none"`, or a per-user secret **by code**. The value never appears in the record, the prompt or
-  the logs; it is injected as a header at call time and scrubbed from the response.
+- `auth` — `"none"`, or a per-user secret **by code**: sugar for a `{secret.code}` header template.
+
+Every template part also takes two server-side namespaces, substituted at call time and never seen
+by the model as values:
+
+- `{user.code}` — the calling user's stored param (timezone, account id, calendar path); an operator
+  sets them in the console. Use these for anything deterministic per user — don't make the model
+  carry a timezone through its context.
+- `{secret.code}` — the calling user's secret. Headers by default; the secret's own `placements`
+  setting opts it into `url` (for `?api_key=…` APIs) or `body`, and its `transform` setting handles
+  static encodings (store `user:password`, set `base64`, write `"Authorization": "Basic
+  {secret.code}"`). Values are scrubbed from responses. Details in
+  [../reference/secrets.md](../reference/secrets.md).
 
 Then write a skill that names the endpoint (as in the example above) so the agent knows when to use it.
 This is not optional bookkeeping: endpoint records **do not appear in default `recall` results** (only
@@ -72,8 +83,10 @@ under `type=endpoint`), so an endpoint nobody's scenario mentions is effectively
 usual pattern is one endpoint record plus one scenario per task it serves — `server/src/octoforge_server/system_skills.py`
 ships exactly that shape as an example (a weather endpoint and the scenario that reads it).
 
-Users add their own secrets themselves: `/secrets` in Telegram returns a one-time link to a form. See
-[../reference/secrets.md](../reference/secrets.md).
+Users add their own secrets themselves: the agent mints a pre-filled one-time form link with the
+`secret_link` tool (the user pastes only the value), or `/secrets` in Telegram returns an empty
+form. Every secret needs a description — it is how the agent tells two secrets for one host apart.
+See [../reference/secrets.md](../reference/secrets.md).
 
 ### Constraints worth knowing before you write one
 
@@ -85,7 +98,9 @@ Users add their own secrets themselves: `/secrets` in Telegram returns a one-tim
 - Only `http`/`https`. Methods: the classic five plus the WebDAV family (`PROPFIND`, `PROPPATCH`,
   `REPORT`, `MKCOL`, `MKCALENDAR`, `COPY`, `MOVE`, `HEAD`, `OPTIONS`) — but not `LOCK`/`UNLOCK`.
 - Parameters are strings. A body is a template with string placeholders; logic that must *compute* a
-  body is where a [code tool](add-a-tool.md) starts making sense.
+  body is where a [code tool](add-a-tool.md) starts making sense. Static value encodings (base64,
+  hex digests) are the secret's `transform`, not template logic; format specs (`{x:>10}`) are
+  rejected.
 
 ## Sharing and lifecycle
 

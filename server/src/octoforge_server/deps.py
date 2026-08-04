@@ -11,6 +11,7 @@ from octoforge_core.cron.api import CronStore
 from octoforge_core.dialogs.api import ClaimRepository, DialogRepository, ExchangeRepository
 from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import InstructionService
+from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.tasks.store import TaskStore
 
@@ -110,6 +111,11 @@ def get_secret_store(request: Request) -> SecretStore | None:
 def get_secret_links(request: Request) -> "SecretLinkService":
     """Return the one-time link service shared with the Telegram surface."""
     return cast("SecretLinkService", request.app.state.secret_links)
+
+
+def get_user_param_store(request: Request) -> UserParamStore:
+    """Return the per-user params store built at startup."""
+    return cast(UserParamStore, request.app.state.user_params)
 
 
 def get_auth_gate(request: Request) -> AuthGate:

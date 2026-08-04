@@ -2,8 +2,21 @@
 
 Core-side execution: the instructions module only stores/searches/ranks
 endpoint records; this executor reads them through the `InstructionService`
-facade, validates and renders the URL, applies the SSRF guard and the
+facade, validates and renders the templates, applies the SSRF guard and the
 composition-root auth whitelist, and performs the HTTP request.
+
+Substitution order is the security order:
+
+1. model params are validated, then rendered together with the user's stored
+   `{user.*}` values — the URL that results is what the SSRF guard and the
+   host binding judge;
+2. secrets are resolved only after those checks, for the host the URL
+   actually names, and only into the request parts the secret's own
+   `placements` allow; in the URL they ride as unguessable sentinels until
+   the checks have passed;
+3. whatever comes back is scrubbed of every resolved secret — both the form
+   that was sent and the stored plain value — before the model or the
+   archive sees it.
 
 An endpoint record's content may declare a `kind`, marking a contract some
 other protocol executes (today: MCP tool mirrors). The executor only sniffs
@@ -13,7 +26,8 @@ dependency arrow pointing at this module.
 """
 
 import json
-from collections.abc import Mapping
+import uuid
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
@@ -24,10 +38,20 @@ from octoforge_core.config import DEFAULT_TIMEOUT_SECONDS
 from octoforge_core.instructions.api import InstructionService, InstructionType
 from octoforge_core.net.errors import ExternalCallError
 from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
-from octoforge_core.net.tool_spec import SecretAuth, ToolSpec, parse_tool_spec
+from octoforge_core.net.tool_spec import (
+    TemplateRefs,
+    ToolSpec,
+    collect_refs,
+    parse_tool_spec,
+    render_template,
+)
+from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import (
+    InvalidSecretError,
+    ResolvedSecret,
     SecretHostMismatchError,
     SecretNotFoundError,
+    SecretPlacement,
     SecretStore,
 )
 
@@ -42,9 +66,23 @@ SECRETS_DISABLED_MESSAGE = (
     "this endpoint requires a per-user secret, but secrets are not configured "
     "on this installation (OF_SECRETS_KEY is not set)"
 )
+PARAMS_DISABLED_MESSAGE = (
+    "this endpoint uses per-user params ({{user.*}}), but user params are not "
+    "wired on this installation"
+)
 SECRET_MISSING_TEMPLATE = (
-    "secret '{code}' is not set for this user: ask them to run /secrets in "
-    "Telegram (it opens a secure form) and add the secret, then retry"
+    "secret '{code}' is not set for this user (needed for host '{host}'): mint "
+    "them a pre-filled one-time form link with the secret_link tool — pass this "
+    "code, this host and a clear description of what the secret is for. Without "
+    "the tool they can run /secrets in Telegram and fill the form by hand"
+)
+PARAM_MISSING_TEMPLATE = (
+    "user param(s) not set for this user: {codes}. An operator sets them in the "
+    "admin console; tell the user which value is needed and what for"
+)
+PLACEMENT_BLOCKED_TEMPLATE = (
+    "secret '{code}' may not be substituted into the {part} of a request "
+    "(it allows: {allowed}); the user can extend its placements in the secrets form"
 )
 
 
@@ -86,15 +124,18 @@ class ExternalCallAuth:
 
 @dataclass(frozen=True, slots=True)
 class CallCredentials:
-    """Credential sources of the executor.
+    """Credential and per-user value sources of the executor.
 
     `auth_whitelist` — installation-level headers for allowlisted origins
     (from the composition root's env). `secrets` — the per-user secret store
-    for endpoints declaring `auth.secret`; None disables the feature.
+    for `{secret.*}` templates; None disables the feature. `user_params` —
+    the per-user non-secret values `{user.*}` templates reference; None
+    disables that feature.
     """
 
     auth_whitelist: tuple[ExternalCallAuth, ...] = ()
     secrets: SecretStore | None = None
+    user_params: UserParamStore | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +161,22 @@ class KindCallDelegate(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class _RenderPlan:
+    """Namespaced references of every template part of one call."""
+
+    url_refs: TemplateRefs
+    body_refs: TemplateRefs
+    header_refs: dict[str, TemplateRefs]
+
+    @property
+    def combined(self) -> TemplateRefs:
+        refs = self.url_refs | self.body_refs
+        for header in self.header_refs.values():
+            refs = refs | header
+        return refs
+
+
 class ExternalCallExecutor:
     """Executes endpoint records fetched through the instructions facade."""
 
@@ -139,6 +196,7 @@ class ExternalCallExecutor:
         self._auth_whitelist = resolved.auth_whitelist
         self._timeout = timeout_seconds
         self._secrets = resolved.secrets
+        self._user_params = resolved.user_params
         self._delegates = dict(delegates or {})
 
     async def execute(
@@ -174,59 +232,126 @@ class ExternalCallExecutor:
             raise ExternalCallError(
                 f"{exc}; the endpoint declares this contract: {instruction.content}"
             ) from exc
-        url = _render_url(spec, validated)
-        await self._guard.check(url)
-        # record-declared static headers first, so the credential sources
-        # below always win a name collision
-        headers = dict(spec.headers)
-        headers.update(self._auth_headers_for(url, user_id))
-        secret_value = await self._resolve_secret(spec.secret_auth, url, user_id)
-        if secret_value is not None and spec.secret_auth is not None:
-            headers[spec.secret_auth.header] = spec.secret_auth.format.format(value=secret_value)
+        plan = _collect_plan(spec)
+        user_values = await self._user_values(plan, user_id)
+        # secrets ride the URL as unguessable sentinels until the guard and
+        # the host binding have judged the real destination
+        sentinels = {code: f"of-secret-{uuid.uuid4().hex}" for code in plan.url_refs.secrets}
+        safe_url = _render_url(spec, validated, user_values, sentinels)
+        await self._guard.check(safe_url)
+        secrets = await self._resolve_secrets(plan, safe_url, user_id)
+        url = _substitute_url_secrets(safe_url, sentinels, secrets)
+        render_values: dict[str, str] = {
+            **validated,
+            **user_values,
+            **{f"secret.{code}": resolved.value for code, resolved in secrets.items()},
+        }
+        headers = self._build_headers(spec, plan, url, user_id, render_values)
+        body = (
+            render_template(spec.body_template, render_values)
+            if spec.body_template is not None
+            else None
+        )
         try:
             async with self._http.stream(
                 spec.method,
                 url,
                 headers=headers,
-                content=_render_body(spec, validated),
+                content=body,
                 follow_redirects=False,  # a redirect would bypass the guard's URL check
                 timeout=self._timeout,
             ) as response:
                 raw, truncated = await read_capped_text(response, MAX_BODY_BYTES)
                 status = response.status_code
         except httpx.HTTPError as exc:
-            raise ExternalCallError(f"external call failed: {exc}") from exc
-        body = _truncate(_scrub(raw, secret_value))
-        if truncated and not body.endswith(TRUNCATED_SUFFIX):
-            body += TRUNCATED_SUFFIX
-        return ExternalCallResult(status=status, body=body)
+            # the exception text can carry the request URL, secrets included
+            raise ExternalCallError(
+                f"external call failed: {_scrub(str(exc), secrets.values())}"
+            ) from exc
+        result = _truncate(_scrub(raw, secrets.values()))
+        if truncated and not result.endswith(TRUNCATED_SUFFIX):
+            result += TRUNCATED_SUFFIX
+        return ExternalCallResult(status=status, body=result)
 
-    async def _resolve_secret(
-        self,
-        auth: SecretAuth | None,
-        url: str,
-        user_id: str | None,
-    ) -> str | None:
-        """Resolve the endpoint's declared secret for the target host.
+    async def _user_values(self, plan: _RenderPlan, user_id: str | None) -> dict[str, str]:
+        """The `{user.*}` values of this call, keyed by full field name."""
+        codes = plan.combined.user_params
+        if not codes:
+            return {}
+        if self._user_params is None:
+            raise ExternalCallError(PARAMS_DISABLED_MESSAGE)
+        if user_id is None:
+            raise ExternalCallError("this endpoint uses per-user params: no user in context")
+        stored = await self._user_params.get_for_user(user_id)
+        missing = sorted(codes - stored.keys())
+        if missing:
+            raise ExternalCallError(
+                PARAM_MISSING_TEMPLATE.format(codes=", ".join(f"'{code}'" for code in missing))
+            )
+        return {f"user.{code}": stored[code] for code in codes}
 
-        The single moment a secret value exists outside the store: it goes
-        into one request header and is never logged, never returned to the
-        caller and scrubbed from the response body. Failures translate into
-        agent-readable guidance (the code, never the value).
+    async def _resolve_secrets(
+        self, plan: _RenderPlan, url: str, user_id: str | None
+    ) -> dict[str, ResolvedSecret]:
+        """Resolve every referenced secret for the target host, placements enforced.
+
+        The single moment secret values exist outside the store: they go into
+        the request parts their placements allow and are never logged, never
+        returned to the caller and scrubbed from the response body. Failures
+        translate into agent-readable guidance (the code, never the value).
         """
-        if auth is None:
-            return None
+        codes = plan.combined.secrets
+        if not codes:
+            return {}
         if self._secrets is None:
             raise ExternalCallError(SECRETS_DISABLED_MESSAGE)
         if user_id is None:
             raise ExternalCallError("this endpoint requires a per-user secret: no user in context")
         host = (urlsplit(url).hostname or "").lower()
-        try:
-            return await self._secrets.resolve(user_id, auth.code, host)
-        except SecretNotFoundError:
-            raise ExternalCallError(SECRET_MISSING_TEMPLATE.format(code=auth.code)) from None
-        except SecretHostMismatchError as exc:
-            raise ExternalCallError(str(exc)) from None
+        resolved: dict[str, ResolvedSecret] = {}
+        for code in sorted(codes):
+            try:
+                resolved[code] = await self._secrets.resolve(user_id, code, host)
+            except SecretNotFoundError:
+                raise ExternalCallError(
+                    SECRET_MISSING_TEMPLATE.format(code=code, host=host)
+                ) from None
+            except (SecretHostMismatchError, InvalidSecretError) as exc:
+                raise ExternalCallError(str(exc)) from None
+        _enforce_placements(plan, resolved)
+        return resolved
+
+    def _build_headers(
+        self,
+        spec: ToolSpec,
+        plan: _RenderPlan,
+        url: str,
+        user_id: str | None,
+        render_values: Mapping[str, str],
+    ) -> dict[str, str]:
+        """Render header templates and merge the credential sources.
+
+        Precedence on a name collision, lowest first: record headers without
+        secret refs, the installation whitelist, record headers WITH secret
+        refs — so a plain record header can never shadow a credential, and
+        the record's own secret-bearing header stays authoritative for the
+        endpoint it was written for.
+        """
+        plain: dict[str, str] = {}
+        secret_bearing: dict[str, str] = {}
+        for name, template in spec.headers.items():
+            rendered = render_template(template, render_values)
+            if not _is_header_safe(rendered):
+                # the value never goes into the error: it may embed a secret
+                raise ExternalCallError(
+                    f"header {name!r} renders to an illegal value (control characters or non-ASCII)"
+                )
+            target = secret_bearing if plan.header_refs[name].secrets else plain
+            target[name] = rendered
+        headers = plain
+        headers.update(self._auth_headers_for(url, user_id))
+        headers.update(secret_bearing)
+        return headers
 
     def _auth_headers_for(self, url: str, user_id: str | None) -> dict[str, str]:
         for entry in self._auth_whitelist:
@@ -273,33 +398,87 @@ def _validate_params(spec: ToolSpec, params: dict[str, Any]) -> dict[str, str]:
     return dict(params)
 
 
-def _render_url(spec: ToolSpec, params: dict[str, str]) -> str:
-    quoted = {name: quote(value, safe="") for name, value in params.items()}
-    return spec.url_template.format(**quoted)
+def _collect_plan(spec: ToolSpec) -> _RenderPlan:
+    """Re-collect the namespaced refs; parse-time validation guarantees success."""
+    return _RenderPlan(
+        url_refs=collect_refs(spec.url_template),
+        body_refs=(
+            collect_refs(spec.body_template) if spec.body_template is not None else TemplateRefs()
+        ),
+        header_refs={name: collect_refs(value) for name, value in spec.headers.items()},
+    )
 
 
-def _render_body(spec: ToolSpec, params: dict[str, str]) -> str | None:
-    """Render the request body, when the record declares one.
+def _render_url(
+    spec: ToolSpec,
+    params: dict[str, str],
+    user_values: Mapping[str, str],
+    sentinels: Mapping[str, str],
+) -> str:
+    values = {name: quote(value, safe="") for name, value in params.items()}
+    values.update({name: quote(value, safe="") for name, value in user_values.items()})
+    values.update({f"secret.{code}": sentinel for code, sentinel in sentinels.items()})
+    return render_template(spec.url_template, values)
 
-    Values go in verbatim — URL-escaping would corrupt an XML or JSON
-    payload; format-appropriate escaping is the record author's concern.
-    Secrets are never substituted here: headers only, by construction.
+
+def _substitute_url_secrets(
+    safe_url: str,
+    sentinels: Mapping[str, str],
+    secrets: Mapping[str, ResolvedSecret],
+) -> str:
+    """Replace the sentinels with the resolved values, after the checks passed."""
+    netloc = urlsplit(safe_url).netloc
+    url = safe_url
+    for code, sentinel in sentinels.items():
+        if sentinel in netloc:
+            # parse-time validation forbids this; a template that still gets
+            # here must fail closed, not leak a secret into the destination
+            raise ExternalCallError("a secret placeholder cannot appear in the URL host")
+        url = url.replace(sentinel, quote(secrets[code].value, safe=""))
+    return url
+
+
+def _enforce_placements(plan: _RenderPlan, resolved: Mapping[str, ResolvedSecret]) -> None:
+    """Each secret goes only into the request parts its placements allow."""
+    header_secrets: frozenset[str] = (
+        frozenset().union(*(refs.secrets for refs in plan.header_refs.values()))
+        if plan.header_refs
+        else frozenset()
+    )
+    demands = (
+        (SecretPlacement.URL, plan.url_refs.secrets),
+        (SecretPlacement.BODY, plan.body_refs.secrets),
+        (SecretPlacement.HEADER, header_secrets),
+    )
+    for placement, codes in demands:
+        for code in sorted(codes):
+            allowed = resolved[code].placements
+            if placement not in allowed:
+                raise ExternalCallError(
+                    PLACEMENT_BLOCKED_TEMPLATE.format(
+                        code=code,
+                        part=placement.value,
+                        allowed=", ".join(sorted(member.value for member in allowed)),
+                    )
+                )
+
+
+def _is_header_safe(value: str) -> bool:
+    return all(" " <= char <= "~" for char in value)
+
+
+def _scrub(body: str, secrets: Iterable[ResolvedSecret]) -> str:
+    """Remove echoes of the injected secrets from text headed to the model.
+
+    Some APIs reflect request material (echo endpoints, error pages); both
+    the substituted form and the stored plain value are masked — an API that
+    inverts the transform (Basic auth decodes the base64) can echo the plain
+    value, not just what was sent.
     """
-    if spec.body_template is None:
-        return None
-    return spec.body_template.format(**params)
-
-
-def _scrub(body: str, secret_value: str | None) -> str:
-    """Remove echoes of the injected secret from the response body.
-
-    Some APIs reflect request headers (echo endpoints, error pages); the body
-    goes to the LLM and the archive, so any literal occurrence of the value
-    is replaced before anyone else sees it.
-    """
-    if not secret_value:
-        return body
-    return body.replace(secret_value, SECRET_SCRUBBED)
+    for secret in secrets:
+        body = body.replace(secret.value, SECRET_SCRUBBED)
+        body = body.replace(secret.plain, SECRET_SCRUBBED)
+    return body
 
 
 def _truncate(body: str) -> str:

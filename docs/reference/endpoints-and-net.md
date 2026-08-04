@@ -29,8 +29,8 @@ An endpoint is an instruction record whose content is a small JSON document:
 The method may be any of the classic verbs or the WebDAV family (`PROPFIND`, `PROPPATCH`, `REPORT`,
 `MKCOL`, `MKCALENDAR`, `COPY`, `MOVE`, plus `HEAD`/`OPTIONS`) — what CalDAV/CardDAV servers speak.
 `LOCK`/`UNLOCK` are deliberately not allowed: an agent cannot manage a lock's lifetime and would
-leave servers with dangling locks. A record may also declare a request body template and static
-headers, which those protocols need:
+leave servers with dangling locks. A record may also declare a request body template and headers,
+which those protocols need:
 
 ```json
 {"method": "REPORT",
@@ -39,19 +39,39 @@ headers, which those protocols need:
  "headers": {"Depth": "1", "Content-Type": "application/xml"}}
 ```
 
-Body values are substituted **verbatim** (URL-escaping would corrupt an XML or JSON payload;
-format-appropriate escaping is the record author's concern), and secrets are never substituted into
-bodies — headers only, as below. Static record headers are applied first, so the credential sources
-below always win a header-name collision.
+### The template language
 
-`auth` may instead declare a per-user secret:
+`url_template`, `body_template` and every header value speak one placeholder language with three
+namespaces:
+
+| Placeholder | Filled by | Source |
+|---|---|---|
+| `{city}` | the model | must be declared (and `required`) in `params_schema` |
+| `{user.timezone}` | the executor | the calling user's stored params, set by the operator in the console |
+| `{secret.gmail_token}` | the executor | the calling user's encrypted secrets — see [secrets.md](secrets.md) |
+
+The model sees the record and therefore every placeholder *name*; the `user.` and `secret.` values
+are substituted server-side after the model's output is fixed and never enter a prompt. That is the
+whole point of the namespaces: a timezone, an account id or a calendar path is deterministic per
+user, so it lives in the record's template instead of the model's context — and a credential never
+enters the context at all.
+
+Substitution rules by destination: URL values are `urllib.parse.quote`-escaped; header values are
+substituted verbatim but the rendered header must be printable ASCII (a model param carrying a
+newline fails the call — the header-injection guard); body values go in **verbatim** (URL-escaping
+would corrupt an XML or JSON payload; format-appropriate escaping is the record author's concern).
+Format specs and conversions (`{x:>10}`, `{x!r}`) are rejected at parse time. `params_schema` keys
+may not contain a dot — dotted names are the namespaces'.
+
+Secrets additionally obey their own `placements` (headers by default; `url` and `body` are opt-in
+per secret) and can never form the URL scheme or host. The `auth` object remains as sugar for the
+one-header case and expands into a header template:
 
 ```json
 {"auth": {"secret": "gmail_token", "header": "Authorization", "format": "Bearer {value}"}}
 ```
 
-The model only ever sees the *code* (`gmail_token`). The executor resolves the value from the encrypted
-store at request time and injects it as a header. See [secrets.md](secrets.md).
+is exactly `"headers": {"Authorization": "Bearer {secret.gmail_token}"}`.
 
 ### Executing a call
 
@@ -66,19 +86,25 @@ store at request time and injects it as a header. See [secrets.md](secrets.md).
 4. validate the given parameters against `params_schema` — required present, unknown rejected,
    values must be strings. **A validation error returns the declared contract**, so a blind call can
    self-correct in one step;
-5. render the URL template with `urllib.parse.quote`-escaped values, and the body template (if any)
-   with verbatim values;
-6. check the URL with the SSRF guard;
-7. apply the record's static headers, then inject infrastructure auth if the origin matches
-   `OF_EXTERNAL_CALL_AUTH_WHITELIST`, and resolve the per-user secret if the record declares one —
-   in that order, so a record header never shadows a credential;
-8. perform the request with `follow_redirects=False`;
-9. truncate the response body to 8000 characters and scrub any echo of a secret value before returning
-   it.
+5. load the referenced `{user.*}` values — a missing one fails the call with the code and where to
+   set it;
+6. render the URL from model params and user values (quote-escaped); `{secret.*}` refs ride as
+   unguessable per-call sentinels for now;
+7. check the URL with the SSRF guard;
+8. resolve every referenced secret for the host that URL names — the host binding and the
+   placements are enforced here, and the secret value has had no say in what the host is — then
+   substitute the sentinels;
+9. render headers (header-safety enforced) and the body; merge headers lowest-precedence first:
+   record headers without secret refs, then infrastructure auth for origins matching
+   `OF_EXTERNAL_CALL_AUTH_WHITELIST`, then the record's secret-bearing headers — so a plain record
+   header never shadows a credential;
+10. perform the request with `follow_redirects=False`;
+11. truncate the response body to 8000 characters and scrub any echo of every resolved secret —
+    both the sent and the stored form — before returning it.
 
-Substitution of secret values happens **only** in the record's own template — never in
-agent-supplied parameter values, which would hand a prompt-injected agent an exfiltration channel — and
-only into headers, because a secret in a query string leaks into URLs, proxies and logs.
+Substitution of `user.*` and `secret.*` values happens **only** in the record's own templates —
+never in agent-supplied parameter values, which would hand a prompt-injected agent an exfiltration
+channel.
 
 ### The SSRF guard
 
@@ -104,11 +130,17 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 ## Invariants
 
 - **Endpoint records are owner-scoped.** A private endpoint of another user cannot be executed.
-- **Parameters are validated before the URL is rendered**, and unknown parameters are refused.
+- **Parameters are validated before anything is rendered**, and unknown parameters are refused.
 - **A parameter-validation error carries the contract** back to the model.
-- **Secrets are substituted only into headers, only from the record's template** — never into a
-  request body, and a record's static header cannot shadow a credential header.
-- **Secret values are scrubbed from responses** before they reach the context or the logs.
+- **`user.*` and `secret.*` values are substituted only from the record's templates** — never from
+  agent-supplied parameter values.
+- **Secrets go only where their placements allow** (headers by default), never into the URL host,
+  and are resolved only after the destination has been rendered and checked without them.
+- **Rendered headers must be header-safe** — a value carrying control characters or non-ASCII fails
+  the call instead of reaching the wire.
+- **A plain record header cannot shadow a credential header** (merge order above).
+- **Secret values are scrubbed from responses** — sent and stored forms both — before they reach the
+  context or the logs.
 - **Redirects are never followed.**
 - **Every outbound URL goes through the guard**, except explicitly allowlisted origins.
 - **Response bodies are truncated** so one call cannot flood the context: 8000 characters for
@@ -120,7 +152,7 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 |---|---|
 | `OF_SELF_BASE_URL` | The one allowlisted origin: this application's own API |
 | `OF_EXTERNAL_CALL_AUTH_WHITELIST` | JSON list of `{base_url_prefix, header_name, header_value}`; `header_value` may contain `{user_id}` |
-| `OF_SECRETS_KEY` | Without it, endpoints declaring `auth.secret` fail with a clear message |
+| `OF_SECRETS_KEY` | Without it, endpoints referencing `{secret.*}` fail with a clear message |
 | `OF_HTTP_REQUEST_ALLOWLIST` | Origins `http_request` may call; empty means the open web |
 
 ## Failure modes
@@ -131,8 +163,11 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 | `http_request` targets an origin outside the allowlist | `EgressBlockedError` naming the permitted origins and pointing at `recall(type=endpoint)` |
 | Endpoint record content is not valid JSON | `ToolSpecError`, reported to the model |
 | Missing or unknown parameter | Validation error including the declared contract |
-| Secret not set for this user | Message telling the agent to ask the user to add it via `/secrets` |
+| Template references an unknown namespace or a dotted param name | `ToolSpecError` at parse time |
+| `{user.*}` value not set for this user | Message naming the code(s); an operator sets them in the console |
+| Secret not set for this user | Message with the code and host, telling the agent to mint a `secret_link` |
 | Secret asked for a host it is not bound to | `SecretHostMismatchError` — the value is not sent |
+| Secret referenced where its placements forbid | The call fails naming the part; nothing is sent |
 | Secrets not configured at all | Explicit "secrets are not configured on this installation" |
 | Server redirects | Not followed; the redirect response is what the model sees |
 | Huge response | Truncated with a marker (8000 characters via `external_call`, 4000 via `http_request`) |
@@ -141,9 +176,12 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 ## Code anchors
 
 - `core/src/octoforge_core/net/guard.py` — `SsrfGuard`, origin allowlisting, the documented TOCTOU gap
-- `core/src/octoforge_core/net/tool_spec.py` — the endpoint document format and its parsing
-- `core/src/octoforge_core/net/external.py` — `ExternalCallExecutor`, auth injection, scrubbing
+- `core/src/octoforge_core/net/tool_spec.py` — the endpoint document format, the template language
+  and its parsing
+- `core/src/octoforge_core/net/external.py` — `ExternalCallExecutor`, substitution order, scrubbing
 - `core/src/octoforge_core/net/tools.py` — `http_request`, `endpoint_get`, `external_call`
 - `core/src/octoforge_core/net/errors.py` — `SsrfBlockedError`, `ExternalCallError`, `ToolSpecError`
+- `core/src/octoforge_core/params/api.py`, `core/src/octoforge_core/params/store.py` — the per-user
+  params behind `{user.*}`
 - `core/tests/test_ssrf_guard.py`, `core/tests/test_external_call.py`,
-  `core/tests/test_http_request_tool.py`
+  `core/tests/test_http_request_tool.py`, `core/tests/test_user_params_store.py`

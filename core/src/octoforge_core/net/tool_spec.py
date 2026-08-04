@@ -7,7 +7,7 @@ An endpoint record's `content` is a JSON document, e.g.:
      "params_schema": {"city": {"type": "string", "required": true}},
      "auth": "none"}
 
-A record may also declare a request body template and static headers — what
+A record may also declare a request body template and headers — what
 protocols like CalDAV need (an XML `REPORT` body plus a `Depth` header):
 
     {"method": "REPORT",
@@ -16,31 +16,40 @@ protocols like CalDAV need (an XML `REPORT` body plus a `Depth` header):
      "headers": {"Depth": "1", "Content-Type": "application/xml"},
      ...}
 
-Body values are substituted verbatim (URL-escaping would corrupt an XML or
-JSON payload); escaping appropriate to the body's own format is the record
-author's concern. Secrets are never substituted into bodies — headers only,
-as below.
+Every template part — `url_template`, `body_template` and each header value —
+speaks one placeholder language with three namespaces:
 
-`auth` may also be an object declaring a per-user secret the executor must
-inject as a header at request time:
+    {city}          a model-supplied parameter, declared in params_schema
+    {user.timezone} a per-user stored value, injected by the executor
+    {secret.token}  a per-user secret, resolved and injected by the executor
+
+The LLM sees the record (and therefore every placeholder NAME); the values of
+the `user.` and `secret.` namespaces are substituted server-side after the
+model's output is fixed and never enter any prompt. Substitution exists ONLY
+in the record-authored templates — never in agent-supplied parameter values,
+which would hand a prompt-injected agent an exfiltration channel. Where a
+secret may land is the secret's own `placements` setting (headers by
+default); a secret can never form the URL host, and body values go in
+verbatim (escaping appropriate to the body's format is the record author's
+concern).
+
+`auth` remains as sugar for the common one-header case and expands into a
+header template:
 
     "auth": {"secret": "gmail_token",
              "header": "Authorization",
              "format": "Bearer {value}"}
 
-The LLM only ever sees this declaration (the secret *code*); the value is
-resolved by the executor from the secret store and never enters any prompt.
-The substitution deliberately exists ONLY here, in the admin-authored record
-template — never in agent-supplied parameter values, which would hand a
-prompt-injected agent an exfiltration channel. Headers only: a query-string
-secret would leak into URLs, proxies and logs.
+is exactly `"headers": {"Authorization": "Bearer {secret.gmail_token}"}`.
 
 Parsing lives on the execution side (core), not in the instructions module:
 the module only stores the document.
 """
 
 import json
+import re
 import string
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -72,6 +81,10 @@ DEFAULT_AUTH = "none"
 DEFAULT_SECRET_HEADER = "Authorization"
 DEFAULT_SECRET_FORMAT = "Bearer {value}"
 SECRET_VALUE_FIELD = "{value}"
+USER_NAMESPACE = "user"
+SECRET_NAMESPACE = "secret"
+# same grammar as the secrets and params modules' codes
+REF_CODE_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,24 +95,27 @@ class ToolParamSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class SecretAuth:
-    """Declaration of the per-user secret a call must carry.
+class TemplateRefs:
+    """The placeholder names one template part references, by namespace."""
 
-    Resolved by the executor at request time; the record (and therefore the
-    LLM) knows the code, never the value.
-    """
+    params: frozenset[str] = frozenset()
+    user_params: frozenset[str] = frozenset()
+    secrets: frozenset[str] = frozenset()
 
-    code: str
-    header: str = DEFAULT_SECRET_HEADER
-    format: str = DEFAULT_SECRET_FORMAT
+    def __or__(self, other: "TemplateRefs") -> "TemplateRefs":
+        return TemplateRefs(
+            params=self.params | other.params,
+            user_params=self.user_params | other.user_params,
+            secrets=self.secrets | other.secrets,
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
     """Executable view of an endpoint instruction record.
 
-    A string `auth` is informational only (legacy records); `secret_auth`
-    is the executable declaration parsed from an object-valued `auth`.
+    A string `auth` is informational only (legacy records); an object-valued
+    `auth` has already been expanded into a header template by the parser.
     Installation-level authorization still comes from the composition-root
     whitelist, never from the record.
     """
@@ -108,9 +124,78 @@ class ToolSpec:
     url_template: str
     params: dict[str, ToolParamSpec] = field(default_factory=dict)
     auth: str = DEFAULT_AUTH
-    secret_auth: SecretAuth | None = None
     body_template: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
+
+
+def collect_refs(template: str) -> TemplateRefs:
+    """Collect and validate the placeholder names of one template part.
+
+    Rejects what the renderer will not do: empty fields, format specs and
+    conversions (`{x:>10}`, `{x!r}` — substitution here is verbatim by
+    design), unknown namespaces and malformed `user.`/`secret.` codes.
+    """
+    params: set[str] = set()
+    user_params: set[str] = set()
+    secrets: set[str] = set()
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        raise ToolSpecError(f"malformed template: {exc}") from exc
+    for _, field_name, format_spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if not field_name:
+            raise ToolSpecError("empty placeholder {} is not allowed in templates")
+        if format_spec or conversion:
+            raise ToolSpecError(
+                f"placeholder {{{field_name}}} carries a format spec or conversion; "
+                "substitution is verbatim — remove it"
+            )
+        if "." not in field_name:
+            params.add(field_name)
+            continue
+        namespace, _, code = field_name.partition(".")
+        if namespace == USER_NAMESPACE:
+            _validate_ref_code(field_name, code)
+            user_params.add(code)
+        elif namespace == SECRET_NAMESPACE:
+            _validate_ref_code(field_name, code)
+            secrets.add(code)
+        else:
+            raise ToolSpecError(
+                f"unknown namespace in placeholder {{{field_name}}}: "
+                f"only '{USER_NAMESPACE}.' and '{SECRET_NAMESPACE}.' exist"
+            )
+    return TemplateRefs(
+        params=frozenset(params),
+        user_params=frozenset(user_params),
+        secrets=frozenset(secrets),
+    )
+
+
+def render_template(template: str, values: Mapping[str, str]) -> str:
+    """Substitute values into a template part, verbatim.
+
+    Keys are full field names (`city`, `user.timezone`, `secret.token`);
+    escaping appropriate to the destination (URL quoting, header safety)
+    is the caller's concern, applied to the values before rendering.
+    Every referenced field must be present: `collect_refs` + the callers'
+    validation guarantee that, so a KeyError here is a programming error.
+    """
+    parts: list[str] = []
+    for literal, field_name, _, _ in string.Formatter().parse(template):
+        parts.append(literal)
+        if field_name is not None:
+            parts.append(values[field_name])
+    return "".join(parts)
+
+
+def _validate_ref_code(field_name: str, code: str) -> None:
+    if not REF_CODE_PATTERN.match(code):
+        raise ToolSpecError(
+            f"placeholder {{{field_name}}} must reference a code of 1-64 characters of [a-z0-9_]"
+        )
 
 
 def parse_tool_spec(content: str) -> ToolSpec:
@@ -120,44 +205,50 @@ def parse_tool_spec(content: str) -> ToolSpec:
     url_template = _parse_url_template(data.get("url_template"))
     params = _parse_params_schema(data.get("params_schema"))
     body_template = _parse_body_template(data.get("body_template"))
-    _validate_template_fields("url_template", url_template, params)
-    if body_template is not None:
-        _validate_template_fields("body_template", body_template, params)
     headers = _parse_headers(data.get("headers"))
     raw_auth = data.get("auth", DEFAULT_AUTH)
-    if isinstance(raw_auth, str):
-        return ToolSpec(
-            method=method,
-            url_template=url_template,
-            params=params,
-            auth=raw_auth,
-            body_template=body_template,
-            headers=headers,
-        )
     if isinstance(raw_auth, dict):
-        return ToolSpec(
-            method=method,
-            url_template=url_template,
-            params=params,
-            auth="secret",
-            secret_auth=_parse_secret_auth(raw_auth),
-            body_template=body_template,
-            headers=headers,
-        )
-    raise ToolSpecError("auth must be a string or a secret declaration object")
+        auth = "secret"
+        header_name, header_template = _expand_secret_auth(raw_auth)
+        # the sugar wins a name collision with a static record header: the
+        # record author wrote both, and the auth block is the specific one
+        headers[header_name] = header_template
+    elif isinstance(raw_auth, str):
+        auth = raw_auth
+    else:
+        raise ToolSpecError("auth must be a string or a secret declaration object")
+    _validate_template_fields("url_template", url_template, params)
+    _validate_no_secret_in_host(url_template)
+    if body_template is not None:
+        _validate_template_fields("body_template", body_template, params)
+    for name, value in headers.items():
+        _validate_template_fields(f"headers[{name!r}]", value, params)
+    return ToolSpec(
+        method=method,
+        url_template=url_template,
+        params=params,
+        auth=auth,
+        body_template=body_template,
+        headers=headers,
+    )
 
 
-def _parse_secret_auth(raw: dict[str, object]) -> SecretAuth:
+def _expand_secret_auth(raw: dict[str, object]) -> tuple[str, str]:
+    """The `auth` object as the header template it is sugar for."""
     code = raw.get("secret")
     if not isinstance(code, str) or not code.strip():
         raise ToolSpecError("auth.secret must be a non-empty secret code")
+    code = code.strip().lower()
+    if not REF_CODE_PATTERN.match(code):
+        raise ToolSpecError("auth.secret must be 1-64 characters of [a-z0-9_]")
     header = raw.get("header", DEFAULT_SECRET_HEADER)
     if not isinstance(header, str) or not header.strip():
         raise ToolSpecError("auth.header must be a non-empty header name")
     value_format = raw.get("format", DEFAULT_SECRET_FORMAT)
     if not isinstance(value_format, str) or SECRET_VALUE_FIELD not in value_format:
         raise ToolSpecError(f"auth.format must contain the {SECRET_VALUE_FIELD} placeholder")
-    return SecretAuth(code=code.strip(), header=header.strip(), format=value_format)
+    template = value_format.replace(SECRET_VALUE_FIELD, f"{{{SECRET_NAMESPACE}.{code}}}")
+    return header.strip(), template
 
 
 def _load_json(content: str) -> dict[str, Any]:
@@ -220,6 +311,11 @@ def _parse_params_schema(raw: object) -> dict[str, ToolParamSpec]:
 def _parse_param_name(raw: object) -> str:
     if not isinstance(raw, str) or not raw:
         raise ToolSpecError("params_schema keys must be non-empty strings")
+    if "." in raw:
+        raise ToolSpecError(
+            f"params_schema key {raw!r} must not contain '.': dotted names are "
+            "reserved for the user./secret. namespaces"
+        )
     return raw
 
 
@@ -235,13 +331,29 @@ def _parse_param(name: str, raw: object) -> ToolParamSpec:
 
 
 def _validate_template_fields(label: str, template: str, params: dict[str, ToolParamSpec]) -> None:
-    for _, field_name, _, _ in string.Formatter().parse(template):
-        if field_name is None:
-            continue
+    try:
+        refs = collect_refs(template)
+    except ToolSpecError as exc:
+        raise ToolSpecError(f"{label}: {exc}") from None
+    for field_name in sorted(refs.params):
         param = params.get(field_name)
         if param is None:
             raise ToolSpecError(f"{label} references undeclared parameter: {field_name!r}")
         if not param.required:
-            # an optional template field would crash the render with a raw
-            # KeyError the moment a caller omits it
+            # an optional template field would fail the render the moment a
+            # caller omits it
             raise ToolSpecError(f"{label} parameter must be required: {field_name!r}")
+
+
+def _validate_no_secret_in_host(url_template: str) -> None:
+    """A secret may never form the URL's scheme or host.
+
+    The host decides where the request goes and what the SSRF guard and the
+    secret's own host binding check; a placeholder there would make the
+    binding check a value the secret itself produced.
+    """
+    scheme_end = url_template.find("://")
+    path_start = url_template.find("/", scheme_end + 3 if scheme_end >= 0 else 0)
+    prefix = url_template if path_start < 0 else url_template[:path_start]
+    if f"{{{SECRET_NAMESPACE}." in prefix:
+        raise ToolSpecError("a secret placeholder cannot appear in the URL scheme or host")
