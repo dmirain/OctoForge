@@ -19,6 +19,13 @@ services:
       args:
         TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
     image: octoforge:local
+    # Capped, and not the record: a json-file dies with its container, and a
+    # deploy recreates it. OF_LOG_DIR below is what survives.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     env_file:
       - .env
     environment:
@@ -31,6 +38,8 @@ services:
       # Not negotiable on a pod, whatever .env says: a second long poll would
       # steal updates from the ingestion node rather than share them.
       OF_TELEGRAM_POLL_IN_PROCESS: "false"
+      # This pod's own rotating log file, on the host, outliving the container
+      OF_LOG_DIR: ${OF_LOG_DIR:-/var/log/octoforge}
       # Comes from this host's .env and must be set there, differently on every
       # pod. The default is the hostname, which for a container is its id — a
       # new one on every redeploy, so a restarted pod would not recognise the
@@ -52,6 +61,7 @@ services:
       # a pod publishes no TLS and trusts whoever reaches it.
       - "${OF_POD_BIND:-127.0.0.1}:${OF_POD_PORT:-8000}:8000"
     volumes:
+      - ./logs:/var/log/octoforge
       # the host's model cache: without it the container re-downloads the
       # 1.1 GB embedding model on first start
       - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface

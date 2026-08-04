@@ -16,13 +16,15 @@ import logging
 import signal
 
 from octoforge_server.config import Settings
+from octoforge_server.logs import configure_logging
 from octoforge_telegram.config import TelegramSettings
 
 from octoforge_deploy.main import runtime
 
 logger = logging.getLogger(__name__)
 
-LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# names this process's own log file when OF_LOG_DIR is set
+PROCESS_LOG_NAME = "telegram"
 NO_TOKEN_MESSAGE = "OF_TELEGRAM_BOT_TOKEN is required to run the standalone Telegram surface"
 UP_MESSAGE = "Telegram surface is up without the HTTP API; send SIGINT/SIGTERM to stop"
 DOWN_MESSAGE = "Telegram surface stopped"
@@ -44,10 +46,14 @@ async def run_standalone(settings: Settings) -> None:
 
 def main() -> None:
     """Console entry: configure logging and run the standalone surface."""
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-    # httpx logs full request URLs at INFO — and Bot API URLs carry the token.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    asyncio.run(run_standalone(Settings()))
+    settings = Settings()
+    configure_logging(
+        PROCESS_LOG_NAME,
+        log_dir=settings.log_dir,
+        max_mb=settings.log_max_mb,
+        backups=settings.log_backups,
+    )
+    asyncio.run(run_standalone(settings))
 
 
 if __name__ == "__main__":

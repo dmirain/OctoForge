@@ -30,6 +30,7 @@ from octoforge_core.speech.client import OpenAITranscriptionClient
 from octoforge_core.vision.api import VisionClient
 from octoforge_core.vision.client import OpenAIVisionClient
 from octoforge_server.config import Settings
+from octoforge_server.logs import configure_logging
 from octoforge_server.secret_links import SecretLinkService, secrets_link_builder
 
 from octoforge_telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
@@ -41,7 +42,8 @@ from octoforge_telegram.schema import TelegramSurfaceBase
 
 logger = logging.getLogger(__name__)
 
-LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# names this process's own log file when OF_LOG_DIR is set
+PROCESS_LOG_NAME = "ingest"
 NO_TOKEN_MESSAGE = "OF_TELEGRAM_BOT_TOKEN is required to run the Telegram ingestion node"
 NO_SERVICE_URL_MESSAGE = (
     "OF_TELEGRAM_SERVICE_URL is required: the ingestion node has no dialogs of its own, "
@@ -180,10 +182,14 @@ async def _build(
 
 def main() -> None:
     """Console entry: configure logging and run the node."""
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-    # httpx logs full request URLs at INFO — and a Bot API URL carries the token
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    asyncio.run(run_ingest(Settings(), TelegramSettings()))
+    settings = Settings()
+    configure_logging(
+        PROCESS_LOG_NAME,
+        log_dir=settings.log_dir,
+        max_mb=settings.log_max_mb,
+        backups=settings.log_backups,
+    )
+    asyncio.run(run_ingest(settings, TelegramSettings()))
 
 
 if __name__ == "__main__":

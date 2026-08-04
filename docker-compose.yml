@@ -23,12 +23,24 @@ x-app-databases: &app-databases
   OF_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_DB:-octoforge}
   OF_TELEGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-octoforge}:${POSTGRES_PASSWORD:-octoforge}@postgres:5432/${POSTGRES_TELEGRAM_DB:-octoforge_telegram}
 
+# Container logs are capped so a chatty day cannot fill the disk. They are NOT
+# the record: a json-file lives and dies with its container, and every deploy
+# recreates them — on 2026-08-04 a crash left nothing readable an hour later,
+# in the middle of diagnosing that very crash. The record is OF_LOG_DIR below,
+# a rotating file on a mounted directory that outlives the container.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   postgres:
     # Stock pgvector plus pg_textsearch — see docker/postgres/Dockerfile for why
     # this is a two-line layer rather than a third-party Postgres distribution.
     build: ./docker/postgres
     image: octoforge-postgres:local
+    logging: *logging
     # pg_textsearch uses shared memory and hooks, so it must be preloaded before
     # `CREATE EXTENSION` can work. This lives next to the image that provides the
     # library on purpose: point the service at a Postgres without it and the
@@ -71,13 +83,19 @@ services:
   app:
     build: *app-build
     image: octoforge:local
+    logging: *logging
     env_file:
       - .env
-    environment: *app-databases
+    environment:
+      <<: *app-databases
+      OF_LOG_DIR: ${OF_LOG_DIR:-/var/log/octoforge}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
+      # where each process keeps its own rotating log file; it is on the host
+      # so the record survives the container being recreated by a deploy
+      - ./logs:/var/log/octoforge
       # the host's model cache: without it the container re-downloads the
       # 1.1 GB embedding model on first start
       - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface
@@ -98,6 +116,7 @@ services:
 
   caddy:
     image: caddy:2-alpine
+    logging: *logging
     depends_on:
       app:
         condition: service_started
@@ -126,14 +145,20 @@ services:
     profiles: ["standalone"]
     build: *app-build
     image: octoforge:local
+    logging: *logging
     command: ["python", "-m", "octoforge_deploy.telegram_only"]
     env_file:
       - .env
-    environment: *app-databases
+    environment:
+      <<: *app-databases
+      OF_LOG_DIR: ${OF_LOG_DIR:-/var/log/octoforge}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
+      # where each process keeps its own rotating log file; it is on the host
+      # so the record survives the container being recreated by a deploy
+      - ./logs:/var/log/octoforge
       - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface
     # No ports and no healthcheck on purpose: this surface only makes outbound
     # connections (Bot API long poll, LLM, embeddings) and exposes no endpoint
@@ -149,6 +174,7 @@ services:
     profiles: ["ingest"]
     build: *app-build
     image: octoforge:local
+    logging: *logging
     command: ["python", "-m", "octoforge_telegram.ingest"]
     env_file:
       - .env
@@ -159,6 +185,11 @@ services:
       # Where it submits what it reads. Caddy, so the affinity that puts a user
       # on the right pod applies to Telegram exactly as it does to the web.
       OF_TELEGRAM_SERVICE_URL: ${OF_TELEGRAM_SERVICE_URL:-https://${SITE_DOMAIN:-localhost}}
+      OF_LOG_DIR: ${OF_LOG_DIR:-/var/log/octoforge}
+    volumes:
+      # where each process keeps its own rotating log file; it is on the host
+      # so the record survives the container being recreated by a deploy
+      - ./logs:/var/log/octoforge
     depends_on:
       postgres:
         condition: service_healthy

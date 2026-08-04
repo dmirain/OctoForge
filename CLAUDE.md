@@ -53,7 +53,7 @@ Take these from here, don't guess:
 | Operator console | `/admin.html`, HTTP Basic (`OF_ADMIN_USERNAME` / `OF_ADMIN_PASSWORD_HASH`; empty hash = 503 everywhere) |
 | Telegram | no HTTP port — long polling only |
 | Deployment | `docker compose up -d` = postgres + app (HTTP, console and bot in one process) + caddy; `--profile standalone` runs the bot alone |
-| Logs | stdout/stderr only — redirect yourself when backgrounding |
+| Logs | stdout/stderr, plus a rotating file per process under `OF_LOG_DIR` (compose mounts `./logs`: `app.log`, `ingest.log`; 2 GB each, survives a redeploy) |
 
 ## Rules that bite
 

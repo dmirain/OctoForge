@@ -113,6 +113,7 @@ from octoforge_server.app import SECRETS_PAGE, build_app
 from octoforge_server.capabilities import log_capabilities
 from octoforge_server.channels import WEB_CHANNEL
 from octoforge_server.config import Settings
+from octoforge_server.logs import configure_logging
 from octoforge_server.prompts import FilePromptProvider
 from octoforge_server.runtime_state import Runtime
 from octoforge_server.secret_links import (
@@ -146,11 +147,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 APP_TITLE = "OctoForge"
-LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+# names this process's own log file when OF_LOG_DIR is set; one deployment
+# runs several processes against one directory
+WEB_PROCESS_LOG_NAME = "app"
 HEALTH_STATUS = "ok"
 READY_STATUS = "ready"
 NOT_READY_STATUS = "not-ready"
-HTTPX_LOGGER = "httpx"
 USER_ID_HEADER = "X-User-Id"
 USER_ID_HEADER_VALUE_TEMPLATE = "{user_id}"
 ADMIN_NOT_SEEN_MESSAGE = (
@@ -444,23 +446,15 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             await telegram_stores.engine.dispose()
 
 
-def _configure_logging() -> None:
-    """Ensure application and core logs reach a handler (idempotent).
-
-    httpx is pinned to WARNING for the same reason the standalone Telegram entry
-    point does it: it logs full request URLs at INFO, and a Bot API URL carries
-    the bot token — which would then sit in the container logs of a process that
-    also runs the bot.
-    """
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-    logging.getLogger(HTTPX_LOGGER).setLevel(logging.WARNING)
-
-
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build this deployment: the service, plus the interfaces installed on it."""
-    _configure_logging()
     resolved = settings or Settings()
+    configure_logging(
+        WEB_PROCESS_LOG_NAME,
+        log_dir=resolved.log_dir,
+        max_mb=resolved.log_max_mb,
+        backups=resolved.log_backups,
+    )
     return build_app(resolved, runtime, _surface_routes())
 
 

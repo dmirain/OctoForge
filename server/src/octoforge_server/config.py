@@ -62,6 +62,10 @@ DEFAULT_RERANKER_API_URL = "https://api.siliconflow.cn/v1/rerank"
 DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
 FILE_SCHEME_PREFIX = "file:"
 DEFAULT_ADMIN_USERNAME = "admin"
+# One rotating log file plus nine kept behind it: 2 GB of history per process,
+# bounded whatever happens, and no sweeper to forget to run.
+DEFAULT_LOG_MAX_MB = 200
+DEFAULT_LOG_BACKUPS = 9
 # the cheap tier of the two-tier vision setup (see core.vision.api); the
 # stronger tier is picked elsewhere, only for explicit follow-up questions
 DEFAULT_VISION_MODEL = "minimax-m3"
@@ -180,6 +184,15 @@ class Settings(BaseSettings):
     # Public base URL of this installation (the /secrets one-time links are
     # built against it); defaults to the loopback self_base_url for dev.
     public_base_url: str = ""
+    # Where this process keeps its own rotating log file, in ADDITION to
+    # stdout. Empty means stdout only, which is what a container gives you —
+    # and a container's log dies with the container, so every deploy used to
+    # erase the history of what happened before it. Point this at a mounted
+    # directory and the record outlives the container.
+    log_dir: str = ""
+    log_max_mb: int = DEFAULT_LOG_MAX_MB
+    # kept ALONGSIDE the live file: the default budget is 200 MB x 10 = 2 GB
+    log_backups: int = DEFAULT_LOG_BACKUPS
     # The separate model that looks at images (the main LLM is text-only).
     # Base URL/key default to the main LLM's when unset — the common case is
     # one OpenAI-compatible gateway serving both. An empty model turns the

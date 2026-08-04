@@ -140,6 +140,21 @@ and dataset search are unavailable — the system-record sync is skipped too.
 Generate a key with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
 Losing it makes every stored secret unreadable; it is not derived from anything else.
 
+## Logs
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OF_LOG_DIR` | *(empty; docker compose sets `/var/log/octoforge`)* | Directory for this process's own rotating log file, kept **beside** stdout. Empty means stdout only |
+| `OF_LOG_MAX_MB` | `200` | Size at which the file rotates |
+| `OF_LOG_BACKUPS` | `9` | Files kept behind the live one — so the budget is `OF_LOG_MAX_MB x (OF_LOG_BACKUPS + 1)`, 2 GB by default |
+
+Stdout is what `docker logs` reads, and it dies with the container: a deploy recreates every container,
+so the record of whatever happened before it disappears exactly when an incident wants it. The file is
+the record — compose mounts `./logs` from the host into each process, and each writes `app.log`,
+`ingest.log` or `telegram.log` there (its own file: two processes rotating one file race on the
+rename). Container logs themselves are capped at 50 MB x 3 per container, so a chatty day cannot fill
+the disk either.
+
 ## Prompts and system records
 
 | Variable | Default | Meaning |
