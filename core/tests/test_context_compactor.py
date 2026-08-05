@@ -31,6 +31,7 @@ from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyM
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent
 from octoforge_core.llm.usage import Completion, Usage
+from octoforge_core.tariffs.api import UsageEvent, UsageKind
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolSpec
 
@@ -105,8 +106,9 @@ def archived(seq: int, content: str, role: MessageRole = MessageRole.USER) -> Ar
 class SummarizingLLM:
     """LLMClient stub replaying scripted summary replies via complete()."""
 
-    def __init__(self, replies: list[str]) -> None:
+    def __init__(self, replies: list[str], usage: Usage | None = None) -> None:
         self._replies = list(replies)
+        self._usage = usage
         self.requests: list[list[ChatMessage]] = []
 
     async def complete(
@@ -116,7 +118,8 @@ class SummarizingLLM:
     ) -> Completion:
         self.requests.append(list(messages))
         return Completion(
-            message=ChatMessage(role=MessageRole.ASSISTANT, content=self._replies.pop(0))
+            message=ChatMessage(role=MessageRole.ASSISTANT, content=self._replies.pop(0)),
+            usage=self._usage,
         )
 
     def stream(
@@ -179,11 +182,22 @@ class CountingSummaryStore:
         return getattr(self._inner, name)
 
 
+class RecordingMeter:
+    """UsageRecorder stub collecting ledgered events."""
+
+    def __init__(self) -> None:
+        self.events: list[UsageEvent] = []
+
+    async def record(self, event: UsageEvent) -> None:
+        self.events.append(event)
+
+
 def make_compactor(
     store: SqlAlchemySummaryStore,
     llm: SummarizingLLM,
     hot_max_chars: int = 100000,
     compact_target_chars: int = 50000,
+    meter: RecordingMeter | None = None,
 ) -> LlmContextCompactor:
     return LlmContextCompactor(
         store=store,
@@ -193,6 +207,7 @@ def make_compactor(
             hot_max_chars=hot_max_chars,
             compact_target_chars=compact_target_chars,
         ),
+        meter=meter,
     )
 
 
@@ -704,6 +719,27 @@ async def test_compact_now_compacts_synchronously_and_reports_progress(
     summaries = await store.list_for_dialog(dialog.id)  # written before the return
     assert len(summaries) == 1
     assert await compactor.compact_now(dialog) is False  # nothing new to compact
+
+
+async def test_compaction_meters_its_llm_usage_on_the_dialogs_user(
+    store: SqlAlchemySummaryStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Summarization spends the user's tokens on their behalf: it is ledgered."""
+    dialog = await make_dialog(session_factory)
+    usage = Usage(prompt_tokens=300, completion_tokens=70)
+    llm = SummarizingLLM([SUMMARY_REPLY], usage=usage)
+    meter = RecordingMeter()
+    compactor = make_compactor(store, llm, meter=meter)
+    await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
+
+    await compactor.compact_now(dialog)
+
+    (event,) = meter.events
+    assert event.user_id == dialog.user_id
+    assert event.kind is UsageKind.LLM_COMPACTION
+    assert (event.prompt_tokens, event.completion_tokens) == (300, 70)
+    assert event.dialog_id == dialog.id
 
 
 async def test_concurrent_compact_now_runs_a_single_compaction(

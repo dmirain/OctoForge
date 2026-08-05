@@ -19,6 +19,7 @@ from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
 from octoforge_core.domain import MessageRole
 from octoforge_core.retention import RetentionPolicy
 from octoforge_core.retention_sweep import RetentionSweeper
+from octoforge_core.tariffs.models import UsageEventRow
 from octoforge_core.tasks.api import TaskStatus
 from octoforge_core.tasks.models import TaskRow
 
@@ -208,3 +209,36 @@ def test_each_entity_is_configured_on_its_own() -> None:
 def test_an_unconfigured_policy_says_so_in_the_report() -> None:
     assert RetentionPolicy().enabled() is False
     assert "every row is kept" in RetentionPolicy().describe()
+
+
+async def add_usage_event(
+    factory: async_sessionmaker[AsyncSession], event_id: str, created_at: datetime
+) -> None:
+    async with factory() as session:
+        session.add(
+            UsageEventRow(
+                id=event_id,
+                user_id=USER,
+                kind="llm_answer",
+                origin="interactive",
+                created_at=created_at,
+            )
+        )
+        await session.commit()
+
+
+async def test_old_usage_events_age_out_and_recent_ones_stay(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Limit checks only ever read the current day; older events are reporting
+    material and age out on the operator's terms."""
+    await add_usage_event(session_factory, "u-old", ANCIENT)
+    await add_usage_event(session_factory, "u-new", RECENT)
+
+    sweeper = RetentionSweeper(session_factory, RetentionPolicy(usage_days=KEEP_A_YEAR))
+    outcome = await sweeper.sweep()
+
+    assert outcome.usage == 1
+    async with session_factory() as session:
+        remaining = (await session.scalars(select(UsageEventRow.id))).all()
+    assert list(remaining) == ["u-new"]

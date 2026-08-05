@@ -16,7 +16,7 @@ from octoforge_core.agent.router import (
 from octoforge_core.dialogs.api import TITLE_MAX_LENGTH, ExchangeStatus
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import StreamEvent
-from octoforge_core.llm.usage import Completion
+from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.tools.base import ToolSpec
 
 OPEN_ID = "x-open"
@@ -91,9 +91,15 @@ def plain_reply() -> ChatMessage:
 class ScriptedLLM:
     """LLMClient stub returning a scripted complete() reply or raising."""
 
-    def __init__(self, reply: ChatMessage | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        reply: ChatMessage | None = None,
+        error: Exception | None = None,
+        usage: Usage | None = None,
+    ) -> None:
         self._reply = reply
         self._error = error
+        self._usage = usage
         self.complete_calls = 0
         self.last_messages: list[ChatMessage] = []
         self.last_tools: list[ToolSpec] | None = None
@@ -109,7 +115,7 @@ class ScriptedLLM:
         if self._error is not None:
             raise self._error
         assert self._reply is not None
-        return Completion(message=self._reply)
+        return Completion(message=self._reply, usage=self._usage)
 
     async def stream(
         self,
@@ -167,6 +173,19 @@ async def test_continue_into_a_known_exchange() -> None:
 
     assert decision.action is RouteAction.CONTINUE
     assert decision.exchange_id == WAITING_ID
+
+
+async def test_decision_carries_the_calls_usage() -> None:
+    """The caller attributes the spend, so the decision must hand it over."""
+    usage = Usage(prompt_tokens=20, completion_tokens=5)
+    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=WAITING_ID), usage=usage)
+    router = make_router(llm)
+
+    decision = await router.route((in_progress(),), MESSAGE, MAX_EXCHANGES)
+    deterministic = await router.route((), MESSAGE, MAX_EXCHANGES)
+
+    assert decision.usage == usage
+    assert deterministic.usage is None  # no LLM call, nothing spent
 
 
 async def test_continue_into_an_unknown_exchange_degrades_to_new(

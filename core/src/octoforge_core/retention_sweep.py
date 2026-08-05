@@ -32,6 +32,7 @@ from octoforge_core.context.models import SummaryRow
 from octoforge_core.dialogs.api import LIVE_EXCHANGE_STATUSES
 from octoforge_core.dialogs.models import ExchangeRow, MessageRow
 from octoforge_core.retention import RetentionOutcome, RetentionPolicy
+from octoforge_core.tariffs.models import UsageEventRow
 from octoforge_core.tasks.models import TaskRow
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class RetentionSweeper:
             messages=await self._sweep_messages(),
             exchanges=await self._sweep_exchanges(),
             tasks=await self._sweep_tasks(),
+            usage=await self._sweep_usage(),
         )
         if outcome.total():
             logger.info("retention sweep removed %s", outcome.describe())
@@ -103,6 +105,15 @@ class RetentionSweeper:
                 TaskRow.created_at < cutoff,
                 TaskRow.delivered_at.is_not(None),
             )
+            return await self._run(session, statement)
+
+    async def _sweep_usage(self) -> int:
+        """Delete old usage events; limit checks only ever read the current day."""
+        cutoff = self.policy.cutoff(self.policy.usage_days)
+        if cutoff is None:
+            return 0
+        async with self.session_factory() as session:
+            statement = delete(UsageEventRow).where(UsageEventRow.created_at < cutoff)
             return await self._run(session, statement)
 
     @staticmethod

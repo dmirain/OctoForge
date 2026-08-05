@@ -34,6 +34,7 @@ from octoforge_core import (
     build_external_executor,
     build_instruction_service,
     build_instruction_store,
+    build_limit_service,
     build_llm_client,
     build_router,
     build_runner_config,
@@ -235,13 +236,14 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
         manager_stores.tasks,
         SqlAlchemyIdentityStore(session_factory),
     )
-    cron_store = SqlAlchemyCronStore(session_factory)
-    secret_store, user_params, tariff_store, usage_meter = (
+    cron_store, secret_store, user_params, tariff_store, usage_meter = (
+        SqlAlchemyCronStore(session_factory),
         _build_secret_store(settings, session_factory),
         SqlAlchemyUserParamStore(session_factory),
         SqlAlchemyTariffStore(session_factory),
         SqlAlchemyUsageMeter(session_factory),
     )
+    limit_service = build_limit_service(tariff_store, usage_meter)
     secret_links = SecretLinkService(
         settings.secrets_key, codes=SqlAlchemySecretFormLinkStore(session_factory)
     )
@@ -363,12 +365,14 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                             model_context_tokens=settings.model_context_tokens,
                             context_buffer_tokens=settings.context_buffer_tokens,
                         ),
+                        meter=limit_service,
                     ),
                     options=RunnerOptions(
                         max_processes=settings.max_processes,
                         task_outcome_listener=build_cron_outcome_reporter(cron_store),
                         vision=deep_vision_client,
                         image_resolver=image_resolver,
+                        limits=limit_service,
                     ),
                 ),
                 stores=manager_stores,

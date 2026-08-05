@@ -182,6 +182,46 @@ def normalize_limit(raw: int | None, name: str) -> int | None:
     return raw
 
 
+class UsageRecorder(Protocol):
+    """The metering side alone — for components that only ever spend."""
+
+    async def record(self, event: UsageEvent) -> None:
+        """Append a usage event; must never raise into the caller."""
+        ...
+
+
+class LimitGate(UsageRecorder, Protocol):
+    """What consumers of the tariffs module see: limit checks plus metering.
+
+    Implemented by `tariffs.service.LimitService`; consumers depend on this
+    port so the concrete service stays behind the module boundary.
+    """
+
+    async def enabled_features(self, user_id: str) -> frozenset[str] | None:
+        """The user's feature codes as plain strings; `None` = everything on."""
+        ...
+
+    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
+        """Whether the user's tariff grants the feature."""
+        ...
+
+    async def check_submit(self, user_id: str) -> LimitVerdict:
+        """May the user's message start a run today (messages + tokens)?"""
+        ...
+
+    async def check_run_budget(self, user_id: str) -> LimitVerdict:
+        """May a cron/background run start today (answers + tokens)?"""
+        ...
+
+    async def max_cron_jobs(self, user_id: str) -> int | None:
+        """The user's cron-job cap; `None` = unlimited."""
+        ...
+
+    async def max_datasets(self, user_id: str) -> int | None:
+        """The user's dataset cap; `None` = unlimited."""
+        ...
+
+
 class TariffStore(Protocol):
     """Port of the tariff catalog and user assignments."""
 

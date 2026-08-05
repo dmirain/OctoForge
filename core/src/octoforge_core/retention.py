@@ -46,11 +46,20 @@ class RetentionPolicy:
     messages_days: int | None = KEEP_FOREVER
     exchanges_days: int | None = KEEP_FOREVER
     tasks_days: int | None = KEEP_FOREVER
+    # the usage ledger is transcript-shaped too: an event is an audit line,
+    # and limit checks only ever read the current day
+    usage_days: int | None = KEEP_FOREVER
 
     def enabled(self) -> bool:
         """Whether anything at all would be deleted."""
         return any(
-            days is not None for days in (self.messages_days, self.exchanges_days, self.tasks_days)
+            days is not None
+            for days in (
+                self.messages_days,
+                self.exchanges_days,
+                self.tasks_days,
+                self.usage_days,
+            )
         )
 
     def cutoff(self, days: int | None, now: datetime | None = None) -> datetime | None:
@@ -69,6 +78,7 @@ class RetentionPolicy:
                 ("messages", self.messages_days),
                 ("exchanges", self.exchanges_days),
                 ("tasks", self.tasks_days),
+                ("usage", self.usage_days),
             )
             if days is not None
         ]
@@ -82,9 +92,13 @@ class RetentionOutcome:
     messages: int = 0
     exchanges: int = 0
     tasks: int = 0
+    usage: int = 0
 
     def total(self) -> int:
-        return self.messages + self.exchanges + self.tasks
+        return self.messages + self.exchanges + self.tasks + self.usage
 
     def describe(self) -> str:
-        return f"messages={self.messages} exchanges={self.exchanges} tasks={self.tasks}"
+        return (
+            f"messages={self.messages} exchanges={self.exchanges} "
+            f"tasks={self.tasks} usage={self.usage}"
+        )

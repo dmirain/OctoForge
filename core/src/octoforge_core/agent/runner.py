@@ -28,6 +28,7 @@ from typing import Any, Protocol
 from octoforge_core.agent.branch import render_branch
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import (
+    AssistantMessage,
     Cancelled,
     Failed,
     Finished,
@@ -72,6 +73,7 @@ from octoforge_core.domain import (
 )
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
+from octoforge_core.tariffs.api import LimitGate, UsageEvent, UsageKind, UsageOrigin
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import TaskList, TaskStore
 from octoforge_core.time import utc_now
@@ -277,6 +279,15 @@ def _task_source_message(task: Task) -> str | None:
     return raw if isinstance(raw, str) else None
 
 
+def _task_origin(task: Task) -> UsageOrigin:
+    """What started this task, for the usage ledger."""
+    if task.kind is TaskKind.ANSWER:
+        return UsageOrigin.INTERACTIVE
+    if "cron_job_id" in task.input:
+        return UsageOrigin.CRON
+    return UsageOrigin.BACKGROUND
+
+
 def _exchange_outcome(status: TaskStatus) -> ExchangeStatus:
     """How a run's terminal status settles the obligation it owed."""
     if status is TaskStatus.DONE:
@@ -469,6 +480,19 @@ class _Process:
     # the run called `ask_user` and its question already went out: everything
     # it writes afterwards is muted (see `_muted_after_ask`)
     asked: bool = False
+    # what started this run, for the usage ledger
+    origin: UsageOrigin = UsageOrigin.INTERACTIVE
+    # tokens of every iteration so far — the terminal event alone carries only
+    # the last iteration's usage, which would undercount multi-tool runs
+    spent_prompt: int = 0
+    spent_completion: int = 0
+
+
+def _observe_spend(process: _Process, event: LoopEvent) -> None:
+    """Accumulate an iteration's token usage onto the run."""
+    if isinstance(event, AssistantMessage) and event.usage is not None:
+        process.spent_prompt += event.usage.prompt_tokens
+        process.spent_completion += event.usage.completion_tokens
 
 
 class DialogSurface(Protocol):
@@ -510,6 +534,8 @@ class RunnerConfig:
     max_processes: int
     compactor: ContextCompactor
     task_outcome_listener: TaskOutcomeListener | None = None
+    # limit checks and the usage ledger; None = unlimited and unmetered
+    limits: LimitGate | None = None
     # quiet window before collected material earns a reaction of its own
     material_quiet_seconds: float = MATERIAL_QUIET_SECONDS
     # the strong vision tier plus the surface that can fetch an attachment
@@ -549,6 +575,7 @@ class ConversationRunner:
         self._vision = config.vision
         self._image_resolver = config.image_resolver
         self._task_outcome_listener = config.task_outcome_listener
+        self._limits = config.limits
         self._compactor = config.compactor
         self._messages = messages
         self._tasks = tasks
@@ -1043,13 +1070,44 @@ class ConversationRunner:
         # the routed/narrative copy carries its row id: the answer task links
         # back to it via source_message_id
         message = replace(message, id=message_id)
+        await self._record_user_message()
         if message.kind is MessageKind.MATERIAL:
             await self._collect_material(message, command)
             return
         # one read serves both the routing decision and the nudge after it
         live = await self._exchanges.list_live(self._dialog.id)
         decision = await self._route(message, command, live)
+        await self._record_routing(decision.usage)
         await self._apply_route(message, decision, command, live)
+
+    async def _record_user_message(self) -> None:
+        """Ledger one persisted user message (duplicates never get here)."""
+        if self._limits is None:
+            return
+        await self._limits.record(
+            UsageEvent(
+                user_id=self._dialog.user_id,
+                kind=UsageKind.USER_MESSAGE,
+                origin=UsageOrigin.INTERACTIVE,
+                quantity=1,
+                dialog_id=self._dialog.id,
+            )
+        )
+
+    async def _record_routing(self, usage: Usage | None) -> None:
+        """Ledger a routing LLM call; the deterministic paths carry no usage."""
+        if self._limits is None or usage is None:
+            return
+        await self._limits.record(
+            UsageEvent(
+                user_id=self._dialog.user_id,
+                kind=UsageKind.LLM_ROUTING,
+                origin=UsageOrigin.INTERACTIVE,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                dialog_id=self._dialog.id,
+            )
+        )
 
     async def _collect_material(self, message: ChatMessage, command: _Submit) -> None:
         """Take in forwarded material: it owes nothing, so nothing starts.
@@ -1175,6 +1233,7 @@ class ConversationRunner:
         decision = await self._router.route(
             infos, self._material_digest(collection.id), self._max_processes
         )
+        await self._record_routing(decision.usage)
         if decision.action is not RouteAction.CONTINUE or decision.exchange_id is None:
             return None
         return next((item for item in live if item.id == decision.exchange_id), None)
@@ -2064,6 +2123,7 @@ class ConversationRunner:
             source_message_id=_task_source_message(task),
             source_client_message_id=_task_client_source(task),
             exchange_id=task.exchange_id,
+            origin=_task_origin(task),
         )
         process.pump = asyncio.create_task(self._pump_process(process))
         self._processes[process.id] = process
@@ -2183,6 +2243,7 @@ class ConversationRunner:
                     # pull model: re-sync the narrative part of the branch
                     # before the loop's next LLM call reads it
                     await self._sync_branch(process)
+                _observe_spend(process, event)
                 out = self._outgoing(process, event)
                 if out is None:
                     continue
@@ -2330,8 +2391,34 @@ class ConversationRunner:
             if salvaged is not None:
                 self._narrative.extend(salvaged)
             status = TaskStatus.CANCELLED
+        await self._record_run_usage(process, terminal)
         await self._report_outcome(task, status)
         return status, task
+
+    async def _record_run_usage(self, process: _Process, terminal: LoopEvent) -> None:
+        """Ledger the run's accumulated tokens, outside any unit of work.
+
+        Failed and cancelled runs spent their tokens too; only a run that
+        produced a visible final counts as an assistant message.
+        """
+        if self._limits is None:
+            return
+        answered = isinstance(terminal, Finished) and bool(terminal.message.content.strip())
+        if not answered and process.spent_prompt == 0 and process.spent_completion == 0:
+            return  # nothing spent, nothing said — no event
+        await self._limits.record(
+            UsageEvent(
+                user_id=self._dialog.user_id,
+                kind=UsageKind.LLM_ANSWER,
+                origin=process.origin,
+                prompt_tokens=process.spent_prompt,
+                completion_tokens=process.spent_completion,
+                quantity=1 if answered else 0,
+                dialog_id=self._dialog.id,
+                exchange_id=process.exchange_id,
+                task_id=process.task_id,
+            )
+        )
 
     def _delivery_is_certain(self, process: _Process, content: str) -> bool:
         """Whether this outcome is already in the user's hands.

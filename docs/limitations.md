@@ -61,8 +61,10 @@ delivered. Scrollback comes from stored messages, not from replaying the stream.
 - **No rate limiting and no quotas** on *usage* — per user or per installation. Nothing stops one dialog from
   spending an unbounded amount of provider tokens; the only bounds are the per-dialog process limit and the
   per-run iteration cap. (Failed operator logins *are* rate limited — see [security.md](security.md).)
-- **Token usage is recorded but not aggregated.** Per-assistant-message counts are stored; there is no cost
-  reporting, per-user total or budget alert.
+- **Token usage is ledgered but not billed.** Every user-attributable LLM call (answer runs, routing,
+  history compaction) lands in the `usage_events` ledger with its origin and entity links; what is still
+  missing is cost reporting in currency and budget alerts. The public MCP skill-generation call has no
+  user to attribute and is not metered.
 - **No metrics endpoint.** No Prometheus surface, no traces; observability is stdout logs plus the operator
   console.
 - **Single writer for everything except cron.** The cron scheduler is safe on several instances (SQL lease),

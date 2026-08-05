@@ -73,6 +73,8 @@ from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool, HttpRequ
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
 from octoforge_core.search.tools import WebSearchTool
+from octoforge_core.tariffs.api import LimitGate, TariffStore, UsageMeter, UsageRecorder
+from octoforge_core.tariffs.service import LimitService
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool, TaskListTool
 from octoforge_core.tools.base import Tool
@@ -153,6 +155,8 @@ class RunnerOptions:
     task_outcome_listener: TaskOutcomeListener | None = None
     vision: VisionClient | None = None
     image_resolver: ImageResolver | None = None
+    # tariff limit checks and usage metering; None = unlimited and unmetered
+    limits: LimitGate | None = None
 
 
 def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMClient:
@@ -333,9 +337,10 @@ def build_compactor(
     archive: MessageArchive,
     llm: LLMClient,
     config: CompactorConfig,
+    meter: UsageRecorder | None = None,
 ) -> ContextCompactor:
     """Build the default context compactor (topics block + hot tail)."""
-    return LlmContextCompactor(store=store, archive=archive, llm=llm, config=config)
+    return LlmContextCompactor(store=store, archive=archive, llm=llm, config=config, meter=meter)
 
 
 def build_router(
@@ -346,6 +351,16 @@ def build_router(
 ) -> MessageRouter:
     """Build the default LLM message router."""
     return LLMRouter(llm, timeout_seconds=timeout_seconds, prompts=prompts)
+
+
+def build_limit_service(tariffs: TariffStore, meter: UsageMeter) -> LimitService:
+    """Build the tariff limit gate over the plan catalog and the usage ledger.
+
+    Always worth wiring: with zero tariff rows every check passes and only
+    the metering side is active, which is what fills the operator's usage
+    view before any plan exists.
+    """
+    return LimitService(tariffs, meter)
 
 
 def build_cron_outcome_reporter(store: CronStore) -> TaskOutcomeListener:
@@ -370,6 +385,7 @@ def build_runner_config(
         task_outcome_listener=options.task_outcome_listener,
         vision=options.vision,
         image_resolver=options.image_resolver,
+        limits=options.limits,
     )
 
 

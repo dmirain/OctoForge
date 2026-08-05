@@ -95,6 +95,13 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished, ToolCallReady
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient
+from octoforge_core.tariffs.api import (
+    FeatureCode,
+    LimitVerdict,
+    UsageEvent,
+    UsageKind,
+    UsageOrigin,
+)
 from octoforge_core.tasks.api import Task, TaskKind, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore, SqlAlchemyTaskStore, TaskStore
 from octoforge_core.tasks.tools import TaskCreateTool, TaskDeleteTool
@@ -174,6 +181,7 @@ class FakeRouter:
         self.cancel_all = False
         self.cancel_one: str | None = None
         self.title: str | None = None
+        self.usage: Usage | None = None
         self.calls: list[tuple[tuple[ExchangeInfo, ...], str]] = []
 
     async def route(
@@ -194,8 +202,9 @@ class FakeRouter:
                 exchange_id=exchanges[0].id,
                 cancel_ids=cancel_ids,
                 title=self.title,
+                usage=self.usage,
             )
-        return RouteDecision(action=self.action, cancel_ids=cancel_ids)
+        return RouteDecision(action=self.action, cancel_ids=cancel_ids, usage=self.usage)
 
     def decide_continue(self, title: str | None = None) -> None:
         """Route the next message into the oldest live exchange (the old INJECT)."""
@@ -305,6 +314,37 @@ class FakeCompactor:
 
     async def aclose(self, dialog_id: str) -> None:
         self.closed.append(dialog_id)
+
+
+class RecordingLimitGate:
+    """LimitGate stub: everything allowed, every ledgered event collected."""
+
+    def __init__(self) -> None:
+        self.events: list[UsageEvent] = []
+
+    async def enabled_features(self, user_id: str) -> frozenset[str] | None:
+        return None
+
+    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
+        return True
+
+    async def check_submit(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def check_run_budget(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def max_cron_jobs(self, user_id: str) -> int | None:
+        return None
+
+    async def max_datasets(self, user_id: str) -> int | None:
+        return None
+
+    async def record(self, event: UsageEvent) -> None:
+        self.events.append(event)
+
+    def by_kind(self, kind: UsageKind) -> list[UsageEvent]:
+        return [event for event in self.events if event.kind is kind]
 
 
 class OverflowLLM:
@@ -576,6 +616,7 @@ class ManagerOptions:
     compactor: ContextCompactor | None = None
     vision: VisionClient | None = None
     image_resolver: ImageResolver | None = None
+    limits: RecordingLimitGate | None = None
     #: How long a claim may go unrefreshed before its owner reads as dead.
     stale_after_seconds: float = CLAIM_STALE_AFTER_SECONDS
 
@@ -599,6 +640,7 @@ def make_manager(
         task_outcome_listener=resolved.listener,
         vision=resolved.vision,
         image_resolver=resolved.image_resolver,
+        limits=resolved.limits,
     )
     return ConversationManager(
         config=config,
@@ -807,6 +849,95 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
     assert assistant.prompt_tokens == PROMPT_TOKENS
     assert assistant.completion_tokens == COMPLETION_TOKENS
     assert assistant.task_id == task.id
+
+
+async def test_submit_and_answer_are_ledgered(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    usage = Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS)
+    gate = RecordingLimitGate()
+    store = SqlAlchemyTaskStore(session_factory)
+    manager = make_manager(
+        UsageLLM([reply()], usage),
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(store=store, limits=gate),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    await collect_until(queue, is_completed)
+
+    (user_event,) = gate.by_kind(UsageKind.USER_MESSAGE)
+    assert user_event.user_id == USER_ID
+    assert user_event.quantity == 1
+    assert user_event.dialog_id == runner.dialog_id
+    (answer,) = gate.by_kind(UsageKind.LLM_ANSWER)
+    task = await single_task(store, runner.dialog_id)
+    assert answer.origin is UsageOrigin.INTERACTIVE
+    assert (answer.prompt_tokens, answer.completion_tokens) == (PROMPT_TOKENS, COMPLETION_TOKENS)
+    assert answer.quantity == 1  # one visible assistant message
+    assert answer.task_id == task.id
+    assert answer.exchange_id == task.exchange_id
+    assert answer.dialog_id == runner.dialog_id
+
+
+async def test_multi_iteration_run_ledgers_the_accumulated_tokens(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The terminal event alone carries only the last iteration's usage; the
+    ledger must hold the sum of every iteration of the run."""
+    usage = Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS)
+    gate = RecordingLimitGate()
+    manager = make_manager(
+        UsageLLM([blocking_call(), reply()], usage),
+        quick_registry(),
+        session_factory,
+        ManagerOptions(limits=gate),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    await collect_until(queue, is_completed)
+
+    (answer,) = gate.by_kind(UsageKind.LLM_ANSWER)
+    assert answer.prompt_tokens == 2 * PROMPT_TOKENS
+    assert answer.completion_tokens == 2 * COMPLETION_TOKENS
+    assert answer.quantity == 1
+
+
+async def test_routing_llm_usage_is_ledgered(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A message routed past a live exchange pays for its routing call."""
+    tool = BlockingTool()
+    router = FakeRouter()
+    router.usage = Usage(prompt_tokens=20, completion_tokens=5)
+    gate = RecordingLimitGate()
+    llm = ScriptedLLM([blocking_call(), reply("second final"), reply("first final")])
+    manager = make_manager(
+        llm,
+        blocking_registry(tool),
+        session_factory,
+        ManagerOptions(router=router, limits=gate),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first")
+    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
+    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit("second")  # a live exchange exists: the router is asked
+    await collect_until(queue, is_delivered("second final"))
+    tool.release.set()
+    await collect_until(queue, is_delivered("first final"))
+
+    (routing,) = gate.by_kind(UsageKind.LLM_ROUTING)
+    assert routing.user_id == USER_ID
+    assert (routing.prompt_tokens, routing.completion_tokens) == (20, 5)
+    assert routing.origin is UsageOrigin.INTERACTIVE
 
 
 async def test_branch_keeps_system_prompt_stable_and_envelopes_last_message(
@@ -1991,6 +2122,33 @@ async def test_wake_runs_cron_tagged_background_process(
     assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
     assert background_request[1].role is MessageRole.USER
     assert background_request[1].content.endswith(CRON_PROMPT)  # date envelope + prompt
+
+
+async def test_a_cron_run_is_ledgered_with_cron_origin(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    usage = Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS)
+    gate = RecordingLimitGate()
+    store = SqlAlchemyTaskStore(session_factory)
+    manager = make_manager(
+        UsageLLM([reply(TASK_RESULT)], usage),
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(store=store, limits=gate),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    assert delivered is WakeOutcome.DELIVERED
+    await collect_until(queue, is_delivered(TASK_RESULT))
+
+    (answer,) = gate.by_kind(UsageKind.LLM_ANSWER)
+    task = await single_task(store, runner.dialog_id)
+    assert answer.origin is UsageOrigin.CRON
+    assert answer.task_id == task.id
+    assert answer.quantity == 1
+    assert gate.by_kind(UsageKind.USER_MESSAGE) == []  # nobody wrote anything
 
 
 async def test_wake_delivers_a_failed_event_for_a_failed_cron_task(

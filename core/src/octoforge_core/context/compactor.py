@@ -35,6 +35,7 @@ from octoforge_core.context.prompts import (
 )
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.ports import LLMClient
+from octoforge_core.tariffs.api import UsageEvent, UsageKind, UsageOrigin, UsageRecorder
 from octoforge_core.time import utc_now
 
 logger = logging.getLogger(__name__)
@@ -104,11 +105,14 @@ class LlmContextCompactor(ContextCompactor):
         archive: MessageArchive,
         llm: LLMClient,
         config: CompactorConfig,
+        meter: UsageRecorder | None = None,
     ) -> None:
         self._store = store
         self._archive = archive
         self._llm = llm
         self._config = config
+        # compaction spends the user's tokens on their behalf; None = unmetered
+        self._meter = meter
         self._running: dict[str, asyncio.Task[None]] = {}
 
     async def assemble(self, dialog: Dialog, history: list[ChatMessage]) -> AssembledContext:
@@ -259,6 +263,17 @@ class LlmContextCompactor(ContextCompactor):
                 ChatMessage(role=MessageRole.USER, content=format_merge_request(previous, segment)),
             ]
         )
+        if self._meter is not None and completion.usage is not None:
+            await self._meter.record(
+                UsageEvent(
+                    user_id=dialog.user_id,
+                    kind=UsageKind.LLM_COMPACTION,
+                    origin=UsageOrigin.INTERACTIVE,
+                    prompt_tokens=completion.usage.prompt_tokens,
+                    completion_tokens=completion.usage.completion_tokens,
+                    dialog_id=dialog.id,
+                )
+            )
         topics, content = parse_summary_reply(completion.message.content)
         seq_from = min([segment[0].seq, *(s.seq_from for s in previous)])
         return DialogueSummary(

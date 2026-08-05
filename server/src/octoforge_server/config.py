@@ -147,6 +147,7 @@ class Settings(BaseSettings):
     retention_messages_days: int = 0
     retention_exchanges_days: int = 0
     retention_tasks_days: int = 0
+    retention_usage_days: int = 0
     llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
     llm_retry_base_seconds: float = DEFAULT_LLM_RETRY_BASE_SECONDS
     llm_retry_max_seconds: float = DEFAULT_LLM_RETRY_MAX_SECONDS
@@ -364,6 +365,7 @@ class Settings(BaseSettings):
             messages_days=self.retention_messages_days or None,
             exchanges_days=self.retention_exchanges_days or None,
             tasks_days=self.retention_tasks_days or None,
+            usage_days=self.retention_usage_days or None,
         )
 
 

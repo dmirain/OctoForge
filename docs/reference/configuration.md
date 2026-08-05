@@ -40,6 +40,7 @@ installation believed it had.
 | `OF_RETENTION_MESSAGES_DAYS` | Age at which a message may be pruned; 0 = keep forever |
 | `OF_RETENTION_EXCHANGES_DAYS` | Age at which a settled exchange may be pruned; 0 = keep forever |
 | `OF_RETENTION_TASKS_DAYS` | Age at which a delivered task may be pruned; 0 = keep forever |
+| `OF_RETENTION_USAGE_DAYS` | Age at which a usage-ledger event may be pruned; 0 = keep forever |
 
 Only transcript-shaped data ages out. Instructions, datasets and their records are things a user
 wrote on purpose — a skill, a memory, a food diary — and retention never touches them.

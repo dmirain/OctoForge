@@ -12,13 +12,14 @@ caller without an LLM call at all; this module is the reasoning fallback.
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
 from octoforge_core.agent.prompts import ROUTER_PROMPT_NAME, PromptProvider
 from octoforge_core.dialogs.api import TITLE_MAX_LENGTH, ExchangeStatus
 from octoforge_core.domain import ChatMessage, MessageRole
+from octoforge_core.llm.usage import Usage
 from octoforge_core.ports import LLMClient
 from octoforge_core.tools.base import ToolSpec
 
@@ -44,12 +45,17 @@ class RouteDecision:
     `title` is the exchange's name rewritten to cover what it is about now
     that this message joined it — set on `continue` only, `None` when the
     router had nothing better to offer than the name already there.
+
+    `usage` carries the routing LLM call's token accounting up to the caller:
+    the router does not know whose message it routes, so attributing the
+    spend to a user is the caller's job. `None` on the deterministic paths.
     """
 
     action: RouteAction = RouteAction.NEW
     exchange_id: str | None = None
     cancel_ids: tuple[str, ...] = ()
     title: str | None = None
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,8 +168,9 @@ class LLMRouter:
         call = next((c for c in reply.tool_calls if c.name == ROUTE_TOOL_NAME), None)
         if call is None:
             logger.warning("router answer carried no %s call; falling back", ROUTE_TOOL_NAME)
-            return RouteDecision()
+            return RouteDecision(usage=completion.usage)
         decision = _parse_decision(call.arguments, {item.id for item in exchanges})
+        decision = replace(decision, usage=completion.usage)
         logger.info(
             "routed: action=%s exchange=%s cancels=%s title=%r candidates=%s",
             decision.action.value,
