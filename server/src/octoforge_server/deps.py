@@ -13,6 +13,7 @@ from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
+from octoforge_core.tariffs.api import TariffStore, UsageMeter
 from octoforge_core.tasks.store import TaskStore
 
 from octoforge_server.auth import AuthGate
@@ -116,6 +117,16 @@ def get_secret_links(request: Request) -> "SecretLinkService":
 def get_user_param_store(request: Request) -> UserParamStore:
     """Return the per-user params store built at startup."""
     return cast(UserParamStore, request.app.state.user_params)
+
+
+def get_tariff_store(request: Request) -> TariffStore:
+    """Return the tariff catalog store built at startup."""
+    return cast(TariffStore, request.app.state.tariff_store)
+
+
+def get_usage_meter(request: Request) -> UsageMeter:
+    """Return the usage ledger built at startup."""
+    return cast(UsageMeter, request.app.state.usage_meter)
 
 
 def get_auth_gate(request: Request) -> AuthGate:

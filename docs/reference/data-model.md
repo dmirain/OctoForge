@@ -21,6 +21,9 @@ and no ORM object ever crosses a module boundary — stores map rows to their mo
 | `secrets` | `secrets/` | Encrypted per-user values with their host binding, required description, allowed placements and optional transform |
 | `user_params` | `params/` | Plaintext per-user values endpoint templates reference as `{user.code}` (timezone, account ids); set by the operator in the console |
 | `secret_form_links` | `secrets/` | Short-lived capability codes for the secrets form, with the prefill the agent put in them; swept when the next code is issued |
+| `tariffs` | `tariffs/` | Operator-defined plans: feature codes plus nullable numeric caps (NULL = unlimited in that dimension) |
+| `user_tariffs` | `tariffs/` | At most one plan binding per user; no row = no restrictions |
+| `usage_events` | `tariffs/` | Insert-only ledger of metered actions: kind, origin, token counts, quantity and the ids of the entities the spend belongs to |
 
 The Telegram invite store is separate: its own declarative base and its own database
 (`OF_TELEGRAM_DATABASE_URL`), holding invite codes and member profiles. On Postgres that is a second
@@ -75,6 +78,8 @@ Isolation is a column plus a predicate, not a layer:
 - `instructions` carry `owner_id` (NULL = public) and `author_id`, with uniqueness on
   `(type, title, owner_id)` plus a partial unique index over public records;
 - `datasets`, `secrets` and `cron_jobs` carry their owner and every query filters by it;
+- `user_tariffs` and `usage_events` carry their user; the ledger is additionally append-only, so
+  concurrent writers on different nodes never contend;
 - `messages` and `exchanges` inherit isolation from their dialog.
 
 The only cross-user reader is the operator console's read model (`admin/`), and it is read-only.

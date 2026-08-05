@@ -23,6 +23,7 @@ from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
+from octoforge_core.tariffs.api import TariffStore, UsageMeter
 from octoforge_core.tasks.store import TaskStore
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -45,6 +46,8 @@ class Runtime:
     secret_store: SecretStore | None
     secret_links: SecretLinkService
     user_params: UserParamStore
+    tariff_store: TariffStore
+    usage_meter: UsageMeter
     dialogs: DialogRepository
     summary_store: SummaryStore
     exchanges: ExchangeRepository

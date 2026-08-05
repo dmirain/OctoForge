@@ -58,6 +58,14 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.instructions.pg_store import PostgresInstructionStore
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
+from octoforge_core.tariffs.api import (
+    FeatureCode,
+    TariffLimits,
+    UsageEvent,
+    UsageKind,
+    UsageOrigin,
+)
+from octoforge_core.tariffs.store import SqlAlchemyTariffStore, SqlAlchemyUsageMeter
 from octoforge_core.time import utc_now
 
 DATABASE_URL_ENV = "OF_TEST_DATABASE_URL"
@@ -845,3 +853,47 @@ async def test_dataset_lexical_search_is_owner_scoped(
     )
 
     assert await store.search_by_text(USER_A, "КБЖУ", limit=SEARCH_LIMIT) == []
+
+
+async def test_tariff_roundtrip_and_assignment(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    token_limit = 1000
+    store = SqlAlchemyTariffStore(session_factory)
+    await store.put(
+        "basic",
+        "Basic",
+        frozenset({FeatureCode.WEB_SEARCH}),
+        TariffLimits(daily_tokens=token_limit),
+    )
+
+    await store.assign(USER_A, "basic")
+    bound = await store.tariff_for_user(USER_A)
+
+    assert bound is not None
+    assert bound.features == {FeatureCode.WEB_SEARCH}
+    assert bound.limits.daily_tokens == token_limit
+    assert await store.tariff_for_user(USER_B) is None
+
+
+async def test_usage_ledger_concurrent_appends_all_land(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two nodes meter the same user concurrently; insert-only must lose nothing."""
+    writers = 10
+    meter = SqlAlchemyUsageMeter(session_factory)
+    since = utc_now() - timedelta(minutes=1)
+    event = UsageEvent(
+        user_id=USER_A,
+        kind=UsageKind.LLM_ANSWER,
+        origin=UsageOrigin.INTERACTIVE,
+        prompt_tokens=10,
+        completion_tokens=5,
+        quantity=1,
+    )
+
+    await asyncio.gather(*(meter.record(event) for _ in range(writers)))
+    totals = await meter.totals_since(USER_A, since)
+
+    assert totals.assistant_messages == writers
+    assert totals.tokens == writers * (event.prompt_tokens + event.completion_tokens)

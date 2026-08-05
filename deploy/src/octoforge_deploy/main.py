@@ -105,6 +105,7 @@ from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.secrets.tools import SecretLinkTool, SecretListTool
 from octoforge_core.speech.api import TranscriptionClient
 from octoforge_core.speech.client import OpenAITranscriptionClient
+from octoforge_core.tariffs.store import SqlAlchemyTariffStore, SqlAlchemyUsageMeter
 from octoforge_core.tools.base import Tool
 from octoforge_core.tools.registry import ToolRegistry
 from octoforge_core.vision.api import ImageResolver, VisionClient
@@ -235,9 +236,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
         SqlAlchemyIdentityStore(session_factory),
     )
     cron_store = SqlAlchemyCronStore(session_factory)
-    secret_store, user_params = (
+    secret_store, user_params, tariff_store, usage_meter = (
         _build_secret_store(settings, session_factory),
         SqlAlchemyUserParamStore(session_factory),
+        SqlAlchemyTariffStore(session_factory),
+        SqlAlchemyUsageMeter(session_factory),
     )
     secret_links = SecretLinkService(
         settings.secrets_key, codes=SqlAlchemySecretFormLinkStore(session_factory)
@@ -427,6 +430,8 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     secret_store=secret_store,
                     secret_links=secret_links,
                     user_params=user_params,
+                    tariff_store=tariff_store,
+                    usage_meter=usage_meter,
                     dialogs=dialogs,
                     summary_store=summary_store,
                     exchanges=exchanges,
