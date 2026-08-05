@@ -275,6 +275,9 @@ NO_JOBS_MESSAGE = "no cron jobs"
 JOB_NOT_FOUND_MESSAGE = "error: cron job not found"
 DELETED_MESSAGE = "deleted cron job {job_id}"
 DUPLICATE_MESSAGE = "already exists: cron job {job_id}"
+QUOTA_MESSAGE = (
+    "the plan allows at most {limit} scheduled jobs; delete one first (task_list / task_delete)"
+)
 PROMPT_PREVIEW_CHARS = 200
 
 TITLE_PARAM: dict[str, Any] = {
@@ -318,19 +321,25 @@ class CronJobDraft:
     one_shot: bool
 
 
-async def create_job(store: CronStore, draft: CronJobDraft) -> str:
+async def create_job(store: CronStore, draft: CronJobDraft, max_jobs: int | None = None) -> str:
     """Create a cron job owned by the user; returns the confirmation text.
 
     Identical jobs are deduplicated: creating the same job twice returns the
-    existing one instead of a second record.
+    existing one instead of a second record — a duplicate is therefore never
+    refused by the quota. `max_jobs` caps the user's job count (None =
+    unlimited); the user's list is fetched once for both checks.
     """
     try:
         next_fire_at = compute_next_fire(draft.schedule, draft.timezone, utc_now())
     except CronScheduleError as exc:
         return f"error: {exc}"
-    duplicate = await _find_duplicate(store, draft)
+    existing = await store.list_for_user(draft.user_id)
+    duplicate = _find_duplicate(existing, draft)
     if duplicate is not None:
         return DUPLICATE_MESSAGE.format(job_id=duplicate.id) + "\n" + format_job(duplicate)
+    refusal = job_quota_refusal(len(existing), max_jobs)
+    if refusal is not None:
+        return refusal
     job = CronJob(
         id=uuid.uuid4().hex,
         user_id=draft.user_id,
@@ -354,9 +363,9 @@ async def create_job(store: CronStore, draft: CronJobDraft) -> str:
     return f"created cron job {stored.id}\n" + format_job(stored)
 
 
-async def _find_duplicate(store: CronStore, draft: CronJobDraft) -> CronJob | None:
+def _find_duplicate(existing: list[CronJob], draft: CronJobDraft) -> CronJob | None:
     """Return the identical existing job, if any (idempotence guard)."""
-    for job in await store.list_for_user(draft.user_id):
+    for job in existing:
         if (
             job.title == draft.title
             and job.schedule == draft.schedule
@@ -365,6 +374,17 @@ async def _find_duplicate(store: CronStore, draft: CronJobDraft) -> CronJob | No
         ):
             return job
     return None
+
+
+def job_quota_refusal(existing_count: int, max_jobs: int | None) -> str | None:
+    """Why a new job may not be created under the plan's cap, or None.
+
+    Shared by the agent tool (via `create_job`) and the HTTP endpoint, so the
+    two entrances enforce the same rule with the same words.
+    """
+    if max_jobs is None or existing_count < max_jobs:
+        return None
+    return QUOTA_MESSAGE.format(limit=max_jobs)
 
 
 def format_job(job: CronJob) -> str:

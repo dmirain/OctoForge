@@ -14,6 +14,7 @@ from octoforge_core.datasets.api import (
     DatasetHit,
     DatasetLexicalSearch,
     DatasetNotFoundError,
+    DatasetQuotaError,
     DatasetRecord,
     DatasetSchema,
     DatasetStore,
@@ -22,6 +23,7 @@ from octoforge_core.datasets.api import (
 )
 from octoforge_core.datasets.ranking import fuse, rank
 from octoforge_core.llm.embeddings import EmbeddingClient
+from octoforge_core.tariffs.api import LimitGate
 
 EMBEDDED_TEXT_SEPARATOR = "\n"
 # Upper bound of rows scanned per query: the store filters the created_at
@@ -37,9 +39,11 @@ class LocalDatasetService:
         self,
         store: DatasetStore,
         embedder: EmbeddingClient,
+        limits: LimitGate | None = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
+        self._limits = limits
 
     async def create_dataset(  # noqa: PLR0913, PLR0917 — facade signature from the module boundary
         self,
@@ -50,11 +54,26 @@ class LocalDatasetService:
         usage_notes: str = "",
         retention: str = "",
     ) -> Dataset:
-        """Embed name + description + usage_notes and insert the descriptor."""
+        """Embed name + description + usage_notes and insert the descriptor.
+
+        The plan cap is checked here so the agent's implicit creation on a
+        first `data_put` goes through the same gate as an explicit one.
+        """
+        await self._check_quota(owner_user_id)
         (embedding,) = await self._embedder.embed((_embedded_text(name, description, usage_notes),))
         return await self._store.create(
             owner_user_id, name, description, schema, usage_notes, retention, embedding
         )
+
+    async def _check_quota(self, owner_user_id: str) -> None:
+        if self._limits is None:
+            return
+        cap = await self._limits.max_datasets(owner_user_id)
+        if cap is None:
+            return
+        existing = len(await self._store.list_with_embeddings(owner_user_id))
+        if existing >= cap:
+            raise DatasetQuotaError(cap)
 
     async def get_dataset(self, owner_user_id: str, name: str) -> Dataset:
         """Return the descriptor of this owner by name."""

@@ -1,6 +1,7 @@
 """Tests for the http_request basic tool."""
 
 from collections.abc import Callable
+from dataclasses import replace
 from http import HTTPStatus
 
 import httpx
@@ -14,6 +15,7 @@ from octoforge_core.net.tools import (
     TRUNCATED_SUFFIX,
     HttpRequestTool,
 )
+from octoforge_core.tariffs.api import FeatureCode
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -189,3 +191,14 @@ async def test_without_an_allowlist_the_open_web_stays_reachable() -> None:
     result = await tool.execute({"method": "GET", "url": "https://anywhere.example/x"}, CTX)
 
     assert RESPONSE_BODY in result
+
+
+async def test_the_tool_is_gated_by_the_plan() -> None:
+    """A plan without http_endpoints hides the tool and refuses a direct call."""
+    tool = make_tool(lambda request: httpx.Response(HTTPStatus.OK, text=RESPONSE_BODY))
+    gated = replace(CTX, enabled_features=frozenset())
+
+    assert tool.visible_to(CTX) is True
+    assert tool.visible_to(gated) is False
+    refused = await tool.execute({"method": "GET", "url": TARGET_URL}, gated)
+    assert refused == f"not available on the current plan: {FeatureCode.HTTP_ENDPOINTS.value}"

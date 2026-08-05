@@ -41,6 +41,7 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.speech.api import AudioData, TranscriptionClient
+from octoforge_core.tariffs.api import FeatureCode, LimitGate, LimitVerdict, UsageEvent
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
 from octoforge_telegram.bridge import RunnerProvider
@@ -76,6 +77,7 @@ from octoforge_telegram.poller import (
     SECRETS_DISABLED_TEXT,
     TEXT_ONLY_NOTICE,
     VOICE_EMPTY_NOTICE,
+    VOICE_PLAN_NOTICE,
     VOICE_TAG,
     VOICE_TOO_SHORT_NOTICE,
     WELCOME_TEXT,
@@ -364,6 +366,7 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
     secrets_link: Callable[[str], str] | None = None,
     vision: VisionClient | None = None,
     speech: TranscriptionClient | None = None,
+    feature_gate: LimitGate | None = None,
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS,
 ) -> TelegramPoller:
     """A poller whose album window is short enough for a test to wait it out."""
@@ -382,6 +385,7 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
             secrets_link=secrets_link,
             vision=vision,
             speech=speech,
+            feature_gate=feature_gate,
             voice_max_seconds=voice_max_seconds,
             album_quiet_seconds=ALBUM_TEST_QUIET_SECONDS,
         ),
@@ -1403,6 +1407,60 @@ class RaisingTranscriptionClient:
 
     async def transcribe(self, audio: AudioData) -> str:
         raise RuntimeError("stt boom")
+
+
+class NoVoiceGate:
+    """LimitGate stub whose plan grants nothing (voice included)."""
+
+    async def enabled_features(self, user_id: str) -> frozenset[str] | None:
+        return frozenset()
+
+    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
+        return False
+
+    async def check_submit(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def check_run_budget(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def max_cron_jobs(self, user_id: str) -> int | None:
+        return None
+
+    async def max_datasets(self, user_id: str) -> int | None:
+        return None
+
+    async def record(self, event: UsageEvent) -> None:
+        return None
+
+
+async def test_a_plan_without_voice_gets_a_notice_and_no_transcription() -> None:
+    """The gate answers before a single byte is downloaded."""
+    client = FakeTelegramClient()
+    speech = FakeTranscriptionClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, speech=speech, feature_gate=NoVoiceGate())
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_voice_update(1))
+
+    assert speech.calls == []  # nothing was transcribed
+    assert client.downloaded_file_ids == []  # nothing was even downloaded
+    assert [text for _, text, _ in client.sent] == [VOICE_PLAN_NOTICE]  # and only this
+    assert bridge.calls == []  # a bare recording carries nothing else to deliver
+
+
+async def test_a_denied_voice_message_still_delivers_its_caption() -> None:
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, speech=FakeTranscriptionClient(), feature_gate=NoVoiceGate())
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_voice_update(1, caption="посмотри меню"))
+
+    assert VOICE_PLAN_NOTICE in [text for _, text, _ in client.sent]
+    (content, _, _) = bridge.calls[0]
+    assert content == "посмотри меню"
 
 
 def make_voice_update(  # noqa: PLR0913, PLR0917 — a test builder mirroring the API shape

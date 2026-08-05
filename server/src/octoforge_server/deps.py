@@ -13,7 +13,7 @@ from octoforge_core.identity.api import IdentityStore
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
-from octoforge_core.tariffs.api import TariffStore, UsageMeter
+from octoforge_core.tariffs.api import LimitGate, TariffStore, UsageMeter
 from octoforge_core.tasks.store import TaskStore
 
 from octoforge_server.auth import AuthGate
@@ -127,6 +127,11 @@ def get_tariff_store(request: Request) -> TariffStore:
 def get_usage_meter(request: Request) -> UsageMeter:
     """Return the usage ledger built at startup."""
     return cast(UsageMeter, request.app.state.usage_meter)
+
+
+def get_limit_gate(request: Request) -> LimitGate:
+    """Return the tariff limit gate built at startup."""
+    return cast(LimitGate, request.app.state.limit_gate)
 
 
 def get_auth_gate(request: Request) -> AuthGate:

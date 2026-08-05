@@ -24,6 +24,7 @@ from octoforge_core.cron.api import (
     format_job,
     prompt_preview,
 )
+from octoforge_core.tariffs.api import LimitGate
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import TaskStore
 from octoforge_core.tools.base import TaskDeleteOutcome, ToolContext, ToolSpec
@@ -90,8 +91,9 @@ NO_SPAWNER_MESSAGE = "task spawning is not available in this context"
 class TaskCreateTool:
     """Creates immediate background tasks (spawner) or cron jobs (schedule)."""
 
-    def __init__(self, cron_store: CronStore) -> None:
+    def __init__(self, cron_store: CronStore, limits: LimitGate | None = None) -> None:
         self._cron_store = cron_store
+        self._limits = limits
 
     @property
     def spec(self) -> ToolSpec:
@@ -125,7 +127,10 @@ class TaskCreateTool:
             timezone=timezone,
             one_shot=arguments.get("one_shot") is True,
         )
-        return await create_job(self._cron_store, draft)
+        max_jobs = (
+            await self._limits.max_cron_jobs(context.user_id) if self._limits is not None else None
+        )
+        return await create_job(self._cron_store, draft, max_jobs=max_jobs)
 
 
 class TaskListTool:

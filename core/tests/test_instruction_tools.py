@@ -1,6 +1,7 @@
 """Tests for the runtime tool adapters over the instructions facade."""
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 
@@ -29,6 +30,7 @@ from octoforge_core.net.external import ExternalCallExecutor
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import CALL_NAME as EXTERNAL_CALL_NAME
 from octoforge_core.net.tools import ExternalCallTool
+from octoforge_core.tariffs.api import FeatureCode
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -378,6 +380,29 @@ async def test_save_skill_defaults_tags_to_empty() -> None:
     await tool.execute({"type": "knowledge", "title": "t", "content": "c"}, CTX)
 
     assert service.saved[0][4] == ()
+
+
+async def test_saving_a_skill_is_gated_by_the_plan() -> None:
+    """The gate is per kind: the same tool still saves knowledge (next test)."""
+    service = FakeInstructionService()
+    tool = InstructionSaveTool(service=service)
+    gated = replace(CTX, enabled_features=frozenset())
+
+    refused = await tool.execute({"type": "skill", "title": "t", "content": "c"}, gated)
+
+    assert refused == f"not available on the current plan: {FeatureCode.SKILL_CREATE.value}"
+    assert service.saved == []
+
+
+async def test_saving_knowledge_passes_the_skill_gate() -> None:
+    service = FakeInstructionService()
+    service.save_result = saved_instruction()
+    tool = InstructionSaveTool(service=service)
+    gated = replace(CTX, enabled_features=frozenset())
+
+    await tool.execute({"type": "knowledge", "title": "t", "content": "c"}, gated)
+
+    assert len(service.saved) == 1
 
 
 @pytest.mark.parametrize(

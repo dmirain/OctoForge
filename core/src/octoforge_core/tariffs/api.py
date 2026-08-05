@@ -23,6 +23,8 @@ from typing import Protocol
 
 CODE_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 MAX_TITLE_CHARS = 256
+# What a tool answers when the caller's plan does not include the feature.
+FEATURE_REFUSAL_TEMPLATE = "not available on the current plan: {feature}"
 
 
 class TariffNotFoundError(Exception):
@@ -155,6 +157,19 @@ class LimitVerdict:
     @classmethod
     def ok(cls) -> "LimitVerdict":
         return cls(allowed=True)
+
+
+def feature_enabled(features: frozenset[str] | None, feature: FeatureCode) -> bool:
+    """Whether a feature set (as carried by `ToolContext`) grants the feature.
+
+    `None` means "no gating at all" — the shape a user without a tariff gets.
+    """
+    return features is None or feature.value in features
+
+
+def feature_refusal(feature: FeatureCode) -> str:
+    """The uniform tool answer for a feature the plan does not include."""
+    return FEATURE_REFUSAL_TEMPLATE.format(feature=feature.value)
 
 
 def normalize_code(raw: str) -> str:

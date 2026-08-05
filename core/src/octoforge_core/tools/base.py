@@ -95,6 +95,9 @@ class ToolContext:
     # re-examines an image of this dialog (None: vision not configured)
     image_inspector: ImageInspector | None = None
     owner_task_id: str | None = None
+    # feature codes the caller's tariff grants, resolved once per run; None
+    # means no gating (plain strings: the tools framework knows no domain)
+    enabled_features: frozenset[str] | None = None
 
 
 class Tool(Protocol):

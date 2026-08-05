@@ -23,6 +23,7 @@ from octoforge_core.mcp.sync import McpToolSync, mirror_title
 from octoforge_core.net.errors import SsrfBlockedError
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.secrets.api import SecretNotFoundError, SecretStore
+from octoforge_core.tariffs.api import FeatureCode, feature_enabled, feature_refusal
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -101,8 +102,14 @@ class McpAddTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(name=NAME, description=DESCRIPTION, parameters_schema=SCHEMA)
 
+    def visible_to(self, context: ToolContext) -> bool:
+        """Hide the tool when the caller's plan does not include MCP servers."""
+        return feature_enabled(context.enabled_features, FeatureCode.MCP_ADD)
+
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Normalize, guard, register (dedup by URL), then mirror the tools."""
+        if not self.visible_to(context):  # defence in depth behind the spec filter
+            return feature_refusal(FeatureCode.MCP_ADD)
         url = _normalize_url(arguments.get("url"))
         try:
             await self._guard.check(url)

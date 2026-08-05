@@ -18,17 +18,20 @@ from octoforge_core.cron.api import (
     CronScheduleError,
     CronStore,
     compute_next_fire,
+    job_quota_refusal,
 )
+from octoforge_core.tariffs.api import LimitGate
 from octoforge_core.time import utc_now
 
 from octoforge_server.api.schemas import CronJobCreateParams, CronJobResponse
-from octoforge_server.deps import get_channel, get_cron_store, get_user_id
+from octoforge_server.deps import get_channel, get_cron_store, get_limit_gate, get_user_id
 
 router = APIRouter(prefix="/api/cron")
 
 StoreDep = Annotated[CronStore, Depends(get_cron_store)]
 UserIdDep = Annotated[str, Depends(get_user_id)]
 ChannelDep = Annotated[str, Depends(get_channel)]
+GateDep = Annotated[LimitGate, Depends(get_limit_gate)]
 
 JOB_NOT_FOUND_DETAIL = "cron job not found"
 
@@ -38,9 +41,20 @@ async def create_job(
     user_id: UserIdDep,
     channel: ChannelDep,
     store: StoreDep,
+    gate: GateDep,
     params: Annotated[CronJobCreateParams, Query()],
 ) -> CronJobResponse:
-    """Create a cron job; the first fire time is computed from now."""
+    """Create a cron job; the first fire time is computed from now.
+
+    The plan's job cap is the same rule the agent tool enforces — the shared
+    `job_quota_refusal` keeps this entrance from being a bypass.
+    """
+    max_jobs = await gate.max_cron_jobs(user_id)
+    if max_jobs is not None:
+        existing = await store.list_for_user(user_id)
+        refusal = job_quota_refusal(len(existing), max_jobs)
+        if refusal is not None:
+            raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=refusal)
     job = CronJob(
         id=uuid.uuid4().hex,
         user_id=user_id,

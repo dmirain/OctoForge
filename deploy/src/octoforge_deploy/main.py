@@ -106,6 +106,7 @@ from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.secrets.tools import SecretLinkTool, SecretListTool
 from octoforge_core.speech.api import TranscriptionClient
 from octoforge_core.speech.client import OpenAITranscriptionClient
+from octoforge_core.tariffs.api import LimitGate
 from octoforge_core.tariffs.store import SqlAlchemyTariffStore, SqlAlchemyUsageMeter
 from octoforge_core.tools.base import Tool
 from octoforge_core.tools.registry import ToolRegistry
@@ -272,6 +273,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             datasets = build_dataset_service(
                 build_dataset_store(session_factory, lexical_search=lexical_backend),
                 embedder,
+                limits=limit_service,
             )
             await _sync_system_skills(instructions, settings)
             # The app's own base URL is allowlisted so tool records can
@@ -323,6 +325,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     ),
                 ),
                 limits=_tool_limits(settings),
+                limit_gate=limit_service,
             )
             admin_tool = await _build_telegram_admin_tool(
                 telegram_settings,
@@ -399,6 +402,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                             ),
                             vision=vision_client,
                             speech=speech_client,
+                            feature_gate=limit_service,
                             admin_tool=admin_tool,
                             identities=identity,
                         ),
@@ -436,6 +440,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     user_params=user_params,
                     tariff_store=tariff_store,
                     usage_meter=usage_meter,
+                    limit_gate=limit_service,
                     dialogs=dialogs,
                     summary_store=summary_store,
                     exchanges=exchanges,
@@ -915,6 +920,8 @@ class _TelegramExtras:
     vision: VisionClient | None = None
     # None: speech-to-text is off, a recording keeps the "text only" notice
     speech: TranscriptionClient | None = None
+    # per-user tariff gate for voice transcription; None = everyone may
+    feature_gate: LimitGate | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,6 +1030,7 @@ def _build_telegram_surface(
             identities=resolved.identities,
             vision=resolved.vision,
             speech=resolved.speech,
+            feature_gate=resolved.feature_gate,
             voice_max_seconds=settings.voice_max_seconds,
         ),
     )

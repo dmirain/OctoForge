@@ -1,5 +1,8 @@
 """Tests for `image_look`: the escape hatch from a one-shot image description."""
 
+from dataclasses import replace
+
+from octoforge_core.tariffs.api import FeatureCode
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.vision.api import VisionUnavailableError
 from octoforge_core.vision.tools import (
@@ -99,3 +102,15 @@ async def test_execute_without_an_inspector_refuses() -> None:
     result = await ImageLookTool().execute({"question": QUESTION}, make_context(None))
 
     assert result == UNAVAILABLE_MESSAGE
+
+
+async def test_the_tool_is_gated_by_the_plan() -> None:
+    """A plan without vision hides the tool even when the dialog could look."""
+    tool = ImageLookTool()
+    inspector = RecordingInspector()
+    gated = replace(make_context(inspector), enabled_features=frozenset())
+
+    assert tool.visible_to(gated) is False
+    refused = await tool.execute({"question": QUESTION}, gated)
+    assert refused == f"not available on the current plan: {FeatureCode.VISION.value}"
+    assert inspector.questions == []

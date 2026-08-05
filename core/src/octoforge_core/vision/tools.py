@@ -9,6 +9,7 @@ actual question — the expensive tier, spent only when it was asked for.
 
 from typing import Any
 
+from octoforge_core.tariffs.api import FeatureCode, feature_enabled, feature_refusal
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.vision.api import VisionUnavailableError
 
@@ -55,10 +56,14 @@ class ImageLookTool:
         )
 
     def visible_to(self, context: ToolContext) -> bool:
-        """Hide the tool entirely when this dialog cannot look at images."""
-        return context.image_inspector is not None
+        """Hidden when this dialog cannot look at images or the plan says no."""
+        return context.image_inspector is not None and feature_enabled(
+            context.enabled_features, FeatureCode.VISION
+        )
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        if not feature_enabled(context.enabled_features, FeatureCode.VISION):
+            return feature_refusal(FeatureCode.VISION)
         if context.image_inspector is None:
             return UNAVAILABLE_MESSAGE
         question = str(arguments.get(QUESTION_PARAM, "")).strip()

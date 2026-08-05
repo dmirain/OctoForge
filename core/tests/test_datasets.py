@@ -16,6 +16,7 @@ from octoforge_core.datasets.api import (
     Dataset,
     DatasetExistsError,
     DatasetNotFoundError,
+    DatasetQuotaError,
     DatasetSchema,
     DatasetService,
     FieldType,
@@ -25,6 +26,7 @@ from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.datasets.validation import parse_schema
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.llm.embeddings import EmbeddingClient
+from octoforge_core.tariffs.api import FeatureCode, LimitVerdict, UsageEvent
 from octoforge_core.time import utc_now
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -372,3 +374,52 @@ async def test_search_blank_query_short_circuits(
 ) -> None:
     assert await service.search(OWNER_A, "   ", k=1) == []
     assert embedder.calls == []
+
+
+class DatasetCapGate:
+    """LimitGate stub with a configurable dataset cap; everything else open."""
+
+    def __init__(self, max_datasets: int | None) -> None:
+        self._max_datasets = max_datasets
+
+    async def enabled_features(self, user_id: str) -> frozenset[str] | None:
+        return None
+
+    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
+        return True
+
+    async def check_submit(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def check_run_budget(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def max_cron_jobs(self, user_id: str) -> int | None:
+        return None
+
+    async def max_datasets(self, user_id: str) -> int | None:
+        return self._max_datasets
+
+    async def record(self, event: UsageEvent) -> None:
+        return None
+
+
+async def test_dataset_creation_refuses_over_the_plans_cap(
+    session_factory: async_sessionmaker[AsyncSession],
+    embedder: StubEmbedder,
+) -> None:
+    service = LocalDatasetService(
+        SqlAlchemyDatasetStore(session_factory), embedder, limits=DatasetCapGate(max_datasets=1)
+    )
+    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, "second", FOOD_DESCRIPTION, V_RIGHT)
+
+    await create_food_dataset(service)
+    with pytest.raises(DatasetQuotaError, match="at most 1 datasets"):
+        await service.create_dataset(OWNER_A, "second", FOOD_DESCRIPTION, DatasetSchema(()))
+
+    # another owner is unaffected, and an unlimited plan (no cap) stays open
+    open_service = LocalDatasetService(
+        SqlAlchemyDatasetStore(session_factory), embedder, limits=DatasetCapGate(max_datasets=None)
+    )
+    await open_service.create_dataset(OWNER_A, "second", FOOD_DESCRIPTION, DatasetSchema(()))

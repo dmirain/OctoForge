@@ -2,9 +2,13 @@
 
 from octoforge_core.search.api import SearchError, SearchResponse, SearchResult
 from octoforge_core.search.tools import WebSearchTool
+from octoforge_core.tariffs.api import FeatureCode
 from octoforge_core.tools.base import ToolContext
 
 CONTEXT = ToolContext(user_id="alice", channel="telegram", dialog_id="dialog-1")
+GATED_CONTEXT = ToolContext(
+    user_id="alice", channel="telegram", dialog_id="dialog-1", enabled_features=frozenset()
+)
 MAX_OUTPUT_WITH_SUFFIX = 4000 + 20
 QUERY = "meaning of life"
 NUM_DEFAULT = 5
@@ -90,3 +94,15 @@ async def test_long_output_is_truncated() -> None:
 
     assert len(result) <= MAX_OUTPUT_WITH_SUFFIX
     assert result.endswith("\n...[truncated]")
+
+
+async def test_the_tool_is_gated_by_the_plan() -> None:
+    """Hidden from the spec list, and refused on a direct call (defence in depth)."""
+    provider = FakeSearchProvider()
+    tool = make_tool(provider)
+
+    assert tool.visible_to(CONTEXT) is True  # no tariff = everything on
+    assert tool.visible_to(GATED_CONTEXT) is False
+    refused = await tool.execute({"query": QUERY}, GATED_CONTEXT)
+    assert refused == f"not available on the current plan: {FeatureCode.WEB_SEARCH.value}"
+    assert provider.calls == []  # the provider was never reached

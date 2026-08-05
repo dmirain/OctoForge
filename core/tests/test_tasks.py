@@ -6,6 +6,7 @@ from datetime import timedelta
 import pytest
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
+from octoforge_core.tariffs.api import FeatureCode, LimitVerdict, UsageEvent
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.tasks.tools import (
@@ -250,6 +251,58 @@ async def test_task_create_with_schedule_is_idempotent_for_an_identical_job() ->
 
     assert "created cron job" in first
     assert "already exists" in second
+    assert len(store.jobs) == 1
+
+
+class CapGate:
+    """LimitGate stub with a configurable cron-job cap; everything else open."""
+
+    def __init__(self, max_cron_jobs: int | None) -> None:
+        self._max_cron_jobs = max_cron_jobs
+
+    async def enabled_features(self, user_id: str) -> frozenset[str] | None:
+        return None
+
+    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
+        return True
+
+    async def check_submit(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def check_run_budget(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def max_cron_jobs(self, user_id: str) -> int | None:
+        return self._max_cron_jobs
+
+    async def max_datasets(self, user_id: str) -> int | None:
+        return None
+
+    async def record(self, event: UsageEvent) -> None:
+        return None
+
+
+async def test_task_create_refuses_over_the_plans_job_cap() -> None:
+    store = FakeCronStore()
+    tool = TaskCreateTool(store, limits=CapGate(max_cron_jobs=1))
+
+    first = await tool.execute(schedule_arguments(), CTX)
+    second = await tool.execute(schedule_arguments(title="evening report"), CTX)
+
+    assert "created cron job" in first
+    assert "at most 1 scheduled jobs" in second
+    assert len(store.jobs) == 1
+
+
+async def test_a_duplicate_job_is_never_refused_by_the_cap() -> None:
+    """Idempotence beats the quota: the identical job answers with itself."""
+    store = FakeCronStore()
+    tool = TaskCreateTool(store, limits=CapGate(max_cron_jobs=1))
+
+    await tool.execute(schedule_arguments(), CTX)
+    repeat = await tool.execute(schedule_arguments(), CTX)
+
+    assert "already exists" in repeat
     assert len(store.jobs) == 1
 
 

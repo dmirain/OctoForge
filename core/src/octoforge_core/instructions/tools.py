@@ -10,6 +10,7 @@ from octoforge_core.instructions.api import (
     InstructionType,
     SearchHit,
 )
+from octoforge_core.tariffs.api import FeatureCode, feature_enabled, feature_refusal
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -219,6 +220,12 @@ class InstructionSaveTool:
         kind = _parse_kind(arguments.get("type"))
         if kind is InstructionType.MEMORY:
             raise ToolArgumentsError("personal memories are saved with memory_store, not here")
+        # gated per kind, not per tool: the same tool saves knowledge, which
+        # every plan keeps
+        if kind is InstructionType.SKILL and not feature_enabled(
+            context.enabled_features, FeatureCode.SKILL_CREATE
+        ):
+            return feature_refusal(FeatureCode.SKILL_CREATE)
         title = arguments.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ToolArgumentsError("title must be a non-empty string")

@@ -254,9 +254,13 @@ def build_instruction_service(
     )
 
 
-def build_dataset_service(store: DatasetStore, embedder: EmbeddingClient) -> DatasetService:
+def build_dataset_service(
+    store: DatasetStore,
+    embedder: EmbeddingClient,
+    limits: LimitGate | None = None,
+) -> DatasetService:
     """Build the default datasets facade over the given store and embedder."""
-    return LocalDatasetService(store, embedder)
+    return LocalDatasetService(store, embedder, limits=limits)
 
 
 def build_external_executor(
@@ -280,12 +284,13 @@ def build_external_executor(
     )
 
 
-def build_tool_registry(
+def build_tool_registry(  # noqa: PLR0913, PLR0917 — the composition facade takes every port
     outbound_http: httpx.AsyncClient,
     guard: SsrfGuard,
     stores: ToolStores,
     services: ToolServices,
     limits: ToolLimits,
+    limit_gate: LimitGate | None = None,
 ) -> ToolRegistry:
     """Build the registry with the full set of code tools.
 
@@ -297,7 +302,7 @@ def build_tool_registry(
     needed here.
     """
     registry = ToolRegistry()
-    _register_core_tools(registry, outbound_http, guard, stores, limits)
+    _register_core_tools(registry, outbound_http, guard, stores, limits, limit_gate)
     registry.register(ImageLookTool())
     if services.search_provider is not None:
         registry.register(WebSearchTool(provider=services.search_provider))
@@ -427,12 +432,13 @@ def build_collecting_sweeper(
     )
 
 
-def _register_core_tools(
+def _register_core_tools(  # noqa: PLR0913, PLR0917 — internal registrar mirroring the facade
     registry: ToolRegistry,
     outbound_http: httpx.AsyncClient,
     guard: SsrfGuard,
     stores: ToolStores,
     limits: ToolLimits,
+    limit_gate: LimitGate | None = None,
 ) -> None:
     """Register the HTTP and deferred-work (task/cron) tools."""
     registry.register(
@@ -443,7 +449,7 @@ def _register_core_tools(
         )
     )
     registry.register(AskUserTool())
-    registry.register(TaskCreateTool(cron_store=stores.cron))
+    registry.register(TaskCreateTool(cron_store=stores.cron, limits=limit_gate))
     registry.register(TaskListTool(store=stores.tasks, cron_store=stores.cron))
     registry.register(TaskDeleteTool(store=stores.tasks, cron_store=stores.cron))
     registry.register(CronPauseTool(store=stores.cron))

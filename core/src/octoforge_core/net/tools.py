@@ -14,6 +14,7 @@ from octoforge_core.instructions.api import (
 from octoforge_core.net.errors import EgressBlockedError
 from octoforge_core.net.external import ExternalCallExecutor, read_capped_text
 from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
+from octoforge_core.tariffs.api import FeatureCode, feature_enabled, feature_refusal
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -209,8 +210,14 @@ class HttpRequestTool:
             parameters_schema=REQUEST_SCHEMA,
         )
 
+    def visible_to(self, context: ToolContext) -> bool:
+        """Hide the tool when the caller's plan does not include HTTP calls."""
+        return feature_enabled(context.enabled_features, FeatureCode.HTTP_ENDPOINTS)
+
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, perform the request and format the response."""
+        if not self.visible_to(context):  # defence in depth behind the spec filter
+            return feature_refusal(FeatureCode.HTTP_ENDPOINTS)
         params = HttpRequestParams.from_arguments(arguments)
         self._check_allowed(params.url)
         await self._guard.check(params.url)
@@ -291,8 +298,14 @@ class ExternalCallTool:
             parameters_schema=CALL_SCHEMA,
         )
 
+    def visible_to(self, context: ToolContext) -> bool:
+        """Hide the tool when the caller's plan does not include HTTP calls."""
+        return feature_enabled(context.enabled_features, FeatureCode.HTTP_ENDPOINTS)
+
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         """Validate arguments, run the call and format status + body."""
+        if not self.visible_to(context):  # defence in depth behind the spec filter
+            return feature_refusal(FeatureCode.HTTP_ENDPOINTS)
         name = arguments.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ToolArgumentsError("name must be a non-empty string")

@@ -3,6 +3,7 @@
 from typing import Any
 
 from octoforge_core.search.api import SearchError, SearchProvider, SearchResponse
+from octoforge_core.tariffs.api import FeatureCode, feature_enabled, feature_refusal
 from octoforge_core.tools.base import ToolContext, ToolSpec
 
 DEFAULT_NUM_RESULTS = 5
@@ -45,7 +46,13 @@ class WebSearchTool:
             parameters_schema=PARAMETERS_SCHEMA,
         )
 
+    def visible_to(self, context: ToolContext) -> bool:
+        """Hide the tool when the caller's plan does not include web search."""
+        return feature_enabled(context.enabled_features, FeatureCode.WEB_SEARCH)
+
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        if not self.visible_to(context):  # defence in depth behind the spec filter
+            return feature_refusal(FeatureCode.WEB_SEARCH)
         query = str(arguments["query"])
         num_results = _num_results(arguments.get("num_results"))
         try:

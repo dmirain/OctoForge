@@ -13,6 +13,7 @@ from octoforge_core.agent.runner import ConversationRunner
 from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
 from octoforge_core.identity.api import IdentityStore
 from octoforge_core.speech.api import AudioData, TranscriptionClient
+from octoforge_core.tariffs.api import FeatureCode, LimitGate
 from octoforge_core.vision.api import ImageData, VisionClient
 
 from octoforge_telegram.bridge import RunnerProvider, TelegramBridge, TelegramBridgeOptions
@@ -132,6 +133,7 @@ VOICE_TOO_LONG_TEMPLATE = (
     "Пришли фрагмент короче или напиши текстом."
 )
 VOICE_EMPTY_NOTICE = "Я не разобрал, что сказано в записи. Напиши текстом или запиши ещё раз?"
+VOICE_PLAN_NOTICE = "Распознавание голосовых не входит в твой тариф — напиши, пожалуйста, текстом."
 SECRETS_LINK_TEXT = (
     "Ссылка на форму секретов (действует 10 минут):\n{url}\n\n"
     "Значения шифруются, ассистент видит только коды секретов. "
@@ -336,6 +338,8 @@ class TelegramPollerOptions:
     # transcribes voice messages; None turns the feature off entirely (a
     # recording keeps today's "text only" notice, zero extra cost)
     speech: TranscriptionClient | None = None
+    # per-user tariff gate for voice transcription; None = everyone may
+    feature_gate: LimitGate | None = None
     # how long an album's burst must stay quiet before it is submitted
     album_quiet_seconds: float = ALBUM_QUIET_SECONDS
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
@@ -360,6 +364,7 @@ class TelegramPoller:
         self._identities = options.identities
         self._vision = options.vision
         self._speech = options.speech
+        self._feature_gate = options.feature_gate
         self._album_quiet_seconds = options.album_quiet_seconds
         self._voice_max_seconds = options.voice_max_seconds
         self._offset: int | None = None
@@ -677,6 +682,14 @@ class TelegramPoller:
         than the cap, which would also eat the day's transcription quota.
         """
         assert self._speech is not None  # only called when the caller already checked
+        if not await self._voice_allowed(user_id):
+            # before any byte is downloaded, like the duration guards below; a
+            # caption still reaches the dialog as text, a bare recording ends
+            # at the notice (a second "text only" note would just be noise)
+            await self._client.send_message(chat_id, VOICE_PLAN_NOTICE)
+            if message.body is not None:
+                await self._dispatch_plain_or_notice(message, user_id, chat_id)
+            return
         refusal = self._voice_refusal(audio)
         if refusal is not None:
             await self._client.send_message(chat_id, refusal)
@@ -714,6 +727,12 @@ class TelegramPoller:
                 Attachment(kind=AttachmentKind.AUDIO, ref=f"{REF_PREFIX}{audio.file_id}"),
             ),
         )
+
+    async def _voice_allowed(self, user_id: str) -> bool:
+        """Whether the user's plan includes voice transcription."""
+        if self._feature_gate is None:
+            return True
+        return await self._feature_gate.allows(user_id, FeatureCode.VOICE_TRANSCRIPTION)
 
     def _voice_refusal(self, audio: TelegramAudioRef) -> str | None:
         """Why this recording will not be transcribed, or None to go ahead."""

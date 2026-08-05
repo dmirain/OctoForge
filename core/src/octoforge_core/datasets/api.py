@@ -46,6 +46,16 @@ class DatasetSchemaError(Exception):
     """Raised when a dataset schema fails to parse at creation time."""
 
 
+class DatasetQuotaError(Exception):
+    """Raised when creating a dataset would exceed the owner's plan cap."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        super().__init__(
+            f"the plan allows at most {limit} datasets; delete one first (data_forget)"
+        )
+
+
 class DatasetRecordValidationError(Exception):
     """Raised when a record payload violates the dataset schema."""
 

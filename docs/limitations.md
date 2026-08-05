@@ -58,9 +58,13 @@ delivered. Scrollback comes from stored messages, not from replaying the stream.
 
 ### Operations
 
-- **No rate limiting and no quotas** on *usage* — per user or per installation. Nothing stops one dialog from
-  spending an unbounded amount of provider tokens; the only bounds are the per-dialog process limit and the
-  per-run iteration cap. (Failed operator logins *are* rate limited — see [security.md](security.md).)
+- **Quotas are daily plan limits, not rate limiting.** A tariff (see
+  [reference/data-model.md](reference/data-model.md)) can cap tokens and messages per UTC day, feature
+  access, and the number of cron jobs and datasets — but there is no per-minute throttling, and a user
+  without a tariff is unlimited. Enforcement is check-then-consume: the run admitted last before
+  exhaustion completes in full, and two nodes may each admit one run at the boundary — the limits are
+  guardrails, not accounting. A tariff change applies from the user's next run. Deferred caps: dataset
+  records, skills, secrets. (Failed operator logins *are* rate limited — see [security.md](security.md).)
 - **Token usage is ledgered but not billed.** Every user-attributable LLM call (answer runs, routing,
   history compaction) lands in the `usage_events` ledger with its origin and entity links; what is still
   missing is cost reporting in currency and budget alerts. The public MCP skill-generation call has no

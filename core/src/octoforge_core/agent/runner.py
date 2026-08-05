@@ -73,7 +73,13 @@ from octoforge_core.domain import (
 )
 from octoforge_core.llm.errors import ContextOverflowError
 from octoforge_core.llm.usage import Usage
-from octoforge_core.tariffs.api import LimitGate, UsageEvent, UsageKind, UsageOrigin
+from octoforge_core.tariffs.api import (
+    LimitGate,
+    LimitVerdict,
+    UsageEvent,
+    UsageKind,
+    UsageOrigin,
+)
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import TaskList, TaskStore
 from octoforge_core.time import utc_now
@@ -119,6 +125,18 @@ PROCESS_LIMIT_NOTICE_TEMPLATE = (
 CRON_LIMIT_NOTICE_TEMPLATE = (
     "Cron job '{title}' could not start: the process limit ({limit}) is reached. "
     "Active processes: {titles}."
+)
+TARIFF_LIMIT_NOTICE_TEMPLATE = (
+    "I cannot take this message: the daily limit of your plan is exhausted "
+    "({reason}: {used}/{limit}). The counter resets at midnight UTC."
+)
+TARIFF_CRON_LIMIT_NOTICE_TEMPLATE = (
+    "Scheduled run '{title}' was skipped: the daily limit of your plan is exhausted "
+    "({reason}: {used}/{limit}). It will fire again after midnight UTC."
+)
+TARIFF_SPAWN_REFUSAL_TEMPLATE = (
+    "cannot start a background task: the daily limit of the user's plan is exhausted "
+    "({reason}: {used}/{limit}) — tell the user and stop"
 )
 SPAWNED_TEMPLATE = "task {task_id} spawned"
 SUBMIT_FAILED_ERROR = "your message could not be saved — please send it again"
@@ -582,6 +600,9 @@ class ConversationRunner:
         self._exchanges = exchanges
         self._narrative = history
         self._processes: dict[str, _Process] = {}
+        # (cron job id -> UTC day) of tariff-limit notes already sent, so an
+        # exhausted budget does not repeat the note on every lease retry
+        self._tariff_notes: dict[str, str] = {}
         self._pending_deliveries: deque[_Delivery] = deque()
         # serializes the limit-check → process-create sequence between the
         # actor (`_apply_start_new`) and direct callers (`spawn_task`/`wake`),
@@ -693,6 +714,11 @@ class ConversationRunner:
 
     async def spawn_task(self, title: str, prompt: str) -> str:
         """Create a RUN task with its background process; refuse when the limit is hit."""
+        budget = await self._run_budget_verdict()
+        if budget is not None:
+            return TARIFF_SPAWN_REFUSAL_TEMPLATE.format(
+                reason=budget.reason, used=budget.used, limit=budget.limit
+            )
         async with self._spawn_lock:
             if len(self._processes) >= self._max_processes:
                 return self._spawn_refusal()
@@ -711,6 +737,10 @@ class ConversationRunner:
         so the caller (the scheduler) can tell a real delivery from a
         limit-skip and avoid advancing the job's schedule on a skip.
         """
+        budget = await self._run_budget_verdict()
+        if budget is not None:
+            await self._publish_tariff_cron_note(title, cron_job_id, budget)
+            return False
         async with self._spawn_lock:
             over_limit = len(self._processes) >= self._max_processes
             if not over_limit:
@@ -721,6 +751,31 @@ class ConversationRunner:
         if over_limit:
             await self._publish_cron_limit_note(title)
         return not over_limit
+
+    async def _run_budget_verdict(self) -> LimitVerdict | None:
+        """The refusing verdict of the plan's run budget, or None to go ahead."""
+        if self._limits is None:
+            return None
+        verdict = await self._limits.check_run_budget(self._dialog.user_id)
+        return None if verdict.allowed else verdict
+
+    async def _publish_tariff_cron_note(
+        self, title: str, cron_job_id: str, verdict: LimitVerdict
+    ) -> None:
+        """Notify once per (job, day): the lease retries all day otherwise.
+
+        In-memory on purpose — after a restart the user gets at most one
+        extra note, which is not worth a column.
+        """
+        day = utc_now().strftime("%Y-%m-%d")
+        if self._tariff_notes.get(cron_job_id) == day:
+            return
+        self._tariff_notes[cron_job_id] = day
+        await self._deliver_notice(
+            TARIFF_CRON_LIMIT_NOTICE_TEMPLATE.format(
+                title=title, reason=verdict.reason, used=verdict.used, limit=verdict.limit
+            )
+        )
 
     async def delete_task(self, task_id: str) -> TaskDeleteOutcome:
         """Stop a live task process so it reaches a terminal state.
@@ -1070,15 +1125,41 @@ class ConversationRunner:
         # the routed/narrative copy carries its row id: the answer task links
         # back to it via source_message_id
         message = replace(message, id=message_id)
-        await self._record_user_message()
         if message.kind is MessageKind.MATERIAL:
+            # a forward owes nothing and starts no run, so it is never
+            # refused — but it is stored and counted like any other message
+            await self._record_user_message()
             await self._collect_material(message, command)
             return
+        if not await self._admit_submit(message):
+            return  # the message stays in the narrative; no exchange, no run
+        await self._record_user_message()
         # one read serves both the routing decision and the nudge after it
         live = await self._exchanges.list_live(self._dialog.id)
         decision = await self._route(message, command, live)
         await self._record_routing(decision.usage)
         await self._apply_route(message, decision, command, live)
+
+    async def _admit_submit(self, message: ChatMessage) -> bool:
+        """Check the plan's daily budget; deliver the refusal notice when spent.
+
+        Checked before the message is counted: with a limit of N the N-th
+        message is still answered, the N+1-th gets the notice. The refused
+        message joins the in-memory narrative before the notice — it is
+        already persisted, and the two copies of the story must not diverge.
+        """
+        if self._limits is None:
+            return True
+        verdict = await self._limits.check_submit(self._dialog.user_id)
+        if verdict.allowed:
+            return True
+        self._narrative.append(message)
+        await self._deliver_notice(
+            TARIFF_LIMIT_NOTICE_TEMPLATE.format(
+                reason=verdict.reason, used=verdict.used, limit=verdict.limit
+            )
+        )
+        return False
 
     async def _record_user_message(self) -> None:
         """Ledger one persisted user message (duplicates never get here)."""
@@ -2226,6 +2307,14 @@ class ConversationRunner:
 
     async def _stream_once(self, process: _Process) -> LoopEvent:
         """Run the loop once, streaming an answer run's events under its exchange tag."""
+        # resolved once per run (the registry's visible_to is sync and the
+        # tool list must stay stable for prompt caching); a tariff change
+        # therefore applies from the next run
+        features = (
+            await self._limits.enabled_features(self._dialog.user_id)
+            if self._limits is not None
+            else None
+        )
         context = ToolContext(
             user_id=self._dialog.user_id,
             channel=self._dialog.channel,
@@ -2235,6 +2324,7 @@ class ConversationRunner:
             user_prompter=_DialogUserPrompter(self, process.id),
             image_inspector=_DialogImageInspector(self) if self._can_see_images else None,
             owner_task_id=process.task_id,
+            enabled_features=features,
         )
         terminal: LoopEvent = Failed(error="loop ended without a terminal event")
         try:

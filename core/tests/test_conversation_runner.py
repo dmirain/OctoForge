@@ -317,22 +317,25 @@ class FakeCompactor:
 
 
 class RecordingLimitGate:
-    """LimitGate stub: everything allowed, every ledgered event collected."""
+    """LimitGate stub: allows by default, refusals scripted, events collected."""
 
     def __init__(self) -> None:
         self.events: list[UsageEvent] = []
+        self.submit_verdict = LimitVerdict.ok()
+        self.run_verdict = LimitVerdict.ok()
+        self.features: frozenset[str] | None = None
 
     async def enabled_features(self, user_id: str) -> frozenset[str] | None:
-        return None
+        return self.features
 
     async def allows(self, user_id: str, feature: FeatureCode) -> bool:
-        return True
+        return self.features is None or feature.value in self.features
 
     async def check_submit(self, user_id: str) -> LimitVerdict:
-        return LimitVerdict.ok()
+        return self.submit_verdict
 
     async def check_run_budget(self, user_id: str) -> LimitVerdict:
-        return LimitVerdict.ok()
+        return self.run_verdict
 
     async def max_cron_jobs(self, user_id: str) -> int | None:
         return None
@@ -2122,6 +2125,117 @@ async def test_wake_runs_cron_tagged_background_process(
     assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
     assert background_request[1].role is MessageRole.USER
     assert background_request[1].content.endswith(CRON_PROMPT)  # date envelope + prompt
+
+
+EXHAUSTED = LimitVerdict(allowed=False, reason="daily_tokens", used=1000, limit=1000)
+
+
+async def test_exhausted_budget_refuses_a_submit_with_a_notice(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The message stays in the narrative, but no exchange or run is created."""
+    gate = RecordingLimitGate()
+    gate.submit_verdict = EXHAUSTED
+    store = SqlAlchemyTaskStore(session_factory)
+    llm = ScriptedLLM([])  # any LLM call would pop an empty script and fail
+    manager = make_manager(
+        llm, ToolRegistry(), session_factory, ManagerOptions(store=store, limits=gate)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    events = await collect_until(
+        queue,
+        lambda e: isinstance(e.payload, Finished),  # the notice delivery
+    )
+
+    notice = next(e.payload for e in events if isinstance(e.payload, Finished))
+    assert "daily limit of your plan is exhausted" in notice.message.content
+    assert "daily_tokens: 1000/1000" in notice.message.content
+    assert next(m.content for m in runner.history()) == "hi"  # persisted, not lost
+    assert await store.list(runner.dialog_id) == []  # no run was started
+    assert await SqlAlchemyExchangeRepository(session_factory).list_live(runner.dialog_id) == []
+    assert gate.by_kind(UsageKind.USER_MESSAGE) == []  # a refused message is not counted
+
+
+async def test_exhausted_budget_skips_a_cron_wake_with_one_note_per_day(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    gate = RecordingLimitGate()
+    gate.run_verdict = EXHAUSTED
+    store = SqlAlchemyTaskStore(session_factory)
+    manager = make_manager(
+        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store, limits=gate)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    first = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    events = await collect_until(queue, lambda e: isinstance(e.payload, Finished))
+    second = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+
+    assert first is WakeOutcome.LIMITED
+    assert second is WakeOutcome.LIMITED
+    assert await store.list(runner.dialog_id) == []
+    notes = [e.payload.message.content for e in events if isinstance(e.payload, Finished)] + [
+        m.content for m in runner.history() if CRON_TITLE in m.content
+    ]
+    assert any("was skipped" in note for note in notes)
+    # the second wake the same day stays silent: one note per (job, day)
+    skipped_notes = [m for m in runner.history() if "was skipped" in m.content]
+    assert len(skipped_notes) == 1
+
+
+async def test_exhausted_budget_refuses_spawn_task_with_text(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    gate = RecordingLimitGate()
+    gate.run_verdict = EXHAUSTED
+    store = SqlAlchemyTaskStore(session_factory)
+    manager = make_manager(
+        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store, limits=gate)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    refusal = await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
+
+    assert "daily limit of the user's plan is exhausted" in refusal
+    assert await store.list(runner.dialog_id) == []
+
+
+async def test_enabled_features_reach_the_tool_context(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A gated tool disappears from the specs the run offers the model."""
+    gate = RecordingLimitGate()
+    gate.features = frozenset()  # a plan with no optional features at all
+    seen_specs: list[str] = []
+
+    class SpyTool:
+        @property
+        def spec(self) -> ToolSpec:
+            return ToolSpec(name="spy", description="records visibility", parameters_schema={})
+
+        def visible_to(self, context: ToolContext) -> bool:
+            seen_specs.append(str(context.enabled_features))
+            return True
+
+        async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
+            return "ok"
+
+    registry = ToolRegistry()
+    registry.register(SpyTool())
+    manager = make_manager(
+        ScriptedLLM([reply()]), registry, session_factory, ManagerOptions(limits=gate)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    await collect_until(queue, is_completed)
+
+    assert seen_specs == ["frozenset()"]
 
 
 async def test_a_cron_run_is_ledgered_with_cron_origin(
