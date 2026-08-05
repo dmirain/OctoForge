@@ -73,6 +73,28 @@ SAVE_DESCRIPTION = (
     "(type, title) updates the published record for everyone. "
     "Personal facts about the user are not instructions: save them with memory_store."
 )
+# What the model needs to write a WORKING endpoint record. It is in the tool
+# description, not a skill, because a record is authored blind: the contract
+# it produces is only exercised later, and until 2026-08-05 the failures were
+# silent (invented field names, a path escaped into %2F, a host it could not
+# express). Each line below is one of those failures.
+ENDPOINT_CONTRACT_HINT = (
+    "An endpoint's content is a JSON contract with these fields and no others "
+    "(unknown ones are refused): method, url_template, params_schema, headers, "
+    "body_template, auth (plus free-form notes/description). "
+    "Placeholders work in url_template, body_template and header values: "
+    "{param} is declared in params_schema, {user.code} is a per-user value an "
+    "operator set, {secret.code} is a per-user secret — you see the name, never "
+    'the value. Declare a secret as auth {"secret": "<code>", "format": '
+    '"Bearer {value}"} or write {secret.<code>} into a header; auth "basic"/'
+    '"bearer" as a bare word attaches NOTHING. params_schema types: "string" — '
+    'one path segment, slashes escaped; "path" — several segments, slashes '
+    'kept (what a CalDAV/discovery href needs); "host" — a hostname, requires '
+    '"hosts": ["*.example.com"] and is the only type allowed where the URL\'s '
+    "host stands, which is how a contract follows a service across sibling "
+    "hosts instead of hard-coding one user's shard. Check secret_list for the "
+    "codes a user actually has."
+)
 SAVED_TEMPLATE = "instruction saved: [{kind}] {title} (version {version})"
 # memory records are written through memory_store, never through this tool
 SAVABLE_KINDS = tuple(kind for kind in InstructionType if kind is not InstructionType.MEMORY)
@@ -85,7 +107,10 @@ SAVE_SCHEMA: dict[str, Any] = {
             "description": "Instruction kind",
         },
         "title": {"type": "string", "description": "Unique (per type) instruction title"},
-        "content": {"type": "string", "description": "Instruction body"},
+        "content": {
+            "type": "string",
+            "description": f"Instruction body. {ENDPOINT_CONTRACT_HINT}",
+        },
         "tags": {
             "type": "array",
             "items": {"type": "string"},

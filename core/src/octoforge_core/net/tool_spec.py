@@ -51,9 +51,15 @@ import re
 import string
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from octoforge_core.net.errors import ToolSpecError
+
+# Host patterns are the secrets module's grammar (`api.example.com` or
+# `*.example.com`), reused rather than reinvented: a record author who has
+# bound a secret to a host already knows it.
+from octoforge_core.secrets.api import InvalidSecretError, normalize_host
 
 # The WebDAV verbs (RFC 4918/3253, CalDAV's MKCALENDAR) are as safe as the
 # classic ones: the SSRF guard checks the address, not the method, and write
@@ -76,7 +82,6 @@ ALLOWED_METHODS = (
     "COPY",
     "MOVE",
 )
-SUPPORTED_PARAM_TYPE = "string"
 DEFAULT_AUTH = "none"
 DEFAULT_SECRET_HEADER = "Authorization"
 DEFAULT_SECRET_FORMAT = "Bearer {value}"
@@ -97,11 +102,36 @@ KNOWN_KEYS = SPEC_KEYS | ANNOTATION_KEYS
 REF_CODE_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 
 
+class ParamKind(StrEnum):
+    """What a declared parameter may carry, and how it is escaped.
+
+    A narrow vocabulary rather than one free-form URL: the model fills
+    obvious slots, and each slot has its own check. The record always writes
+    the scheme, so no parameter can choose the protocol.
+    """
+
+    # one path segment: every reserved character is escaped, slashes included
+    STRING = "string"
+    # several path segments: each is escaped, the slashes between them survive.
+    # Discovery protocols (CalDAV, CardDAV) hand back paths, and a `string`
+    # turns `a/b/` into `a%2Fb%2F`, which the far side answers 401/404 to.
+    PATH = "path"
+    # a hostname, and only one the record's `hosts` allowlist covers. This is
+    # what lets a contract follow a service that shards across sibling hosts
+    # (iCloud answers on p54-caldav.icloud.com after discovery) without
+    # letting the model name the destination itself.
+    HOST = "host"
+
+
 @dataclass(frozen=True, slots=True)
 class ToolParamSpec:
     """One declared parameter of a tool call."""
 
     required: bool
+    kind: ParamKind = ParamKind.STRING
+    # for HOST params: the patterns the value must match (exact hostnames or
+    # `*.example.com`, the same grammar a secret's binding uses)
+    hosts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,7 +259,7 @@ def parse_tool_spec(content: str) -> ToolSpec:
     else:
         raise ToolSpecError("auth must be a string or a secret declaration object")
     _validate_template_fields("url_template", url_template, params)
-    _validate_no_secret_in_host(url_template)
+    _validate_url_authority(url_template, params)
     if body_template is not None:
         _validate_template_fields("body_template", body_template, params)
     for name, value in headers.items():
@@ -368,12 +398,42 @@ def _parse_param_name(raw: object) -> str:
 def _parse_param(name: str, raw: object) -> ToolParamSpec:
     if not isinstance(raw, dict):
         raise ToolSpecError(f"params_schema[{name!r}] must be an object")
-    if raw.get("type") != SUPPORTED_PARAM_TYPE:
-        raise ToolSpecError(f"params_schema[{name!r}]: only 'string' params are supported")
+    try:
+        kind = ParamKind(str(raw.get("type")))
+    except ValueError:
+        allowed = ", ".join(member.value for member in ParamKind)
+        raise ToolSpecError(f"params_schema[{name!r}].type must be one of: {allowed}") from None
     required = raw.get("required", False)
     if not isinstance(required, bool):
         raise ToolSpecError(f"params_schema[{name!r}].required must be a boolean")
-    return ToolParamSpec(required=required)
+    return ToolParamSpec(required=required, kind=kind, hosts=_parse_param_hosts(name, raw, kind))
+
+
+def _parse_param_hosts(name: str, raw: dict[str, object], kind: ParamKind) -> tuple[str, ...]:
+    """The allowlist a `host` param is confined to; nothing else takes one."""
+    declared = raw.get("hosts")
+    if kind is not ParamKind.HOST:
+        if declared is not None:
+            raise ToolSpecError(
+                f"params_schema[{name!r}]: 'hosts' belongs to a 'host' param, not {kind.value!r}"
+            )
+        return ()
+    if not isinstance(declared, list) or not declared:
+        raise ToolSpecError(
+            f"params_schema[{name!r}]: a 'host' param must declare a non-empty 'hosts' "
+            'allowlist, e.g. ["*.icloud.com"] — the record names where it may go, '
+            "never the caller"
+        )
+    patterns: list[str] = []
+    for item in declared:
+        if not isinstance(item, str):
+            raise ToolSpecError(f"params_schema[{name!r}].hosts must be strings")
+        try:
+            # the same grammar a secret's binding uses, so an author learns it once
+            patterns.append(normalize_host(item))
+        except InvalidSecretError as exc:
+            raise ToolSpecError(f"params_schema[{name!r}].hosts: {exc}") from None
+    return tuple(patterns)
 
 
 def _validate_template_fields(label: str, template: str, params: dict[str, ToolParamSpec]) -> None:
@@ -391,15 +451,32 @@ def _validate_template_fields(label: str, template: str, params: dict[str, ToolP
             raise ToolSpecError(f"{label} parameter must be required: {field_name!r}")
 
 
-def _validate_no_secret_in_host(url_template: str) -> None:
-    """A secret may never form the URL's scheme or host.
+def _validate_url_authority(url_template: str, params: dict[str, ToolParamSpec]) -> None:
+    """Police what may appear in the URL's scheme and host.
 
-    The host decides where the request goes and what the SSRF guard and the
-    secret's own host binding check; a placeholder there would make the
-    binding check a value the secret itself produced.
+    That prefix decides where the request goes, and it is what the SSRF
+    guard and a secret's host binding judge. So:
+
+    - a secret may never appear there — the binding check would be judging a
+      value the secret itself produced;
+    - a model-supplied parameter may appear there only as a `host` param,
+      whose allowlist the RECORD wrote. A plain `string`/`path` there would
+      let the caller name the destination outright.
+
+    A `{user.*}` value is allowed: an operator set it, and an operator can
+    write any URL into the record anyway.
     """
     scheme_end = url_template.find("://")
     path_start = url_template.find("/", scheme_end + 3 if scheme_end >= 0 else 0)
     prefix = url_template if path_start < 0 else url_template[:path_start]
-    if f"{{{SECRET_NAMESPACE}." in prefix:
+    refs = collect_refs(prefix)
+    if refs.secrets:
         raise ToolSpecError("a secret placeholder cannot appear in the URL scheme or host")
+    for field_name in sorted(refs.params):
+        param = params.get(field_name)
+        if param is not None and param.kind is not ParamKind.HOST:
+            raise ToolSpecError(
+                f"url_template puts {field_name!r} in the host, but it is a "
+                f"{param.kind.value!r} param: only a 'host' param (with its own "
+                "'hosts' allowlist) may decide where the request goes"
+            )

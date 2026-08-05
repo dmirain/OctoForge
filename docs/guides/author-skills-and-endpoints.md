@@ -61,8 +61,12 @@ An endpoint record makes a system callable. Its content is a small JSON document
 - `headers` (optional) — headers the call carries (e.g. `Depth`, `Content-Type` for WebDAV/CalDAV);
   their values are templates too. A credential header from `auth` or the installation whitelist
   always wins a name collision with a plain record header.
-- `params_schema` — declared parameters, `required` per parameter. Unknown parameters are refused, and a
-  validation error hands the model this contract back, so a wrong call corrects itself in one step.
+- `params_schema` — declared parameters, `required` per parameter, each with a `type`:
+  `string` (one path segment, separators escaped — the default), `path` (several segments, slashes
+  kept: what a CalDAV/discovery href needs) or `host` (a hostname confined to the record's own
+  `"hosts": ["*.example.com"]` allowlist, and the only type allowed where the URL's host stands).
+  Unknown parameters are refused, and a validation error hands the model this contract back, so a
+  wrong call corrects itself in one step.
 - `auth` — `"none"`, or a per-user secret **by code**: sugar for a `{secret.code}` header template.
   A scheme word like `"basic"`/`"bearer"` is refused: it reads as authenticated and attaches
   nothing. Fields outside this list are refused too — only `notes` and `description` are allowed
@@ -101,7 +105,7 @@ See [../reference/secrets.md](../reference/secrets.md).
 - Response bodies are truncated at 8000 characters — return JSON, not HTML pages.
 - Only `http`/`https`. Methods: the classic five plus the WebDAV family (`PROPFIND`, `PROPPATCH`,
   `REPORT`, `MKCOL`, `MKCALENDAR`, `COPY`, `MOVE`, `HEAD`, `OPTIONS`) — but not `LOCK`/`UNLOCK`.
-- Parameters are strings. A body is a template with string placeholders; logic that must *compute* a
+- Parameter values are strings. A body is a template with string placeholders; logic that must *compute* a
   body is where a [code tool](add-a-tool.md) starts making sense. Static value encodings (base64,
   hex digests) are the secret's `transform`, not template logic; format specs (`{x:>10}`) are
   rejected.

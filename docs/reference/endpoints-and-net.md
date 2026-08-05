@@ -56,7 +56,35 @@ whole point of the namespaces: a timezone, an account id or a calendar path is d
 user, so it lives in the record's template instead of the model's context — and a credential never
 enters the context at all.
 
-Substitution rules by destination: URL values are `urllib.parse.quote`-escaped; header values are
+A declared parameter has a **type**, which is what it may carry and how it is escaped:
+
+| `type` | Carries | Escaping |
+|---|---|---|
+| `string` | one path segment (the default) | everything reserved, separators included |
+| `path` | several segments — a discovery href such as an account id followed by `calendars` | each segment, the slashes between them survive |
+| `host` | a hostname, and only one the record's own `hosts` allowlist covers | none; the value is validated, not escaped |
+
+`path` exists because escaping a separator is not a cosmetic detail. A `string` renders the href
+`<account>/principal/` as `<account>%2Fprincipal%2F`, which iCloud answers with 401 — that was every
+CalDAV call after discovery until this type existed.
+
+`host` is what lets a contract follow a service that shards across sibling hosts — CalDAV discovery
+answers on `caldav.icloud.com` and then hands out `p124-caldav.icloud.com` — without hard-coding one
+user's shard into the record:
+
+```json
+{"url_template": "https://{host}/{calendar_home_path}",
+ "params_schema": {"host": {"type": "host", "required": true, "hosts": ["*.icloud.com"]},
+                   "calendar_home_path": {"type": "path", "required": true}}}
+```
+
+The allowlist is written by the record, never by the caller, and uses the same grammar as a secret's
+host binding (an exact hostname or a one-level `*.` pattern). **Only a `host` param may stand where
+the URL's host does** — a `string` or `path` there would let the caller name the destination
+outright. A `{user.*}` value may: an operator set it, and an operator can write any URL into the
+record anyway. A `{secret.*}` may not, ever.
+
+Substitution rules by destination: URL values are escaped per the table above; header values are
 substituted verbatim but the rendered header must be printable ASCII (a model param carrying a
 newline fails the call — the header-injection guard); body values go in **verbatim** (URL-escaping
 would corrupt an XML or JSON payload; format-appropriate escaping is the record author's concern).
@@ -140,6 +168,10 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 - **A parameter-validation error carries the contract** back to the model.
 - **`user.*` and `secret.*` values are substituted only from the record's templates** — never from
   agent-supplied parameter values.
+- **Only a `host` parameter may occupy the URL's host**, and only within the allowlist its record
+  declares — so a caller picks from what the record permits, it never names a destination.
+- **A `path` parameter may not walk up (`..`) or carry a scheme, query or fragment**, so it stays a
+  path rather than becoming a URL.
 - **Secrets go only where their placements allow** (headers by default), never into the URL host,
   and are resolved only after the destination has been rendered and checked without them.
 - **Rendered headers must be header-safe** — a value carrying control characters or non-ASCII fails
@@ -170,6 +202,9 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
 | Endpoint record content is not valid JSON | `ToolSpecError`, reported to the model |
 | Missing or unknown parameter | Validation error including the declared contract |
 | Template references an unknown namespace or a dotted param name | `ToolSpecError` at parse time |
+| A `string`/`path` param placed where the URL's host stands | `ToolSpecError` naming the rule |
+| A `host` param without a `hosts` allowlist, or `hosts` on another type | `ToolSpecError` at parse time |
+| A host value outside the record's allowlist | The call fails naming the allowed patterns; nothing is sent |
 | Document carries an invented field (`secret_key`, `body`, …) | `ToolSpecError` naming the allowed fields and how a secret is actually declared |
 | `auth` is a scheme word (`"basic"`, `"bearer"`) | `ToolSpecError`: it promises a credential and attaches none |
 | Upstream answers 401/403 and no secret was attached | The body carries an explicit "this request carried NO credential" note |

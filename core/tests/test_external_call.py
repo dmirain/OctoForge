@@ -1195,3 +1195,140 @@ async def test_a_401_with_a_secret_attached_keeps_the_body_alone() -> None:
     result = await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
 
     assert "NO credential" not in result.body
+
+
+# --- path and host parameters ------------------------------------------------
+
+DISCOVERY_TOOL_NAME = "caldav_calendars"
+DISCOVERY_TOOL_CONTENT = json.dumps(
+    {
+        "method": "PROPFIND",
+        "url_template": "https://{host}/{calendar_home_path}",
+        "params_schema": {
+            "host": {"type": "host", "required": True, "hosts": ["*.icloud.com"]},
+            "calendar_home_path": {"type": "path", "required": True},
+        },
+        "auth": "none",
+    }
+)
+
+
+async def test_a_path_param_keeps_its_separators() -> None:
+    """Escaping them turned `1056456520/principal/` into `...%2Fprincipal%2F`,
+    and every CalDAV call after discovery answered 401."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="{}")
+
+    executor = make_executor(handler, records={DISCOVERY_TOOL_NAME: DISCOVERY_TOOL_CONTENT})
+
+    await executor.execute(
+        DISCOVERY_TOOL_NAME,
+        {"host": "p124-caldav.icloud.com", "calendar_home_path": "1056456520/calendars/"},
+        user_id="user-test",
+    )
+
+    assert str(captured[0].url) == "https://p124-caldav.icloud.com/1056456520/calendars/"
+
+
+async def test_a_string_param_stays_one_segment() -> None:
+    """The default is unchanged: a separator inside a value is data, not structure."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(HTTPStatus.OK, text="{}")
+
+    executor = make_executor(handler, records={TOOL_NAME: WEATHER_TOOL_CONTENT})
+
+    await executor.execute(TOOL_NAME, {"city": "a/b"}, user_id="user-test")
+
+    assert "a%2Fb" in str(captured[0].url)
+
+
+async def test_a_host_param_is_confined_to_the_records_allowlist() -> None:
+    """The record names where it may go; the caller only picks from that."""
+    executor = make_executor(ok_handler(), records={DISCOVERY_TOOL_NAME: DISCOVERY_TOOL_CONTENT})
+
+    with pytest.raises(ExternalCallError, match="not one this endpoint may call"):
+        await executor.execute(
+            DISCOVERY_TOOL_NAME,
+            {"host": "evil.example.com", "calendar_home_path": "x/"},
+            user_id="user-test",
+        )
+
+
+@pytest.mark.parametrize(
+    ("params", "message"),
+    [
+        ({"host": "api.icloud.com:443", "calendar_home_path": "x/"}, "bare hostname"),
+        ({"host": "user@api.icloud.com", "calendar_home_path": "x/"}, "bare hostname"),
+        ({"host": "api.icloud.com", "calendar_home_path": "../../etc/"}, "walk up"),
+        ({"host": "api.icloud.com", "calendar_home_path": "https://evil.com/x"}, "not a URL"),
+        ({"host": "api.icloud.com", "calendar_home_path": "x/?a=b"}, "not a URL"),
+    ],
+)
+async def test_malformed_path_and_host_values_are_refused(
+    params: dict[str, str], message: str
+) -> None:
+    executor = make_executor(ok_handler(), records={DISCOVERY_TOOL_NAME: DISCOVERY_TOOL_CONTENT})
+
+    with pytest.raises(ExternalCallError, match=message):
+        await executor.execute(DISCOVERY_TOOL_NAME, params, user_id="user-test")
+
+
+def test_only_a_host_param_may_stand_in_the_url_host() -> None:
+    """Otherwise the caller, not the record, decides where the request goes."""
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://{anything}/v1",
+            "params_schema": {"anything": {"type": "string", "required": True}},
+        }
+    )
+
+    with pytest.raises(ToolSpecError, match="only a 'host' param"):
+        parse_tool_spec(content)
+
+
+def test_a_host_param_must_declare_its_allowlist() -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://{host}/v1",
+            "params_schema": {"host": {"type": "host", "required": True}},
+        }
+    )
+
+    with pytest.raises(ToolSpecError, match="allowlist"):
+        parse_tool_spec(content)
+
+
+def test_an_allowlist_belongs_only_to_a_host_param() -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://api.example.com/{path}",
+            "params_schema": {
+                "path": {"type": "path", "required": True, "hosts": ["*.example.com"]}
+            },
+        }
+    )
+
+    with pytest.raises(ToolSpecError, match="belongs to a 'host' param"):
+        parse_tool_spec(content)
+
+
+def test_an_unknown_param_type_names_the_ones_that_exist() -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://api.example.com/x",
+            "params_schema": {"n": {"type": "integer", "required": True}},
+        }
+    )
+
+    with pytest.raises(ToolSpecError, match="string, path, host"):
+        parse_tool_spec(content)

@@ -39,7 +39,9 @@ from octoforge_core.instructions.api import InstructionService, InstructionType
 from octoforge_core.net.errors import ExternalCallError
 from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
 from octoforge_core.net.tool_spec import (
+    ParamKind,
     TemplateRefs,
+    ToolParamSpec,
     ToolSpec,
     collect_refs,
     parse_tool_spec,
@@ -53,6 +55,7 @@ from octoforge_core.secrets.api import (
     SecretNotFoundError,
     SecretPlacement,
     SecretStore,
+    host_matches,
 )
 
 MAX_BODY_CHARS = 8000
@@ -408,7 +411,50 @@ def _validate_params(spec: ToolSpec, params: dict[str, Any]) -> dict[str, str]:
         # endpoint renders params into a URL and takes strings only
         joined = ", ".join(not_strings)
         raise ExternalCallError(f"params must be strings for this endpoint: {joined}")
-    return dict(params)
+    return {name: _validate_value(name, spec.params[name], value) for name, value in params.items()}
+
+
+def _validate_value(name: str, spec: ToolParamSpec, value: str) -> str:
+    """Check one value against what its declared kind may carry.
+
+    Here rather than at render time so a bad value comes back with the
+    contract attached, which is what lets a wrong call correct itself in one
+    step instead of guessing.
+    """
+    match spec.kind:
+        case ParamKind.STRING:
+            return value
+        case ParamKind.PATH:
+            return _validate_path(name, value)
+        case ParamKind.HOST:
+            return _validate_host(name, spec, value)
+
+
+def _validate_path(name: str, value: str) -> str:
+    """A path: several segments, and nothing that changes where they lead."""
+    path = value.strip().lstrip("/")
+    if any(char in path for char in "?#") or "://" in path:
+        raise ExternalCallError(
+            f"param {name!r} is a path, not a URL: drop the scheme, query and fragment"
+        )
+    if any(segment == ".." for segment in path.split("/")):
+        raise ExternalCallError(f"param {name!r} must not walk up the path with '..'")
+    return path
+
+
+def _validate_host(name: str, spec: ToolParamSpec, value: str) -> str:
+    """A hostname the record's own allowlist covers, and nothing more."""
+    host = value.strip().lower().rstrip(".")
+    if not host or any(char in host for char in "/@:?#") or "*" in host:
+        raise ExternalCallError(
+            f"param {name!r} must be a bare hostname (no scheme, port, path or credentials)"
+        )
+    if not any(host_matches(pattern, host) for pattern in spec.hosts):
+        allowed = ", ".join(spec.hosts)
+        raise ExternalCallError(
+            f"param {name!r}: host {host!r} is not one this endpoint may call (allowed: {allowed})"
+        )
+    return host
 
 
 def _collect_plan(spec: ToolSpec) -> _RenderPlan:
@@ -428,10 +474,28 @@ def _render_url(
     user_values: Mapping[str, str],
     sentinels: Mapping[str, str],
 ) -> str:
-    values = {name: quote(value, safe="") for name, value in params.items()}
+    values = {name: _escape_for_url(spec.params[name], value) for name, value in params.items()}
     values.update({name: quote(value, safe="") for name, value in user_values.items()})
     values.update({f"secret.{code}": sentinel for code, sentinel in sentinels.items()})
     return render_template(spec.url_template, values)
+
+
+def _escape_for_url(spec: ToolParamSpec, value: str) -> str:
+    """Escape one value for the URL, by what its kind is allowed to be.
+
+    A `path` keeps its separators — escaping them is what turned
+    `1056456520/principal/` into `1056456520%2Fprincipal%2F` and made every
+    CalDAV call after discovery answer 401. A `host` was already validated
+    against the record's allowlist and needs no escaping; escaping it would
+    only corrupt it.
+    """
+    match spec.kind:
+        case ParamKind.STRING:
+            return quote(value, safe="")
+        case ParamKind.PATH:
+            return "/".join(quote(segment, safe="") for segment in value.split("/"))
+        case ParamKind.HOST:
+            return value
 
 
 def _substitute_url_secrets(
