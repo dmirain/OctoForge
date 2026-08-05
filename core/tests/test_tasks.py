@@ -6,7 +6,7 @@ from datetime import timedelta
 import pytest
 
 from octoforge_core.cron.api import CronJob, CronJobNotFoundError
-from octoforge_core.tariffs.api import FeatureCode, LimitVerdict, UsageEvent
+from octoforge_core.tariffs.api import LimitVerdict, UsageEvent
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import InMemoryTaskStore
 from octoforge_core.tasks.tools import (
@@ -263,7 +263,7 @@ class CapGate:
     async def enabled_features(self, user_id: str) -> frozenset[str] | None:
         return None
 
-    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
+    async def allows(self, user_id: str, feature: str) -> bool:
         return True
 
     async def check_submit(self, user_id: str) -> LimitVerdict:

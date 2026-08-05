@@ -134,6 +134,11 @@ def get_limit_gate(request: Request) -> LimitGate:
     return cast(LimitGate, request.app.state.limit_gate)
 
 
+def get_known_features(request: Request) -> frozenset[str]:
+    """Return the feature vocabulary this assembly declared at startup."""
+    return cast(frozenset[str], request.app.state.known_features)
+
+
 def get_auth_gate(request: Request) -> AuthGate:
     """Return the operator gate built at application startup."""
     return cast(AuthGate, request.app.state.auth_gate)

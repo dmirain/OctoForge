@@ -96,6 +96,17 @@ async def test_put_and_replace(tariffs: SqlAlchemyTariffStore) -> None:
     assert [tariff.code for tariff in await tariffs.list()] == ["basic"]
 
 
+async def test_custom_feature_codes_roundtrip(tariffs: SqlAlchemyTariffStore) -> None:
+    """Installer-defined codes are plain strings: the store accepts a code it
+    has never heard of — the vocabulary check lives at the operator boundary,
+    where the assembly's merged feature set is known."""
+    created = await tariffs.put("ext", "Ext", frozenset({"my_tool", FeatureCode.VISION}))
+
+    assert created.features == {"my_tool", "vision"}
+    with pytest.raises(InvalidTariffError):  # grammar is still enforced
+        await tariffs.put("ext", "Ext", frozenset({"Bad Feature!"}))
+
+
 async def test_validation(tariffs: SqlAlchemyTariffStore) -> None:
     with pytest.raises(InvalidTariffError):
         await tariffs.put("Bad Code!", "x", frozenset())

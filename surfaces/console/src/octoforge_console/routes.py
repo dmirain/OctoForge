@@ -52,7 +52,6 @@ from octoforge_core.params.api import (
     UserParamStore,
 )
 from octoforge_core.tariffs.api import (
-    FeatureCode,
     InvalidTariffError,
     Tariff,
     TariffInUseError,
@@ -72,6 +71,7 @@ from octoforge_server.deps import (
     get_exchange_repository,
     get_identity_store,
     get_instruction_service,
+    get_known_features,
     get_operator,
     get_summary_store,
     get_tariff_store,
@@ -96,6 +96,7 @@ ClaimsDep = Annotated[ClaimRepository, Depends(get_claim_repository)]
 SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
 UserParamsDep = Annotated[UserParamStore, Depends(get_user_param_store)]
 TariffStoreDep = Annotated[TariffStore, Depends(get_tariff_store)]
+KnownFeaturesDep = Annotated[frozenset[str], Depends(get_known_features)]
 LimitDep = Annotated[int | None, Query(ge=1)]
 OffsetDep = Annotated[int | None, Query(ge=0)]
 USAGE_REPORT_DEFAULT_DAYS = 30
@@ -695,11 +696,16 @@ class AssignTariffRequest(BaseModel):
 
 
 @router.get("/tariffs")
-async def tariffs(store: TariffStoreDep, identities: IdentityStoreDep) -> dict[str, Any]:
+async def tariffs(
+    store: TariffStoreDep,
+    identities: IdentityStoreDep,
+    known_features: KnownFeaturesDep,
+) -> dict[str, Any]:
     """The plan catalog with its users, and the feature vocabulary for the form.
 
     Page-shaped for the console's generic table; the catalog is small enough
-    that "one page holds everything" is the honest answer.
+    that "one page holds everything" is the honest answer. The vocabulary is
+    whatever this assembly declared — core codes plus the installer's own.
     """
     plans = await store.list()
     assignments = await store.assignments()
@@ -713,7 +719,7 @@ async def tariffs(store: TariffStoreDep, identities: IdentityStoreDep) -> dict[s
         "total": len(items),
         "limit": max(1, len(items)),
         "offset": 0,
-        "features": [feature.value for feature in FeatureCode],
+        "features": sorted(known_features),
     }
 
 
@@ -722,12 +728,23 @@ async def set_tariff(
     request: SetTariffRequest,
     operator: OperatorDep,
     store: TariffStoreDep,
+    known_features: KnownFeaturesDep,
 ) -> dict[str, Any]:
-    """Create or replace a plan; a put replaces every limit and feature."""
-    try:
-        features = frozenset(FeatureCode(value) for value in request.features)
-    except ValueError as exc:
-        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    """Create or replace a plan; a put replaces every limit and feature.
+
+    Feature codes are checked against the assembly's declared vocabulary — a
+    typo silently granting nothing is exactly the mistake this catches.
+    """
+    unknown = sorted(set(request.features) - known_features)
+    if unknown:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=(
+                f"unknown feature(s): {', '.join(unknown)}; "
+                f"known: {', '.join(sorted(known_features))}"
+            ),
+        )
+    features = frozenset(request.features)
     limits = TariffLimits(
         daily_tokens=request.daily_tokens,
         daily_user_messages=request.daily_user_messages,
@@ -827,7 +844,7 @@ def _tariff_to_dict(item: Tariff) -> dict[str, Any]:
     return {
         "code": item.code,
         "title": item.title,
-        "features": sorted(feature.value for feature in item.features),
+        "features": sorted(item.features),
         "daily_tokens": item.limits.daily_tokens,
         "daily_user_messages": item.limits.daily_user_messages,
         "daily_assistant_messages": item.limits.daily_assistant_messages,

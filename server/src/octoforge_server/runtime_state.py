@@ -49,6 +49,10 @@ class Runtime:
     tariff_store: TariffStore
     usage_meter: UsageMeter
     limit_gate: LimitGate
+    #: Feature codes tariffs may grant: the core's plus the assembly's own.
+    #: The console validates against this set and serves it as the form's
+    #: vocabulary — an installer extends it without touching the core.
+    known_features: frozenset[str]
     dialogs: DialogRepository
     summary_store: SummaryStore
     exchanges: ExchangeRepository

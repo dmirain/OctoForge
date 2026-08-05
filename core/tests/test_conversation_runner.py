@@ -96,7 +96,6 @@ from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion, Usage
 from octoforge_core.ports import LLMClient
 from octoforge_core.tariffs.api import (
-    FeatureCode,
     LimitVerdict,
     UsageEvent,
     UsageKind,
@@ -328,8 +327,8 @@ class RecordingLimitGate:
     async def enabled_features(self, user_id: str) -> frozenset[str] | None:
         return self.features
 
-    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
-        return self.features is None or feature.value in self.features
+    async def allows(self, user_id: str, feature: str) -> bool:
+        return self.features is None or feature in self.features
 
     async def check_submit(self, user_id: str) -> LimitVerdict:
         return self.submit_verdict

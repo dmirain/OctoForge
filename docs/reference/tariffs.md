@@ -40,15 +40,36 @@ the run — the event is logged as lost instead.
   with a broker notice (the message stays in the narrative), skips a cron wake (`WakeOutcome.LIMITED`,
   one notice per job per day; the lease retries silently) and refuses agent-spawned tasks with text.
   A run already in flight is never killed.
-- **Feature switches** (`FeatureCode`): `skill_create`, `voice_transcription`, `web_search`,
-  `mcp_add`, `http_endpoints` (`http_request` + `external_call`), `vision`. The runner resolves the
-  user's feature set once per run into `ToolContext.enabled_features` (plain strings — the tools
-  framework imports no domain module); each gated tool hides itself via the registry's `visible_to`
-  hook and re-checks inside `execute`. Skill saves are gated per *kind*: the same tool still saves
+- **Feature switches**: plain string codes end to end. The core ships its vocabulary as
+  `FeatureCode` / `CORE_FEATURES` (`skill_create`, `voice_transcription`, `web_search`, `mcp_add`,
+  `http_endpoints` = `http_request` + `external_call`, `vision`), and an assembly extends it without
+  touching the core (below). The runner resolves the user's feature set once per run into
+  `ToolContext.enabled_features`; each gated tool hides itself via the registry's `visible_to` hook
+  and re-checks inside `execute`. Skill saves are gated per *kind*: the same tool still saves
   knowledge on every plan. Telegram checks `voice_transcription` before downloading a byte.
 - **Count caps**: `max_cron_jobs` (enforced by `cron.api.create_job` and, through the shared
   `job_quota_refusal`, by `POST /api/cron/jobs` — HTTP 403) and `max_datasets` (enforced by the
   dataset service, so the agent's implicit create on a first `data_put` goes through the same gate).
+
+### Gating a custom tool — no core changes
+
+A feature is data, not an enum case. To ship a gated tool in your own assembly:
+
+1. declare the code next to the tool: `MY_TOOL_FEATURE = "my_tool"` (same `[a-z0-9_]{1,64}`
+   grammar as every other code);
+2. give the tool `visible_to(context)` returning
+   `feature_enabled(context.enabled_features, MY_TOOL_FEATURE)` and re-check inside `execute`,
+   answering `feature_refusal(MY_TOOL_FEATURE)` — the same defence-in-depth shape the core tools
+   use;
+3. in your composition root, register the tool and pass
+   `known_features=CORE_FEATURES | {MY_TOOL_FEATURE}` into `Runtime` — that set is the console's
+   form vocabulary and its validation list, so the operator can grant the code and cannot typo it.
+
+The store deliberately accepts codes it has never heard of (grammar-checked only): the vocabulary
+check lives at the operator boundary, where the merged set is known. Mind the default: a code
+absent from a tariff's list is *denied* for that tariff's users — after adding a feature, existing
+plans grant it only once the operator adds the code to them. Users without a tariff have
+everything, as always.
 
 ### The service
 

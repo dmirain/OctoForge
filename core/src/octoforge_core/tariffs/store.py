@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.unit_of_work import read_session, write_session
 from octoforge_core.tariffs.api import (
-    FeatureCode,
     Tariff,
     TariffInUseError,
     TariffLimits,
@@ -18,6 +17,7 @@ from octoforge_core.tariffs.api import (
     UsageKind,
     UsageTotals,
     normalize_code,
+    normalize_feature,
     normalize_title,
 )
 from octoforge_core.tariffs.models import TariffRow, UsageEventRow, UserTariffRow
@@ -38,10 +38,15 @@ class SqlAlchemyTariffStore:
         self,
         code: str,
         title: str,
-        features: frozenset[FeatureCode],
+        features: frozenset[str],
         limits: TariffLimits | None = None,
     ) -> Tariff:
-        """Create or replace the tariff under `code`."""
+        """Create or replace the tariff under `code`.
+
+        Feature codes are grammar-checked only: the store must accept an
+        installer-defined code it has never heard of — the known-vocabulary
+        check belongs to the operator boundary, where the merged set lives.
+        """
         code = normalize_code(code)
         title = normalize_title(title)
         caps = (limits or TariffLimits()).normalized()
@@ -53,7 +58,7 @@ class SqlAlchemyTariffStore:
             else:
                 row.title = title
                 row.updated_at = utc_now()
-            row.features = sorted(feature.value for feature in features)
+            row.features = sorted({normalize_feature(feature) for feature in features})
             for name, value in asdict(caps).items():
                 setattr(row, name, value)
             await session.flush()
@@ -191,7 +196,7 @@ def _to_tariff(row: TariffRow) -> Tariff:
         id=row.id,
         code=row.code,
         title=row.title,
-        features=frozenset(FeatureCode(value) for value in row.features),
+        features=frozenset(row.features),
         limits=TariffLimits(
             daily_tokens=row.daily_tokens,
             daily_user_messages=row.daily_user_messages,

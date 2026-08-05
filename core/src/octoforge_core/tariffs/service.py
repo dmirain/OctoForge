@@ -13,7 +13,6 @@ import time
 from datetime import datetime
 
 from octoforge_core.tariffs.api import (
-    FeatureCode,
     LimitVerdict,
     Tariff,
     TariffStore,
@@ -48,12 +47,10 @@ class LimitService:
     async def enabled_features(self, user_id: str) -> frozenset[str] | None:
         """The user's feature codes as plain strings; `None` = everything on."""
         tariff = await self.resolve(user_id)
-        if tariff is None:
-            return None
-        return frozenset(feature.value for feature in tariff.features)
+        return None if tariff is None else tariff.features
 
-    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
-        """Whether the user's tariff grants the feature."""
+    async def allows(self, user_id: str, feature: str) -> bool:
+        """Whether the user's tariff grants the feature (any code, core or custom)."""
         tariff = await self.resolve(user_id)
         return tariff is None or feature in tariff.features
 

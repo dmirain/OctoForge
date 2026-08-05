@@ -41,7 +41,7 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.speech.api import AudioData, TranscriptionClient
-from octoforge_core.tariffs.api import FeatureCode, LimitGate, LimitVerdict, UsageEvent
+from octoforge_core.tariffs.api import LimitGate, LimitVerdict, UsageEvent
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
 from octoforge_telegram.bridge import RunnerProvider
@@ -1415,7 +1415,7 @@ class NoVoiceGate:
     async def enabled_features(self, user_id: str) -> frozenset[str] | None:
         return frozenset()
 
-    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
+    async def allows(self, user_id: str, feature: str) -> bool:
         return False
 
     async def check_submit(self, user_id: str) -> LimitVerdict:

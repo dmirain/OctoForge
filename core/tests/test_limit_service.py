@@ -145,6 +145,7 @@ async def test_features_and_caps() -> None:
     assert await service.enabled_features(USER) == {"skill_create"}
     assert await service.allows(USER, FeatureCode.SKILL_CREATE)
     assert not await service.allows(USER, FeatureCode.VISION)
+    assert not await service.allows(USER, "my_tool")  # custom codes gate the same way
     assert await service.max_cron_jobs(USER) == CRON_CAP
     assert await service.max_datasets(USER) == DATASET_CAP
 

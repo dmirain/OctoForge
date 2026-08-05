@@ -106,7 +106,7 @@ from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.secrets.tools import SecretLinkTool, SecretListTool
 from octoforge_core.speech.api import TranscriptionClient
 from octoforge_core.speech.client import OpenAITranscriptionClient
-from octoforge_core.tariffs.api import LimitGate
+from octoforge_core.tariffs.api import CORE_FEATURES, LimitGate
 from octoforge_core.tariffs.store import SqlAlchemyTariffStore, SqlAlchemyUsageMeter
 from octoforge_core.tools.base import Tool
 from octoforge_core.tools.registry import ToolRegistry
@@ -441,6 +441,9 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     tariff_store=tariff_store,
                     usage_meter=usage_meter,
                     limit_gate=limit_service,
+                    # this assembly ships no custom tools; an installer with
+                    # its own gated tools passes CORE_FEATURES | {its codes}
+                    known_features=CORE_FEATURES,
                     dialogs=dialogs,
                     summary_store=summary_store,
                     exchanges=exchanges,

@@ -40,11 +40,15 @@ class InvalidTariffError(Exception):
 
 
 class FeatureCode(StrEnum):
-    """A switchable capability a tariff may grant.
+    """The switchable capabilities shipped with the core.
 
-    The registry gates tools by these codes; a user without a tariff has every
-    feature. Values travel as plain strings through `ToolContext` because the
-    tools framework must not import this module.
+    A feature is a plain string everywhere in the data path (`Tariff.features`,
+    `ToolContext.enabled_features`), so an installer adds its own codes without
+    touching this module: declare the string next to the tool, gate the tool
+    with `feature_enabled`, and include the code in the `known_features` set
+    the composition root hands the console (see `CORE_FEATURES`). This enum is
+    the core's own vocabulary — its members are strings, so they pass anywhere
+    a feature code is expected. A user without a tariff has every feature.
     """
 
     SKILL_CREATE = "skill_create"
@@ -53,6 +57,11 @@ class FeatureCode(StrEnum):
     MCP_ADD = "mcp_add"
     HTTP_ENDPOINTS = "http_endpoints"
     VISION = "vision"
+
+
+#: Feature codes shipped with the core; a composition root passes
+#: `CORE_FEATURES | {its own codes}` as the console's vocabulary.
+CORE_FEATURES: frozenset[str] = frozenset(code.value for code in FeatureCode)
 
 
 class UsageKind(StrEnum):
@@ -99,12 +108,12 @@ class TariffLimits:
 
 @dataclass(frozen=True, slots=True)
 class Tariff:
-    """One plan: a feature set plus its numeric caps."""
+    """One plan: a feature set (plain codes, extensible) plus its numeric caps."""
 
     id: str
     code: str
     title: str
-    features: frozenset[FeatureCode]
+    features: frozenset[str]
     limits: TariffLimits
     created_at: datetime
     updated_at: datetime
@@ -159,17 +168,29 @@ class LimitVerdict:
         return cls(allowed=True)
 
 
-def feature_enabled(features: frozenset[str] | None, feature: FeatureCode) -> bool:
+def feature_enabled(features: frozenset[str] | None, feature: str) -> bool:
     """Whether a feature set (as carried by `ToolContext`) grants the feature.
 
     `None` means "no gating at all" — the shape a user without a tariff gets.
+    Takes any string so installer-defined codes work; `FeatureCode` members
+    are strings and pass unchanged.
     """
-    return features is None or feature.value in features
+    return features is None or feature in features
 
 
-def feature_refusal(feature: FeatureCode) -> str:
+def feature_refusal(feature: str) -> str:
     """The uniform tool answer for a feature the plan does not include."""
-    return FEATURE_REFUSAL_TEMPLATE.format(feature=feature.value)
+    return FEATURE_REFUSAL_TEMPLATE.format(feature=feature)
+
+
+def normalize_feature(raw: str) -> str:
+    """Validate and normalize a feature code (same grammar as tariff codes)."""
+    feature = raw.strip().lower()
+    if not CODE_PATTERN.match(feature):
+        raise InvalidTariffError(
+            "feature code must be 1-64 characters of [a-z0-9_], e.g. 'web_search'"
+        )
+    return feature
 
 
 def normalize_code(raw: str) -> str:
@@ -216,8 +237,8 @@ class LimitGate(UsageRecorder, Protocol):
         """The user's feature codes as plain strings; `None` = everything on."""
         ...
 
-    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
-        """Whether the user's tariff grants the feature."""
+    async def allows(self, user_id: str, feature: str) -> bool:
+        """Whether the user's tariff grants the feature (any code, core or custom)."""
         ...
 
     async def check_submit(self, user_id: str) -> LimitVerdict:
@@ -244,10 +265,11 @@ class TariffStore(Protocol):
         self,
         code: str,
         title: str,
-        features: frozenset[FeatureCode],
+        features: frozenset[str],
         limits: TariffLimits | None = None,
     ) -> Tariff:
-        """Create or replace the tariff under `code`."""
+        """Create or replace the tariff under `code`; feature codes are
+        grammar-checked here, vocabulary-checked at the operator boundary."""
         ...
 
     async def list(self) -> list[Tariff]:

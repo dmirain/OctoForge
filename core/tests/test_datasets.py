@@ -26,7 +26,7 @@ from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.datasets.validation import parse_schema
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.llm.embeddings import EmbeddingClient
-from octoforge_core.tariffs.api import FeatureCode, LimitVerdict, UsageEvent
+from octoforge_core.tariffs.api import LimitVerdict, UsageEvent
 from octoforge_core.time import utc_now
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -385,7 +385,7 @@ class DatasetCapGate:
     async def enabled_features(self, user_id: str) -> frozenset[str] | None:
         return None
 
-    async def allows(self, user_id: str, feature: FeatureCode) -> bool:
+    async def allows(self, user_id: str, feature: str) -> bool:
         return True
 
     async def check_submit(self, user_id: str) -> LimitVerdict:
