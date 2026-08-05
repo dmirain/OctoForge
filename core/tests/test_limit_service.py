@@ -149,7 +149,9 @@ async def test_features_and_caps() -> None:
     assert await service.max_datasets(USER) == DATASET_CAP
 
 
-async def test_tariff_and_totals_are_cached() -> None:
+async def test_totals_are_cached_but_the_tariff_is_not() -> None:
+    """The sum-over-window is the costly read; the tariff lookup stays fresh
+    so an operator's change applies at once."""
     service, store, meter = _service(
         _tariff(limits=TariffLimits(daily_tokens=TOKEN_LIMIT)), UsageTotals()
     )
@@ -157,7 +159,7 @@ async def test_tariff_and_totals_are_cached() -> None:
     await service.check_submit(USER)
     await service.check_submit(USER)
 
-    assert store.lookups == 1
+    assert store.lookups == 1 + 1
     assert meter.reads == 1
 
 

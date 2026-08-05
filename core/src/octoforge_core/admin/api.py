@@ -139,6 +139,35 @@ class UserParamOverview:
 
 
 @dataclass(frozen=True, slots=True)
+class UsageEventOverview:
+    """One metered action from the usage ledger, with its entity links."""
+
+    user_id: str
+    kind: str
+    origin: str
+    prompt_tokens: int
+    completion_tokens: int
+    quantity: int
+    dialog_id: str | None
+    exchange_id: str | None
+    task_id: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class UsageReportRow:
+    """Aggregated consumption over the report window, per (user, kind, origin)."""
+
+    user_id: str
+    kind: str
+    origin: str
+    prompt_tokens: int
+    completion_tokens: int
+    quantity: int
+    events: int
+
+
+@dataclass(frozen=True, slots=True)
 class SecretOverview:
     """Secret *metadata* with its owner; the value never reaches this model."""
 
@@ -246,6 +275,14 @@ class AdminReadModel(Protocol):
 
     async def list_secrets(self, limit: int, offset: int) -> Page[SecretOverview]:
         """Secret metadata of every user, never the values."""
+        ...
+
+    async def list_usage_events(self, limit: int, offset: int) -> Page[UsageEventOverview]:
+        """Usage-ledger events of every user, newest first."""
+        ...
+
+    async def usage_report(self, days: int) -> list[UsageReportRow]:
+        """Consumption of the last `days` days, grouped per (user, kind, origin)."""
         ...
 
 

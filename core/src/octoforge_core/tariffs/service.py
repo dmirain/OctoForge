@@ -1,10 +1,11 @@
 """Limit checks and metering over the tariff catalog and the usage ledger.
 
-One instance serves every dialog on the node, so each check must stay cheap:
-the user's tariff and the day's totals are cached with short TTLs, and a
-recorded event invalidates that user's totals so same-node checks see their
-own spend immediately. Cross-node spend converges within the TTL — limits are
-guardrails, not accounting.
+One instance serves every dialog on the node, so a check must stay cheap. The
+tariff lookup is a single SELECT by unique key per user action (a message, a
+run start) and is deliberately uncached — an operator's change applies at
+once. The day's totals are the sum-over-window query, so they are cached for
+a few seconds and invalidated by the node's own metering; cross-node spend
+converges within the TTL — limits are guardrails, not accounting.
 """
 
 import logging
@@ -33,24 +34,16 @@ class LimitService:
         tariffs: TariffStore,
         meter: UsageMeter,
         *,
-        tariff_cache_ttl: float = 60.0,
         verdict_cache_ttl: float = 5.0,
     ) -> None:
         self._tariffs = tariffs
         self._meter = meter
-        self._tariff_ttl = tariff_cache_ttl
         self._totals_ttl = verdict_cache_ttl
-        self._tariff_cache: dict[str, tuple[float, Tariff | None]] = {}
         self._totals_cache: dict[str, tuple[float, datetime, UsageTotals]] = {}
 
     async def resolve(self, user_id: str) -> Tariff | None:
-        """Return the user's tariff (cached); `None` means no restrictions."""
-        cached = self._tariff_cache.get(user_id)
-        if cached is not None and cached[0] > time.monotonic():
-            return cached[1]
-        tariff = await self._tariffs.tariff_for_user(user_id)
-        self._tariff_cache[user_id] = (time.monotonic() + self._tariff_ttl, tariff)
-        return tariff
+        """Return the user's tariff; `None` means no restrictions."""
+        return await self._tariffs.tariff_for_user(user_id)
 
     async def enabled_features(self, user_id: str) -> frozenset[str] | None:
         """The user's feature codes as plain strings; `None` = everything on."""

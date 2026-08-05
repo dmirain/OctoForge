@@ -186,6 +186,28 @@ def test_pause_and_resume_reject_foreign_jobs(client: TestClient) -> None:
     assert resumed.status_code == HTTPStatus.NOT_FOUND
 
 
+def test_the_plans_job_cap_answers_403_on_this_entrance_too(client: TestClient) -> None:
+    """The HTTP endpoint enforces the same quota as the agent tool — no bypass."""
+    first = create_job(client)
+    person_id = str(first.json()["user_id"])
+    plan = client.post(
+        "/api/admin/tariffs",
+        json={"code": "capped", "title": "Capped", "max_cron_jobs": 1},
+    )
+    assigned = client.post(
+        "/api/admin/tariffs/assign", json={"user_id": person_id, "code": "capped"}
+    )
+    refused = create_job(client, title="evening report")
+
+    assert first.status_code == HTTPStatus.CREATED
+    assert plan.status_code == HTTPStatus.OK
+    assert assigned.status_code == HTTPStatus.OK
+    assert refused.status_code == HTTPStatus.FORBIDDEN
+    assert "at most 1 scheduled jobs" in refused.json()["detail"]
+    listing = client.get(JOBS_URL, headers={USER_ID_HEADER: USER_A}).json()
+    assert len(listing) == 1
+
+
 def test_missing_user_id_header_is_rejected(client: TestClient) -> None:
     create = client.post(JOBS_URL, params={"title": "t", "schedule": DAILY_9AM, "prompt": "p"})
     listing = client.get(JOBS_URL)

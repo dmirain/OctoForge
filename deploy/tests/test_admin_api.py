@@ -473,3 +473,67 @@ def test_deleting_a_missing_user_param_is_a_404(client: TestClient) -> None:
     response = client.delete("/api/admin/params/absent", params={"user_id": "person-1"})
 
     assert response.status_code == HTTPStatus.NOT_FOUND
+
+
+BASIC_TARIFF = {
+    "code": "basic",
+    "title": "Basic",
+    "features": ["web_search"],
+    "daily_tokens": 100_000,
+    "max_cron_jobs": 2,
+}
+
+
+def test_tariff_crud_and_assignment_via_the_console(client: TestClient) -> None:
+    created = client.post("/api/admin/tariffs", json=BASIC_TARIFF)
+    listed = client.get("/api/admin/tariffs").json()
+    assigned = client.post(
+        "/api/admin/tariffs/assign", json={"user_id": "person-1", "code": "basic"}
+    )
+    with_user = client.get("/api/admin/tariffs").json()
+    blocked = client.delete("/api/admin/tariffs/basic")
+    unassigned = client.post("/api/admin/tariffs/assign", json={"user_id": "person-1"})
+    deleted = client.delete("/api/admin/tariffs/basic")
+
+    assert created.status_code == HTTPStatus.OK
+    assert created.json()["daily_tokens"] == BASIC_TARIFF["daily_tokens"]
+    assert created.json()["daily_user_messages"] is None  # unnamed limits stay unlimited
+    (plan,) = listed["items"]
+    assert plan["code"] == "basic"
+    assert plan["features"] == ["web_search"]
+    assert "skill_create" in listed["features"]  # the vocabulary for the form
+    assert assigned.status_code == HTTPStatus.OK
+    assert with_user["items"][0]["users"] == ["person-1"]
+    assert blocked.status_code == HTTPStatus.CONFLICT  # still assigned
+    assert unassigned.status_code == HTTPStatus.OK
+    assert deleted.status_code == HTTPStatus.OK
+    assert client.get("/api/admin/tariffs").json()["items"] == []
+
+
+def test_unknown_feature_and_bad_code_are_400(client: TestClient) -> None:
+    unknown = client.post(
+        "/api/admin/tariffs", json={"code": "x", "title": "X", "features": ["teleport"]}
+    )
+    bad_code = client.post("/api/admin/tariffs", json={"code": "Bad Code!", "title": "X"})
+
+    assert unknown.status_code == HTTPStatus.BAD_REQUEST
+    assert bad_code.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_assigning_a_missing_tariff_is_a_404(client: TestClient) -> None:
+    response = client.post(
+        "/api/admin/tariffs/assign", json={"user_id": "person-1", "code": "absent"}
+    )
+
+    assert response.status_code == HTTPStatus.NOT_FOUND
+
+
+def test_usage_report_and_events_answer_empty(client: TestClient) -> None:
+    """The views exist and answer page-shaped payloads before any spend."""
+    default_days = 30
+    report = client.get("/api/admin/usage").json()
+    events = client.get("/api/admin/usage/events").json()
+
+    assert report["days"] == default_days
+    assert report["items"] == []
+    assert events["items"] == [] and events["total"] == 0

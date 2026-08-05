@@ -8,6 +8,7 @@ public API for one console.
 """
 
 from collections.abc import Sequence
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import Select, func, select
@@ -21,6 +22,8 @@ from octoforge_core.admin.api import (
     SecretOverview,
     TaskOverview,
     Totals,
+    UsageEventOverview,
+    UsageReportRow,
     UserParamOverview,
 )
 from octoforge_core.context.api import DialogueSummary
@@ -39,6 +42,7 @@ from octoforge_core.memory.api import Memory
 from octoforge_core.params.models import UserParamRow
 from octoforge_core.secrets.api import DEFAULT_PLACEMENTS
 from octoforge_core.secrets.models import SecretRow
+from octoforge_core.tariffs.models import UsageEventRow
 from octoforge_core.tasks.api import TaskKind, TaskStatus
 from octoforge_core.tasks.models import TaskRow
 from octoforge_core.time import utc_now
@@ -369,6 +373,69 @@ class SqlAlchemyAdminStore:
             for row in rows
         )
         return Page(items=items, total=total, limit=limit, offset=offset)
+
+    async def list_usage_events(self, limit: int, offset: int) -> Page[UsageEventOverview]:
+        """Usage-ledger events of every user, newest first."""
+        statement = (
+            select(UsageEventRow)
+            .order_by(UsageEventRow.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        counter = select(func.count()).select_from(UsageEventRow)
+        rows, total = await self._page(statement, counter)
+        items = tuple(
+            UsageEventOverview(
+                user_id=row.user_id,
+                kind=row.kind,
+                origin=row.origin,
+                prompt_tokens=row.prompt_tokens,
+                completion_tokens=row.completion_tokens,
+                quantity=row.quantity,
+                dialog_id=row.dialog_id,
+                exchange_id=row.exchange_id,
+                task_id=row.task_id,
+                created_at=row.created_at,
+            )
+            for row in rows
+        )
+        return Page(items=items, total=total, limit=limit, offset=offset)
+
+    async def usage_report(self, days: int) -> list[UsageReportRow]:
+        """Consumption of the last `days` days, grouped per (user, kind, origin).
+
+        Grouping avoids any per-dialect date arithmetic: the cutoff is
+        computed in Python and the sums run in SQL.
+        """
+        cutoff = utc_now() - timedelta(days=max(1, days))
+        statement = (
+            select(
+                UsageEventRow.user_id,
+                UsageEventRow.kind,
+                UsageEventRow.origin,
+                func.sum(UsageEventRow.prompt_tokens),
+                func.sum(UsageEventRow.completion_tokens),
+                func.sum(UsageEventRow.quantity),
+                func.count(),
+            )
+            .where(UsageEventRow.created_at >= cutoff)
+            .group_by(UsageEventRow.user_id, UsageEventRow.kind, UsageEventRow.origin)
+            .order_by(UsageEventRow.user_id, UsageEventRow.kind, UsageEventRow.origin)
+        )
+        async with read_session(self._session_factory) as session:
+            rows = (await session.execute(statement)).all()
+        return [
+            UsageReportRow(
+                user_id=user_id,
+                kind=kind,
+                origin=origin,
+                prompt_tokens=prompt or 0,
+                completion_tokens=completion or 0,
+                quantity=quantity or 0,
+                events=events,
+            )
+            for user_id, kind, origin, prompt, completion, quantity, events in rows
+        ]
 
     async def list_secrets(self, limit: int, offset: int) -> Page[SecretOverview]:
         """Secret metadata of every user; the ciphertext column is never selected."""

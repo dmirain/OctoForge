@@ -29,6 +29,8 @@ that boundary intact — enforced by `core/tests/test_boundaries.py`.
 | `list_exchanges` | Obligations with statuses |
 | `list_user_params` | Per-user params — the values endpoint templates reference as `{user.code}` |
 | `list_secrets` | Secret *metadata* across users: code, host, description, placements, transform — never a value (the ciphertext column is not even selected) |
+| `list_usage_events` | The usage ledger, newest first, with the dialog/exchange/task links of every event |
+| `usage_report(days)` | Consumption aggregated per (user, kind, origin) over the report window |
 
 Page size defaults to 50 and is capped at 500.
 
@@ -49,10 +51,12 @@ Telegram's own knowledge, and only Telegram can answer for them.
 ### Mutations are not part of it
 
 Two actions are available from the console — publishing an instruction and enabling or disabling a cron
-job — plus deletions of dialogs, tasks and cron jobs, and the per-user params CRUD
+job — plus deletions of dialogs, tasks and cron jobs, the per-user params CRUD
 (`POST /api/admin/params`, `DELETE /api/admin/params/{code}?user_id=…`): the console is where an
 operator sets a user's `{user.*}` values, and the write goes through the same `UserParamStore` the
-call executor reads. All of them go through the same owner-scoped services a user action would
+call executor reads. The tariff catalog is managed here too (`POST/DELETE /api/admin/tariffs`,
+`POST /api/admin/tariffs/assign` — see [tariffs.md](tariffs.md)), through the same `TariffStore` the
+limit gate reads. All of them go through the same owner-scoped services a user action would
 (`InstructionService.publish`, `CronStore.set_enabled`, `TaskStore.delete`,
 `DialogRepository.delete`, …), so an admin cannot bypass an invariant that protects a user.
 

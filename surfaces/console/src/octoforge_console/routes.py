@@ -24,6 +24,7 @@ from octoforge_core.admin.api import (
     Page,
     SecretOverview,
     TaskOverview,
+    UsageEventOverview,
     UserParamOverview,
     clamp_page,
 )
@@ -50,6 +51,15 @@ from octoforge_core.params.api import (
     UserParamNotFoundError,
     UserParamStore,
 )
+from octoforge_core.tariffs.api import (
+    FeatureCode,
+    InvalidTariffError,
+    Tariff,
+    TariffInUseError,
+    TariffLimits,
+    TariffNotFoundError,
+    TariffStore,
+)
 from octoforge_core.tasks.api import TaskNotFoundError
 from octoforge_core.tasks.store import TaskStore
 from octoforge_server import audit
@@ -64,6 +74,7 @@ from octoforge_server.deps import (
     get_instruction_service,
     get_operator,
     get_summary_store,
+    get_tariff_store,
     get_task_store,
     get_user_param_store,
     require_admin,
@@ -84,8 +95,11 @@ IdentityStoreDep = Annotated[IdentityStore, Depends(get_identity_store)]
 ClaimsDep = Annotated[ClaimRepository, Depends(get_claim_repository)]
 SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
 UserParamsDep = Annotated[UserParamStore, Depends(get_user_param_store)]
+TariffStoreDep = Annotated[TariffStore, Depends(get_tariff_store)]
 LimitDep = Annotated[int | None, Query(ge=1)]
 OffsetDep = Annotated[int | None, Query(ge=0)]
+USAGE_REPORT_DEFAULT_DAYS = 30
+USAGE_REPORT_MAX_DAYS = 366
 
 DELETED_STATUS = {"status": "deleted"}
 
@@ -657,6 +671,186 @@ def _secret_to_dict(item: SecretOverview, names: dict[str, str]) -> dict[str, An
         "transform": item.transform,
         "created_at": _iso(item.created_at),
         "last_used_at": _iso(item.last_used_at),
+    }
+
+
+class SetTariffRequest(BaseModel):
+    """Payload of the tariff upsert; a null limit means unlimited."""
+
+    code: str
+    title: str
+    features: list[str] = []
+    daily_tokens: int | None = None
+    daily_user_messages: int | None = None
+    daily_assistant_messages: int | None = None
+    max_cron_jobs: int | None = None
+    max_datasets: int | None = None
+
+
+class AssignTariffRequest(BaseModel):
+    """Bind a user to a plan; a null code unbinds (= unlimited)."""
+
+    user_id: str
+    code: str | None = None
+
+
+@router.get("/tariffs")
+async def tariffs(store: TariffStoreDep, identities: IdentityStoreDep) -> dict[str, Any]:
+    """The plan catalog with its users, and the feature vocabulary for the form.
+
+    Page-shaped for the console's generic table; the catalog is small enough
+    that "one page holds everything" is the honest answer.
+    """
+    plans = await store.list()
+    assignments = await store.assignments()
+    names = await _names(identities)
+    users_of: dict[str, list[str]] = {}
+    for user_id, code in sorted(assignments.items()):
+        users_of.setdefault(code, []).append(names.get(user_id) or user_id)
+    items = [_tariff_to_dict(item) | {"users": users_of.get(item.code, [])} for item in plans]
+    return {
+        "items": items,
+        "total": len(items),
+        "limit": max(1, len(items)),
+        "offset": 0,
+        "features": [feature.value for feature in FeatureCode],
+    }
+
+
+@router.post("/tariffs")
+async def set_tariff(
+    request: SetTariffRequest,
+    operator: OperatorDep,
+    store: TariffStoreDep,
+) -> dict[str, Any]:
+    """Create or replace a plan; a put replaces every limit and feature."""
+    try:
+        features = frozenset(FeatureCode(value) for value in request.features)
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    limits = TariffLimits(
+        daily_tokens=request.daily_tokens,
+        daily_user_messages=request.daily_user_messages,
+        daily_assistant_messages=request.daily_assistant_messages,
+        max_cron_jobs=request.max_cron_jobs,
+        max_datasets=request.max_datasets,
+    )
+    try:
+        tariff = await store.put(request.code, request.title, features, limits)
+    except InvalidTariffError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    audit.record("tariff.set", operator, tariff.code)
+    return _tariff_to_dict(tariff)
+
+
+@router.delete("/tariffs/{code}")
+async def delete_tariff(
+    code: str,
+    operator: OperatorDep,
+    store: TariffStoreDep,
+) -> dict[str, str]:
+    try:
+        await store.delete(code)
+    except TariffNotFoundError as exc:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    except TariffInUseError as exc:
+        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=str(exc)) from exc
+    except InvalidTariffError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    audit.record("tariff.delete", operator, code)
+    return DELETED_STATUS
+
+
+@router.post("/tariffs/assign")
+async def assign_tariff(
+    request: AssignTariffRequest,
+    operator: OperatorDep,
+    store: TariffStoreDep,
+) -> dict[str, Any]:
+    """Bind the user to a plan, or unbind with a null code (= unlimited)."""
+    try:
+        await store.assign(request.user_id, request.code)
+    except TariffNotFoundError as exc:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    except InvalidTariffError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    audit.record("tariff.assign", operator, f"{request.user_id}/{request.code or '-'}")
+    return {"user_id": request.user_id, "code": request.code}
+
+
+@router.get("/usage")
+async def usage_report(
+    read_model: ReadModelDep,
+    identities: IdentityStoreDep,
+    days: Annotated[int, Query(ge=1, le=USAGE_REPORT_MAX_DAYS)] = USAGE_REPORT_DEFAULT_DAYS,
+) -> dict[str, Any]:
+    """Aggregated consumption per (user, kind, origin) over the last `days`."""
+    rows = await read_model.usage_report(days)
+    names = await _names(identities)
+    items = [
+        {
+            "user_id": row.user_id,
+            "user_name": names.get(row.user_id, ""),
+            "kind": row.kind,
+            "origin": row.origin,
+            "prompt_tokens": row.prompt_tokens,
+            "completion_tokens": row.completion_tokens,
+            "quantity": row.quantity,
+            "events": row.events,
+        }
+        for row in rows
+    ]
+    return {
+        "days": days,
+        "items": items,
+        "total": len(items),
+        "limit": max(1, len(items)),
+        "offset": 0,
+    }
+
+
+@router.get("/usage/events")
+async def usage_events(
+    read_model: ReadModelDep,
+    identities: IdentityStoreDep,
+    limit: LimitDep = None,
+    offset: OffsetDep = None,
+) -> dict[str, Any]:
+    """The raw usage ledger, newest first, with its entity links."""
+    resolved_limit, resolved_offset = clamp_page(limit, offset)
+    page = await read_model.list_usage_events(resolved_limit, resolved_offset)
+    names = await _names(identities)
+    return _page_payload(page, lambda item: _usage_event_to_dict(item, names))
+
+
+def _tariff_to_dict(item: Tariff) -> dict[str, Any]:
+    return {
+        "code": item.code,
+        "title": item.title,
+        "features": sorted(feature.value for feature in item.features),
+        "daily_tokens": item.limits.daily_tokens,
+        "daily_user_messages": item.limits.daily_user_messages,
+        "daily_assistant_messages": item.limits.daily_assistant_messages,
+        "max_cron_jobs": item.limits.max_cron_jobs,
+        "max_datasets": item.limits.max_datasets,
+        "created_at": _iso(item.created_at),
+        "updated_at": _iso(item.updated_at),
+    }
+
+
+def _usage_event_to_dict(item: UsageEventOverview, names: dict[str, str]) -> dict[str, Any]:
+    return {
+        "user_id": item.user_id,
+        "user_name": names.get(item.user_id, ""),
+        "kind": item.kind,
+        "origin": item.origin,
+        "prompt_tokens": item.prompt_tokens,
+        "completion_tokens": item.completion_tokens,
+        "quantity": item.quantity,
+        "dialog_id": item.dialog_id,
+        "exchange_id": item.exchange_id,
+        "task_id": item.task_id,
+        "created_at": _iso(item.created_at),
     }
 
 

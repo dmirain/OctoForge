@@ -58,6 +58,8 @@ failure modes, code anchors.
 - [reference/search.md](reference/search.md) — web search
 - [reference/vision-and-speech.md](reference/vision-and-speech.md) — images and voice messages
 - [reference/llm-clients.md](reference/llm-clients.md) — LLM, embedding and reranker clients
+- [reference/tariffs.md](reference/tariffs.md) — per-user plans: feature gates, daily budgets and the
+  usage ledger
 - [reference/data-model.md](reference/data-model.md) — tables, dialects, time, migrations
 
 **Surfaces**
