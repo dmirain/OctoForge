@@ -220,6 +220,7 @@ def _to_tariff(row: TariffRow) -> Tariff:
             daily_assistant_messages=row.daily_assistant_messages,
             max_cron_jobs=row.max_cron_jobs,
             max_datasets=row.max_datasets,
+            max_memory_chars=row.max_memory_chars,
         ),
         created_at=row.created_at,
         updated_at=row.updated_at,

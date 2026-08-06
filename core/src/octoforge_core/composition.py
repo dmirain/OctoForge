@@ -314,7 +314,7 @@ def build_tool_registry(  # noqa: PLR0913, PLR0917 — the composition facade ta
         registry.register(services.secret_link)
     _register_instruction_tools(registry, services, limits)
     _register_dataset_tools(registry, services.datasets, limits)
-    _register_memory_tools(registry, services.instructions)
+    _register_memory_tools(registry, services.instructions, limit_gate)
     _register_history_tool(registry, stores.archive, stores.summaries, limits)
     return registry
 
@@ -495,13 +495,14 @@ def _register_dataset_tools(
 def _register_memory_tools(
     registry: ToolRegistry,
     instructions: InstructionService,
+    limit_gate: LimitGate | None,
 ) -> None:
     """Register the memory write tools over the shared instruction store.
 
     Reading memories is instruction_search's job (memories are ranked with
     everything else), so no memory_search tool is registered.
     """
-    registry.register(MemoryStoreTool(service=instructions))
+    registry.register(MemoryStoreTool(service=instructions, limits=limit_gate))
     registry.register(MemoryDeleteTool(service=instructions))
 
 

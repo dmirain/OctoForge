@@ -176,6 +176,14 @@ class InstructionStore(Protocol):
         """
         ...
 
+    async def memory_chars(self, owner_id: str) -> int:
+        """Total characters of the owner's stored memories (one SQL aggregate).
+
+        The number a plan's `max_memory_chars` is checked against — computed
+        by the database, never by pulling the rows.
+        """
+        ...
+
     async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
         """Increment usage_count of the given records (search hits proved useful)."""
         ...
@@ -370,6 +378,10 @@ class InstructionService(Protocol):
         candidates share the title, the oldest record wins. Raises
         `InstructionNotFoundError` when nothing matches.
         """
+        ...
+
+    async def memory_chars(self, owner_id: str) -> int:
+        """Total characters of the owner's stored memories (delegated aggregate)."""
         ...
 
     async def delete(self, user_id: str, instruction_id: str) -> None:

@@ -175,6 +175,17 @@ class SqlAlchemyInstructionStore:
             rows = (await session.scalars(statement)).all()
             return [to_instruction(row) for row in rows]
 
+    async def memory_chars(self, owner_id: str) -> int:
+        """Total characters of the owner's stored memories, summed in SQL."""
+        async with read_session(self._session_factory) as session:
+            total = await session.scalar(
+                select(func.coalesce(func.sum(func.length(InstructionRow.content)), 0)).where(
+                    InstructionRow.type == InstructionType.MEMORY.value,
+                    InstructionRow.owner_id == owner_id,
+                )
+            )
+            return int(total or 0)
+
     async def bump_usage(self, instruction_ids: tuple[str, ...]) -> None:
         """Increment usage_count of the given records (search hits proved useful)."""
         if not instruction_ids:

@@ -696,6 +696,7 @@ class SetTariffRequest(BaseModel):
     daily_assistant_messages: int | None = None
     max_cron_jobs: int | None = None
     max_datasets: int | None = None
+    max_memory_chars: int | None = None
     is_default: bool = False
 
 
@@ -762,6 +763,7 @@ async def set_tariff(
         daily_assistant_messages=request.daily_assistant_messages,
         max_cron_jobs=request.max_cron_jobs,
         max_datasets=request.max_datasets,
+        max_memory_chars=request.max_memory_chars,
     )
     try:
         tariff = await store.put(
@@ -863,6 +865,7 @@ def _tariff_to_dict(item: Tariff) -> dict[str, Any]:
         "daily_assistant_messages": item.limits.daily_assistant_messages,
         "max_cron_jobs": item.limits.max_cron_jobs,
         "max_datasets": item.limits.max_datasets,
+        "max_memory_chars": item.limits.max_memory_chars,
         "is_default": item.is_default,
         "created_at": _iso(item.created_at),
         "updated_at": _iso(item.updated_at),

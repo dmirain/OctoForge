@@ -275,6 +275,9 @@ class CapGate:
     async def max_datasets(self, user_id: str) -> int | None:
         return None
 
+    async def max_memory_chars(self, user_id: str) -> int | None:
+        return None
+
     async def record(self, event: UsageEvent) -> None:
         return None
 

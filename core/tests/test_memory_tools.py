@@ -13,6 +13,7 @@ from octoforge_core.instructions.api import (
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.memory.tools import MemoryDeleteTool, MemoryStoreTool
+from octoforge_core.tariffs.api import LimitVerdict, UsageEvent
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -218,3 +219,88 @@ async def test_delete_rejects_invalid_arguments(delete_tool: MemoryDeleteTool) -
         await delete_tool.execute({}, CTX_A)
     with pytest.raises(ToolArgumentsError):
         await delete_tool.execute({"key": "  "}, CTX_A)
+
+
+# --- max_memory_chars --------------------------------------------------------
+
+
+class MemoryCapGate:
+    """LimitGate stub with a configurable memory cap; everything else open."""
+
+    def __init__(self, max_memory_chars: int | None) -> None:
+        self._max_memory_chars = max_memory_chars
+
+    async def enabled_features(self, user_id: str) -> frozenset[str] | None:
+        return None
+
+    async def allows(self, user_id: str, feature: str) -> bool:
+        return True
+
+    async def check_run_budget(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def max_cron_jobs(self, user_id: str) -> int | None:
+        return None
+
+    async def max_datasets(self, user_id: str) -> int | None:
+        return None
+
+    async def max_memory_chars(self, user_id: str) -> int | None:
+        return self._max_memory_chars
+
+    async def record(self, event: UsageEvent) -> None:
+        return None
+
+
+def capped_tool(service: InstructionService, cap: int | None) -> MemoryStoreTool:
+    return MemoryStoreTool(service=service, limits=MemoryCapGate(cap))
+
+
+async def test_memory_chars_sums_only_the_owners_memories(
+    service: InstructionService,
+    store_tool: MemoryStoreTool,
+) -> None:
+    await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
+    await store_tool.execute({"key": "job", "content": "works remotely"}, CTX_A)
+    await store_tool.execute({"key": CITY_KEY, "content": "somewhere else"}, CTX_B)
+
+    assert await service.memory_chars(CTX_A.user_id) == len(CITY_CONTENT) + len("works remotely")
+    assert await service.memory_chars("nobody") == 0
+
+
+async def test_a_full_memory_refuses_growth_but_never_shrinking(
+    service: InstructionService,
+) -> None:
+    """The replacement-aware check: the cap must not wedge the user out of
+    freeing space, so rewriting a key smaller passes over a full memory."""
+    tool = capped_tool(service, cap=len(CITY_CONTENT))
+    await tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
+
+    refusal = await tool.execute({"key": "job", "content": "x"}, CTX_A)
+    shrunk = await tool.execute({"key": CITY_KEY, "content": "Berlin"}, CTX_A)
+    regrown = await tool.execute({"key": "job", "content": "works remotely from home"}, CTX_A)
+
+    assert "memory" in refusal and "Delete something" in refusal
+    assert shrunk.startswith("memory stored")
+    assert "Delete something" in regrown  # the freed space is smaller than the ask
+    assert await service.memory_chars(CTX_A.user_id) == len("Berlin")
+
+
+async def test_the_exact_fit_is_still_stored(service: InstructionService) -> None:
+    tool = capped_tool(service, cap=len(CITY_CONTENT))
+
+    stored = await tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
+
+    assert stored.startswith("memory stored")
+
+
+async def test_no_cap_and_no_gate_mean_no_restriction(service: InstructionService) -> None:
+    uncapped = capped_tool(service, cap=None)
+    ungated = MemoryStoreTool(service=service)
+
+    assert (await uncapped.execute({"key": "a", "content": CITY_CONTENT}, CTX_A)).startswith(
+        "memory stored"
+    )
+    assert (await ungated.execute({"key": "b", "content": CITY_CONTENT}, CTX_A)).startswith(
+        "memory stored"
+    )

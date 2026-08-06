@@ -314,6 +314,10 @@ class LocalInstructionService:
             raise InstructionNotFoundError(name)
         return instruction
 
+    async def memory_chars(self, owner_id: str) -> int:
+        """Total characters of the owner's stored memories (delegated aggregate)."""
+        return await self._store.memory_chars(owner_id)
+
     async def list_system(self) -> list[Instruction]:
         """Return every system (registry-owned) record."""
         return await self._store.list_system()

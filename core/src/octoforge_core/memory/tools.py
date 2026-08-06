@@ -17,6 +17,7 @@ from octoforge_core.instructions.api import (
     InstructionService,
     InstructionType,
 )
+from octoforge_core.tariffs.api import LimitGate
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -30,6 +31,11 @@ STORE_DESCRIPTION = (
     "Stored memories come back through recall."
 )
 STORED_TEMPLATE = "memory stored (key={key}, version={version})"
+MEMORY_LIMIT_REFUSAL_TEMPLATE = (
+    "cannot store: this would take the memory to {projected} of the plan's "
+    "{limit} characters. Delete something via memory_delete, shorten the "
+    "content, or upgrade to a bigger plan."
+)
 STORE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -60,8 +66,9 @@ DELETE_SCHEMA: dict[str, Any] = {
 class MemoryStoreTool:
     """Intent-shaped wrapper over the shared instruction store (type=memory)."""
 
-    def __init__(self, service: InstructionService) -> None:
+    def __init__(self, service: InstructionService, limits: LimitGate | None = None) -> None:
         self._service = service
+        self._limits = limits
 
     @property
     def spec(self) -> ToolSpec:
@@ -82,10 +89,39 @@ class MemoryStoreTool:
         key = _non_empty_string(arguments.get("key"), "key")
         content = _non_empty_string(arguments.get("content"), "content")
         tags = _tags(arguments.get("tags"))
+        refusal = await self._over_the_cap(context.user_id, key, content)
+        if refusal is not None:
+            return refusal
         record = await self._service.save(
             context.user_id, InstructionType.MEMORY, key, content, tags
         )
         return STORED_TEMPLATE.format(key=record.title, version=record.version)
+
+    async def _over_the_cap(self, user_id: str, key: str, content: str) -> str | None:
+        """The plan's memory-size refusal, or None to go ahead.
+
+        Replacement-aware: an upsert releases the old content of the same
+        key, so a shrinking rewrite always passes even over a full memory —
+        the cap must never wedge the user out of freeing space.
+        """
+        if self._limits is None:
+            return None
+        cap = await self._limits.max_memory_chars(user_id)
+        if cap is None:
+            return None
+        used = await self._service.memory_chars(user_id)
+        replaced = await self._own_content_length(user_id, key)
+        projected = used - replaced + len(content)
+        if projected <= cap:
+            return None
+        return MEMORY_LIMIT_REFUSAL_TEMPLATE.format(projected=projected, limit=cap)
+
+    async def _own_content_length(self, user_id: str, key: str) -> int:
+        try:
+            record = await self._service.get_by_name(key, InstructionType.MEMORY, user_id)
+        except InstructionNotFoundError:
+            return 0
+        return len(record.content) if record.owner_id == user_id else 0
 
 
 class MemoryDeleteTool:

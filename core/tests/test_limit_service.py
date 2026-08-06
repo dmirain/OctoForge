@@ -21,6 +21,7 @@ MESSAGE_LIMIT = 10
 ANSWER_LIMIT = 5
 CRON_CAP = 3
 DATASET_CAP = 2
+MEMORY_CAP = 4000
 
 
 def _tariff(
@@ -147,7 +148,9 @@ async def test_features_and_caps() -> None:
     service, _, _ = _service(
         _tariff(
             features=frozenset({FeatureCode.SKILL_CREATE}),
-            limits=TariffLimits(max_cron_jobs=CRON_CAP, max_datasets=DATASET_CAP),
+            limits=TariffLimits(
+                max_cron_jobs=CRON_CAP, max_datasets=DATASET_CAP, max_memory_chars=MEMORY_CAP
+            ),
         ),
         UsageTotals(),
     )
@@ -158,6 +161,7 @@ async def test_features_and_caps() -> None:
     assert not await service.allows(USER, "my_tool")  # custom codes gate the same way
     assert await service.max_cron_jobs(USER) == CRON_CAP
     assert await service.max_datasets(USER) == DATASET_CAP
+    assert await service.max_memory_chars(USER) == MEMORY_CAP
 
 
 async def test_totals_are_cached_but_the_tariff_is_not() -> None:

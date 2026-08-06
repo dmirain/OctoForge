@@ -27,6 +27,7 @@ class TariffRow(Base):
     )
     max_cron_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     max_datasets: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    max_memory_chars: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     # at most one row is true; the store keeps the invariant on every put
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)

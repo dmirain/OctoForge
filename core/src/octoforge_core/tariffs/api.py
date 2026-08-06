@@ -92,6 +92,8 @@ class TariffLimits:
     daily_assistant_messages: int | None = None
     max_cron_jobs: int | None = None
     max_datasets: int | None = None
+    #: total characters of the user's stored memories (SUM over contents)
+    max_memory_chars: int | None = None
 
     def normalized(self) -> "TariffLimits":
         """Validate every cap; raise `InvalidTariffError` on a negative one."""
@@ -103,6 +105,7 @@ class TariffLimits:
             ),
             max_cron_jobs=normalize_limit(self.max_cron_jobs, "max_cron_jobs"),
             max_datasets=normalize_limit(self.max_datasets, "max_datasets"),
+            max_memory_chars=normalize_limit(self.max_memory_chars, "max_memory_chars"),
         )
 
 
@@ -259,6 +262,10 @@ class LimitGate(UsageRecorder, Protocol):
 
     async def max_datasets(self, user_id: str) -> int | None:
         """The user's dataset cap; `None` = unlimited."""
+        ...
+
+    async def max_memory_chars(self, user_id: str) -> int | None:
+        """The user's total memory-size cap in characters; `None` = unlimited."""
         ...
 
 

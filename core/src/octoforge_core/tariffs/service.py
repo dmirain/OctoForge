@@ -94,6 +94,11 @@ class LimitService:
         tariff = await self.resolve(user_id)
         return None if tariff is None else tariff.limits.max_datasets
 
+    async def max_memory_chars(self, user_id: str) -> int | None:
+        """The user's total memory-size cap in characters; `None` = unlimited."""
+        tariff = await self.resolve(user_id)
+        return None if tariff is None else tariff.limits.max_memory_chars
+
     async def record(self, event: UsageEvent) -> None:
         """Append a usage event; a metering failure never fails the caller."""
         try:

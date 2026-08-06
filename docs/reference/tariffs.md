@@ -62,6 +62,11 @@ the run — the event is logged as lost instead.
 - **Count caps**: `max_cron_jobs` (enforced by `cron.api.create_job` and, through the shared
   `job_quota_refusal`, by `POST /api/cron/jobs` — HTTP 403) and `max_datasets` (enforced by the
   dataset service, so the agent's implicit create on a first `data_put` goes through the same gate).
+- **Memory size**: `max_memory_chars` caps the SUM of the user's stored memory contents in
+  characters (one SQL aggregate, `InstructionStore.memory_chars`). Checked by `memory_store`,
+  replacement-aware — an upsert releases the old content of the same key first, so a shrinking
+  rewrite always passes and the cap can never wedge the user out of freeing space. The refusal
+  suggests `memory_delete` or a bigger plan.
 
 ### Gating a custom tool — no core changes
 
