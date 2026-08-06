@@ -31,6 +31,7 @@ import octoforge_core.instructions.models
 import octoforge_core.mcp.models
 import octoforge_core.params.models
 import octoforge_core.secrets.models
+import octoforge_core.settings.models
 import octoforge_core.tariffs.models
 import octoforge_core.tasks.models  # noqa: F401
 from octoforge_core.db.base import Base

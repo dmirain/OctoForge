@@ -1,9 +1,9 @@
 """SQL store of the identity module."""
 
 import uuid
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import CursorResult, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -16,6 +16,7 @@ from octoforge_core.identity.api import (
     UserIdentityList,
     UserList,
     UserNotFoundError,
+    UserStatus,
 )
 from octoforge_core.identity.models import UserIdentityRow, UserRow
 from octoforge_core.time import utc_now
@@ -162,6 +163,67 @@ class SqlAlchemyIdentityStore:
             if user is not None and not user.name:
                 user.name = name
 
+    async def set_status(self, user_id: str, status: UserStatus) -> None:
+        """Set the person's status outright; the operator outranks the cap."""
+        async with write_session(self._session_factory) as session:
+            row = await session.get(UserRow, user_id)
+            if row is None:
+                raise UserNotFoundError(user_id)
+            row.status = status.value
+
+    async def try_activate(self, user_id: str, max_active: int | None) -> bool:
+        """Promote a WAITING person to ACTIVE if a slot is free.
+
+        The head-count lives in the UPDATE's own WHERE (a scalar subquery),
+        so the check and the flip are one statement. One statement is not
+        yet one winner: under READ COMMITTED two concurrent UPDATEs each
+        count the world *before* the other's flip and both pass at the
+        boundary — so on Postgres the whole activation takes a transaction
+        advisory lock first. Unlike every other guardrail here, this cap is
+        a promise ("никогда не больше N активных"), not an estimate, and
+        activations are rare enough that a global lock costs nothing.
+        SQLite needs none: its writers are serialized by the database.
+        """
+        conditions = [UserRow.id == user_id, UserRow.status == UserStatus.WAITING.value]
+        if max_active is not None:
+            active_count = (
+                select(func.count())
+                .select_from(UserRow)
+                .where(UserRow.status == UserStatus.ACTIVE.value)
+                .scalar_subquery()
+            )
+            conditions.append(active_count < max_active)
+        async with write_session(self._session_factory) as session:
+            capped_on_postgres = (
+                max_active is not None
+                and session.bind is not None
+                and session.bind.dialect.name == "postgresql"
+            )
+            if capped_on_postgres:
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext('users_activation'))")
+                )
+            # DML executes into a CursorResult at runtime; the stubs type
+            # AsyncSession.execute loosely, so narrow it for rowcount.
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    update(UserRow).where(*conditions).values(status=UserStatus.ACTIVE.value)
+                ),
+            )
+            return result.rowcount == 1
+
+    async def count_by_status(self) -> dict[UserStatus, int]:
+        """How many people hold each status; absent statuses count zero."""
+        async with read_session(self._session_factory) as session:
+            pairs = (
+                await session.execute(select(UserRow.status, func.count()).group_by(UserRow.status))
+            ).all()
+        counts = dict.fromkeys(UserStatus, 0)
+        for status, count in pairs:
+            counts[UserStatus(status)] = count
+        return counts
+
     async def list_users(self) -> UserList:
         """Everyone the installation knows, newest first."""
         async with read_session(self._session_factory) as session:
@@ -206,7 +268,13 @@ class SqlAlchemyIdentityStore:
 
 
 def _to_user(row: UserRow) -> User:
-    return User(id=row.id, name=row.name, email=row.email or "", created_at=row.created_at)
+    return User(
+        id=row.id,
+        name=row.name,
+        email=row.email or "",
+        status=UserStatus(row.status),
+        created_at=row.created_at,
+    )
 
 
 def _to_identity(row: UserIdentityRow) -> UserIdentity:

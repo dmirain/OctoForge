@@ -60,6 +60,8 @@ failure modes, code anchors.
 - [reference/llm-clients.md](reference/llm-clients.md) — LLM, embedding and reranker clients
 - [reference/tariffs.md](reference/tariffs.md) — per-user plans: feature gates, daily budgets and the
   usage ledger
+- [reference/access.md](reference/access.md) — user statuses, the registration queue and the
+  operator settings table
 - [reference/data-model.md](reference/data-model.md) — tables, dialects, time, migrations
 
 **Surfaces**

@@ -11,9 +11,11 @@ from enum import StrEnum
 import httpx
 from octoforge_core.agent.runner import ConversationRunner
 from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
-from octoforge_core.identity.api import IdentityStore
+from octoforge_core.identity.api import IdentityStore, UserStatus
+from octoforge_core.identity.service import AccessService
 from octoforge_core.speech.api import AudioData, TranscriptionClient
 from octoforge_core.tariffs.api import FeatureCode, LimitGate
+from octoforge_core.time import utc_now
 from octoforge_core.vision.api import ImageData, VisionClient
 
 from octoforge_telegram.bridge import RunnerProvider, TelegramBridge, TelegramBridgeOptions
@@ -134,6 +136,13 @@ VOICE_TOO_LONG_TEMPLATE = (
 )
 VOICE_EMPTY_NOTICE = "Я не разобрал, что сказано в записи. Напиши текстом или запиши ещё раз?"
 VOICE_PLAN_NOTICE = "Распознавание голосовых не входит в твой тариф — напиши, пожалуйста, текстом."
+# the queue notice never names a position: the number is not a promise the
+# installation can keep, and watching it move (or not) is worse than waiting
+QUEUE_WAIT_TEXT = (
+    "Сейчас все места заняты — я записал тебя в очередь на доступ. "
+    "Напишу, как только место освободится."
+)
+ACCESS_CLOSED_TEXT = "Доступ закрыт."
 SECRETS_LINK_TEXT = (
     "Ссылка на форму секретов (действует 10 минут):\n{url}\n\n"
     "Значения шифруются, ассистент видит только коды секретов. "
@@ -340,6 +349,9 @@ class TelegramPollerOptions:
     speech: TranscriptionClient | None = None
     # per-user tariff gate for voice transcription; None = everyone may
     feature_gate: LimitGate | None = None
+    # the status gate (waiting/active/banned); None = statuses are not
+    # enforced on this surface (an HTTP-gateway bot leaves them to the service)
+    access: AccessService | None = None
     # how long an album's burst must stay quiet before it is submitted
     album_quiet_seconds: float = ALBUM_QUIET_SECONDS
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
@@ -365,6 +377,10 @@ class TelegramPoller:
         self._vision = options.vision
         self._speech = options.speech
         self._feature_gate = options.feature_gate
+        self._access = options.access
+        # (person, text) → day: one status notice per person per day — the
+        # answer does not change by asking, and silence beats a nag
+        self._status_notes: dict[tuple[str, str], str] = {}
         self._album_quiet_seconds = options.album_quiet_seconds
         self._voice_max_seconds = options.voice_max_seconds
         self._offset: int | None = None
@@ -510,12 +526,8 @@ class TelegramPoller:
             await self._client.send_message(chat_id, GROUP_NOTICE)
             return
         assert message.from_user is not None  # dispatch drops senderless updates
-        # the gate comes before every reply: a stranger must not be able to
-        # make the bot answer anything, not even the "text only" notice
-        if not await self._check_membership(user_id, chat_id, message.body or ""):
+        if not await self._gate(user_id, chat_id, message):
             return
-        # only past the gate: strangers knocking with bad codes stay unrecorded
-        await self._record_member(user_id, message.from_user)
         if len(batch) > 1 or message.media_group_id is not None:
             await self._dispatch_album(batch, user_id, chat_id)
             return
@@ -728,11 +740,53 @@ class TelegramPoller:
             ),
         )
 
+    async def _gate(self, user_id: str, chat_id: int, message: TelegramMessage) -> bool:
+        """Both doors of one entrance: the invite gate, then the status gate.
+
+        The invite gate comes before every reply — a stranger must not be
+        able to make the bot answer anything, not even the "text only"
+        notice — and only past it is the member recorded, so strangers
+        knocking with bad codes stay unrecorded.
+        """
+        if not await self._check_membership(user_id, chat_id, message.body or ""):
+            return False
+        assert message.from_user is not None  # the caller already checked
+        await self._record_member(user_id, message.from_user)
+        return await self._admit(user_id, chat_id)
+
+    async def _admit(self, user_id: str, chat_id: int) -> bool:
+        """The status gate: WAITING and BANNED stop here, before any dispatch.
+
+        Runs after the invite gate (a stranger gets nothing, not even a
+        queue notice) and resolves the core person to do it — statuses,
+        like plans, are filed under the person, never under the Telegram
+        handle. `admit` itself grabs a free slot for the waiting, so the
+        queue drains as its people knock, with no sweep anywhere.
+        """
+        if self._access is None:
+            return True
+        person = await self._registry.person_of(user_id.removeprefix(USER_ID_PREFIX))
+        status = await self._access.admit(person)
+        if status is UserStatus.ACTIVE:
+            return True
+        notice = ACCESS_CLOSED_TEXT if status is UserStatus.BANNED else QUEUE_WAIT_TEXT
+        note_key = (person, notice)
+        day = utc_now().strftime("%Y-%m-%d")
+        if self._status_notes.get(note_key) != day:
+            self._status_notes[note_key] = day
+            await self._client.send_message(chat_id, notice)
+        return False
+
     async def _voice_allowed(self, user_id: str) -> bool:
-        """Whether the user's plan includes voice transcription."""
+        """Whether the user's plan includes voice transcription.
+
+        The plan is filed under the person, so the handle is resolved first —
+        asking with `tg:…` would always find no binding and answer yes.
+        """
         if self._feature_gate is None:
             return True
-        return await self._feature_gate.allows(user_id, FeatureCode.VOICE_TRANSCRIPTION)
+        person = await self._registry.person_of(user_id.removeprefix(USER_ID_PREFIX))
+        return await self._feature_gate.allows(person, FeatureCode.VOICE_TRANSCRIPTION)
 
     def _voice_refusal(self, audio: TelegramAudioRef) -> str | None:
         """Why this recording will not be transcribed, or None to go ahead."""

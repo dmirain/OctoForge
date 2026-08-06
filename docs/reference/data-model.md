@@ -7,7 +7,8 @@ and no ORM object ever crosses a module boundary — stores map rows to their mo
 
 | Table | Owner module | Holds |
 |---|---|---|
-| `users` | `identity/` | A person: opaque id (an id that can be parsed will be parsed) and their canonical `name`, seeded by the first surface that reports one |
+| `users` | `identity/` | A person: opaque id (an id that can be parsed will be parsed), their canonical `name` (seeded by the first surface that reports one) and their admission `status` (waiting/active/banned; everyone is born waiting, pre-status rows were backfilled active) |
+| `app_settings` | `settings/` | Operator-editable installation settings as key→value rows (first key: `max_active_users`); settings live in data so the console changes them without a redeploy |
 | `user_identities` | `identity/` | What one surface calls a person; unique on `(surface, external_id)`; mirrors the surface profile (`name`, optional `username`) |
 | `dialogs` | `dialogs/` | One row per `(user_id, channel)` |
 | `messages` | `dialogs/` | The narrative and archive: role, content, kind, per-dialog `seq`, `exchange_id`, `task_id`, attachments |

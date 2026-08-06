@@ -37,7 +37,7 @@ from octoforge_core.dialogs.api import (
     DialogRepository,
     ExchangeRepository,
 )
-from octoforge_core.identity.api import IdentityStore
+from octoforge_core.identity.api import IdentityStore, UserNotFoundError, UserStatus
 from octoforge_core.instructions.api import (
     Instruction,
     InstructionNotFoundError,
@@ -51,6 +51,11 @@ from octoforge_core.params.api import (
     UserParamNotFoundError,
     UserParamStore,
 )
+from octoforge_core.settings.api import (
+    InvalidSettingError,
+    SettingsStore,
+    max_active_users,
+)
 from octoforge_core.tariffs.api import (
     InvalidTariffError,
     Tariff,
@@ -63,6 +68,7 @@ from octoforge_core.tasks.api import TaskNotFoundError
 from octoforge_core.tasks.store import TaskStore
 from octoforge_server import audit
 from octoforge_server.deps import (
+    get_activation_notifier,
     get_admin_read_model,
     get_claim_repository,
     get_conversation_manager,
@@ -73,12 +79,14 @@ from octoforge_server.deps import (
     get_instruction_service,
     get_known_features,
     get_operator,
+    get_settings_store,
     get_summary_store,
     get_tariff_store,
     get_task_store,
     get_user_param_store,
     require_admin,
 )
+from octoforge_server.runtime_state import ActivationNotifier
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_admin)])
@@ -97,6 +105,8 @@ SummariesDep = Annotated[SummaryStore, Depends(get_summary_store)]
 UserParamsDep = Annotated[UserParamStore, Depends(get_user_param_store)]
 TariffStoreDep = Annotated[TariffStore, Depends(get_tariff_store)]
 KnownFeaturesDep = Annotated[frozenset[str], Depends(get_known_features)]
+SettingsStoreDep = Annotated[SettingsStore, Depends(get_settings_store)]
+NotifierDep = Annotated[ActivationNotifier | None, Depends(get_activation_notifier)]
 LimitDep = Annotated[int | None, Query(ge=1)]
 OffsetDep = Annotated[int | None, Query(ge=0)]
 USAGE_REPORT_DEFAULT_DAYS = 30
@@ -876,20 +886,24 @@ def _usage_event_to_dict(item: UsageEventOverview, names: dict[str, str]) -> dic
 
 
 @router.get("/users")
-async def users(identities: IdentityStoreDep) -> dict[str, Any]:
+async def users(identities: IdentityStoreDep, settings_store: SettingsStoreDep) -> dict[str, Any]:
     """Who the installation knows, and which accounts each person answers on.
 
     A person is the unit here, not a handle: the same human may arrive from
     Telegram and from a browser, and everything they own is filed under them.
     Revoked identities are shown rather than hidden — that an account was once
-    theirs is part of the answer to "who is this".
+    theirs is part of the answer to "who is this". The head-count and the cap
+    ride along so the users tab can say "X active of Y, Z waiting" without a
+    second request.
     """
     people = await identities.list_users()
+    counts = await identities.count_by_status()
     items = [
         {
             "user_id": person.id,
             "name": person.name,
             "email": person.email,
+            "status": person.status.value,
             "created_at": person.created_at.isoformat() if person.created_at else None,
             "identities": [
                 {
@@ -904,4 +918,100 @@ async def users(identities: IdentityStoreDep) -> dict[str, Any]:
         }
         for person in people
     ]
-    return {"items": items, "total": len(items)}
+    return {
+        "items": items,
+        "total": len(items),
+        "limit": max(1, len(items)),
+        "offset": 0,
+        "active_count": counts[UserStatus.ACTIVE],
+        "waiting_count": counts[UserStatus.WAITING],
+        "banned_count": counts[UserStatus.BANNED],
+        "max_active_users": await max_active_users(settings_store),
+    }
+
+
+@router.post("/users/{user_id}/status")
+async def set_user_status(  # noqa: PLR0913, PLR0917 — the console needs all of it
+    user_id: str,
+    status: Annotated[UserStatus, Query()],
+    operator: OperatorDep,
+    identities: IdentityStoreDep,
+    cron_store: CronStoreDep,
+    notifier: NotifierDep,
+) -> dict[str, Any]:
+    """Ban, unban or activate a person by hand.
+
+    The operator outranks the cap: activation applies even past a full
+    house. A ban pauses every cron job the person has — banned users must
+    not keep spending through the scheduler; an unban deliberately does NOT
+    resume them, the operator decides what wakes up. Activating somebody who
+    was waiting tells them their access opened, when a surface can reach
+    them.
+    """
+    try:
+        before = (await identities.get_user(user_id)).status
+        await identities.set_status(user_id, status)
+    except UserNotFoundError as exc:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(exc)) from exc
+    paused = 0
+    if status is UserStatus.BANNED:
+        for job in await cron_store.list_for_user(user_id):
+            if job.enabled:
+                await cron_store.set_enabled(user_id, job.id, False)
+                paused += 1
+    notified = False
+    if status is UserStatus.ACTIVE and before is UserStatus.WAITING and notifier is not None:
+        notified = await notifier(user_id)
+    audit.record("user.status", operator, f"{user_id}/{status.value}")
+    return {
+        "user_id": user_id,
+        "status": status.value,
+        "paused_cron_jobs": paused,
+        "notified": notified,
+    }
+
+
+class SetSettingRequest(BaseModel):
+    """One operator setting; the key is free-form within the grammar."""
+
+    key: str
+    value: str
+
+
+@router.get("/settings")
+async def settings_list(settings_store: SettingsStoreDep) -> dict[str, Any]:
+    """Every stored installation setting (page-shaped for the generic table)."""
+    items = [
+        {"key": item.key, "value": item.value, "updated_at": _iso(item.updated_at)}
+        for item in await settings_store.list()
+    ]
+    return {"items": items, "total": len(items), "limit": max(1, len(items)), "offset": 0}
+
+
+@router.post("/settings")
+async def set_setting(
+    request: SetSettingRequest,
+    operator: OperatorDep,
+    settings_store: SettingsStoreDep,
+) -> dict[str, Any]:
+    try:
+        stored = await settings_store.put(request.key, request.value)
+    except InvalidSettingError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    audit.record("setting.set", operator, stored.key)
+    return {"key": stored.key, "value": stored.value}
+
+
+@router.delete("/settings/{key}")
+async def delete_setting(
+    key: str,
+    operator: OperatorDep,
+    settings_store: SettingsStoreDep,
+) -> dict[str, str]:
+    """Clear a setting; absence is a meaning, not an error, so this is idempotent."""
+    try:
+        await settings_store.delete(key)
+    except InvalidSettingError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+    audit.record("setting.delete", operator, key)
+    return DELETED_STATUS

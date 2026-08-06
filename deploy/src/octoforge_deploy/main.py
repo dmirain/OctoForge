@@ -73,6 +73,7 @@ from octoforge_core.dialogs.store import (
 )
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.identity.api import IdentityStore
+from octoforge_core.identity.service import AccessService
 from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.instructions.registry import (
@@ -104,6 +105,8 @@ from octoforge_core.secrets.api import SecretStore
 from octoforge_core.secrets.link_store import SqlAlchemySecretFormLinkStore
 from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.secrets.tools import SecretLinkTool, SecretListTool
+from octoforge_core.settings.api import max_active_users
+from octoforge_core.settings.store import SqlAlchemySettingsStore
 from octoforge_core.speech.api import TranscriptionClient
 from octoforge_core.speech.client import OpenAITranscriptionClient
 from octoforge_core.tariffs.api import CORE_FEATURES, LimitGate
@@ -136,6 +139,7 @@ from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.drafts import SqlAlchemyDraftStore
 from octoforge_telegram.images import TelegramImageResolver
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
+from octoforge_telegram.notifier import TelegramActivationNotifier
 from octoforge_telegram.poller import (
     TelegramBridgeRegistry,
     TelegramMembership,
@@ -237,14 +241,20 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
         manager_stores.tasks,
         SqlAlchemyIdentityStore(session_factory),
     )
-    cron_store, secret_store, user_params, tariff_store, usage_meter = (
+    cron_store, secret_store, user_params, tariff_store, usage_meter, settings_store = (
         SqlAlchemyCronStore(session_factory),
         _build_secret_store(settings, session_factory),
         SqlAlchemyUserParamStore(session_factory),
         SqlAlchemyTariffStore(session_factory),
         SqlAlchemyUsageMeter(session_factory),
+        SqlAlchemySettingsStore(session_factory),
     )
-    limit_service = build_limit_service(tariff_store, usage_meter)
+    # the cap arrives as a callable: identity must not import settings, the
+    # two modules meet only here
+    limit_service, access = (
+        build_limit_service(tariff_store, usage_meter),
+        AccessService(identity, lambda: max_active_users(settings_store)),
+    )
     secret_links = SecretLinkService(
         settings.secrets_key, codes=SqlAlchemySecretFormLinkStore(session_factory)
     )
@@ -403,6 +413,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                             vision=vision_client,
                             speech=speech_client,
                             feature_gate=limit_service,
+                            access=access,
                             admin_tool=admin_tool,
                             identities=identity,
                         ),
@@ -449,7 +460,20 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     exchanges=exchanges,
                     claims=claims,
                     identity_store=identity,
+                    settings_store=settings_store,
+                    access=access,
                     channels=_served_channels(surfaces),
+                    activation_notifier=(
+                        TelegramActivationNotifier(
+                            TelegramBotClient(
+                                http_client=outbound_http,
+                                token=telegram_settings.telegram_bot_token,
+                            ),
+                            identity,
+                        )
+                        if telegram_settings.telegram_bot_token
+                        else None
+                    ),
                     surface_state=_surface_state(telegram_stores),
                 )
             finally:
@@ -925,6 +949,8 @@ class _TelegramExtras:
     speech: TranscriptionClient | None = None
     # per-user tariff gate for voice transcription; None = everyone may
     feature_gate: LimitGate | None = None
+    # the waiting/active/banned gate; None = statuses are not enforced here
+    access: AccessService | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1034,6 +1060,7 @@ def _build_telegram_surface(
             vision=resolved.vision,
             speech=resolved.speech,
             feature_gate=resolved.feature_gate,
+            access=resolved.access,
             voice_max_seconds=settings.voice_max_seconds,
         ),
     )

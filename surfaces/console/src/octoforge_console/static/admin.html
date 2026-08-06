@@ -113,6 +113,20 @@ function open(text) {
   document.getElementById("viewer").showModal();
 }
 
+function statusBadge(status) {
+  const label = { active: "активен", waiting: "в очереди", banned: "забанен" }[status] || status;
+  return `<span title="${esc(status)}">${esc(label)}</span>`;
+}
+
+function userActions(u) {
+  const post = (label, status, cls, confirmMsg) =>
+    `<button class="act ${cls || ""}" data-post="/api/admin/users/${encodeURIComponent(u.user_id)}/status?status=${status}"` +
+    `${confirmMsg ? ` data-confirm="${esc(confirmMsg)}"` : ""}>${label}</button>`;
+  if (u.status === "banned") return post("разбанить", "active");
+  const ban = post("бан", "banned", "danger", "Забанить? Его cron-задачи встанут на паузу.");
+  return (u.status === "waiting" ? post("активировать", "active") + " " : "") + ban;
+}
+
 const VIEWS = {
   dialogs: {
     title: "Диалоги", path: () => "/api/admin/dialogs",
@@ -197,8 +211,17 @@ const VIEWS = {
       `<td><button class="link" data-view="${esc(s.content)}">открыть</button></td>` +
       `<td class="mono">${time(s.created_at)}</td>`,
   },
+  users: {
+    title: "Пользователи", path: () => "/api/admin/users",
+    columns: ["имя", "статус", "поверхности", "создан", ""],
+    row: (u) => `${person(u.user_id, u.name || u.email)}` +
+      `<td>${statusBadge(u.status)}</td>` +
+      `<td>${tags(u.identities.map((i) => i.surface + ":" + (i.username ? "@" + i.username : i.external_id) + (i.active ? "" : " ✕")))}</td>` +
+      `<td class="mono">${time(u.created_at)}</td>` +
+      `<td>${userActions(u)}</td>`,
+  },
   tgusers: {
-    title: "Пользователи", path: () => "/api/admin/telegram/users",
+    title: "Telegram", path: () => "/api/admin/telegram/users",
     columns: ["имя", "username", "user_id", "инвайт", "впервые", "последний раз"],
     row: (u) => `${clip([u.first_name, u.last_name].filter(Boolean).join(" ") || "—")}` +
       `<td class="mono">${u.username ? "@" + esc(u.username) : "—"}</td>` +
@@ -261,7 +284,7 @@ const VIEWS = {
 };
 
 const NAV = [
-  ["dialogs", "Диалоги"], ["tgusers", "Пользователи"], ["exchanges", "Обмены"],
+  ["dialogs", "Диалоги"], ["users", "Пользователи"], ["tgusers", "Telegram"], ["exchanges", "Обмены"],
   ["tasks", "Задачи"], ["cron", "Cron"],
   ["instructions", "Инструкции"], ["datasets", "Датасеты"], ["memories", "Память"],
   ["params", "Параметры"], ["secrets", "Секреты"], ["summaries", "Сводки"],
@@ -286,6 +309,12 @@ function renderToolbar(view) {
     const options = values
       .map((s) => `<option value="${s}" ${s === state.status ? "selected" : ""}>${s || "любой статус"}</option>`);
     parts.push(`<select id="f-status">${options.join("")}</select>`);
+  }
+  if (state.view === "users") {
+    parts.push(`<span class="count" id="u-counts"></span>` +
+      `<input id="u-cap" type="number" min="0" placeholder="лимит активных" ` +
+      `title="пусто = без лимита; 0 = приём закрыт, все новые в очередь">` +
+      `<button class="act" id="u-cap-save">сохранить лимит</button>`);
   }
   if (state.view === "params") {
     parts.push(`<select id="p-user"><option value="">пользователь…</option></select>` +
@@ -323,8 +352,35 @@ function renderToolbar(view) {
   document.getElementById("f-status")?.addEventListener("change", (e) => {
     state.status = e.target.value; state.offset = 0; load();
   });
+  if (state.view === "users") setupUsersForm();
   if (state.view === "params") setupParamForm();
   if (state.view === "tariffs") setupTariffForm();
+}
+
+async function setupUsersForm() {
+  try {
+    const page = await api("/api/admin/users");
+    const cap = page.max_active_users;
+    document.getElementById("u-counts").textContent =
+      `активных: ${page.active_count}${cap == null ? "" : " из " + cap} · ` +
+      `в очереди: ${page.waiting_count} · забанено: ${page.banned_count}`;
+    if (cap != null) document.getElementById("u-cap").value = cap;
+  } catch (error) { fail(`не удалось получить счётчики: ${error.message}`); }
+  document.getElementById("u-cap-save").addEventListener("click", async () => {
+    const raw = document.getElementById("u-cap").value.trim();
+    try {
+      if (raw === "") {
+        await api("/api/admin/settings/max_active_users", { method: "DELETE" });
+      } else {
+        await api("/api/admin/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: "max_active_users", value: raw }),
+        });
+      }
+      await load();
+    } catch (error) { fail(`сохранение не удалось: ${error.message}`); }
+  });
 }
 
 async function setupParamForm() {
@@ -471,6 +527,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
   if (data.post) {
+    if (data.confirm && !confirm(data.confirm)) return;
     try { await api(data.post, { method: "POST" }); await load(); }
     catch (error) { fail(`действие не удалось: ${error.message}`); }
   }

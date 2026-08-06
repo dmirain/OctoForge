@@ -8,6 +8,7 @@ from sqlalchemy import JSON, Boolean, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from octoforge_core.db.base import Base, UTCDateTime
+from octoforge_core.identity.api import UserStatus
 from octoforge_core.time import utc_now
 
 
@@ -24,6 +25,11 @@ class UserRow(Base):
     # people cannot claim one address, nullable because nobody has one yet —
     # "" would collide on the second row.
     email: Mapped[str | None] = mapped_column(String, nullable=True, unique=True, default=None)
+    # Everyone is born waiting (the ORM default); the migration backfills
+    # pre-status rows as active — an upgrade must not lock existing people out.
+    status: Mapped[str] = mapped_column(
+        String, default=UserStatus.WAITING.value, server_default=UserStatus.WAITING.value
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
 
 

@@ -9,20 +9,27 @@ from octoforge_core.admin.api import AdminReadModel
 from octoforge_core.context.api import SummaryStore
 from octoforge_core.cron.api import CronStore
 from octoforge_core.dialogs.api import ClaimRepository, DialogRepository, ExchangeRepository
-from octoforge_core.identity.api import IdentityStore
+from octoforge_core.identity.api import IdentityStore, UserStatus
+from octoforge_core.identity.service import AccessService
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
+from octoforge_core.settings.api import SettingsStore
 from octoforge_core.tariffs.api import LimitGate, TariffStore, UsageMeter
 from octoforge_core.tasks.store import TaskStore
 
 from octoforge_server.auth import AuthGate
 from octoforge_server.config import Settings
+from octoforge_server.runtime_state import ActivationNotifier
 from octoforge_server.secret_links import SecretLinkService
 
 CHANNEL_HEADER = "X-Channel"
 UNKNOWN_CHANNEL_MESSAGE = "unknown channel: {channel}"
 MISSING_USER_ID_MESSAGE = "X-User-Id header is required"
+# neither message names a queue position: it is not a promise the
+# installation can keep
+ACCESS_WAITING_MESSAGE = "registration is pending: no free slots right now"
+ACCESS_BANNED_MESSAGE = "access is closed"
 
 
 def get_settings(request: Request) -> Settings:
@@ -181,6 +188,21 @@ def get_identity_store(request: Request) -> IdentityStore:
     return cast(IdentityStore, request.app.state.identity_store)
 
 
+def get_settings_store(request: Request) -> SettingsStore:
+    """Return the operator-settings store built at startup."""
+    return cast(SettingsStore, request.app.state.settings_store)
+
+
+def get_access_service(request: Request) -> AccessService:
+    """Return the admission gate built at startup."""
+    return cast(AccessService, request.app.state.access)
+
+
+def get_activation_notifier(request: Request) -> "ActivationNotifier | None":
+    """How to tell a person their access was opened (None: nobody can reach them)."""
+    return cast("ActivationNotifier | None", request.app.state.activation_notifier)
+
+
 async def get_user_id(
     request: Request,
     external_id: Annotated[str, Depends(get_external_id)],
@@ -192,6 +214,13 @@ async def get_user_id(
     calls someone and nothing more, and the actor below wants a person. Who
     may talk at all was already decided — by the invite gate, or by the
     credential in front of this service — so an unknown account arriving here
-    is somebody new.
+    is somebody new. What their *status* allows is decided right here: a
+    banned or still-waiting person gets 403, never a dialog.
     """
-    return await get_identity_store(request).resolve_or_create(channel, external_id)
+    person = await get_identity_store(request).resolve_or_create(channel, external_id)
+    status = await get_access_service(request).admit(person)
+    if status is UserStatus.BANNED:
+        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=ACCESS_BANNED_MESSAGE)
+    if status is not UserStatus.ACTIVE:
+        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=ACCESS_WAITING_MESSAGE)
+    return person

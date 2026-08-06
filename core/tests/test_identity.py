@@ -17,7 +17,9 @@ from octoforge_core.identity.api import (
     IdentityNotFoundError,
     IdentityTakenError,
     UserNotFoundError,
+    UserStatus,
 )
+from octoforge_core.identity.service import AccessService
 from octoforge_core.identity.store import SqlAlchemyIdentityStore
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -299,3 +301,85 @@ async def test_first_contact_never_attaches_itself_to_somebody(
     newcomer = await store.resolve_or_create(TELEGRAM, ACCOUNT)
 
     assert newcomer != existing.id
+
+
+async def test_everyone_is_born_waiting(store: SqlAlchemyIdentityStore) -> None:
+    user_id = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+
+    assert (await store.get_user(user_id)).status is UserStatus.WAITING
+
+
+async def test_a_free_slot_activates_and_a_full_house_does_not(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    first = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+    second = await store.resolve_or_create(TELEGRAM, OTHER_ACCOUNT)
+
+    assert await store.try_activate(first, 1)
+    assert not await store.try_activate(second, 1)  # the house is full
+    assert (await store.get_user(first)).status is UserStatus.ACTIVE
+    assert (await store.get_user(second)).status is UserStatus.WAITING
+    assert await store.try_activate(second, 2)  # a raised cap frees a slot
+
+
+async def test_no_cap_activates_everyone_and_zero_activates_nobody(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    unlimited = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+    frozen = await store.resolve_or_create(TELEGRAM, OTHER_ACCOUNT)
+
+    assert await store.try_activate(unlimited, None)
+    assert not await store.try_activate(frozen, 0)  # 0 = the pause button
+
+
+async def test_only_the_waiting_are_ever_touched_by_activation(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    user_id = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+    await store.set_status(user_id, UserStatus.BANNED)
+
+    assert not await store.try_activate(user_id, None)  # a ban is not a queue
+    assert (await store.get_user(user_id)).status is UserStatus.BANNED
+
+
+async def test_set_status_is_the_operators_unconditional_hand(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    user_id = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+
+    await store.set_status(user_id, UserStatus.ACTIVE)  # past any cap on purpose
+    assert (await store.get_user(user_id)).status is UserStatus.ACTIVE
+
+    with pytest.raises(UserNotFoundError):
+        await store.set_status("nobody", UserStatus.BANNED)
+
+
+async def test_count_by_status_names_every_status(store: SqlAlchemyIdentityStore) -> None:
+    active = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+    await store.resolve_or_create(TELEGRAM, OTHER_ACCOUNT)
+    await store.set_status(active, UserStatus.ACTIVE)
+
+    counts = await store.count_by_status()
+
+    assert counts == {UserStatus.ACTIVE: 1, UserStatus.WAITING: 1, UserStatus.BANNED: 0}
+
+
+async def test_admit_promotes_at_the_door_and_settles_the_rest(
+    store: SqlAlchemyIdentityStore,
+) -> None:
+    """The AccessService flow: born waiting, admitted when a slot frees."""
+    cap_holder: list[int | None] = [0]
+
+    async def read_cap() -> int | None:
+        return cap_holder[0]
+
+    access = AccessService(store, read_cap)
+    user_id = await store.resolve_or_create(TELEGRAM, ACCOUNT)
+
+    assert await access.admit(user_id) is UserStatus.WAITING
+    cap_holder[0] = 1
+    assert await access.admit(user_id) is UserStatus.ACTIVE
+    assert await access.admit(user_id) is UserStatus.ACTIVE  # settled: no cap read needed
+
+    await store.set_status(user_id, UserStatus.BANNED)
+    assert await access.admit(user_id) is UserStatus.BANNED

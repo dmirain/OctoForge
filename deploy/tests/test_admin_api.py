@@ -546,3 +546,108 @@ def test_usage_report_and_events_answer_empty(client: TestClient) -> None:
     assert report["days"] == default_days
     assert report["items"] == []
     assert events["items"] == [] and events["total"] == 0
+
+
+CRON_PARAMS = {
+    "title": "morning report",
+    "schedule": "0 9 * * *",
+    "prompt": "prepare the report",
+    "timezone": "UTC",
+}
+
+
+def test_users_tab_carries_statuses_and_counters(client: TestClient) -> None:
+    client.post("/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "alice"})
+
+    page = client.get("/api/admin/users").json()
+
+    (person,) = page["items"]
+    assert person["status"] == "active"  # no cap set: activated at first contact
+    assert page["active_count"] == 1
+    assert page["waiting_count"] == 0
+    assert page["max_active_users"] is None
+
+
+def test_a_full_house_answers_403_and_the_console_can_open_the_door(
+    client: TestClient,
+) -> None:
+    """The whole freemium admission flow over HTTP: cap, queue, activation."""
+    client.post("/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "early"})
+    client.post(
+        "/api/admin/settings",
+        json={"key": "max_active_users", "value": "1"},
+        headers={"Sec-Fetch-Site": "same-origin"},
+    )
+
+    refused = client.post(
+        "/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "late"}
+    )
+    early_again = client.post(
+        "/api/dialog/messages", json={"content": "again"}, headers={USER_ID_HEADER: "early"}
+    )
+
+    assert refused.status_code == HTTPStatus.FORBIDDEN
+    assert "waiting" in refused.json()["detail"] or "slots" in refused.json()["detail"]
+    assert not any(char.isdigit() for char in refused.json()["detail"])  # never a position
+    assert early_again.status_code == HTTPStatus.ACCEPTED  # the settled are never demoted
+
+    waiting = next(
+        item
+        for item in client.get("/api/admin/users").json()["items"]
+        if item["status"] == "waiting"
+    )
+    opened = client.post(
+        f"/api/admin/users/{waiting['user_id']}/status",
+        params={"status": "active"},
+        headers={"Sec-Fetch-Site": "same-origin"},
+    )
+    assert opened.status_code == HTTPStatus.OK
+    assert opened.json()["notified"] is False  # no surface can reach them here
+
+    admitted = client.post(
+        "/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "late"}
+    )
+    assert admitted.status_code == HTTPStatus.ACCEPTED  # the operator outranks the cap
+
+
+def test_a_ban_pauses_cron_and_an_unban_leaves_it_paused(client: TestClient) -> None:
+    created = client.post(
+        "/api/cron/jobs", params=CRON_PARAMS, headers={USER_ID_HEADER: "cron-owner"}
+    ).json()
+    person = created["user_id"]
+
+    banned = client.post(
+        f"/api/admin/users/{person}/status",
+        params={"status": "banned"},
+        headers={"Sec-Fetch-Site": "same-origin"},
+    )
+    refused = client.get("/api/cron/jobs", headers={USER_ID_HEADER: "cron-owner"})
+    unbanned = client.post(
+        f"/api/admin/users/{person}/status",
+        params={"status": "active"},
+        headers={"Sec-Fetch-Site": "same-origin"},
+    )
+    (job,) = client.get("/api/admin/cron").json()["items"]
+
+    assert banned.json()["paused_cron_jobs"] == 1
+    assert refused.status_code == HTTPStatus.FORBIDDEN  # a banned user gets no API
+    assert unbanned.status_code == HTTPStatus.OK
+    assert job["enabled"] is False  # an unban resumes nothing on purpose
+
+
+def test_settings_are_a_console_edited_table(client: TestClient) -> None:
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
+    stored = client.post(
+        "/api/admin/settings", json={"key": "max_active_users", "value": "5"}, headers=same_origin
+    )
+    listed = client.get("/api/admin/settings").json()
+    bad = client.post(
+        "/api/admin/settings", json={"key": "Bad Key!", "value": "5"}, headers=same_origin
+    )
+    deleted = client.delete("/api/admin/settings/max_active_users", headers=same_origin)
+
+    assert stored.status_code == HTTPStatus.OK
+    assert [(item["key"], item["value"]) for item in listed["items"]] == [("max_active_users", "5")]
+    assert bad.status_code == HTTPStatus.BAD_REQUEST
+    assert deleted.status_code == HTTPStatus.OK
+    assert client.get("/api/admin/settings").json()["items"] == []

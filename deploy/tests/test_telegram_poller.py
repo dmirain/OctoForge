@@ -36,6 +36,8 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyExchangeRepository,
     SqlAlchemyMessageRepository,
 )
+from octoforge_core.identity.api import IdentityStore, UserStatus
+from octoforge_core.identity.service import AccessService
 from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
@@ -61,6 +63,7 @@ from octoforge_telegram.models import (
     TelegramVoice,
 )
 from octoforge_telegram.poller import (
+    ACCESS_CLOSED_TEXT,
     ACCESS_DENIED_TEXT,
     CAPTION_LABEL,
     COMMAND_START,
@@ -74,6 +77,7 @@ from octoforge_telegram.poller import (
     INVITE_INVALID_TEXT,
     MATERIAL_ATTRIBUTION_ANONYMOUS,
     MATERIAL_PLACEHOLDER,
+    QUEUE_WAIT_TEXT,
     SECRETS_DISABLED_TEXT,
     TEXT_ONLY_NOTICE,
     VOICE_EMPTY_NOTICE,
@@ -367,6 +371,8 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
     vision: VisionClient | None = None,
     speech: TranscriptionClient | None = None,
     feature_gate: LimitGate | None = None,
+    access: AccessService | None = None,
+    identities: IdentityStore | None = None,
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS,
 ) -> TelegramPoller:
     """A poller whose album window is short enough for a test to wait it out."""
@@ -374,6 +380,7 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
         runner_provider=provider,
         client=client,
         edit_throttle_seconds=NO_THROTTLE,
+        identities=identities,
     )
     return TelegramPoller(
         client=client,
@@ -386,6 +393,7 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
             vision=vision,
             speech=speech,
             feature_gate=feature_gate,
+            access=access,
             voice_max_seconds=voice_max_seconds,
             album_quiet_seconds=ALBUM_TEST_QUIET_SECONDS,
         ),
@@ -1458,6 +1466,96 @@ async def test_a_denied_voice_message_still_delivers_its_caption() -> None:
     assert VOICE_PLAN_NOTICE in [text for _, text, _ in client.sent]
     (content, _, _) = bridge.calls[0]
     assert content == "посмотри меню"
+
+
+def make_access(
+    session_factory: async_sessionmaker[AsyncSession], cap: int | None
+) -> tuple[AccessService, SqlAlchemyIdentityStore]:
+    identities = SqlAlchemyIdentityStore(session_factory)
+
+    async def read_cap() -> int | None:
+        return cap
+
+    return AccessService(identities, read_cap), identities
+
+
+async def test_a_full_house_queues_the_newcomer_without_a_position(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No slot: one queue notice, no position named, and nothing dispatched."""
+    client = FakeTelegramClient()
+    access, identities = make_access(session_factory, cap=0)
+    poller = make_poller(client, access=access, identities=identities)
+
+    await deliver(poller, make_update(1))
+    await deliver(poller, make_update(2, text="ещё раз"))
+
+    # one notice for two knocks: the state did not change by asking
+    assert [text for _, text, _ in client.sent] == [QUEUE_WAIT_TEXT]
+    assert not any(char.isdigit() for char in QUEUE_WAIT_TEXT)  # never a position
+    person = await identities.resolve(CHANNEL, str(TELEGRAM_USER_ID))
+    assert person is not None
+    assert (await identities.get_user(person)).status is UserStatus.WAITING
+
+
+async def test_a_free_slot_activates_the_newcomer_on_first_contact(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    access, identities = make_access(session_factory, cap=1)
+    poller = make_poller(client, access=access, identities=identities)
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_update(1, text="привет"))
+
+    (content, _, _) = bridge.calls[0]
+    assert content == "привет"
+    person = await identities.resolve(CHANNEL, str(TELEGRAM_USER_ID))
+    assert person is not None
+    assert (await identities.get_user(person)).status is UserStatus.ACTIVE
+
+
+async def test_a_banned_user_is_told_the_door_is_closed_once(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = FakeTelegramClient()
+    access, identities = make_access(session_factory, cap=None)
+    poller = make_poller(client, access=access, identities=identities)
+    person = await identities.resolve_or_create(CHANNEL, str(TELEGRAM_USER_ID))
+    await identities.set_status(person, UserStatus.BANNED)
+
+    await deliver(poller, make_update(1))
+    await deliver(poller, make_update(2))
+
+    assert [text for _, text, _ in client.sent] == [ACCESS_CLOSED_TEXT]
+
+
+async def test_the_queue_drains_as_its_people_knock(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A freed slot needs no sweep: the waiting person's next message takes it."""
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    identities = SqlAlchemyIdentityStore(session_factory)
+    cap_holder = [0]
+
+    async def read_cap() -> int | None:
+        return cap_holder[0]
+
+    access = AccessService(identities, read_cap)
+    poller = make_poller(client, access=access, identities=identities)
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_update(1))  # queued: no slots
+    cap_holder[0] = 1  # the operator raises the cap in the console
+    await deliver(poller, make_update(2, text="я ещё тут"))
+
+    (content, _, _) = bridge.calls[0]
+    assert content == "я ещё тут"
+    person = await identities.resolve(CHANNEL, str(TELEGRAM_USER_ID))
+    assert person is not None
+    assert (await identities.get_user(person)).status is UserStatus.ACTIVE
 
 
 def make_voice_update(  # noqa: PLR0913, PLR0917 — a test builder mirroring the API shape

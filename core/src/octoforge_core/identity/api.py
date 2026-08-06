@@ -16,7 +16,22 @@ carries no structure makes that impossible rather than merely discouraged.
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from typing import Any, Protocol
+
+
+class UserStatus(StrEnum):
+    """Where a person stands with the installation.
+
+    Everyone is born WAITING; a free slot under the operator's cap promotes
+    them to ACTIVE right at first contact, otherwise they queue until the
+    operator activates them by hand. BANNED is the operator's door: the data
+    stays, the access does not.
+    """
+
+    WAITING = "waiting"
+    ACTIVE = "active"
+    BANNED = "banned"
 
 
 class UserNotFoundError(Exception):
@@ -47,6 +62,9 @@ class User:
     #: The cross-cutting identifier once registration exists. Empty until then;
     #: it is the account itself, not a surface, which is why it lives here.
     email: str = ""
+    #: ACTIVE as the DTO default keeps hand-built users (tests, fixtures)
+    #: usable; every stored row carries its real status explicitly.
+    status: UserStatus = UserStatus.ACTIVE
     created_at: datetime | None = None
 
 
@@ -149,6 +167,28 @@ class IdentityStore(Protocol):
         A no-op for an unknown account: recording a profile is a courtesy,
         not a way to create an identity.
         """
+        ...
+
+    async def set_status(self, user_id: str, status: UserStatus) -> None:
+        """Set the person's status outright (the operator's hand).
+
+        Raises `UserNotFoundError`. Deliberately unconditional: the operator
+        outranks the cap — activating past a full house is their call.
+        """
+        ...
+
+    async def try_activate(self, user_id: str, max_active: int | None) -> bool:
+        """Promote a WAITING person to ACTIVE if a slot is free; report success.
+
+        The check and the flip are atomic and serialized across nodes: the
+        cap is a promise, not an estimate — two nodes admitting at once
+        cannot both slip past it. `None` = no cap; `0` = no slots at all.
+        A person not WAITING is never touched.
+        """
+        ...
+
+    async def count_by_status(self) -> dict[UserStatus, int]:
+        """How many people hold each status (operator console, admission)."""
         ...
 
     async def list_users(self) -> "UserList":

@@ -54,6 +54,14 @@ class GatewayRegistry(Protocol):
         """The gateway for this chat, creating one if needed."""
         ...
 
+    async def person_of(self, external_id: str) -> str:
+        """The person behind a Telegram account (statuses and plans key on them).
+
+        An HTTP registry cannot resolve and echoes the handle back — over
+        that arrangement the service resolves and gates on its own side.
+        """
+        ...
+
     async def aclose(self) -> None:
         """Release whatever was held."""
         ...
@@ -121,6 +129,10 @@ class ApiGatewayRegistry:
 
     async def gateway_for(self, handle: str, chat_id: int) -> DialogGateway:
         return ApiDialogGateway(self._client, handle.removeprefix(USER_ID_PREFIX))
+
+    async def person_of(self, external_id: str) -> str:
+        """Echo the handle: resolution (and the status gate) live on the service."""
+        return f"{USER_ID_PREFIX}{external_id}"
 
     async def aclose(self) -> None:
         """The HTTP client is owned by whoever opened it."""

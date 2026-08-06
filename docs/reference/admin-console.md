@@ -42,7 +42,10 @@ a name yet) falls back to the id.
 `GET /api/admin/users` lists people and the accounts each one answers on. A person is the unit here,
 not a handle: the same human may arrive from Telegram and from a browser, and everything they own is
 filed under them. Revoked identities are listed rather than hidden — that an account was once theirs
-is part of the answer to "who is this".
+is part of the answer to "who is this". The payload carries each person's admission status and the
+installation's head-counts (`active_count`, `waiting_count`, `banned_count`, `max_active_users`) —
+the «Пользователи» tab is where the operator runs the queue: ban/unban/activate buttons and the
+active-user cap field (see [access.md](access.md)).
 
 The Telegram surface adds its own listing (`GET /api/admin/telegram/users`), which joins the member
 directory with invite attribution: names, usernames and which invite somebody came through are
@@ -56,7 +59,10 @@ job — plus deletions of dialogs, tasks and cron jobs, the per-user params CRUD
 operator sets a user's `{user.*}` values, and the write goes through the same `UserParamStore` the
 call executor reads. The tariff catalog is managed here too (`POST/DELETE /api/admin/tariffs`,
 `POST /api/admin/tariffs/assign` — see [tariffs.md](tariffs.md)), through the same `TariffStore` the
-limit gate reads. All of them go through the same owner-scoped services a user action would
+limit gate reads; so are user statuses (`POST /api/admin/users/{id}/status?status=…` — a ban pauses
+the person's cron jobs, an unban resumes nothing) and the installation settings
+(`GET/POST /api/admin/settings`, `DELETE /api/admin/settings/{key}` — see
+[access.md](access.md)). All of them go through the same owner-scoped services a user action would
 (`InstructionService.publish`, `CronStore.set_enabled`, `TaskStore.delete`,
 `DialogRepository.delete`, …), so an admin cannot bypass an invariant that protects a user.
 

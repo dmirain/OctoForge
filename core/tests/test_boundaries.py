@@ -24,6 +24,7 @@ DOMAIN_MODULES = {
     "net",
     "search",
     "secrets",
+    "settings",
     "tariffs",
     "tasks",
 }

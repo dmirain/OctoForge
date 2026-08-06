@@ -11,6 +11,7 @@ filled by whichever surface owns it and read by that surface's own
 dependencies.
 """
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -20,15 +21,21 @@ from octoforge_core.context.api import SummaryStore
 from octoforge_core.cron.api import CronStore
 from octoforge_core.dialogs.api import ExchangeRepository
 from octoforge_core.identity.api import IdentityStore
+from octoforge_core.identity.service import AccessService
 from octoforge_core.instructions.api import InstructionService
 from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
+from octoforge_core.settings.api import SettingsStore
 from octoforge_core.tariffs.api import LimitGate, TariffStore, UsageMeter
 from octoforge_core.tasks.store import TaskStore
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_server.config import Settings
 from octoforge_server.secret_links import SecretLinkService
+
+#: Tells a person their access was opened; returns whether the notice went
+#: out. The surface that can reach them supplies the implementation.
+ActivationNotifier = Callable[[str], Awaitable[bool]]
 
 
 @dataclass(slots=True)
@@ -58,8 +65,15 @@ class Runtime:
     exchanges: ExchangeRepository
     claims: ClaimRepository
     identity_store: IdentityStore
+    #: Operator-editable installation settings (the console edits, data decides).
+    settings_store: SettingsStore
+    #: The admission gate (waiting/active/banned); asked on every API request.
+    access: AccessService
     #: Channels this deployment serves, gathered from installed surfaces.
     channels: frozenset[str]
+    #: How to tell a person the operator opened their access; None when no
+    #: installed surface can reach them out of band.
+    activation_notifier: ActivationNotifier | None = None
     #: Extra entries an installed surface needs its own dependencies to reach.
     #: The service copies them across without knowing what they mean.
     surface_state: dict[str, Any] = field(default_factory=dict)

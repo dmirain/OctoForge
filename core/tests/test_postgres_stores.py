@@ -50,6 +50,8 @@ from octoforge_core.dialogs.store import (
     SqlAlchemyMessageRepository,
 )
 from octoforge_core.domain import ChatMessage, MessageRole
+from octoforge_core.identity.api import UserStatus
+from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.instructions.api import (
     InstructionDraft,
     InstructionLexicalSearch,
@@ -58,6 +60,8 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.instructions.pg_store import PostgresInstructionStore
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
+from octoforge_core.settings.api import max_active_users
+from octoforge_core.settings.store import SqlAlchemySettingsStore
 from octoforge_core.tariffs.api import (
     FeatureCode,
     TariffLimits,
@@ -897,3 +901,36 @@ async def test_usage_ledger_concurrent_appends_all_land(
 
     assert totals.assistant_messages == writers
     assert totals.tokens == writers * (event.prompt_tokens + event.completion_tokens)
+
+
+async def test_concurrent_activation_respects_the_cap(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Many contenders, one slot: the conditional UPDATE is the referee.
+
+    This is the cross-process guarantee the SQLite suite cannot give — on
+    Postgres the head-count subquery and the status flip run as one
+    statement under real concurrency.
+    """
+    contenders = 8
+    cap = 1
+    identity = SqlAlchemyIdentityStore(session_factory)
+    people = [await identity.resolve_or_create("telegram", f"acct-{n}") for n in range(contenders)]
+
+    outcomes = await asyncio.gather(*(identity.try_activate(person, cap) for person in people))
+    counts = await identity.count_by_status()
+
+    assert sum(outcomes) == cap  # not one over, not one under
+    assert counts[UserStatus.ACTIVE] == cap
+    assert counts[UserStatus.WAITING] == contenders - cap
+
+
+async def test_settings_roundtrip(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    cap = 3
+    store = SqlAlchemySettingsStore(session_factory)
+
+    await store.put("max_active_users", str(cap))
+    assert await max_active_users(store) == cap
+
+    await store.delete("max_active_users")
+    assert await max_active_users(store) is None
