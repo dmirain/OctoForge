@@ -55,6 +55,11 @@ Two details that come from the real world rather than from the design:
 Recordings longer than `OF_VOICE_MAX_SECONDS` are refused before download — a guard on both latency and
 the provider's daily quota.
 
+Both capabilities sit behind the tariff gate as well: Telegram checks the person's plan
+(`voice_transcription` / `vision` feature codes) before downloading a byte, and successful work is
+ledgered — transcription as seconds of audio, ingest describes and `image_look` calls as image
+counts (see [tariffs.md](tariffs.md)).
+
 ## Invariants
 
 - **The main model never receives image bytes or audio.** Only text derived from them.

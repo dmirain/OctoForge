@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from octoforge_core.tariffs.api import FeatureCode
+from octoforge_core.tariffs.api import FeatureCode, UsageEvent, UsageKind
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.vision.api import VisionUnavailableError
 from octoforge_core.vision.tools import (
@@ -114,3 +114,36 @@ async def test_the_tool_is_gated_by_the_plan() -> None:
     refused = await tool.execute({"question": QUESTION}, gated)
     assert refused == f"not available on the current plan: {FeatureCode.VISION.value}"
     assert inspector.questions == []
+
+
+class RecordingMeter:
+    """UsageRecorder stub keeping every event."""
+
+    def __init__(self) -> None:
+        self.events: list[UsageEvent] = []
+
+    async def record(self, event: UsageEvent) -> None:
+        self.events.append(event)
+
+
+async def test_a_strong_tier_look_is_ledgered() -> None:
+    meter = RecordingMeter()
+    tool = ImageLookTool(meter=meter)
+
+    await tool.execute({"question": QUESTION}, make_context(RecordingInspector()))
+
+    (event,) = meter.events
+    assert event.kind is UsageKind.VISION
+    assert event.quantity == 1
+    assert event.user_id == USER_ID
+    assert event.dialog_id == DIALOG_ID
+
+
+async def test_a_refused_or_failed_look_is_not_ledgered() -> None:
+    meter = RecordingMeter()
+    tool = ImageLookTool(meter=meter)
+
+    await tool.execute({"question": ""}, make_context(RecordingInspector()))
+    await tool.execute({"question": QUESTION}, make_context(MissingImageInspector()))
+
+    assert meter.events == []  # nothing was spent, nothing is counted

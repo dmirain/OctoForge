@@ -303,7 +303,7 @@ def build_tool_registry(  # noqa: PLR0913, PLR0917 — the composition facade ta
     """
     registry = ToolRegistry()
     _register_core_tools(registry, outbound_http, guard, stores, limits, limit_gate)
-    registry.register(ImageLookTool())
+    registry.register(ImageLookTool(meter=limit_gate))
     if services.search_provider is not None:
         registry.register(WebSearchTool(provider=services.search_provider))
     if services.mcp_add is not None:

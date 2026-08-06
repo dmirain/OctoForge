@@ -14,7 +14,13 @@ from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
 from octoforge_core.identity.api import IdentityStore, UserStatus
 from octoforge_core.identity.service import AccessService
 from octoforge_core.speech.api import AudioData, TranscriptionClient
-from octoforge_core.tariffs.api import FeatureCode, LimitGate
+from octoforge_core.tariffs.api import (
+    FeatureCode,
+    LimitGate,
+    UsageEvent,
+    UsageKind,
+    UsageOrigin,
+)
 from octoforge_core.time import utc_now
 from octoforge_core.vision.api import ImageData, VisionClient
 
@@ -141,6 +147,9 @@ VOICE_TOO_LONG_TEMPLATE = (
 )
 VOICE_EMPTY_NOTICE = "Я не разобрал, что сказано в записи. Напиши текстом или запиши ещё раз?"
 VOICE_PLAN_NOTICE = "Распознавание голосовых не входит в твой тариф — напиши, пожалуйста, текстом."
+VISION_PLAN_NOTICE = (
+    "Распознавание изображений не входит в твой тариф — опиши, пожалуйста, словами."
+)
 # the queue notice never names a position: the number is not a promise the
 # installation can keep, and watching it move (or not) is worse than waiting
 QUEUE_WAIT_TEXT = (
@@ -629,6 +638,9 @@ class TelegramPoller:
             return
         image = message.best_image
         if image is not None and self._vision is not None:
+            if not await self._vision_allowed(user_id):
+                await self._refuse_vision(message, user_id, chat_id)
+                return
             try:
                 await self._dispatch_image(
                     message, user_id, chat_id, image, kind=MessageKind.MATERIAL
@@ -656,6 +668,9 @@ class TelegramPoller:
         agent asks what to do with it. A caption changes that — then the
         caption is the user speaking and the picture is its context.
         """
+        if not await self._vision_allowed(user_id):
+            await self._refuse_vision(message, user_id, chat_id)
+            return
         kind = MessageKind.OWN if message.body else MessageKind.MATERIAL
         try:
             await self._dispatch_image(message, user_id, chat_id, image, kind=kind)
@@ -680,14 +695,15 @@ class TelegramPoller:
         """Describe one picture and submit it; failures propagate to the caller's fallback."""
         bridge = await self._registry.gateway_for(user_id, chat_id)
         async with self._showing_activity(chat_id, kind):
-            await self._submit_images(message, (image,), bridge, kind=kind)
+            await self._submit_images(message, (image,), bridge, user_id=user_id, kind=kind)
 
-    async def _submit_images(
+    async def _submit_images(  # noqa: PLR0913 — mirrors everything one submission needs
         self,
         anchor: TelegramMessage,
         images: Sequence[TelegramImageRef],
         bridge: DialogGateway,
         *,
+        user_id: str,
         kind: MessageKind,
         caption: str | None = None,
     ) -> None:
@@ -728,6 +744,8 @@ class TelegramPoller:
                 for image in images
             ),
         )
+        # only what was actually described and delivered is ledgered
+        await self._record_ingest_usage(user_id, UsageKind.VISION, len(results) - len(failures))
 
     async def _dispatch_voice(
         self,
@@ -767,6 +785,9 @@ class TelegramPoller:
         try:
             async with self._showing_activity(chat_id, kind):
                 transcript = (await self._transcribe(audio)).strip()
+            await self._record_ingest_usage(
+                user_id, UsageKind.VOICE_TRANSCRIPTION, int(audio.duration_seconds or 0)
+            )
         except Exception:
             logger.warning(
                 "Transcription failed for a recording from %s; falling back",
@@ -845,6 +866,51 @@ class TelegramPoller:
             return True
         person = await self._registry.person_of(user_id.removeprefix(USER_ID_PREFIX))
         return await self._feature_gate.allows(person, FeatureCode.VOICE_TRANSCRIPTION)
+
+    async def _vision_allowed(self, user_id: str) -> bool:
+        """Whether the user's plan includes image understanding (pre-download)."""
+        if self._feature_gate is None:
+            return True
+        person = await self._registry.person_of(user_id.removeprefix(USER_ID_PREFIX))
+        return await self._feature_gate.allows(person, FeatureCode.VISION)
+
+    async def _refuse_vision(self, message: TelegramMessage, user_id: str, chat_id: int) -> None:
+        """The plan said no to a picture: one notice, and any text still lands.
+
+        Before a single byte is downloaded, like the voice gate. A forward
+        keeps its material path (the placeholder stands in for the picture);
+        a caption is the user speaking and reaches the dialog as text; a
+        bare photo ends at the notice — a "text only" note on top would just
+        be noise.
+        """
+        await self._client.send_message(chat_id, VISION_PLAN_NOTICE)
+        if message.forward_origin is not None:
+            await self._dispatch_material(message, user_id, chat_id)
+            return
+        if message.body is not None:
+            await self._dispatch_plain_or_notice(message, user_id, chat_id)
+
+    async def _record_ingest_usage(self, user_id: str, kind: UsageKind, quantity: int) -> None:
+        """Ledger surface-side ingestion; metering must never break dispatch.
+
+        A raise here after a successful submit would trip the caller's
+        fallback and deliver the message twice — so everything is swallowed
+        and logged, the same stance the gate itself takes on a lost event.
+        """
+        if self._feature_gate is None or quantity <= 0:
+            return
+        try:
+            person = await self._registry.person_of(user_id.removeprefix(USER_ID_PREFIX))
+            await self._feature_gate.record(
+                UsageEvent(
+                    user_id=person,
+                    kind=kind,
+                    origin=UsageOrigin.INTERACTIVE,
+                    quantity=quantity,
+                )
+            )
+        except Exception:
+            logger.warning("ingest usage event lost: user=%s kind=%s", user_id, kind, exc_info=True)
 
     def _voice_refusal(self, audio: TelegramAudioRef) -> str | None:
         """Why this recording will not be transcribed, or None to go ahead."""
@@ -933,12 +999,17 @@ class TelegramPoller:
         if self._vision is None or not images:
             await self._dispatch_without_vision(anchor, user_id, chat_id)
             return
+        if not await self._vision_allowed(user_id):
+            await self._refuse_vision(anchor, user_id, chat_id)
+            return
         forwarded = anchor.forward_origin is not None
         kind = MessageKind.MATERIAL if forwarded or not caption else MessageKind.OWN
         bridge = await self._registry.gateway_for(user_id, chat_id)
         try:
             async with self._showing_activity(chat_id, kind):
-                await self._submit_images(anchor, images, bridge, kind=kind, caption=caption)
+                await self._submit_images(
+                    anchor, images, bridge, user_id=user_id, kind=kind, caption=caption
+                )
             return
         except Exception:
             logger.warning(

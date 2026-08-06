@@ -43,7 +43,7 @@ from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
 from octoforge_core.speech.api import AudioData, TranscriptionClient
-from octoforge_core.tariffs.api import LimitGate, LimitVerdict, UsageEvent
+from octoforge_core.tariffs.api import LimitGate, LimitVerdict, UsageEvent, UsageKind
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
 from octoforge_telegram.bridge import RunnerProvider
@@ -83,6 +83,7 @@ from octoforge_telegram.poller import (
     REFERRALS_DISABLED_TEXT,
     SECRETS_DISABLED_TEXT,
     TEXT_ONLY_NOTICE,
+    VISION_PLAN_NOTICE,
     VOICE_EMPTY_NOTICE,
     VOICE_PLAN_NOTICE,
     VOICE_TAG,
@@ -1929,3 +1930,107 @@ async def test_invite_command_without_referrals_reports_not_set_up() -> None:
     await deliver(poller, make_update(FIRST_UPDATE_ID, text=COMMAND_INVITE))
 
     assert client.sent == [(TELEGRAM_USER_ID, REFERRALS_DISABLED_TEXT, None)]
+
+
+# --- vision gate and ingest metering -----------------------------------------
+
+
+class RecordingUsageGate:
+    """LimitGate stub: everything allowed, every usage event kept."""
+
+    def __init__(self) -> None:
+        self.events: list[UsageEvent] = []
+
+    async def enabled_features(self, user_id: str) -> frozenset[str] | None:
+        return None
+
+    async def allows(self, user_id: str, feature: str) -> bool:
+        return True
+
+    async def check_run_budget(self, user_id: str) -> LimitVerdict:
+        return LimitVerdict.ok()
+
+    async def max_cron_jobs(self, user_id: str) -> int | None:
+        return None
+
+    async def max_datasets(self, user_id: str) -> int | None:
+        return None
+
+    async def record(self, event: UsageEvent) -> None:
+        self.events.append(event)
+
+
+async def test_a_plan_without_vision_gets_a_notice_before_any_download() -> None:
+    """The gate answers before a single byte or vision call is spent."""
+    client = FakeTelegramClient()
+    vision = FakeVisionClient(VISION_DESCRIPTION)
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=vision, feature_gate=NoVoiceGate())
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_photo_update(1, file_id=PHOTO_FILE_ID))
+
+    assert client.downloaded_file_ids == []
+    assert vision.calls == []
+    assert [text for _, text, _ in client.sent] == [VISION_PLAN_NOTICE]
+    assert bridge.calls == []  # a bare photo carries nothing else to deliver
+
+
+async def test_a_denied_photo_still_delivers_its_caption() -> None:
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(
+        client, vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=NoVoiceGate()
+    )
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_photo_update(1, caption="что на фото?"))
+
+    assert VISION_PLAN_NOTICE in [text for _, text, _ in client.sent]
+    assert bridge.calls[0][0] == "что на фото?"
+
+
+async def test_a_denied_forwarded_photo_keeps_its_material_path() -> None:
+    """The forward is not lost: the placeholder stands in for the picture."""
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(
+        client, vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=NoVoiceGate()
+    )
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_photo_update(1, forward_origin=make_forward_origin()))
+
+    assert client.downloaded_file_ids == []
+    assert VISION_PLAN_NOTICE in [text for _, text, _ in client.sent]
+    assert bridge.kinds[0][0] is MessageKind.MATERIAL
+    assert MATERIAL_PLACEHOLDER in bridge.calls[0][0]
+
+
+async def test_described_images_are_ledgered_on_the_person() -> None:
+    gate = RecordingUsageGate()
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=gate)
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_photo_update(1, file_id=PHOTO_FILE_ID))
+
+    (event,) = gate.events
+    assert event.kind is UsageKind.VISION
+    assert event.quantity == 1
+    assert event.user_id == USER_ID  # the person (no identity store: the handle)
+
+
+async def test_transcribed_seconds_are_ledgered() -> None:
+    gate = RecordingUsageGate()
+    client = FakeTelegramClient()
+    bridge = RecordingBridge()
+    poller = make_poller(client, speech=FakeTranscriptionClient(), feature_gate=gate)
+    use_bridge(poller, bridge)
+
+    await deliver(poller, make_voice_update(1, duration=VOICE_DURATION))
+
+    (event,) = gate.events
+    assert event.kind is UsageKind.VOICE_TRANSCRIPTION
+    assert event.quantity == VOICE_DURATION
