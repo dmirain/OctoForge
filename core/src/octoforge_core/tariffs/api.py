@@ -117,6 +117,9 @@ class Tariff:
     limits: TariffLimits
     created_at: datetime
     updated_at: datetime
+    #: at most one plan carries this flag; it binds every user with no
+    #: explicit assignment — the freemium default of a public installation
+    is_default: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,9 +271,12 @@ class TariffStore(Protocol):
         title: str,
         features: frozenset[str],
         limits: TariffLimits | None = None,
+        *,
+        is_default: bool = False,
     ) -> Tariff:
         """Create or replace the tariff under `code`; feature codes are
-        grammar-checked here, vocabulary-checked at the operator boundary."""
+        grammar-checked here, vocabulary-checked at the operator boundary.
+        Marking a plan default clears the flag from every other plan."""
         ...
 
     async def list(self) -> list[Tariff]:

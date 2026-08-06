@@ -510,6 +510,15 @@ def test_tariff_crud_and_assignment_via_the_console(client: TestClient) -> None:
     assert client.get("/api/admin/tariffs").json()["items"] == []
 
 
+def test_the_default_flag_moves_between_plans(client: TestClient) -> None:
+    client.post("/api/admin/tariffs", json=BASIC_TARIFF | {"is_default": True})
+    client.post("/api/admin/tariffs", json={"code": "trial", "title": "Trial", "is_default": True})
+
+    flags = {t["code"]: t["is_default"] for t in client.get("/api/admin/tariffs").json()["items"]}
+
+    assert flags == {"basic": False, "trial": True}  # at most one default
+
+
 def test_unknown_feature_and_bad_code_are_400(client: TestClient) -> None:
     unknown = client.post(
         "/api/admin/tariffs", json={"code": "x", "title": "X", "features": ["teleport"]}

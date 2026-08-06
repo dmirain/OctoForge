@@ -225,8 +225,9 @@ const VIEWS = {
   },
   tariffs: {
     title: "Тарифы", path: () => "/api/admin/tariffs",
-    columns: ["код", "название", "функции", "токены/д", "сообщ./д", "ответы/д", "cron", "датасеты", "пользователи", ""],
-    row: (t) => `<td class="mono">${esc(t.code)}</td>${clip(t.title)}<td>${tags(t.features)}</td>` +
+    columns: ["код", "название", "дефолт", "функции", "токены/д", "сообщ./д", "ответы/д", "cron", "датасеты", "пользователи", ""],
+    row: (t) => `<td class="mono">${esc(t.code)}</td>${clip(t.title)}` +
+      `<td>${t.is_default ? "✓" : ""}</td><td>${tags(t.features)}</td>` +
       `<td class="mono">${lim(t.daily_tokens)}</td><td class="mono">${lim(t.daily_user_messages)}</td>` +
       `<td class="mono">${lim(t.daily_assistant_messages)}</td><td class="mono">${lim(t.max_cron_jobs)}</td>` +
       `<td class="mono">${lim(t.max_datasets)}</td><td>${tags(t.users)}</td>` +
@@ -301,6 +302,7 @@ function renderToolbar(view) {
       `<input id="t-answers" type="number" placeholder="ответы/д" size="6">` +
       `<input id="t-cron" type="number" placeholder="cron" size="4">` +
       `<input id="t-datasets" type="number" placeholder="датасеты" size="4">` +
+      `<label class="mono" title="тариф пользователей без явного назначения"><input type="checkbox" id="t-default">дефолт</label>` +
       `<button class="act" id="t-save">сохранить</button>` +
       `<select id="a-user"><option value="">пользователь…</option></select>` +
       `<select id="a-code"><option value="">тариф…</option></select>` +
@@ -383,6 +385,7 @@ async function setupTariffForm() {
       daily_assistant_messages: num("t-answers"),
       max_cron_jobs: num("t-cron"),
       max_datasets: num("t-datasets"),
+      is_default: document.getElementById("t-default").checked,
     };
     if (!body.code || !body.title) { fail("заполните код и название тарифа"); return; }
     try {

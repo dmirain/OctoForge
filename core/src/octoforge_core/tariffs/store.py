@@ -4,7 +4,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime
 
-from sqlalchemy import ColumnElement, case, func, select
+from sqlalchemy import ColumnElement, case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.unit_of_work import read_session, write_session
@@ -40,12 +40,16 @@ class SqlAlchemyTariffStore:
         title: str,
         features: frozenset[str],
         limits: TariffLimits | None = None,
+        *,
+        is_default: bool = False,
     ) -> Tariff:
         """Create or replace the tariff under `code`.
 
         Feature codes are grammar-checked only: the store must accept an
         installer-defined code it has never heard of — the known-vocabulary
         check belongs to the operator boundary, where the merged set lives.
+        Marking a plan default demotes every other plan in the same
+        transaction, so at most one row ever carries the flag.
         """
         code = normalize_code(code)
         title = normalize_title(title)
@@ -61,6 +65,11 @@ class SqlAlchemyTariffStore:
             row.features = sorted({normalize_feature(feature) for feature in features})
             for name, value in asdict(caps).items():
                 setattr(row, name, value)
+            row.is_default = is_default
+            if is_default:
+                await session.execute(
+                    update(TariffRow).where(TariffRow.code != code).values(is_default=False)
+                )
             await session.flush()
             return _to_tariff(row)
 
@@ -108,7 +117,13 @@ class SqlAlchemyTariffStore:
                 binding.assigned_at = utc_now()
 
     async def tariff_for_user(self, user_id: str) -> Tariff | None:
-        """Return the user's tariff; `None` means no restrictions."""
+        """Return the user's tariff; `None` means no restrictions.
+
+        A user with no explicit binding falls back to the default plan, if
+        the operator marked one — with none marked, no binding still means
+        unlimited, so an installation that never touches the flag behaves
+        exactly as before.
+        """
         async with read_session(self._session_factory) as session:
             row = (
                 await session.scalars(
@@ -117,6 +132,8 @@ class SqlAlchemyTariffStore:
                     .where(UserTariffRow.user_id == user_id)
                 )
             ).first()
+            if row is None:
+                row = (await session.scalars(select(TariffRow).where(TariffRow.is_default))).first()
             return None if row is None else _to_tariff(row)
 
     async def assignments(self) -> dict[str, str]:
@@ -206,4 +223,5 @@ def _to_tariff(row: TariffRow) -> Tariff:
         ),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        is_default=row.is_default,
     )

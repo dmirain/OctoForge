@@ -140,6 +140,38 @@ async def test_assignment_lifecycle(tariffs: SqlAlchemyTariffStore) -> None:
         await tariffs.assign(USER_A, "missing")
 
 
+async def test_default_tariff_binds_the_unassigned(tariffs: SqlAlchemyTariffStore) -> None:
+    """No binding falls back to the default plan; an explicit binding wins."""
+    await tariffs.put("free", "Free", frozenset(), TariffLimits(daily_tokens=TOKEN_LIMIT))
+    await tariffs.put("pro", "Pro", frozenset({FeatureCode.VISION}))
+
+    assert await tariffs.tariff_for_user(USER_A) is None  # no default marked yet
+
+    await tariffs.put(
+        "free", "Free", frozenset(), TariffLimits(daily_tokens=TOKEN_LIMIT), is_default=True
+    )
+    fallback = await tariffs.tariff_for_user(USER_A)
+    assert fallback is not None and fallback.code == "free" and fallback.is_default
+
+    await tariffs.assign(USER_A, "pro")
+    bound = await tariffs.tariff_for_user(USER_A)
+    assert bound is not None and bound.code == "pro"  # explicit binding wins
+
+
+async def test_at_most_one_default(tariffs: SqlAlchemyTariffStore) -> None:
+    """Marking a new default demotes the previous one in the same put."""
+    await tariffs.put("free", "Free", frozenset(), is_default=True)
+    await tariffs.put("trial", "Trial", frozenset(), is_default=True)
+
+    flags = {tariff.code: tariff.is_default for tariff in await tariffs.list()}
+    assert flags == {"free": False, "trial": True}
+
+    # a put without the flag drops it: the operator sees no default anywhere
+    await tariffs.put("trial", "Trial", frozenset())
+    assert not any(tariff.is_default for tariff in await tariffs.list())
+    assert await tariffs.tariff_for_user(USER_A) is None
+
+
 async def test_delete_refuses_while_assigned(tariffs: SqlAlchemyTariffStore) -> None:
     await tariffs.put("basic", "Basic", frozenset())
     await tariffs.assign(USER_A, "basic")

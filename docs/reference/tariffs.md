@@ -3,15 +3,20 @@
 Per-user plans: which features a user may use and how much they may spend per day. The mechanism is
 data-driven end to end — zero tariff rows leave everything unlimited and unmetered checks all pass, so
 an installation that never opens the tariffs tab behaves exactly as before. A user bound to no tariff
-is unrestricted; that is the deliberate default for existing users.
+falls back to the **default plan** if the operator marked one (the «дефолт» checkbox; at most one
+plan carries the flag) — with no default marked they are unrestricted, the deliberate behavior of a
+private installation. A public installation should mark its freemium plan default: without it, every
+new user starts unlimited.
 
 ## How it works
 
 Three tables (see [data-model.md](data-model.md)):
 
 - `tariffs` — the operator-defined catalog: a set of `FeatureCode`s plus nullable numeric caps
-  (`NULL` = unlimited in that dimension).
-- `user_tariffs` — at most one binding per user; no row = no restrictions.
+  (`NULL` = unlimited in that dimension). At most one plan is marked default; the store demotes the
+  previous default whenever a put marks a new one.
+- `user_tariffs` — at most one binding per user; no row = the default plan, or no restrictions when
+  none is marked. An explicit binding always wins over the default.
 - `usage_events` — an **insert-only ledger** of metered actions. A log, not a counter: every event
   carries its kind, its origin (`interactive` / `cron` / `background`) and the ids of the entities it
   belongs to (`dialog_id`, `exchange_id`, `task_id` — nullable, because routing happens before any

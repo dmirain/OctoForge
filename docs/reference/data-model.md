@@ -21,8 +21,8 @@ and no ORM object ever crosses a module boundary — stores map rows to their mo
 | `secrets` | `secrets/` | Encrypted per-user values with their host binding, required description, allowed placements and optional transform |
 | `user_params` | `params/` | Plaintext per-user values endpoint templates reference as `{user.code}` (timezone, account ids); set by the operator in the console |
 | `secret_form_links` | `secrets/` | Short-lived capability codes for the secrets form, with the prefill the agent put in them; swept when the next code is issued |
-| `tariffs` | `tariffs/` | Operator-defined plans: feature codes plus nullable numeric caps (NULL = unlimited in that dimension) |
-| `user_tariffs` | `tariffs/` | At most one plan binding per user; no row = no restrictions |
+| `tariffs` | `tariffs/` | Operator-defined plans: feature codes plus nullable numeric caps (NULL = unlimited in that dimension); at most one row is the default plan |
+| `user_tariffs` | `tariffs/` | At most one plan binding per user; no row = the default plan, or no restrictions when none is marked |
 | `usage_events` | `tariffs/` | Insert-only ledger of metered actions: kind, origin, token counts, quantity and the ids of the entities the spend belongs to |
 
 The Telegram invite store is separate: its own declarative base and its own database

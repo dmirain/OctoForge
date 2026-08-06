@@ -686,6 +686,7 @@ class SetTariffRequest(BaseModel):
     daily_assistant_messages: int | None = None
     max_cron_jobs: int | None = None
     max_datasets: int | None = None
+    is_default: bool = False
 
 
 class AssignTariffRequest(BaseModel):
@@ -753,7 +754,9 @@ async def set_tariff(
         max_datasets=request.max_datasets,
     )
     try:
-        tariff = await store.put(request.code, request.title, features, limits)
+        tariff = await store.put(
+            request.code, request.title, features, limits, is_default=request.is_default
+        )
     except InvalidTariffError as exc:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
     audit.record("tariff.set", operator, tariff.code)
@@ -850,6 +853,7 @@ def _tariff_to_dict(item: Tariff) -> dict[str, Any]:
         "daily_assistant_messages": item.limits.daily_assistant_messages,
         "max_cron_jobs": item.limits.max_cron_jobs,
         "max_datasets": item.limits.max_datasets,
+        "is_default": item.is_default,
         "created_at": _iso(item.created_at),
         "updated_at": _iso(item.updated_at),
     }
