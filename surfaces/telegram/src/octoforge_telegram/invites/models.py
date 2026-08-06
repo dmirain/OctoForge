@@ -26,6 +26,32 @@ class MemberRow(TelegramSurfaceBase):
     last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
 
+class ReferralCodeRow(TelegramSurfaceBase):
+    """One member's personal, reusable referral code (minted lazily).
+
+    A separate table rather than columns on `members`/`invites` on purpose:
+    this database has no migration chain, so it only ever grows by whole
+    tables that `create_all` can add.
+    """
+
+    __tablename__ = "referral_codes"
+
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class ReferralClaimRow(TelegramSurfaceBase):
+    """Who brought whom: written once at the invitee's first entry."""
+
+    __tablename__ = "referral_claims"
+
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    referrer_user_id: Mapped[str] = mapped_column(String, index=True)
+    code: Mapped[str] = mapped_column(String)
+    claimed_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
 class InviteRow(TelegramSurfaceBase):
     """One invite code: pending -> claimed -> (revoked -> claimed)."""
 

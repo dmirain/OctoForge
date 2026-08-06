@@ -32,6 +32,11 @@ person per day. The HTTP API checks inside `get_user_id`, so a waiting or banned
 from every dialog endpoint. Both gates resolve the core person first — statuses, like tariffs, are
 filed under the person, never under a surface handle.
 
+**Referrals do not bypass the cap.** A member's `/invite` link opens the *invite* gate for a
+friend and records who brought whom ([telegram.md](telegram.md)); the friend then queues through
+this cap like anyone else. The cap has exactly two doors: a free slot at the knock, or the
+operator's hand.
+
 ## Operator settings
 
 `app_settings` is a generic key→value table (`settings/` module) edited from the console:

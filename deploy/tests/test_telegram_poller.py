@@ -50,7 +50,7 @@ from octoforge_telegram.bridge import RunnerProvider
 from octoforge_telegram.client import USER_ID_PREFIX, TelegramApiError
 from octoforge_telegram.images import REF_PREFIX
 from octoforge_telegram.invites.api import MemberProfile
-from octoforge_telegram.invites.store import SqlAlchemyInviteStore
+from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyReferralStore
 from octoforge_telegram.models import (
     TelegramChat,
     TelegramChatType,
@@ -66,6 +66,7 @@ from octoforge_telegram.poller import (
     ACCESS_CLOSED_TEXT,
     ACCESS_DENIED_TEXT,
     CAPTION_LABEL,
+    COMMAND_INVITE,
     COMMAND_START,
     DEFAULT_VOICE_MAX_SECONDS,
     GREETING_TEXT,
@@ -78,6 +79,8 @@ from octoforge_telegram.poller import (
     MATERIAL_ATTRIBUTION_ANONYMOUS,
     MATERIAL_PLACEHOLDER,
     QUEUE_WAIT_TEXT,
+    REFERRAL_PREFIX,
+    REFERRALS_DISABLED_TEXT,
     SECRETS_DISABLED_TEXT,
     TEXT_ONLY_NOTICE,
     VOICE_EMPTY_NOTICE,
@@ -85,6 +88,7 @@ from octoforge_telegram.poller import (
     VOICE_TAG,
     VOICE_TOO_SHORT_NOTICE,
     WELCOME_TEXT,
+    MembershipDecision,
     TelegramBridgeRegistry,
     TelegramMembership,
     TelegramPoller,
@@ -373,6 +377,8 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
     feature_gate: LimitGate | None = None,
     access: AccessService | None = None,
     identities: IdentityStore | None = None,
+    referrals: SqlAlchemyReferralStore | None = None,
+    bot_username: str | None = None,
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS,
 ) -> TelegramPoller:
     """A poller whose album window is short enough for a test to wait it out."""
@@ -394,6 +400,8 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
             speech=speech,
             feature_gate=feature_gate,
             access=access,
+            referrals=referrals,
+            bot_username=bot_username,
             voice_max_seconds=voice_max_seconds,
             album_quiet_seconds=ALBUM_TEST_QUIET_SECONDS,
         ),
@@ -1803,3 +1811,121 @@ async def test_a_pod_that_only_renders_never_polls(
     finally:
         await surface.aclose()
         await manager.stop_all()
+
+
+# --- referral links ----------------------------------------------------------
+
+REFERRER_TELEGRAM_ID = 777
+REFERRER_HANDLE = f"{USER_ID_PREFIX}{REFERRER_TELEGRAM_ID}"
+TEST_BOT_USERNAME = "octoforge_test_bot"
+
+
+@pytest.fixture
+async def telegram_stores() -> AsyncIterator[tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore]]:
+    engine = create_engine(MEMORY_DATABASE_URL)
+    async with engine.begin() as connection:
+        await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
+    factory = create_session_factory(engine)
+    yield SqlAlchemyInviteStore(factory), SqlAlchemyReferralStore(factory)
+    await engine.dispose()
+
+
+async def test_a_referral_link_opens_the_gate_and_records_who_brought_whom(
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+) -> None:
+    invites, referrals = telegram_stores
+    code = await referrals.code_of(REFERRER_HANDLE)
+    client = FakeTelegramClient()
+    poller = make_poller(
+        client, forbidden_provider, membership=TelegramMembership(invites, [], referrals=referrals)
+    )
+
+    await deliver(
+        poller, make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
+    )
+
+    assert client.sent == [(TELEGRAM_USER_ID, WELCOME_TEXT, None)]
+    claim = await referrals.claim_of(USER_ID)
+    assert claim is not None
+    assert claim.referrer_user_id == REFERRER_HANDLE
+
+
+async def test_a_referral_member_passes_the_gate_on_later_messages(
+    session_factory: async_sessionmaker[AsyncSession],
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+) -> None:
+    invites, referrals = telegram_stores
+    await referrals.record_claim(USER_ID, REFERRER_HANDLE, "whatever")
+    reply = ChatMessage(role=MessageRole.ASSISTANT, content=REPLY)
+    manager = await make_manager([reply], session_factory)
+    client = FakeTelegramClient()
+    poller = make_poller(
+        client,
+        manager.get_or_create_runner,
+        membership=TelegramMembership(invites, [], referrals=referrals),
+    )
+
+    await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
+    await wait_until(lambda: bool(client.sent))
+
+    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
+    await manager.stop_all()
+
+
+async def test_a_referral_code_is_reusable_but_never_self_serving(
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+) -> None:
+    invites, referrals = telegram_stores
+    code = await referrals.code_of(REFERRER_HANDLE)
+    membership = TelegramMembership(invites, [], referrals=referrals)
+
+    first = await membership.check("tg:1001", f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
+    second = await membership.check("tg:1002", f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
+    own = await membership.check(REFERRER_HANDLE, f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
+    unknown = await membership.check("tg:1003", f"{COMMAND_START} {REFERRAL_PREFIX}missing")
+
+    assert first is MembershipDecision.ALLOW_WITH_WELCOME
+    assert second is MembershipDecision.ALLOW_WITH_WELCOME  # the link does not burn out
+    assert own is MembershipDecision.DENY_INVITE_INVALID  # self-referral is no way in
+    assert unknown is MembershipDecision.DENY_INVITE_INVALID
+
+
+async def test_the_first_attribution_stands(
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+) -> None:
+    invites, referrals = telegram_stores
+    first_code = await referrals.code_of(REFERRER_HANDLE)
+    other_code = await referrals.code_of("tg:888")
+    membership = TelegramMembership(invites, [], referrals=referrals)
+
+    await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}{first_code}")
+    later = await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}{other_code}")
+
+    assert later is MembershipDecision.ALLOW  # a member stays a member
+    claim = await referrals.claim_of(USER_ID)
+    assert claim is not None
+    assert claim.referrer_user_id == REFERRER_HANDLE  # who brought them first
+
+
+async def test_invite_command_hands_out_a_stable_personal_link(
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+) -> None:
+    _, referrals = telegram_stores
+    client = FakeTelegramClient()
+    poller = make_poller(client, referrals=referrals, bot_username=TEST_BOT_USERNAME)
+
+    await deliver(poller, make_update(FIRST_UPDATE_ID, text=COMMAND_INVITE))
+    await deliver(poller, make_update(SECOND_UPDATE_ID, text=COMMAND_INVITE))
+
+    first, second = (text for _, text, _ in client.sent)
+    assert first == second  # the code is minted once and stays
+    assert f"https://t.me/{TEST_BOT_USERNAME}?start={REFERRAL_PREFIX}" in first
+
+
+async def test_invite_command_without_referrals_reports_not_set_up() -> None:
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+
+    await deliver(poller, make_update(FIRST_UPDATE_ID, text=COMMAND_INVITE))
+
+    assert client.sent == [(TELEGRAM_USER_ID, REFERRALS_DISABLED_TEXT, None)]

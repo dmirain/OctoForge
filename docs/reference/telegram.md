@@ -107,6 +107,16 @@ and no Alembic chain — invites are a Telegram-specific concept and core knows 
   and says which variable would improve that.
 - **The gate only activates once the admin list is non-empty.** With no admins configured the bot answers
   everyone — a deliberate first-run behavior that the startup capability report flags in capitals.
+- **Referral links** are the members' own way to invite: `/invite` hands out a personal reusable
+  deep link (`/start ref_<code>`; the prefix keeps referral and operator codes in separate
+  namespaces). A newcomer arriving through one passes this gate and is attributed — who brought
+  whom lands in `referral_claims`, shown in the console's Telegram tab — but a referral is **never
+  a way past the active-user cap**: behind this gate the invitee queues like anyone else (see
+  [access.md](access.md)). The first attribution stands forever, self-referral is invalid, and the
+  link never burns out.
+- Past this gate sits the **status gate**: `waiting` users get the queue notice (never a
+  position), `banned` users a closed door, each at most once per day — see
+  [access.md](access.md).
 
 Past the gate, every message upserts the sender's profile (name, `@username`) into a members table, so the
 console and the `admin_manage` tool can show who a `tg:<id>` actually is and which invite they came through.
@@ -118,7 +128,9 @@ arrangement identity names refresh only from the pod side.
 ### Commands and the admin tool
 
 `/start [code]` joins; `/secrets` returns a one-time link to the secret form (see
-[secrets.md](secrets.md)). That is the whole list — in particular there is **no stop command**:
+[secrets.md](secrets.md)); `/invite` returns the member's personal referral link (only the
+admitted reach it — the status gate runs first, so a queued user cannot mint links into the
+queue). That is the whole list — in particular there is **no stop command**:
 asking to stop is a message like any other, and the router decides which exchanges it refers to
 (see [routing.md](routing.md)). A command could not do that, because it has nowhere to say *which*
 of several running answers to stop.

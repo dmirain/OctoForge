@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from octoforge_core.time import utc_now
 from sqlalchemy import CursorResult, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_telegram.invites.api import (
@@ -18,8 +19,15 @@ from octoforge_telegram.invites.api import (
     InviteStore,
     MemberDirectory,
     MemberProfile,
+    ReferralClaim,
+    ReferralStore,
 )
-from octoforge_telegram.invites.models import InviteRow, MemberRow
+from octoforge_telegram.invites.models import (
+    InviteRow,
+    MemberRow,
+    ReferralClaimRow,
+    ReferralCodeRow,
+)
 
 _CODE_BYTES = 8
 
@@ -142,6 +150,83 @@ def _to_invite(row: InviteRow) -> Invite:
         revoked_at=row.revoked_at,
         claimed_by=row.claimed_by,
         disabled_cron_job_ids=tuple(row.disabled_cron_job_ids or ()),
+    )
+
+
+class SqlAlchemyReferralStore(ReferralStore):
+    """Referral codes and attributions in the same dedicated Telegram database."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def code_of(self, owner_user_id: str) -> str:
+        async with self._session_factory() as session:
+            existing = await session.scalars(
+                select(ReferralCodeRow).where(ReferralCodeRow.owner_user_id == owner_user_id)
+            )
+            row = existing.first()
+            if row is not None:
+                return row.code
+            row = ReferralCodeRow(
+                code=secrets.token_urlsafe(_CODE_BYTES),
+                owner_user_id=owner_user_id,
+                created_at=utc_now(),
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError:
+                # two first asks at once: the loser reads the winner's code
+                await session.rollback()
+                retry = await session.scalars(
+                    select(ReferralCodeRow).where(ReferralCodeRow.owner_user_id == owner_user_id)
+                )
+                won = retry.first()
+                assert won is not None  # somebody's insert committed
+                return won.code
+            return row.code
+
+    async def owner_of(self, code: str) -> str | None:
+        async with self._session_factory() as session:
+            row = await session.get(ReferralCodeRow, code)
+            return row.owner_user_id if row is not None else None
+
+    async def record_claim(self, user_id: str, referrer_user_id: str, code: str) -> None:
+        async with self._session_factory() as session:
+            if await session.get(ReferralClaimRow, user_id) is not None:
+                return  # the first attribution stands
+            session.add(
+                ReferralClaimRow(
+                    user_id=user_id,
+                    referrer_user_id=referrer_user_id,
+                    code=code,
+                    claimed_at=utc_now(),
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()  # a concurrent first entry: same answer
+
+    async def claim_of(self, user_id: str) -> ReferralClaim | None:
+        async with self._session_factory() as session:
+            row = await session.get(ReferralClaimRow, user_id)
+            return _to_claim(row) if row is not None else None
+
+    async def claims(self) -> list[ReferralClaim]:
+        async with self._session_factory() as session:
+            result = await session.scalars(
+                select(ReferralClaimRow).order_by(ReferralClaimRow.claimed_at)
+            )
+            return [_to_claim(row) for row in result.all()]
+
+
+def _to_claim(row: ReferralClaimRow) -> ReferralClaim:
+    return ReferralClaim(
+        user_id=row.user_id,
+        referrer_user_id=row.referrer_user_id,
+        code=row.code,
+        claimed_at=row.claimed_at,
     )
 
 

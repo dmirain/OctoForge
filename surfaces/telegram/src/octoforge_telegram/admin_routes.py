@@ -20,8 +20,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends
 from octoforge_server.deps import require_admin
 
-from octoforge_telegram.deps import get_invites, get_members
-from octoforge_telegram.invites.api import InviteStore, MemberDirectory
+from octoforge_telegram.deps import get_invites, get_members, get_referrals
+from octoforge_telegram.invites.api import InviteStore, MemberDirectory, ReferralStore
 
 # `require_admin` exactly as on the console's own router: defense in depth
 # behind the middleware, and the same gate object, so a request that already
@@ -31,14 +31,19 @@ router = APIRouter(prefix="/api/admin/telegram", dependencies=[Depends(require_a
 
 MembersDep = Annotated["MemberDirectory | None", Depends(get_members)]
 InvitesDep = Annotated["InviteStore | None", Depends(get_invites)]
+ReferralsDep = Annotated["ReferralStore | None", Depends(get_referrals)]
 
 
 @router.get("/users")
-async def telegram_users(members: MembersDep, invites: InvitesDep) -> dict[str, Any]:
-    """Telegram who-is-who: profiles recorded at the gate, with invite attribution.
+async def telegram_users(
+    members: MembersDep, invites: InvitesDep, referrals: ReferralsDep
+) -> dict[str, Any]:
+    """Telegram who-is-who: profiles recorded at the gate, with attribution.
 
-    Empty when the bot is not configured — the surface is installed but has
-    nothing to show.
+    Attribution is either an operator invite or a member's referral — who
+    brought whom is the operator's map of the social graph the bot grew
+    through. Empty when the bot is not configured — the surface is installed
+    but has nothing to show.
     """
     if members is None:
         return {"items": [], "total": 0}
@@ -49,9 +54,17 @@ async def telegram_users(members: MembersDep, invites: InvitesDep) -> dict[str, 
             for invite in await invites.list_all()
             if invite.claimed_by is not None
         }
+    claim_by_user = (
+        {claim.user_id: claim for claim in await referrals.claims()}
+        if referrals is not None
+        else {}
+    )
+    profiles = await members.list_all()
+    names = {profile.user_id: profile.display_name for profile in profiles}
     items = []
-    for profile in await members.list_all():
+    for profile in profiles:
         invite = invite_by_user.get(profile.user_id)
+        claim = claim_by_user.get(profile.user_id)
         items.append(
             {
                 "user_id": profile.user_id,
@@ -62,6 +75,11 @@ async def telegram_users(members: MembersDep, invites: InvitesDep) -> dict[str, 
                 "invite_code": invite.code if invite is not None else None,
                 "invite_note": invite.note if invite is not None else None,
                 "invite_status": invite.status.value if invite is not None else None,
+                "referred_by": (
+                    names.get(claim.referrer_user_id, claim.referrer_user_id)
+                    if claim is not None
+                    else None
+                ),
                 "first_seen_at": profile.first_seen_at.isoformat(),
                 "last_seen_at": profile.last_seen_at.isoformat(),
             }

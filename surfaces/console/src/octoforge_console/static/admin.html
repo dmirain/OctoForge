@@ -222,11 +222,12 @@ const VIEWS = {
   },
   tgusers: {
     title: "Telegram", path: () => "/api/admin/telegram/users",
-    columns: ["имя", "username", "user_id", "инвайт", "впервые", "последний раз"],
+    columns: ["имя", "username", "user_id", "инвайт", "кто привёл", "впервые", "последний раз"],
     row: (u) => `${clip([u.first_name, u.last_name].filter(Boolean).join(" ") || "—")}` +
       `<td class="mono">${u.username ? "@" + esc(u.username) : "—"}</td>` +
       `${clip(u.user_id, "mono")}` +
       `<td class="mono">${u.invite_code ? esc(u.invite_code) + (u.invite_note ? " · " + esc(u.invite_note) : "") + " (" + esc(u.invite_status) + ")" : "—"}</td>` +
+      `${clip(u.referred_by || "—")}` +
       `<td class="mono">${time(u.first_seen_at)}</td>` +
       `<td class="mono">${time(u.last_seen_at)}</td>`,
   },

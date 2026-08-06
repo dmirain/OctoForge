@@ -138,7 +138,11 @@ from octoforge_telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.drafts import SqlAlchemyDraftStore
 from octoforge_telegram.images import TelegramImageResolver
-from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
+from octoforge_telegram.invites.store import (
+    SqlAlchemyInviteStore,
+    SqlAlchemyMemberDirectory,
+    SqlAlchemyReferralStore,
+)
 from octoforge_telegram.notifier import TelegramActivationNotifier
 from octoforge_telegram.poller import (
     TelegramBridgeRegistry,
@@ -542,6 +546,7 @@ def _surface_state(stores: _TelegramStores | None) -> dict[str, Any]:
     return {
         "telegram_members": stores.directory if stores is not None else None,
         "telegram_invites": stores.invites if stores is not None else None,
+        "telegram_referrals": stores.referrals if stores is not None else None,
     }
 
 
@@ -903,9 +908,10 @@ def _start_mcp_sync(sync: McpToolSync, settings: Settings) -> asyncio.Task[None]
 
 @dataclass(frozen=True, slots=True)
 class _TelegramStores:
-    """The Telegram surface's own database: invites plus member profiles."""
+    """The Telegram surface's own database: invites, referrals, member profiles."""
 
     invites: SqlAlchemyInviteStore
+    referrals: SqlAlchemyReferralStore
     directory: SqlAlchemyMemberDirectory
     drafts: SqlAlchemyDraftStore
     engine: AsyncEngine
@@ -927,6 +933,7 @@ async def _build_telegram_stores(settings: TelegramSettings) -> _TelegramStores 
         invites=SqlAlchemyInviteStore(
             session_factory, ttl_seconds=settings.telegram_invite_ttl_seconds
         ),
+        referrals=SqlAlchemyReferralStore(session_factory),
         directory=SqlAlchemyMemberDirectory(session_factory),
         drafts=SqlAlchemyDraftStore(session_factory),
         engine=engine,
@@ -1047,7 +1054,11 @@ def _build_telegram_surface(
     )
     membership = None
     if resolved.stores is not None and settings.telegram_admin_ids:
-        membership = TelegramMembership(resolved.stores.invites, settings.telegram_admin_ids)
+        membership = TelegramMembership(
+            resolved.stores.invites,
+            settings.telegram_admin_ids,
+            referrals=resolved.stores.referrals,
+        )
     poller = TelegramPoller(
         client=client,
         registry=registry,
@@ -1061,6 +1072,8 @@ def _build_telegram_surface(
             speech=resolved.speech,
             feature_gate=resolved.feature_gate,
             access=resolved.access,
+            referrals=resolved.stores.referrals if resolved.stores is not None else None,
+            bot_username=settings.resolved_bot_username(),
             voice_max_seconds=settings.voice_max_seconds,
         ),
     )

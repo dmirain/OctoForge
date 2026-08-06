@@ -10,7 +10,7 @@ from typing import cast
 
 from fastapi import Request
 
-from octoforge_telegram.invites.api import InviteStore, MemberDirectory
+from octoforge_telegram.invites.api import InviteStore, MemberDirectory, ReferralStore
 
 
 def get_members(request: Request) -> "MemberDirectory | None":
@@ -21,3 +21,8 @@ def get_members(request: Request) -> "MemberDirectory | None":
 def get_invites(request: Request) -> "InviteStore | None":
     """The invite store, or None when the bot is not configured."""
     return cast("InviteStore | None", request.app.state.telegram_invites)
+
+
+def get_referrals(request: Request) -> "ReferralStore | None":
+    """The referral store, or None when the bot is not configured."""
+    return cast("ReferralStore | None", request.app.state.telegram_referrals)

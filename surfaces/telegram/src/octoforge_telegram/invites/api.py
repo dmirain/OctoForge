@@ -73,6 +73,44 @@ class MemberDirectory(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class ReferralClaim:
+    """Who brought whom: one attribution, written at first entry, never rewritten."""
+
+    user_id: str
+    referrer_user_id: str
+    code: str
+    claimed_at: datetime
+
+
+class ReferralStore(Protocol):
+    """Personal reusable referral codes and the who-brought-whom trail.
+
+    A referral is attribution plus a way through the invite gate — never a
+    way past the active-user cap: the invitee queues like anyone else.
+    """
+
+    async def code_of(self, owner_user_id: str) -> str:
+        """The owner's personal code, minted lazily on first ask, stable after."""
+        ...
+
+    async def owner_of(self, code: str) -> str | None:
+        """Whose code this is (None: unknown — the gate treats it as invalid)."""
+        ...
+
+    async def record_claim(self, user_id: str, referrer_user_id: str, code: str) -> None:
+        """Attribute the newcomer; a later entry never overwrites the first."""
+        ...
+
+    async def claim_of(self, user_id: str) -> ReferralClaim | None:
+        """How this user came in (None: not through a referral)."""
+        ...
+
+    async def claims(self) -> list[ReferralClaim]:
+        """Every attribution, oldest first (the operator's who-brought-whom)."""
+        ...
+
+
 class InviteNotFoundError(Exception):
     """No invite for the given code or id."""
 

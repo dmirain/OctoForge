@@ -37,6 +37,7 @@ from octoforge_telegram.invites.api import (
     InviteStatus,
     InviteStore,
     MemberDirectory,
+    ReferralStore,
 )
 from octoforge_telegram.models import (
     TelegramAudioRef,
@@ -52,6 +53,10 @@ logger = logging.getLogger(__name__)
 
 COMMAND_START = "/start"
 COMMAND_SECRETS = "/secrets"
+COMMAND_INVITE = "/invite"
+# what a personal referral payload looks like in `/start ref_<code>`: the
+# prefix keeps referral codes and operator invite codes in separate namespaces
+REFERRAL_PREFIX = "ref_"
 # Stopping an answer is a request like any other — the router recognises it
 # and cancels the exchanges the user meant. There is no stop command: one
 # would be a second way to say the same thing, and a worse one, because it
@@ -143,6 +148,19 @@ QUEUE_WAIT_TEXT = (
     "Напишу, как только место освободится."
 )
 ACCESS_CLOSED_TEXT = "Доступ закрыт."
+REFERRAL_LINK_TEXT = (
+    "Твоя персональная ссылка-приглашение:\n{link}\n\n"
+    "Отправь её другу — по ней он попадёт в бота (если все места заняты, "
+    "встанет в очередь)."
+)
+REFERRAL_CODE_TEXT = (
+    "Твой персональный код-приглашение: {code}\n"
+    # the mixed-script line trips the confusable-character lint; the text is
+    # ordinary Russian around a latin command
+    "Друг активирует его, отправив боту /start {code} (если все места "  # noqa: RUF001
+    "заняты, встанет в очередь)."
+)
+REFERRALS_DISABLED_TEXT = "Приглашения не настроены на этой инсталляции."
 SECRETS_LINK_TEXT = (
     "Ссылка на форму секретов (действует 10 минут):\n{url}\n\n"
     "Значения шифруются, ассистент видит только коды секретов. "
@@ -167,14 +185,24 @@ class MembershipDecision(StrEnum):
 class TelegramMembership:
     """Invite gate: who may talk to the bot at all.
 
-    Admins (their numeric Telegram id in `admin_ids`) always pass. Anyone else
-    needs an invite: either an already claimed one (status CLAIMED) or a fresh
-    code passed as `/start <code>`, which is claimed atomically on entry.
+    Admins (their numeric Telegram id in `admin_ids`) always pass. Anyone
+    else needs a way in: an already claimed invite, a fresh operator code
+    passed as `/start <code>` (claimed atomically on entry), or — when the
+    referral store is wired — a member's personal `/start ref_<code>` link,
+    which records who brought whom and stays reusable. A referral opens this
+    gate only; the active-user cap behind it queues the invitee like anyone
+    else.
     """
 
-    def __init__(self, invite_store: InviteStore, admin_ids: Iterable[int]) -> None:
+    def __init__(
+        self,
+        invite_store: InviteStore,
+        admin_ids: Iterable[int],
+        referrals: ReferralStore | None = None,
+    ) -> None:
         self._invites = invite_store
         self._admin_ids = frozenset(admin_ids)
+        self._referrals = referrals
 
     async def check(self, user_id: str, text: str) -> MembershipDecision:
         """Decide whether the user may proceed; claims `/start <code>` invites."""
@@ -182,18 +210,41 @@ class TelegramMembership:
         if numeric_id is not None and numeric_id in self._admin_ids:
             return MembershipDecision.ALLOW
         code = _start_code(text)
+        if code is not None and code.startswith(REFERRAL_PREFIX) and self._referrals is not None:
+            return await self._claim_referral(code.removeprefix(REFERRAL_PREFIX), user_id)
         if code is not None:
             return await self._claim(code, user_id)
-        invite = await self._invites.get_by_user(user_id)
-        if invite is not None and invite.status is InviteStatus.CLAIMED:
+        if await self._is_member(user_id):
             return MembershipDecision.ALLOW
         return MembershipDecision.DENY_NO_ACCESS
+
+    async def _is_member(self, user_id: str) -> bool:
+        invite = await self._invites.get_by_user(user_id)
+        if invite is not None and invite.status is InviteStatus.CLAIMED:
+            return True
+        return self._referrals is not None and await self._referrals.claim_of(user_id) is not None
 
     async def _claim(self, code: str, user_id: str) -> MembershipDecision:
         try:
             await self._invites.claim(code, user_id)
         except (InviteAlreadyClaimedError, InviteExpiredError, InviteNotFoundError):
             return MembershipDecision.DENY_INVITE_INVALID
+        return MembershipDecision.ALLOW_WITH_WELCOME
+
+    async def _claim_referral(self, code: str, user_id: str) -> MembershipDecision:
+        """A member's reusable link: attribute once, never gate a member out.
+
+        Self-referral is invalid — a way in must not be mintable from
+        inside one's own pocket; a member clicking somebody's link passes
+        (they are a member) but their original attribution stands.
+        """
+        assert self._referrals is not None  # only called when wired
+        owner = await self._referrals.owner_of(code)
+        if owner is None or owner == user_id:
+            return MembershipDecision.DENY_INVITE_INVALID
+        if await self._is_member(user_id):
+            return MembershipDecision.ALLOW
+        await self._referrals.record_claim(user_id, owner, code)
         return MembershipDecision.ALLOW_WITH_WELCOME
 
 
@@ -352,6 +403,11 @@ class TelegramPollerOptions:
     # the status gate (waiting/active/banned); None = statuses are not
     # enforced on this surface (an HTTP-gateway bot leaves them to the service)
     access: AccessService | None = None
+    # personal referral links (/invite); None = the command reports "not set up"
+    referrals: ReferralStore | None = None
+    # the bot's @handle for building t.me deep links; None = codes are handed
+    # out as text with a /start instruction instead
+    bot_username: str | None = None
     # how long an album's burst must stay quiet before it is submitted
     album_quiet_seconds: float = ALBUM_QUIET_SECONDS
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
@@ -378,6 +434,8 @@ class TelegramPoller:
         self._speech = options.speech
         self._feature_gate = options.feature_gate
         self._access = options.access
+        self._referrals = options.referrals
+        self._bot_username = options.bot_username
         # (person, text) → day: one status notice per person per day — the
         # answer does not change by asking, and silence beats a nag
         self._status_notes: dict[tuple[str, str], str] = {}
@@ -938,6 +996,9 @@ class TelegramPoller:
             # narrative, the archive or the LLM
             await self._send_secrets_link(user_id, chat_id)
             return
+        if text.strip() == COMMAND_INVITE:
+            await self._send_referral_link(user_id, chat_id)
+            return
         bridge = await self._registry.gateway_for(user_id, chat_id)
         # the chat-level message id, not update_id: it doubles as the reply
         # target when the answer threads back to this question, and it is
@@ -962,6 +1023,22 @@ class TelegramPoller:
         await self._client.send_message(
             chat_id, SECRETS_LINK_TEXT.format(url=self._secrets_link(external_id))
         )
+
+    async def _send_referral_link(self, user_id: str, chat_id: int) -> None:
+        """Hand out the member's personal reusable link.
+
+        Only the admitted reach this command — the status gate ran first —
+        so a waiting user cannot mint links into the queue.
+        """
+        if self._referrals is None:
+            await self._client.send_message(chat_id, REFERRALS_DISABLED_TEXT)
+            return
+        code = f"{REFERRAL_PREFIX}{await self._referrals.code_of(user_id)}"
+        if self._bot_username:
+            link = f"https://t.me/{self._bot_username}?start={code}"
+            await self._client.send_message(chat_id, REFERRAL_LINK_TEXT.format(link=link))
+            return
+        await self._client.send_message(chat_id, REFERRAL_CODE_TEXT.format(code=code))
 
     async def _record_member(self, user_id: str, user: TelegramUser) -> None:
         """Mirror the sender's profile; recording must never break dispatch."""
