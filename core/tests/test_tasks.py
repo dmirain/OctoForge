@@ -266,9 +266,6 @@ class CapGate:
     async def allows(self, user_id: str, feature: str) -> bool:
         return True
 
-    async def check_submit(self, user_id: str) -> LimitVerdict:
-        return LimitVerdict.ok()
-
     async def check_run_budget(self, user_id: str) -> LimitVerdict:
         return LimitVerdict.ok()
 

@@ -26,7 +26,7 @@ Three tables (see [data-model.md](data-model.md)):
 | `llm_answer` | one per finished run (`ConversationRunner._finalize`) | tokens of **every** iteration (the terminal event alone carries only the last one), `quantity=1` for a visible final; failed and cancelled runs still ledger their tokens |
 | `llm_routing` | the runner, from `RouteDecision.usage` — the router itself does not know whose message it routes | routing-call tokens |
 | `llm_compaction` | the compactor, on the dialog's user | summarization tokens |
-| `user_message` | every persisted submit (duplicates and refused messages are not counted) | `quantity=1` |
+| `user_message` | every persisted submit (duplicates are not counted) | `quantity=1` |
 | `voice_transcription`, `vision` | reserved kinds for surface-side metering | seconds / images |
 
 The public MCP skill-generation call (`mcp/skills.py`) has no user to attribute and is not metered.
@@ -36,10 +36,13 @@ the run — the event is logged as lost instead.
 ### What a tariff limits
 
 - **Daily budgets** (UTC calendar day): `daily_tokens` (prompt + completion of every attributable
-  call), `daily_user_messages`, `daily_assistant_messages`. An exhausted budget refuses a new message
-  with a broker notice (the message stays in the narrative), skips a cron wake (`WakeOutcome.LIMITED`,
-  one notice per job per day; the lease retries silently) and refuses agent-spawned tasks with text.
-  A run already in flight is never killed.
+  call), `daily_user_messages`, `daily_assistant_messages`. They are enforced at **one choke point —
+  the start of an LLM run** (`LimitGate.check_run_budget`, all three budgets together). Intake never
+  refuses: a message is always persisted and counted, only the run is withheld — an answer start
+  delivers a broker notice (one per dialog per day) and leaves the exchange OPEN, so the next
+  trigger after the budget resets picks the work up; a cron wake is skipped (`WakeOutcome.LIMITED`,
+  one notice per job per day; the lease retries silently); an agent-spawned task is refused with
+  text; a restart-orphaned task is failed with the reason. A run already in flight is never killed.
 - **Feature switches**: plain string codes end to end. The core ships its vocabulary as
   `FeatureCode` / `CORE_FEATURES` (`skill_create`, `voice_transcription`, `web_search`, `mcp_add`,
   `http_endpoints` = `http_request` + `external_call`, `vision`), and an assembly extends it without
@@ -79,7 +82,8 @@ operator's change applies at once; the day's totals (the sum-over-window query) 
 and invalidated by the node's own `record`. Enforcement is check-then-consume:
 the run admitted last before exhaustion completes in full, and two nodes can each admit one run at
 the boundary — limits are guardrails, not accounting. A tariff change applies from the user's next
-run.
+run. `check_run_budget` is the port's only budget question; every run-start path asks it and no
+other code path checks budgets at all.
 
 ### Operator surface
 
@@ -93,9 +97,10 @@ The ledger joins the retention sweep through `OF_RETENTION_USAGE_DAYS`
 
 - **Zero configuration = zero behavior change.** No tariffs, no bindings — every check passes.
 - **The ledger is append-only.** Reports and limit checks are sums; nothing updates an event.
-- **A refused message is persisted but not counted**, and the in-memory narrative stays in step with
-  the store.
-- **The N-th message under a limit of N is still answered**; the check runs before the count.
+- **A message is never refused, only its run is withheld.** It is persisted, counted and waits in
+  its OPEN exchange for the budget to reset — nothing the user sends is lost.
+- **The N-th message under a limit of N is still answered**: the message is counted at intake, so
+  the run-start comparison for `daily_user_messages` is strict.
 - **Feature gating is defence in depth**: hidden from the spec list *and* refused inside `execute`.
 - **Both entrances enforce a cap with the same words** — the agent tool and the HTTP endpoint share
   `job_quota_refusal`.

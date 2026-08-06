@@ -320,7 +320,6 @@ class RecordingLimitGate:
 
     def __init__(self) -> None:
         self.events: list[UsageEvent] = []
-        self.submit_verdict = LimitVerdict.ok()
         self.run_verdict = LimitVerdict.ok()
         self.features: frozenset[str] | None = None
 
@@ -329,9 +328,6 @@ class RecordingLimitGate:
 
     async def allows(self, user_id: str, feature: str) -> bool:
         return self.features is None or feature in self.features
-
-    async def check_submit(self, user_id: str) -> LimitVerdict:
-        return self.submit_verdict
 
     async def check_run_budget(self, user_id: str) -> LimitVerdict:
         return self.run_verdict
@@ -2129,12 +2125,13 @@ async def test_wake_runs_cron_tagged_background_process(
 EXHAUSTED = LimitVerdict(allowed=False, reason="daily_tokens", used=1000, limit=1000)
 
 
-async def test_exhausted_budget_refuses_a_submit_with_a_notice(
+async def test_exhausted_budget_withholds_the_run_but_keeps_the_message(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The message stays in the narrative, but no exchange or run is created."""
+    """The message is persisted and counted, the exchange stays OPEN with no
+    run — once the budget resets, the next trigger picks the work up."""
     gate = RecordingLimitGate()
-    gate.submit_verdict = EXHAUSTED
+    gate.run_verdict = EXHAUSTED
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([])  # any LLM call would pop an empty script and fail
     manager = make_manager(
@@ -2154,8 +2151,31 @@ async def test_exhausted_budget_refuses_a_submit_with_a_notice(
     assert "daily_tokens: 1000/1000" in notice.message.content
     assert next(m.content for m in runner.history()) == "hi"  # persisted, not lost
     assert await store.list(runner.dialog_id) == []  # no run was started
-    assert await SqlAlchemyExchangeRepository(session_factory).list_live(runner.dialog_id) == []
-    assert gate.by_kind(UsageKind.USER_MESSAGE) == []  # a refused message is not counted
+    (exchange,) = await SqlAlchemyExchangeRepository(session_factory).list_live(runner.dialog_id)
+    assert exchange.status is ExchangeStatus.OPEN  # the obligation survives
+    (counted,) = gate.by_kind(UsageKind.USER_MESSAGE)  # intake always counts
+    assert counted.quantity == 1
+
+
+async def test_exhausted_budget_notices_once_per_dialog_and_day(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    gate = RecordingLimitGate()
+    gate.run_verdict = EXHAUSTED
+    manager = make_manager(
+        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(limits=gate)
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("first try")
+    await collect_until(queue, lambda e: isinstance(e.payload, Finished))
+    await runner.submit("second try")
+    await wait_for_message(runner, "second try")
+    await asyncio.sleep(POLL_SECONDS * 5)  # give a second notice a chance to appear
+
+    notices = [m for m in runner.history() if "daily limit of your plan" in m.content]
+    assert len(notices) == 1  # the second refusal the same day stays silent
 
 
 async def test_exhausted_budget_skips_a_cron_wake_with_one_note_per_day(

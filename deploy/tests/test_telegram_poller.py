@@ -1418,9 +1418,6 @@ class NoVoiceGate:
     async def allows(self, user_id: str, feature: str) -> bool:
         return False
 
-    async def check_submit(self, user_id: str) -> LimitVerdict:
-        return LimitVerdict.ok()
-
     async def check_run_budget(self, user_id: str) -> LimitVerdict:
         return LimitVerdict.ok()
 

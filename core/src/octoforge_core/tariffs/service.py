@@ -54,37 +54,33 @@ class LimitService:
         tariff = await self.resolve(user_id)
         return tariff is None or feature in tariff.features
 
-    async def check_submit(self, user_id: str) -> LimitVerdict:
-        """May the user's message start a run today (messages + tokens)?"""
+    async def check_run_budget(self, user_id: str) -> LimitVerdict:
+        """May an LLM run start today (user messages, answers, tokens)?
+
+        The single budget choke point — every kind of run start asks this
+        one question, so all three daily budgets are checked together.
+        """
         tariff = await self.resolve(user_id)
         if tariff is None:
             return LimitVerdict.ok()
         totals = await self._totals_today(user_id)
-        if tariff.limits.daily_user_messages is not None and (
-            totals.user_messages >= tariff.limits.daily_user_messages
-        ):
+        messages_cap = tariff.limits.daily_user_messages
+        # strict ">": the message being answered was already ledgered at
+        # intake, so the N-th message under a limit of N still gets its run
+        if messages_cap is not None and totals.user_messages > messages_cap:
             return LimitVerdict(
                 allowed=False,
                 reason="daily_user_messages",
                 used=totals.user_messages,
-                limit=tariff.limits.daily_user_messages,
+                limit=messages_cap,
             )
-        return self._check_tokens(tariff, totals)
-
-    async def check_run_budget(self, user_id: str) -> LimitVerdict:
-        """May a cron/background run start today (answers + tokens)?"""
-        tariff = await self.resolve(user_id)
-        if tariff is None:
-            return LimitVerdict.ok()
-        totals = await self._totals_today(user_id)
-        if tariff.limits.daily_assistant_messages is not None and (
-            totals.assistant_messages >= tariff.limits.daily_assistant_messages
-        ):
+        answers_cap = tariff.limits.daily_assistant_messages
+        if answers_cap is not None and totals.assistant_messages >= answers_cap:
             return LimitVerdict(
                 allowed=False,
                 reason="daily_assistant_messages",
                 used=totals.assistant_messages,
-                limit=tariff.limits.daily_assistant_messages,
+                limit=answers_cap,
             )
         return self._check_tokens(tariff, totals)
 

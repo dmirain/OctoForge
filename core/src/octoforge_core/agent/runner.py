@@ -127,8 +127,9 @@ CRON_LIMIT_NOTICE_TEMPLATE = (
     "Active processes: {titles}."
 )
 TARIFF_LIMIT_NOTICE_TEMPLATE = (
-    "I cannot take this message: the daily limit of your plan is exhausted "
-    "({reason}: {used}/{limit}). The counter resets at midnight UTC."
+    "I cannot answer right now: the daily limit of your plan is exhausted "
+    "({reason}: {used}/{limit}). Your message is saved; the counter resets "
+    "at midnight UTC."
 )
 TARIFF_CRON_LIMIT_NOTICE_TEMPLATE = (
     "Scheduled run '{title}' was skipped: the daily limit of your plan is exhausted "
@@ -139,8 +140,15 @@ TARIFF_SPAWN_REFUSAL_TEMPLATE = (
     "({reason}: {used}/{limit}) — tell the user and stop"
 )
 SPAWNED_TEMPLATE = "task {task_id} spawned"
+#: dedup key of the answer-path budget notice (the runner is per-dialog, so
+#: a constant means "once per dialog per day"); cron notes key by job id
+_ANSWER_NOTE_KEY = "answer"
 SUBMIT_FAILED_ERROR = "your message could not be saved — please send it again"
 RESTART_LIMIT_ERROR = "could not resume after the service restart: process limit reached"
+TARIFF_RESTART_ERROR_TEMPLATE = (
+    "could not resume after the service restart: the daily limit of the plan "
+    "is exhausted ({reason}: {used}/{limit})"
+)
 DEFAULT_TASK_ERROR = "unknown error"
 # how many pictures of one message the strong vision tier is shown at once
 # (an album is one message): enough for a multi-page document, bounded
@@ -762,20 +770,27 @@ class ConversationRunner:
     async def _publish_tariff_cron_note(
         self, title: str, cron_job_id: str, verdict: LimitVerdict
     ) -> None:
-        """Notify once per (job, day): the lease retries all day otherwise.
-
-        In-memory on purpose — after a restart the user gets at most one
-        extra note, which is not worth a column.
-        """
-        day = utc_now().strftime("%Y-%m-%d")
-        if self._tariff_notes.get(cron_job_id) == day:
-            return
-        self._tariff_notes[cron_job_id] = day
-        await self._deliver_notice(
+        """Notify once per (job, day): the lease retries all day otherwise."""
+        await self._tariff_notice_once(
+            cron_job_id,
             TARIFF_CRON_LIMIT_NOTICE_TEMPLATE.format(
                 title=title, reason=verdict.reason, used=verdict.used, limit=verdict.limit
-            )
+            ),
         )
+
+    async def _tariff_notice_once(self, key: str, notice: str) -> None:
+        """Deliver a tariff notice at most once per (key, UTC day).
+
+        Sweeps and reopens retry the same refused start all day; one note
+        says everything the tenth would. In-memory on purpose — after a
+        restart the user gets at most one extra note, which is not worth a
+        column.
+        """
+        day = utc_now().strftime("%Y-%m-%d")
+        if self._tariff_notes.get(key) == day:
+            return
+        self._tariff_notes[key] = day
+        await self._deliver_notice(notice)
 
     async def delete_task(self, task_id: str) -> TaskDeleteOutcome:
         """Stop a live task process so it reaches a terminal state.
@@ -814,6 +829,8 @@ class ConversationRunner:
     async def _start_orphaned(self, task: Task) -> None:
         """Start the replacement background process of an orphaned task."""
         if task.kind is not TaskKind.ANSWER:
+            if not await self._admit_orphaned(task):
+                return
             self._start_process(task)
             return
         exchange_id = task.exchange_id
@@ -823,6 +840,13 @@ class ConversationRunner:
             # restarted run would clobber that state and duplicate the work.
             # Close the row silently; the user's reply resumes the exchange.
             await self._tasks.mark_done(task.id, "")
+            return
+        if not await self._admit_orphaned(task):
+            if exchange_id is not None:
+                # back to OPEN: the unowned sweep revives the exchange once
+                # the budget resets, instead of a task-less IN_PROGRESS zombie
+                with suppress(ExchangeNotFoundError):
+                    await self._exchanges.set_status(exchange_id, ExchangeStatus.OPEN)
             return
         narrative, watermark = await self._assemble_narrative(own_exchange_id=exchange_id)
         process = self._create_process(
@@ -836,6 +860,24 @@ class ConversationRunner:
             # the restarted run re-owns its obligation
             with suppress(ExchangeNotFoundError):
                 await self._exchanges.set_status(exchange_id, ExchangeStatus.IN_PROGRESS)
+
+    async def _admit_orphaned(self, task: Task) -> bool:
+        """Budget-check a restart; a refused task is failed, not left a zombie.
+
+        A skipped restart nobody records would sit IN_PROGRESS forever —
+        recovery runs once per startup, not per day. Failing it tells the
+        user what happened and keeps the task table honest.
+        """
+        budget = await self._run_budget_verdict()
+        if budget is None:
+            return True
+        error = TARIFF_RESTART_ERROR_TEMPLATE.format(
+            reason=budget.reason, used=budget.used, limit=budget.limit
+        )
+        await self._tasks.mark_failed(task.id, error)
+        self._pending_deliveries.append(_Delivery(events=(Failed(error=error),), task_id=task.id))
+        await self._flush_deliveries()
+        return False
 
     async def _exchange_awaits_user(self, exchange_id: str) -> bool:
         try:
@@ -1131,35 +1173,15 @@ class ConversationRunner:
             await self._record_user_message()
             await self._collect_material(message, command)
             return
-        if not await self._admit_submit(message):
-            return  # the message stays in the narrative; no exchange, no run
+        # no budget check here: intake always accepts and counts the message;
+        # the single budget choke point is the run start (`_start_answer`,
+        # `spawn_task`, `wake`, `_start_orphaned`)
         await self._record_user_message()
         # one read serves both the routing decision and the nudge after it
         live = await self._exchanges.list_live(self._dialog.id)
         decision = await self._route(message, command, live)
         await self._record_routing(decision.usage)
         await self._apply_route(message, decision, command, live)
-
-    async def _admit_submit(self, message: ChatMessage) -> bool:
-        """Check the plan's daily budget; deliver the refusal notice when spent.
-
-        Checked before the message is counted: with a limit of N the N-th
-        message is still answered, the N+1-th gets the notice. The refused
-        message joins the in-memory narrative before the notice — it is
-        already persisted, and the two copies of the story must not diverge.
-        """
-        if self._limits is None:
-            return True
-        verdict = await self._limits.check_submit(self._dialog.user_id)
-        if verdict.allowed:
-            return True
-        self._narrative.append(message)
-        await self._deliver_notice(
-            TARIFF_LIMIT_NOTICE_TEMPLATE.format(
-                reason=verdict.reason, used=verdict.used, limit=verdict.limit
-            )
-        )
-        return False
 
     async def _record_user_message(self) -> None:
         """Ledger one persisted user message (duplicates never get here)."""
@@ -1701,7 +1723,7 @@ class ConversationRunner:
                         # sweep stays silent and retries on the next slot
                         await self._reject_for_limit(message)
                     return
-                await self._start_answer(exchange, message)
+                await self._start_answer(exchange, message, notify_limit=notify_limit)
 
     async def _sweep_unowned_open(self) -> None:
         """Revive OPEN exchanges nobody owns (crash and limit leftovers).
@@ -2046,6 +2068,8 @@ class ConversationRunner:
         message: ChatMessage,
         client_key: str | None = None,
         cancel_epoch: int | None = None,
+        *,
+        notify_limit: bool = True,
     ) -> None:
         """Start the run that owes `exchange` an answer.
 
@@ -2054,6 +2078,12 @@ class ConversationRunner:
         the last user cancel starts already-cancelled: the stop button was
         pressed while the message was still being routed, and "I pressed
         stop and it answered anyway" is a broken stop.
+
+        The plan's daily budget is checked here and only here for answers —
+        every path that owes a run (submit, promote, reopen, bring-back, the
+        unowned sweep) converges on this method. A refusal leaves the
+        exchange and its message exactly as they are: once the budget resets,
+        the next trigger picks the work up and nothing is lost.
 
         Ownership is checked here, once per run, and nowhere on the streaming
         path: one query is nothing beside a model call, while a per-event
@@ -2069,6 +2099,16 @@ class ConversationRunner:
                 self._dialog.id,
                 exchange.id,
             )
+            return
+        budget = await self._run_budget_verdict()
+        if budget is not None:
+            if notify_limit:
+                await self._tariff_notice_once(
+                    _ANSWER_NOTE_KEY,
+                    TARIFF_LIMIT_NOTICE_TEMPLATE.format(
+                        reason=budget.reason, used=budget.used, limit=budget.limit
+                    ),
+                )
             return
         # the task and the IN_PROGRESS flip land together: a crash between
         # them used to leave an IN_PROGRESS exchange with no task behind it —

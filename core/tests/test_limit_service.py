@@ -76,7 +76,6 @@ def _service(
 async def test_no_tariff_means_no_restrictions() -> None:
     service, _, meter = _service(None, UsageTotals())
 
-    assert (await service.check_submit(USER)).allowed
     assert (await service.check_run_budget(USER)).allowed
     assert await service.enabled_features(USER) is None
     assert await service.allows(USER, FeatureCode.VISION)
@@ -84,27 +83,38 @@ async def test_no_tariff_means_no_restrictions() -> None:
     assert meter.reads == 0  # no tariff — the ledger is never consulted
 
 
-async def test_submit_refused_on_message_limit() -> None:
+async def test_run_budget_refused_over_the_message_limit() -> None:
+    service, _, _ = _service(
+        _tariff(limits=TariffLimits(daily_user_messages=MESSAGE_LIMIT)),
+        UsageTotals(user_messages=MESSAGE_LIMIT + 1),
+    )
+
+    verdict = await service.check_run_budget(USER)
+
+    assert not verdict.allowed
+    assert verdict.reason == "daily_user_messages"
+    assert verdict.used == MESSAGE_LIMIT + 1
+    assert verdict.limit == MESSAGE_LIMIT
+
+
+async def test_the_nth_message_under_a_limit_of_n_still_runs() -> None:
+    """The message was ledgered at intake, before this check — the comparison
+    is strict so the run it owes is not the one refused."""
     service, _, _ = _service(
         _tariff(limits=TariffLimits(daily_user_messages=MESSAGE_LIMIT)),
         UsageTotals(user_messages=MESSAGE_LIMIT),
     )
 
-    verdict = await service.check_submit(USER)
-
-    assert not verdict.allowed
-    assert verdict.reason == "daily_user_messages"
-    assert verdict.used == MESSAGE_LIMIT
-    assert verdict.limit == MESSAGE_LIMIT
+    assert (await service.check_run_budget(USER)).allowed
 
 
-async def test_submit_refused_on_token_limit() -> None:
+async def test_run_budget_refused_on_token_limit() -> None:
     service, _, _ = _service(
         _tariff(limits=TariffLimits(daily_tokens=TOKEN_LIMIT)),
         UsageTotals(prompt_tokens=TOKEN_LIMIT - 200, completion_tokens=200),
     )
 
-    verdict = await service.check_submit(USER)
+    verdict = await service.check_run_budget(USER)
 
     assert not verdict.allowed
     assert verdict.reason == "daily_tokens"
@@ -112,13 +122,13 @@ async def test_submit_refused_on_token_limit() -> None:
     assert verdict.limit == TOKEN_LIMIT
 
 
-async def test_submit_allowed_under_limits() -> None:
+async def test_run_budget_allowed_under_limits() -> None:
     service, _, _ = _service(
         _tariff(limits=TariffLimits(daily_tokens=TOKEN_LIMIT, daily_user_messages=MESSAGE_LIMIT)),
         UsageTotals(prompt_tokens=TOKEN_LIMIT // 2, user_messages=MESSAGE_LIMIT - 1),
     )
 
-    assert (await service.check_submit(USER)).allowed
+    assert (await service.check_run_budget(USER)).allowed
 
 
 async def test_run_budget_checks_assistant_messages() -> None:
@@ -157,8 +167,8 @@ async def test_totals_are_cached_but_the_tariff_is_not() -> None:
         _tariff(limits=TariffLimits(daily_tokens=TOKEN_LIMIT)), UsageTotals()
     )
 
-    await service.check_submit(USER)
-    await service.check_submit(USER)
+    await service.check_run_budget(USER)
+    await service.check_run_budget(USER)
 
     assert store.lookups == 1 + 1
     assert meter.reads == 1
@@ -172,9 +182,9 @@ async def test_record_invalidates_totals_and_never_raises() -> None:
         user_id=USER, kind=UsageKind.USER_MESSAGE, origin=UsageOrigin.INTERACTIVE, quantity=1
     )
 
-    await service.check_submit(USER)
+    await service.check_run_budget(USER)
     await service.record(event)
-    await service.check_submit(USER)
+    await service.check_run_budget(USER)
 
     assert meter.events == [event]
     assert meter.reads == 1 + 1  # the recorded event invalidated the cached totals

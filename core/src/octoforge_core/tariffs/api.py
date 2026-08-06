@@ -241,12 +241,13 @@ class LimitGate(UsageRecorder, Protocol):
         """Whether the user's tariff grants the feature (any code, core or custom)."""
         ...
 
-    async def check_submit(self, user_id: str) -> LimitVerdict:
-        """May the user's message start a run today (messages + tokens)?"""
-        ...
-
     async def check_run_budget(self, user_id: str) -> LimitVerdict:
-        """May a cron/background run start today (answers + tokens)?"""
+        """May an LLM run start today (user messages, answers, tokens)?
+
+        The single budget choke point: every run — an answer, a cron wake, a
+        spawned background task — asks this and nothing else does. A refused
+        message is still persisted; only the run is withheld.
+        """
         ...
 
     async def max_cron_jobs(self, user_id: str) -> int | None:
