@@ -56,6 +56,11 @@ NO_CREDENTIAL_MESSAGE = (
     "be dropped with nothing but a 401 in this log. Note OF_SERVICE_PASSWORD, not the "
     "_HASH the pod verifies against."
 )
+# A rollout restarts the service and this node at once, so the startup probe
+# has to outlast the service's boot; long enough for that, short enough that a
+# genuinely absent service still shows up in the log while somebody is watching.
+MEDIA_PROBE_ATTEMPTS = 6
+MEDIA_PROBE_DELAY_SECONDS = 5.0
 UP_MESSAGE = "Telegram ingestion is up; send SIGINT/SIGTERM to stop"
 DOWN_MESSAGE = "Telegram ingestion stopped"
 
@@ -114,14 +119,26 @@ def _secrets_link(settings: Settings) -> Callable[[str], str] | None:
 async def _report_media(media: ApiMediaUnderstanding) -> None:
     """State what media understanding this node will actually get, at startup.
 
-    Unreachable is worth a warning of its own: it means every picture and
-    every recording will fall back to text until the service answers.
+    Retried, because a rollout starts this node while the service is still
+    booting: the first deploy of this probe logged "the service did not
+    answer" against a service that answered fine two seconds later, and a
+    one-shot report that is wrong for the rest of the process's life is worse
+    than no report at all. Unreachable after all of them is worth a warning:
+    every picture and recording falls back to text until the service answers.
     """
-    capabilities = await media.capabilities()
+    for attempt in range(1, MEDIA_PROBE_ATTEMPTS + 1):
+        capabilities = await media.capabilities()
+        if capabilities is not None:
+            break
+        if attempt < MEDIA_PROBE_ATTEMPTS:
+            await asyncio.sleep(MEDIA_PROBE_DELAY_SECONDS)
+    else:
+        capabilities = None
     if capabilities is None:
         logger.warning(
-            "media understanding: the service did not answer — pictures and "
-            "recordings will fall back to text until it does"
+            "media understanding: the service did not answer in %.0fs — pictures "
+            "and recordings will fall back to text until it does",
+            MEDIA_PROBE_ATTEMPTS * MEDIA_PROBE_DELAY_SECONDS,
         )
         return
     logger.info(

@@ -20,6 +20,7 @@ from octoforge_telegram.gateway import (
     ApiGatewayRegistry,
     basic_auth_header,
 )
+from octoforge_telegram.ingest import __main__ as ingest_main
 from octoforge_telegram.ingest.__main__ import _build, run_ingest, service_headers
 from octoforge_telegram.media_client import ApiMediaUnderstanding
 
@@ -28,6 +29,19 @@ HANDLE = f"tg:{CHAT_ID}"
 SERVICE_USER = "telegram-ingest"
 SERVICE_PASSWORD = "a-long-generated-secret"
 DIALOG_PATH = "/api/dialog/messages"
+#: how many probe attempts the boot-race test makes the service refuse first
+BOOT_ATTEMPTS = 3
+
+
+@pytest.fixture(autouse=True)
+def instant_media_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No real waiting: `_build` probes the service, which no test here runs.
+
+    Left alone, every test that assembles the node would sit through the
+    startup probe's full retry budget — thirty seconds each of waiting for a
+    balancer that was never there.
+    """
+    monkeypatch.setattr(ingest_main, "MEDIA_PROBE_DELAY_SECONDS", 0.0)
 
 
 def recording_client(seen: list[httpx.Request]) -> httpx.AsyncClient:
@@ -271,3 +285,24 @@ async def test_an_unreachable_service_is_reported_rather_than_assumed() -> None:
         transport=httpx.MockTransport(handler), base_url="http://balancer"
     ) as client:
         assert await ApiMediaUnderstanding(client).capabilities() is None
+
+
+async def test_the_startup_probe_outlasts_the_services_boot() -> None:
+    """A rollout restarts both at once, so the first answer is often a 503 from
+    a service that is fine seconds later. The first deploy of this probe logged
+    'the service did not answer' against exactly that, and a one-shot report
+    that is wrong for the rest of the process's life is worse than none."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) < BOOT_ATTEMPTS:
+            return httpx.Response(503, json={"detail": "still booting"})
+        return httpx.Response(200, json={"describes_images": True, "transcribes_audio": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://balancer"
+    ) as client:
+        await ingest_main._report_media(ApiMediaUnderstanding(client))
+
+    assert len(attempts) == BOOT_ATTEMPTS  # it kept asking until the service was up
