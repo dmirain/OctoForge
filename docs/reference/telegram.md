@@ -148,7 +148,9 @@ wires — `/secrets` only when the secrets form is configured, `/invite` only wh
 store is — so the menu mirrors the configuration and a switched-off capability disappears from it
 on the next restart. `/start` is deliberately not listed: it is the entry handshake, not something
 a member ever needs again. The registration is best-effort — a Bot API failure is logged and the
-surface starts anyway, keeping whatever menu Telegram had before.
+surface starts anyway, keeping whatever menu Telegram had before. The descriptions are a few words
+each and bounded by `MAX_MENU_DESCRIPTION_CHARS`: the client gives one unwrapped line beside the
+command, and a sentence there pushes the menu off a phone screen.
 
 Admins additionally get the `admin_manage` tool inside the chat — list users
 with names and invite attribution, generate, revoke and restore invites, search instructions across users,

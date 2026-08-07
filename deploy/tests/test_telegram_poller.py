@@ -81,6 +81,7 @@ from octoforge_telegram.poller import (
     INVITE_MENU_DESCRIPTION,
     MATERIAL_ATTRIBUTION_ANONYMOUS,
     MATERIAL_PLACEHOLDER,
+    MAX_MENU_DESCRIPTION_CHARS,
     QUEUE_WAIT_TEXT,
     REFERRAL_PREFIX,
     REFERRALS_DISABLED_TEXT,
@@ -2097,6 +2098,19 @@ async def test_the_command_menu_lists_only_the_wired_commands(
     assert client.command_menus == [
         [("secrets", SECRETS_MENU_DESCRIPTION), ("invite", INVITE_MENU_DESCRIPTION)]
     ]
+
+
+async def test_menu_descriptions_stay_short_enough_for_a_phone() -> None:
+    """A sentence here is not merely verbose — it breaks the client's layout.
+
+    The description gets one unwrapped line beside the command, and the first
+    wording ("Передать пароль или токен через защищённую форму") pushed the menu
+    off the screen on a phone. Length is the requirement, so it is asserted.
+    """
+    assert all(
+        len(description) <= MAX_MENU_DESCRIPTION_CHARS
+        for description in (SECRETS_MENU_DESCRIPTION, INVITE_MENU_DESCRIPTION)
+    )
 
 
 async def test_a_bare_deployment_publishes_an_empty_menu() -> None:

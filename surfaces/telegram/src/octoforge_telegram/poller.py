@@ -59,9 +59,13 @@ COMMAND_START = "/start"
 COMMAND_SECRETS = "/secrets"
 COMMAND_INVITE = "/invite"
 # what the client shows behind its "/" menu button; /start is deliberately
-# absent — it is the entry handshake, not something a member ever needs again
-SECRETS_MENU_DESCRIPTION = "Передать пароль или токен через защищённую форму"
-INVITE_MENU_DESCRIPTION = "Получить персональную ссылку-приглашение"
+# absent — it is the entry handshake, not something a member ever needs again.
+# A phone gives the description one line next to the command and does not wrap
+# it, so a sentence there breaks the menu's layout: keep these to a few words,
+# bounded by MAX_MENU_DESCRIPTION_CHARS.
+MAX_MENU_DESCRIPTION_CHARS = 24
+SECRETS_MENU_DESCRIPTION = "Пароли и токены"
+INVITE_MENU_DESCRIPTION = "Пригласить друга"
 # what a personal referral payload looks like in `/start ref_<code>`: the
 # prefix keeps referral codes and operator invite codes in separate namespaces
 REFERRAL_PREFIX = "ref_"
