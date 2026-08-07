@@ -889,7 +889,11 @@ def _usage_event_to_dict(item: UsageEventOverview, names: dict[str, str]) -> dic
 
 
 @router.get("/users")
-async def users(identities: IdentityStoreDep, settings_store: SettingsStoreDep) -> dict[str, Any]:
+async def users(
+    identities: IdentityStoreDep,
+    settings_store: SettingsStoreDep,
+    store: TariffStoreDep,
+) -> dict[str, Any]:
     """Who the installation knows, and which accounts each person answers on.
 
     A person is the unit here, not a handle: the same human may arrive from
@@ -898,15 +902,28 @@ async def users(identities: IdentityStoreDep, settings_store: SettingsStoreDep) 
     theirs is part of the answer to "who is this". The head-count and the cap
     ride along so the users tab can say "X active of Y, Z waiting" without a
     second request.
+
+    Each person carries the plan they actually run under — the explicit binding
+    when there is one, otherwise the default plan, which is what most people on
+    a public installation are on. The plan-centric listing cannot answer this:
+    an unbound person appears in no plan's user list, so on a freemium
+    installation the majority would show no tariff at all. The catalog rides
+    along for the same reason as the head-count: the row offers a picker, and
+    it must not need a second request to fill it.
     """
     people = await identities.list_users()
     counts = await identities.count_by_status()
+    plans = await store.list()
+    assignments = await store.assignments()
+    default_code = next((plan.code for plan in plans if plan.is_default), None)
     items = [
         {
             "user_id": person.id,
             "name": person.name,
             "email": person.email,
             "status": person.status.value,
+            "tariff": assignments.get(person.id, default_code),
+            "tariff_assigned": person.id in assignments,
             "created_at": person.created_at.isoformat() if person.created_at else None,
             "identities": [
                 {
@@ -930,6 +947,8 @@ async def users(identities: IdentityStoreDep, settings_store: SettingsStoreDep) 
         "waiting_count": counts[UserStatus.WAITING],
         "banned_count": counts[UserStatus.BANNED],
         "max_active_users": await max_active_users(settings_store),
+        "tariffs": [plan.code for plan in plans],
+        "default_tariff": default_code,
     }
 
 

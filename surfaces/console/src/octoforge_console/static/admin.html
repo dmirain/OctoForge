@@ -33,6 +33,9 @@
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
   .toolbar input, .toolbar select { background: var(--panel); color: var(--text);
     border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; font: inherit; }
+  td select { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 4px; font: inherit; font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .toolbar .spacer { flex: 1; }
   .count { color: var(--muted); font-size: 12px; }
   .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px;
@@ -84,7 +87,8 @@
 <script>
 "use strict";
 
-const state = { view: "dialogs", offset: 0, limit: 50, query: "", status: "", dialogId: null, datasetId: null };
+const state = { view: "dialogs", offset: 0, limit: 50, query: "", status: "", dialogId: null,
+  datasetId: null, tariffs: [], defaultTariff: null };
 
 const short = (value) => (value === null || value === undefined ? "—" : String(value));
 const lim = (value) => (value === null || value === undefined ? "∞" : String(value));
@@ -116,6 +120,19 @@ function open(text) {
 function statusBadge(status) {
   const label = { active: "активен", waiting: "в очереди", banned: "забанен" }[status] || status;
   return `<span title="${esc(status)}">${esc(label)}</span>`;
+}
+
+// Тариф человека — и показ, и смена одним контролом, в его же строке.
+// Пустое значение = явной привязки нет; тогда действует дефолтный тариф, и
+// именно он назван в подписи: иначе большинство публичной установки выглядело
+// бы как «тарифа нет», хотя лимиты к ним применяются.
+function tariffPicker(u) {
+  const inherited = state.defaultTariff ? `по умолчанию · ${state.defaultTariff}` : "без тарифа · ∞";
+  const options = [`<option value="" ${u.tariff_assigned ? "" : "selected"}>${esc(inherited)}</option>`]
+    .concat((state.tariffs || []).map((code) =>
+      `<option value="${esc(code)}" ${u.tariff_assigned && code === u.tariff ? "selected" : ""}>${esc(code)}</option>`));
+  return `<select class="mono" data-assign="${esc(u.user_id)}" ` +
+    `title="действует: ${esc(u.tariff || "без тарифа (без ограничений)")}">${options.join("")}</select>`;
 }
 
 function userActions(u) {
@@ -213,9 +230,11 @@ const VIEWS = {
   },
   users: {
     title: "Пользователи", path: () => "/api/admin/users",
-    columns: ["имя", "статус", "поверхности", "создан", ""],
+    absorb: (page) => { state.tariffs = page.tariffs; state.defaultTariff = page.default_tariff; },
+    columns: ["имя", "статус", "тариф", "поверхности", "создан", ""],
     row: (u) => `${person(u.user_id, u.name || u.email)}` +
       `<td>${statusBadge(u.status)}</td>` +
+      `<td>${tariffPicker(u)}</td>` +
       `<td>${tags(u.identities.map((i) => i.surface + ":" + (i.username ? "@" + i.username : i.external_id) + (i.active ? "" : " ✕")))}</td>` +
       `<td class="mono">${time(u.created_at)}</td>` +
       `<td>${userActions(u)}</td>`,
@@ -335,10 +354,7 @@ function renderToolbar(view) {
       `<input id="t-memory" type="number" placeholder="память, симв." size="7">` +
       `<label class="mono" title="тариф пользователей без явного назначения"><input type="checkbox" id="t-default">дефолт</label>` +
       `<button class="act" id="t-save">сохранить</button>` +
-      `<select id="a-user"><option value="">пользователь…</option></select>` +
-      `<select id="a-code"><option value="">тариф…</option></select>` +
-      `<button class="act" id="a-assign">назначить</button>` +
-      `<button class="act danger" id="a-unassign">снять</button>`);
+      `<span class="count">назначают тариф в строке человека, вкладка «Пользователи»</span>`);
   }
   if (state.view === "usage") {
     parts.push(`<button class="act" data-nav="usageevents">журнал событий</button>`);
@@ -414,18 +430,8 @@ async function setupParamForm() {
 }
 
 async function setupTariffForm() {
-  const userSelect = document.getElementById("a-user");
-  const codeSelect = document.getElementById("a-code");
   try {
-    const [{ items: people }, { items: plans, features }] = await Promise.all([
-      api("/api/admin/users"), api("/api/admin/tariffs"),
-    ]);
-    userSelect.innerHTML = `<option value="">пользователь…</option>` + people
-      .map((u) => `<option value="${esc(u.user_id)}">${esc(u.name || u.user_id)}</option>`)
-      .join("");
-    codeSelect.innerHTML = `<option value="">тариф…</option>` + plans
-      .map((t) => `<option value="${esc(t.code)}">${esc(t.code)}</option>`)
-      .join("");
+    const { features } = await api("/api/admin/tariffs");
     document.getElementById("t-features").title = `известные функции: ${features.join(", ")}`;
   } catch (error) { fail(`не удалось получить данные формы: ${error.message}`); }
   const num = (id) => {
@@ -456,22 +462,6 @@ async function setupTariffForm() {
       await load();
     } catch (error) { fail(`сохранение не удалось: ${error.message}`); }
   });
-  const assign = async (code) => {
-    if (!userSelect.value) { fail("выберите пользователя"); return; }
-    try {
-      await api("/api/admin/tariffs/assign", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userSelect.value, code }),
-      });
-      await load();
-    } catch (error) { fail(`назначение не удалось: ${error.message}`); }
-  };
-  document.getElementById("a-assign").addEventListener("click", () => {
-    if (!codeSelect.value) { fail("выберите тариф"); return; }
-    assign(codeSelect.value);
-  });
-  document.getElementById("a-unassign").addEventListener("click", () => assign(null));
 }
 
 async function api(path, options) {
@@ -502,6 +492,7 @@ async function load() {
   if (view.filters?.includes("status") && state.status) params.set("status", state.status);
   try {
     const page = await api(`${view.path()}?${params}`);
+    view.absorb?.(page);  // что строка умеет показать, но не может запросить сама
     document.getElementById("head").innerHTML =
       `<tr>${view.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>`;
     document.getElementById("body").innerHTML = page.items.length
@@ -534,6 +525,19 @@ document.addEventListener("click", async (event) => {
     try { await api(data.post, { method: "POST" }); await load(); }
     catch (error) { fail(`действие не удалось: ${error.message}`); }
   }
+});
+
+document.addEventListener("change", async (event) => {
+  const select = event.target.closest("select[data-assign]");
+  if (!select) return;
+  try {
+    await api("/api/admin/tariffs/assign", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: select.dataset.assign, code: select.value || null }),
+    });
+    await load();
+  } catch (error) { fail(`назначение не удалось: ${error.message}`); await load(); }
 });
 
 document.getElementById("prev").addEventListener("click", () => {

@@ -47,6 +47,15 @@ installation's head-counts (`active_count`, `waiting_count`, `banned_count`, `ma
 the «Пользователи» tab is where the operator runs the queue: ban/unban/activate buttons and the
 active-user cap field (see [access.md](access.md)).
 
+It also carries the plan each person actually runs under: `tariff` is the explicit binding when
+there is one and the default plan otherwise, with `tariff_assigned` telling the two apart, and the
+catalog rides along (`tariffs`, `default_tariff`) so the row can offer a picker without a second
+request. The plan-centric listing cannot answer this question — an unbound person appears in no
+plan's user list, so on a freemium installation the majority would read as having no tariff while
+the default's limits apply to them in full. Changing the plan is done in the person's own row (the
+picker posts to `/api/admin/tariffs/assign`; its empty value unbinds, which means "follow the
+default"); the «Тарифы» tab keeps the catalog and the plan-centric view of who is on what.
+
 The Telegram surface adds its own listing (`GET /api/admin/telegram/users`), which joins the member
 directory with invite attribution: names, usernames and which invite somebody came through are
 Telegram's own knowledge, and only Telegram can answer for them.

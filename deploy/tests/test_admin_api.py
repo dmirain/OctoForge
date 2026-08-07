@@ -581,6 +581,32 @@ def test_users_tab_carries_statuses_and_counters(client: TestClient) -> None:
     assert page["max_active_users"] is None
 
 
+def test_the_users_tab_says_which_plan_each_person_runs_under(client: TestClient) -> None:
+    """Asking the plan catalog cannot answer this.
+
+    A person with no explicit binding appears in no plan's user list, yet the
+    default plan's limits apply to them in full — so on a public installation
+    the majority read as "no tariff" while being metered. The row has to say
+    what actually applies, and mark whether it was chosen or inherited.
+    """
+    client.post("/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "alice"})
+    client.post("/api/admin/tariffs", json=BASIC_TARIFF | {"is_default": True})
+    (person,) = client.get("/api/admin/users").json()["items"]
+
+    inherited = client.get("/api/admin/users").json()
+    client.post(
+        "/api/admin/tariffs/assign", json={"user_id": person["user_id"], "code": "freemium"}
+    )
+    bound = client.get("/api/admin/users").json()
+
+    assert inherited["items"][0]["tariff"] == "basic"  # never assigned anything
+    assert inherited["items"][0]["tariff_assigned"] is False
+    assert inherited["default_tariff"] == "basic"
+    assert set(inherited["tariffs"]) == STARTER_PLANS | {"basic"}  # the row's picker
+    assert bound["items"][0]["tariff"] == "freemium"
+    assert bound["items"][0]["tariff_assigned"] is True  # an explicit choice outranks the default
+
+
 def test_a_full_house_answers_403_and_the_console_can_open_the_door(
     client: TestClient,
 ) -> None:

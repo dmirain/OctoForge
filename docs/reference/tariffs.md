@@ -121,8 +121,11 @@ other code path checks budgets at all.
 
 ### Operator surface
 
-The console's «Тарифы» tab manages the catalog and the bindings (`GET/POST/DELETE /api/admin/tariffs`,
-`POST /api/admin/tariffs/assign`; audited as `tariff.*`); «Потребление» shows the aggregated report
+The console's «Тарифы» tab manages the catalog (`GET/POST/DELETE /api/admin/tariffs`; audited as
+`tariff.*`) and shows who is on each plan. Binding a person happens where the person is — the
+«Пользователи» tab carries a plan picker in every row (`POST /api/admin/tariffs/assign`, empty =
+unbound, which means the default plan applies; see [admin-console.md](admin-console.md)).
+«Потребление» shows the aggregated report
 (`GET /api/admin/usage?days=…`) with a drill-down into the raw ledger (`GET /api/admin/usage/events`).
 The ledger joins the retention sweep through `OF_RETENTION_USAGE_DAYS`
 (see [configuration.md](configuration.md)); 0 keeps every event forever.
