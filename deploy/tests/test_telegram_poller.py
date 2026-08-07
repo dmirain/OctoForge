@@ -48,6 +48,7 @@ from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
 from octoforge_telegram.bridge import RunnerProvider
 from octoforge_telegram.client import USER_ID_PREFIX, TelegramApiError
+from octoforge_telegram.gateway import AccessRefusedError
 from octoforge_telegram.images import REF_PREFIX
 from octoforge_telegram.invites.api import MemberProfile
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyReferralStore
@@ -718,6 +719,62 @@ async def test_stranger_is_denied_and_gets_no_runner(
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
 
     assert client.sent == [(TELEGRAM_USER_ID, ACCESS_DENIED_TEXT, None)]
+
+
+async def test_open_registration_lets_a_stranger_straight_in(
+    session_factory: async_sessionmaker[AsyncSession],
+    invite_store: SqlAlchemyInviteStore,
+) -> None:
+    """What makes a bot public: no code, no refusal. How MANY people get in is
+    the active-user cap's job one layer down, not this door's."""
+    reply = ChatMessage(role=MessageRole.ASSISTANT, content=REPLY)
+    manager = await make_manager([reply], session_factory)
+    client = FakeTelegramClient()
+    poller = make_poller(
+        client,
+        manager.get_or_create_runner,
+        membership=TelegramMembership(invite_store, [], open_registration=True),
+    )
+
+    await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
+    await wait_until(lambda: bool(client.sent))
+
+    assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
+    await manager.stop_all()
+
+
+async def test_open_registration_does_not_dead_end_a_bad_code(
+    invite_store: SqlAlchemyInviteStore,
+) -> None:
+    """With the door open a wrong code is a typo, not a verdict: refusing
+    would be a dead end guarding nothing."""
+    client = FakeTelegramClient()
+    poller = make_poller(
+        client,
+        forbidden_provider,
+        membership=TelegramMembership(invite_store, [], open_registration=True),
+    )
+
+    await deliver(poller, make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} nonsense"))
+
+    assert INVITE_INVALID_TEXT not in [text for _, text, _ in client.sent]
+
+
+async def test_open_registration_still_welcomes_a_real_invite(
+    invite_store: SqlAlchemyInviteStore,
+) -> None:
+    """A code handed out before the doors opened still greets its holder."""
+    invite = await invite_store.create(INVITE_NOTE)
+    client = FakeTelegramClient()
+    poller = make_poller(
+        client,
+        forbidden_provider,
+        membership=TelegramMembership(invite_store, [], open_registration=True),
+    )
+
+    await deliver(poller, make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} {invite.code}"))
+
+    assert client.sent == [(TELEGRAM_USER_ID, WELCOME_TEXT, None)]
 
 
 async def test_claimed_invite_passes_the_gate(
@@ -1577,6 +1634,56 @@ async def test_the_queue_drains_as_its_people_knock(
     person = await identities.resolve(CHANNEL, str(TELEGRAM_USER_ID))
     assert person is not None
     assert (await identities.get_user(person)).status is UserStatus.ACTIVE
+
+
+class RefusingBridge:
+    """A bridge that answers like the service does for a person not admitted."""
+
+    def __init__(self, status: str) -> None:
+        self._status = status
+
+    async def handle_text(self, content: str, **kwargs: object) -> None:
+        raise AccessRefusedError(self._status)
+
+
+async def test_a_service_side_refusal_reaches_the_person_as_words() -> None:
+    """The split arrangement's version of the status gate.
+
+    Ingestion cannot resolve a person, so the service refuses and this is the
+    only place the verdict can become a sentence. Swallowed as an ordinary
+    transport error — which is what it was before — a queued newcomer would
+    get nothing at all.
+    """
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+    use_bridge(poller, RefusingBridge("waiting"))
+
+    await deliver(poller, make_update(1, text="привет"))
+    await deliver(poller, make_update(2, text="ещё раз"))
+
+    # once a day, not once per message
+    assert [text for _, text, _ in client.sent] == [QUEUE_WAIT_TEXT]
+
+
+async def test_a_banned_refusal_says_the_door_is_closed() -> None:
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+    use_bridge(poller, RefusingBridge("banned"))
+
+    await deliver(poller, make_update(1, text="привет"))
+
+    assert [text for _, text, _ in client.sent] == [ACCESS_CLOSED_TEXT]
+
+
+async def test_an_unknown_refusal_verdict_says_nothing() -> None:
+    """A status this build does not know is a bug to log, not a text to invent."""
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+    use_bridge(poller, RefusingBridge("teleported"))
+
+    await deliver(poller, make_update(1, text="привет"))
+
+    assert client.sent == []
 
 
 def make_voice_update(  # noqa: PLR0913, PLR0917 — a test builder mirroring the API shape

@@ -23,5 +23,12 @@ def _detail(settings: TelegramSettings) -> str:
     if not settings.telegram_bot_token:
         return "OF_TELEGRAM_BOT_TOKEN is empty — the adapter does not start"
     admins = len(settings.telegram_admin_ids)
-    gate = f"invite gate, {admins} admin(s)" if admins else "OPEN TO EVERYONE (no admin ids)"
+    if not admins:
+        gate = "OPEN TO EVERYONE (no admin ids)"
+    elif settings.telegram_open_registration:
+        # a deliberately loud line: which doorman is on duty is the single
+        # most consequential thing about a public bot
+        gate = f"OPEN REGISTRATION (admission is the active-user cap), {admins} admin(s)"
+    else:
+        gate = f"invite gate, {admins} admin(s)"
     return f"long-poll, {gate}"

@@ -36,7 +36,11 @@ from octoforge_server.secret_links import SecretLinkService, secrets_link_builde
 from octoforge_telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.gateway import ApiGatewayRegistry, basic_auth_header
-from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
+from octoforge_telegram.invites.store import (
+    SqlAlchemyInviteStore,
+    SqlAlchemyMemberDirectory,
+    SqlAlchemyReferralStore,
+)
 from octoforge_telegram.poller import TelegramMembership, TelegramPoller, TelegramPollerOptions
 from octoforge_telegram.schema import TelegramSurfaceBase
 
@@ -138,8 +142,16 @@ async def _build(
     invites = SqlAlchemyInviteStore(
         session_factory, ttl_seconds=telegram.telegram_invite_ttl_seconds
     )
+    # referrals live in this database too, so /invite works here exactly as it
+    # does in-process; the status gate does not, and runs on the service
+    referrals = SqlAlchemyReferralStore(session_factory)
     membership = (
-        TelegramMembership(invites, telegram.telegram_admin_ids)
+        TelegramMembership(
+            invites,
+            telegram.telegram_admin_ids,
+            referrals=referrals,
+            open_registration=telegram.telegram_open_registration,
+        )
         if telegram.telegram_admin_ids
         else None
     )
@@ -176,6 +188,8 @@ async def _build(
             speech=speech,
             voice_max_seconds=telegram.voice_max_seconds,
             secrets_link=_secrets_link(settings),
+            referrals=referrals,
+            bot_username=telegram.resolved_bot_username(),
         ),
     )
 

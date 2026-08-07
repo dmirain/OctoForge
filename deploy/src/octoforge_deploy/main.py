@@ -1058,6 +1058,7 @@ def _build_telegram_surface(
             resolved.stores.invites,
             settings.telegram_admin_ids,
             referrals=resolved.stores.referrals,
+            open_registration=settings.telegram_open_registration,
         )
     poller = TelegramPoller(
         client=client,

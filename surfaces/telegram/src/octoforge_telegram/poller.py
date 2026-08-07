@@ -34,7 +34,7 @@ from octoforge_telegram.client import (
     TelegramClient,
 )
 from octoforge_telegram.drafts import DraftStore
-from octoforge_telegram.gateway import DialogGateway, GatewayRegistry
+from octoforge_telegram.gateway import AccessRefusedError, DialogGateway, GatewayRegistry
 from octoforge_telegram.images import REF_PREFIX
 from octoforge_telegram.invites.api import (
     InviteAlreadyClaimedError,
@@ -212,16 +212,30 @@ class TelegramMembership:
         invite_store: InviteStore,
         admin_ids: Iterable[int],
         referrals: ReferralStore | None = None,
+        open_registration: bool = False,
     ) -> None:
         self._invites = invite_store
         self._admin_ids = frozenset(admin_ids)
         self._referrals = referrals
+        self._open = open_registration
 
     async def check(self, user_id: str, text: str) -> MembershipDecision:
-        """Decide whether the user may proceed; claims `/start <code>` invites."""
+        """Decide whether the user may proceed; claims `/start <code>` invites.
+
+        With registration open nobody is turned away here — codes still work
+        and still record who brought whom, but a bad one no longer closes the
+        door, because the door is not what limits anything any more. How many
+        people get in is then the active-user cap's business, one layer down.
+        """
         numeric_id = chat_id_from_user_id(user_id)
         if numeric_id is not None and numeric_id in self._admin_ids:
             return MembershipDecision.ALLOW
+        decision = await self._decide(user_id, text)
+        if self._open and decision is not MembershipDecision.ALLOW_WITH_WELCOME:
+            return MembershipDecision.ALLOW
+        return decision
+
+    async def _decide(self, user_id: str, text: str) -> MembershipDecision:
         code = _start_code(text)
         if code is not None and code.startswith(REFERRAL_PREFIX) and self._referrals is not None:
             return await self._claim_referral(code.removeprefix(REFERRAL_PREFIX), user_id)
@@ -605,8 +619,22 @@ class TelegramPoller:
             await self._handle(user_id, batch)
         except asyncio.CancelledError:
             raise  # a stop, or shutdown: abandon this work deliberately
+        except AccessRefusedError as refusal:
+            # the status gate ran on the service (this process cannot resolve
+            # a person), and its verdict has to reach the person as words:
+            # swallowing it would leave a queued newcomer in silence
+            await self._refuse_access(user_id, batch[0].chat.id, refusal)
         except Exception:
             logger.warning("Failed to handle a Telegram message from %s", user_id, exc_info=True)
+
+    async def _refuse_access(self, user_id: str, chat_id: int, refusal: AccessRefusedError) -> None:
+        """Say a service-side refusal out loud; an unknown verdict stays quiet."""
+        try:
+            status = UserStatus(refusal.status)
+        except ValueError:
+            logger.warning("service refused %s with an unknown status %r", user_id, refusal.status)
+            return
+        await self._say_status(user_id, chat_id, status)
 
     async def _handle(self, user_id: str, batch: list[TelegramMessage]) -> None:
         """Route one message (or one album): notices, gate, forwards, images or text."""
@@ -871,13 +899,22 @@ class TelegramPoller:
         status = await self._access.admit(person)
         if status is UserStatus.ACTIVE:
             return True
+        await self._say_status(person, chat_id, status)
+        return False
+
+    async def _say_status(self, person: str, chat_id: int, status: UserStatus) -> None:
+        """Tell the person why they are not through, at most once a day.
+
+        The answer does not change by asking again, so repeating it every
+        message would be a nag; saying it once a day still reaches somebody
+        who comes back tomorrow to find the queue moved.
+        """
         notice = ACCESS_CLOSED_TEXT if status is UserStatus.BANNED else QUEUE_WAIT_TEXT
         note_key = (person, notice)
         day = utc_now().strftime("%Y-%m-%d")
         if self._status_notes.get(note_key) != day:
             self._status_notes[note_key] = day
             await self._client.send_message(chat_id, notice)
-        return False
 
     async def _voice_allowed(self, user_id: str) -> bool:
         """Whether the user's plan includes voice transcription.

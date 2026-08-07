@@ -29,6 +29,21 @@ logger = logging.getLogger(__name__)
 MESSAGES_PATH = "/api/dialog/messages"
 USER_ID_HEADER = "X-User-Id"
 CHANNEL_HEADER = "X-Channel"
+#: What the service names the status behind a 403 (`octoforge_server.deps`).
+ACCESS_STATUS_HEADER = "X-Access-Status"
+
+
+class AccessRefusedError(Exception):
+    """The service refused this person: `status` is what it called them.
+
+    Ingestion cannot decide admission — it has no core database and knows
+    accounts, not people — so the service decides and this carries the
+    verdict back far enough for the surface to say it out loud.
+    """
+
+    def __init__(self, status: str) -> None:
+        super().__init__(f"access refused: {status}")
+        self.status = status
 
 
 class DialogGateway(Protocol):
@@ -113,6 +128,9 @@ class ApiDialogGateway:
             json=body,
             headers={USER_ID_HEADER: self._external_id, CHANNEL_HEADER: TELEGRAM_CHANNEL},
         )
+        refusal = response.headers.get(ACCESS_STATUS_HEADER)
+        if response.status_code == httpx.codes.FORBIDDEN and refusal:
+            raise AccessRefusedError(refusal)
         response.raise_for_status()
 
 

@@ -30,6 +30,9 @@ MISSING_USER_ID_MESSAGE = "X-User-Id header is required"
 # installation can keep
 ACCESS_WAITING_MESSAGE = "registration is pending: no free slots right now"
 ACCESS_BANNED_MESSAGE = "access is closed"
+#: Carries the `UserStatus` that caused a 403, for a surface that has to say
+#: it in its own words (see `_access_refused`).
+ACCESS_STATUS_HEADER = "X-Access-Status"
 
 
 def get_settings(request: Request) -> Settings:
@@ -220,7 +223,23 @@ async def get_user_id(
     person = await get_identity_store(request).resolve_or_create(channel, external_id)
     status = await get_access_service(request).admit(person)
     if status is UserStatus.BANNED:
-        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=ACCESS_BANNED_MESSAGE)
+        raise _access_refused(ACCESS_BANNED_MESSAGE, status)
     if status is not UserStatus.ACTIVE:
-        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=ACCESS_WAITING_MESSAGE)
+        raise _access_refused(ACCESS_WAITING_MESSAGE, status)
     return person
+
+
+def _access_refused(message: str, status: UserStatus) -> HTTPException:
+    """403 carrying the reason in a header as well as in the body.
+
+    The body is for a human reading an API error; the header is for a surface
+    that has to turn the refusal into words of its own. The Telegram
+    ingestion node is the case: it speaks to the person in Russian and has
+    no way to resolve their status itself, so without this it could only
+    stay silent — which is what a queued newcomer would experience.
+    """
+    return HTTPException(
+        status_code=HTTPStatus.FORBIDDEN,
+        detail=message,
+        headers={ACCESS_STATUS_HEADER: status.value},
+    )

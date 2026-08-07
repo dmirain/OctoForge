@@ -44,6 +44,13 @@ class TelegramSettings(BaseSettings):
     telegram_database_url: str = DEFAULT_DATABASE_URL
     telegram_invite_ttl_seconds: float = DEFAULT_INVITE_TTL_SECONDS
     telegram_admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    # Whether a stranger may simply start talking. False (the default) keeps
+    # the invite gate as the front door: no code, no bot. True opens it for a
+    # public installation, where how many people are admitted is governed by
+    # the active-user cap and its queue instead (see docs/reference/access.md)
+    # — the two are alternative doormen, and the cap is the one an operator
+    # can turn without a redeploy. Admin ids keep their meaning either way.
+    telegram_open_registration: bool = False
     # The bot's public @handle. Only the Bot API knows it, and nothing in the
     # code may assume it: with it configured, an invite is handed out as a
     # t.me deep link instead of a bare code the recipient has to paste.

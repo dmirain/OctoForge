@@ -107,6 +107,13 @@ and no Alembic chain — invites are a Telegram-specific concept and core knows 
   and says which variable would improve that.
 - **The gate only activates once the admin list is non-empty.** With no admins configured the bot answers
   everyone — a deliberate first-run behavior that the startup capability report flags in capitals.
+- **`OF_TELEGRAM_OPEN_REGISTRATION=true` opens the door** for a public installation: a stranger may
+  simply start talking, no code required. The doorman then is the **active-user cap and its queue**
+  (`max_active_users`, edited from the console) rather than a code handed out by hand — the two are
+  alternative doormen, and the cap is the one that changes without a redeploy. Codes keep working
+  and keep attributing; a wrong one no longer refuses anybody, because refusing would be a dead end
+  guarding nothing. Admin ids keep their meaning either way, so opening the door does not cost you
+  `admin_manage`. The capability report says which doorman is on duty.
 - **Referral links** are the members' own way to invite: `/invite` hands out a personal reusable
   deep link (`/start ref_<code>`; the prefix keeps referral and operator codes in separate
   namespaces). A newcomer arriving through one passes this gate and is attributed — who brought

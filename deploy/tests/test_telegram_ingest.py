@@ -15,7 +15,11 @@ from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
 from octoforge_server.auth import AuthGate, hash_password
 from octoforge_server.config import Settings
 from octoforge_telegram.config import TelegramSettings
-from octoforge_telegram.gateway import ApiGatewayRegistry, basic_auth_header
+from octoforge_telegram.gateway import (
+    AccessRefusedError,
+    ApiGatewayRegistry,
+    basic_auth_header,
+)
 from octoforge_telegram.ingest.__main__ import _build, run_ingest, service_headers
 
 CHAT_ID = 424242
@@ -154,6 +158,63 @@ async def test_a_refusal_is_not_swallowed() -> None:
 
         with pytest.raises(httpx.HTTPStatusError):
             await gateway.handle_text("привет")
+
+
+async def test_a_status_refusal_arrives_as_a_verdict_the_surface_can_speak() -> None:
+    """403 from the status gate is not a transport failure to log and forget.
+
+    This process cannot resolve a person, so the service decides admission —
+    and if its verdict did not survive the boundary, a queued newcomer would
+    get silence instead of being told there is a queue.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403, json={"detail": "registration is pending"}, headers={"X-Access-Status": "waiting"}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://balancer"
+    ) as client:
+        gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
+
+        with pytest.raises(AccessRefusedError) as refusal:
+            await gateway.handle_text("привет")
+
+    assert refusal.value.status == "waiting"
+
+
+async def test_a_403_without_the_header_stays_an_ordinary_failure() -> None:
+    """Only the admission gate speaks that header; anything else 403 is a bug
+    to surface, not a message to relay to the user as a queue notice."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"detail": "forbidden"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://balancer"
+    ) as client:
+        gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await gateway.handle_text("привет")
+
+
+async def test_the_node_hands_out_referral_links() -> None:
+    """The referral store lives in the surface's own database, which this node
+    has — so /invite must work here exactly as it does in-process. Its first
+    deployment shipped without it and the command answered "not set up"."""
+    settings = Settings(service_username=SERVICE_USER, service_password=SERVICE_PASSWORD)
+    telegram = TelegramSettings(
+        telegram_bot_token="123:abc",
+        telegram_service_url="http://balancer",
+        telegram_database_url="sqlite+aiosqlite:///:memory:",
+        telegram_bot_username="@octoforge_test_bot",
+    )
+    async with AsyncExitStack() as stack:
+        poller = await _build(stack, settings, telegram)
+        assert poller._referrals is not None
+        assert poller._bot_username == "octoforge_test_bot"
 
 
 async def test_the_node_sees_and_hears_like_a_pod() -> None:

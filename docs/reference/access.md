@@ -26,16 +26,28 @@ every cron job they have (a banned user must not keep spending through the sched
 deliberately resumes nothing. Activating somebody who was waiting sends them a Telegram notice when
 the surface can reach them.
 
-**Where the gate runs.** Telegram checks after the invite gate and before any dispatch (a stranger
-without a code still gets nothing, not even a queue notice); the notice repeats at most once per
-person per day. The HTTP API checks inside `get_user_id`, so a waiting or banned person gets 403
-from every dialog endpoint. Both gates resolve the core person first — statuses, like tariffs, are
-filed under the person, never under a surface handle.
+**Where the gate runs.** Telegram checks after the invite gate and before any dispatch (with the
+invite gate closed, a stranger without a code still gets nothing, not even a queue notice); the
+notice repeats at most once per person per day. The HTTP API checks inside `get_user_id`, so a
+waiting or banned person gets 403 from every dialog endpoint. Both gates resolve the core person
+first — statuses, like tariffs, are filed under the person, never under a surface handle.
+
+**In the split arrangement the service is the gate.** A standalone Telegram ingestion node has no
+core database and cannot resolve a person, so it does not run this gate at all — it posts the
+message and the service refuses. That 403 carries an `X-Access-Status` header naming the status,
+which the node turns into the same queue or closed-door notice, with the same once-a-day dedup. The
+header exists for exactly this: without it the refusal would be an anonymous transport error, and a
+queued newcomer would sit in silence wondering whether the bot was broken.
 
 **Referrals do not bypass the cap.** A member's `/invite` link opens the *invite* gate for a
 friend and records who brought whom ([telegram.md](telegram.md)); the friend then queues through
 this cap like anyone else. The cap has exactly two doors: a free slot at the knock, or the
 operator's hand.
+
+**Opening a public installation.** The invite gate and this cap are alternative doormen, not
+layers to stack. A public bot sets `OF_TELEGRAM_OPEN_REGISTRATION=true` — anyone may start talking
+— and regulates *how many* get in with `max_active_users` from the console. Keeping both is
+possible but pointless: the invite code would already have decided who gets in.
 
 ## Operator settings
 
