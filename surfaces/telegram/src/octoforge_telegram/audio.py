@@ -18,10 +18,11 @@ from octoforge_telegram.images import LEGACY_REF_PREFIX, REF_PREFIX
 
 logger = logging.getLogger(__name__)
 
-# Telegram voice notes arrive as Ogg/Opus under an `.oga` name the
-# transcription APIs refuse; `speech.api.upload_name` maps it, so what
-# matters here is only that a name with an extension travels with the bytes.
-DEFAULT_FILE_NAME = "voice.oga"
+# Only the extension matters — these APIs pick a decoder by it — and this one
+# is already accepted, so nothing downstream has to rescue it. Telegram's own
+# `.oga` (which the APIs refuse) survives on the resolved path and is mapped
+# by `speech.api.upload_name`; this is the fallback for a path without one.
+DEFAULT_FILE_NAME = "voice.ogg"
 DEFAULT_MEDIA_TYPE = "audio/ogg"
 UNKNOWN_REF_ERROR = "not a Telegram audio ref: {ref!r}"
 FETCH_FAILED_ERROR = "could not fetch recording: {error}"

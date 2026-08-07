@@ -23,6 +23,7 @@ from octoforge_core.dialogs.api import ExchangeRepository
 from octoforge_core.identity.api import IdentityStore
 from octoforge_core.identity.service import AccessService
 from octoforge_core.instructions.api import InstructionService
+from octoforge_core.media.service import MediaService
 from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.settings.api import SettingsStore
@@ -69,6 +70,10 @@ class Runtime:
     settings_store: SettingsStore
     #: The admission gate (waiting/active/banned); asked on every API request.
     access: AccessService
+    #: Understanding a picture or a recording: the plan check, the model call
+    #: and the ledger entry, together. An out-of-process surface reaches it
+    #: over `/api/media`; nothing else is allowed to call these models.
+    media_service: MediaService
     #: Channels this deployment serves, gathered from installed surfaces.
     channels: frozenset[str]
     #: How to tell a person the operator opened their access; None when no

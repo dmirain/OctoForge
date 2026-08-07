@@ -12,6 +12,7 @@ from octoforge_core.dialogs.api import ClaimRepository, DialogRepository, Exchan
 from octoforge_core.identity.api import IdentityStore, UserStatus
 from octoforge_core.identity.service import AccessService
 from octoforge_core.instructions.api import InstructionService
+from octoforge_core.media.service import MediaService
 from octoforge_core.params.api import UserParamStore
 from octoforge_core.secrets.api import SecretStore
 from octoforge_core.settings.api import SettingsStore
@@ -199,6 +200,11 @@ def get_settings_store(request: Request) -> SettingsStore:
 def get_access_service(request: Request) -> AccessService:
     """Return the admission gate built at startup."""
     return cast(AccessService, request.app.state.access)
+
+
+def get_media_service(request: Request) -> MediaService:
+    """Return the gated, metered media understanding built at startup."""
+    return cast(MediaService, request.app.state.media_service)
 
 
 def get_activation_notifier(request: Request) -> "ActivationNotifier | None":

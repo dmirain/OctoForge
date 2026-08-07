@@ -21,6 +21,7 @@ from octoforge_telegram.gateway import (
     basic_auth_header,
 )
 from octoforge_telegram.ingest.__main__ import _build, run_ingest, service_headers
+from octoforge_telegram.media_client import ApiMediaUnderstanding
 
 CHAT_ID = 424242
 HANDLE = f"tg:{CHAT_ID}"
@@ -217,12 +218,10 @@ async def test_the_node_hands_out_referral_links() -> None:
         assert poller._bot_username == "octoforge_test_bot"
 
 
-async def test_the_node_sees_and_hears_like_a_pod() -> None:
-    """The split's promise: describing images and transcribing recordings
-    happen at ingestion, so THIS process must hold the clients. Its first
-    deployment shipped without them, and voice and images silently degraded
-    to text for a day — the poller treats a missing client as a feature
-    turned off, which is exactly why nothing errored."""
+async def test_the_node_owns_no_model_client_of_its_own() -> None:
+    """The whole point of the move: this process cannot resolve a person, so
+    a model call made here could be neither checked against a plan nor
+    ledgered. It asks the service, whatever its own settings happen to say."""
     settings = Settings(
         service_username=SERVICE_USER,
         service_password=SERVICE_PASSWORD,
@@ -238,26 +237,37 @@ async def test_the_node_sees_and_hears_like_a_pod() -> None:
     )
     async with AsyncExitStack() as stack:
         poller = await _build(stack, settings, telegram)
-        assert poller._vision is not None
-        assert poller._speech is not None
+
+    assert isinstance(poller._media, ApiMediaUnderstanding)
 
 
-async def test_the_node_keeps_its_senses_off_when_unconfigured() -> None:
-    """No model configured = the feature is off, not broken: the poller gets
-    None and keeps the text-only behavior on purpose."""
-    settings = Settings(
-        service_username=SERVICE_USER,
-        service_password=SERVICE_PASSWORD,
-        vision_model="",
-        stt_model="",
-        llm_base_url="https://llm.example",
-    )
-    telegram = TelegramSettings(
-        telegram_bot_token="123:abc",
-        telegram_service_url="http://balancer",
-        telegram_database_url="sqlite+aiosqlite:///:memory:",
-    )
-    async with AsyncExitStack() as stack:
-        poller = await _build(stack, settings, telegram)
-        assert poller._vision is None
-        assert poller._speech is None
+async def test_the_node_says_what_media_it_will_actually_get() -> None:
+    """The descendant of a real incident: shipped without model clients, the
+    poller degraded silently to text-only and images and voice "stopped
+    working" for a day, while every capability report that mentioned them
+    belonged to a different process. This one reports what it will rely on."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"describes_images": True, "transcribes_audio": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://balancer"
+    ) as client:
+        reported = await ApiMediaUnderstanding(client).capabilities()
+
+    assert seen == ["/api/media/capabilities"]
+    assert reported == {"describes_images": True, "transcribes_audio": False}
+
+
+async def test_an_unreachable_service_is_reported_rather_than_assumed() -> None:
+    """Silence is what the incident looked like; None makes the node say so."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "down"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://balancer"
+    ) as client:
+        assert await ApiMediaUnderstanding(client).capabilities() is None

@@ -42,14 +42,16 @@ from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
+from octoforge_core.media.service import INGESTION_PROMPT, MediaService
 from octoforge_core.speech.api import AudioData, TranscriptionClient
 from octoforge_core.tariffs.api import LimitGate, LimitVerdict, UsageEvent, UsageKind
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
+from octoforge_telegram.audio import TelegramAudioResolver
 from octoforge_telegram.bridge import RunnerProvider
 from octoforge_telegram.client import USER_ID_PREFIX, TelegramApiError
 from octoforge_telegram.gateway import AccessRefusedError
-from octoforge_telegram.images import REF_PREFIX
+from octoforge_telegram.images import REF_PREFIX, TelegramImageResolver
 from octoforge_telegram.invites.api import MemberProfile
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyReferralStore
 from octoforge_telegram.models import (
@@ -75,7 +77,6 @@ from octoforge_telegram.poller import (
     IMAGE_FAILED_PLACEHOLDER,
     IMAGE_TAG,
     IMAGE_TAG_NUMBERED,
-    INGESTION_PROMPT,
     INVITE_INVALID_TEXT,
     INVITE_MENU_DESCRIPTION,
     MATERIAL_ATTRIBUTION_ANONYMOUS,
@@ -392,7 +393,15 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
     bot_username: str | None = None,
     voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS,
 ) -> TelegramPoller:
-    """A poller whose album window is short enough for a test to wait it out."""
+    """A poller whose album window is short enough for a test to wait it out.
+
+    The model stubs are wired through the REAL `MediaService`, the way the
+    composition root wires the real clients: the gate check, the model call
+    and the ledger entry are the thing under test as much as the poller is,
+    and a hand-written double of it would have missed the bug that made this
+    module exist. Refs resolve through the real Telegram resolvers over the
+    fake Bot API client, so `downloaded_file_ids` still tells the truth.
+    """
     registry = TelegramBridgeRegistry(
         runner_provider=provider,
         client=client,
@@ -407,15 +416,35 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
             error_backoff_seconds=NO_BACKOFF,
             membership=membership,
             secrets_link=secrets_link,
-            vision=vision,
-            speech=speech,
-            feature_gate=feature_gate,
+            media=make_media(client, vision, speech, feature_gate),
             access=access,
             referrals=referrals,
             bot_username=bot_username,
             voice_max_seconds=voice_max_seconds,
             album_quiet_seconds=ALBUM_TEST_QUIET_SECONDS,
         ),
+    )
+
+
+def make_media(
+    client: FakeTelegramClient,
+    vision: VisionClient | None,
+    speech: TranscriptionClient | None,
+    limits: LimitGate | None,
+) -> MediaService | None:
+    """The core's media understanding over the test's model stubs.
+
+    None when the deployment understands no media at all — the poller then
+    keeps the placeholder/text-only paths and never asks anything.
+    """
+    if vision is None and speech is None:
+        return None
+    return MediaService(
+        vision=vision,
+        images=TelegramImageResolver(client),
+        speech=speech,
+        audio=TelegramAudioResolver(client),
+        limits=limits,
     )
 
 

@@ -25,10 +25,6 @@ from contextlib import AsyncExitStack
 
 import httpx
 from octoforge_core.db.engine import create_engine, create_session_factory
-from octoforge_core.speech.api import TranscriptionClient
-from octoforge_core.speech.client import OpenAITranscriptionClient
-from octoforge_core.vision.api import VisionClient
-from octoforge_core.vision.client import OpenAIVisionClient
 from octoforge_server.config import Settings
 from octoforge_server.logs import configure_logging
 from octoforge_server.secret_links import SecretLinkService, secrets_link_builder
@@ -41,6 +37,7 @@ from octoforge_telegram.invites.store import (
     SqlAlchemyMemberDirectory,
     SqlAlchemyReferralStore,
 )
+from octoforge_telegram.media_client import ApiMediaUnderstanding
 from octoforge_telegram.poller import TelegramMembership, TelegramPoller, TelegramPollerOptions
 from octoforge_telegram.schema import TelegramSurfaceBase
 
@@ -114,18 +111,44 @@ def _secrets_link(settings: Settings) -> Callable[[str], str] | None:
     return secrets_link_builder(settings, SecretLinkService(settings.secrets_key), TELEGRAM_CHANNEL)
 
 
+async def _report_media(media: ApiMediaUnderstanding) -> None:
+    """State what media understanding this node will actually get, at startup.
+
+    Unreachable is worth a warning of its own: it means every picture and
+    every recording will fall back to text until the service answers.
+    """
+    capabilities = await media.capabilities()
+    if capabilities is None:
+        logger.warning(
+            "media understanding: the service did not answer — pictures and "
+            "recordings will fall back to text until it does"
+        )
+        return
+    logger.info(
+        "media understanding (on the service): images %s, voice %s",
+        "on" if capabilities.get("describes_images") else "off — images arrive as text",
+        "on" if capabilities.get("transcribes_audio") else "off — recordings get the text notice",
+    )
+
+
 async def _build(
     stack: AsyncExitStack, settings: Settings, telegram: TelegramSettings
 ) -> TelegramPoller:
-    """Assemble the node: a bot client, the gate, a way into the service — and
-    the vision/speech clients, because describing an image and transcribing a
-    recording happen AT INGESTION, in this process, not behind the API.
+    """Assemble the node: a bot client, the gate, and a way into the service.
 
-    The first deployment of the split shipped without those two, and the
-    poller degraded exactly as designed for an unconfigured feature: silently,
-    to text-only — voice messages and images "stopped working" for a day
-    while every capability report that mentioned them was the pods', not this
-    node's. Hence the log lines below: this process states its own senses.
+    Describing an image and transcribing a recording still happen at
+    ingestion, but this process no longer does either itself: it holds no
+    core database and cannot resolve an account into a person, so a model
+    call made here could be neither checked against a plan nor ledgered
+    (a free plan used paid vision for months this way). It asks the service,
+    which owns both.
+
+    The startup probe below is the descendant of two log lines that were
+    written after the split's first deployment shipped without vision and
+    speech clients: the poller degraded exactly as designed for an
+    unconfigured feature — silently, to text-only — and images and voice
+    "stopped working" for a day. This node still states what it is about to
+    rely on; it just asks the service instead of reading its own settings.
     """
     outbound = await stack.enter_async_context(httpx.AsyncClient())
     service = await stack.enter_async_context(
@@ -155,28 +178,8 @@ async def _build(
         if telegram.telegram_admin_ids
         else None
     )
-    vision: VisionClient | None = None
-    if settings.vision_configured():
-        vision_http = await stack.enter_async_context(
-            httpx.AsyncClient(base_url=settings.resolved_vision_base_url())
-        )
-        vision = OpenAIVisionClient(http_client=vision_http, config=settings.to_vision_config())
-    speech: TranscriptionClient | None = None
-    if settings.speech_configured():
-        speech_http = await stack.enter_async_context(
-            httpx.AsyncClient(base_url=settings.stt_base_url)
-        )
-        speech = OpenAITranscriptionClient(
-            http_client=speech_http, config=settings.to_speech_config()
-        )
-    logger.info(
-        "vision at ingestion: %s",
-        f"on, {settings.vision_model}" if vision else "off — images arrive as text",
-    )
-    logger.info(
-        "voice at ingestion: %s",
-        f"on, {settings.stt_model}" if speech else "off — recordings get the text-only notice",
-    )
+    media = ApiMediaUnderstanding(service)
+    await _report_media(media)
     return TelegramPoller(
         client=TelegramBotClient(http_client=outbound, token=telegram.telegram_bot_token),
         registry=ApiGatewayRegistry(service),
@@ -184,8 +187,7 @@ async def _build(
             poll_timeout_seconds=telegram.telegram_poll_timeout_seconds,
             membership=membership,
             directory=SqlAlchemyMemberDirectory(session_factory),
-            vision=vision,
-            speech=speech,
+            media=media,
             voice_max_seconds=telegram.voice_max_seconds,
             secrets_link=_secrets_link(settings),
             referrals=referrals,

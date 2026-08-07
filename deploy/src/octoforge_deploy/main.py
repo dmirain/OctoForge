@@ -94,6 +94,8 @@ from octoforge_core.mcp.skills import McpSkillGenerator
 from octoforge_core.mcp.store import SqlAlchemyMcpServerStore
 from octoforge_core.mcp.sync import McpSyncLoop, McpToolSync
 from octoforge_core.mcp.tools import McpAddTool
+from octoforge_core.media.api import MediaResult, MediaUnderstanding
+from octoforge_core.media.service import MediaService
 from octoforge_core.net.external import CallCredentials, ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.params.store import SqlAlchemyUserParamStore
@@ -107,7 +109,7 @@ from octoforge_core.secrets.store import SqlAlchemySecretStore
 from octoforge_core.secrets.tools import SecretLinkTool, SecretListTool
 from octoforge_core.settings.api import max_active_users
 from octoforge_core.settings.store import SqlAlchemySettingsStore
-from octoforge_core.speech.api import TranscriptionClient
+from octoforge_core.speech.api import AudioResolver, TranscriptionClient
 from octoforge_core.speech.client import OpenAITranscriptionClient
 from octoforge_core.tariffs.api import CORE_FEATURES, LimitGate
 from octoforge_core.tariffs.store import SqlAlchemyTariffStore, SqlAlchemyUsageMeter
@@ -133,8 +135,9 @@ from octoforge_server.system_skills import WEB_SYSTEM_SKILLS
 from octoforge_telegram import capabilities as telegram_capabilities
 from octoforge_telegram import surface as telegram_surface
 from octoforge_telegram.admin import AdminAccess, AdminManageTool, AdminStores
+from octoforge_telegram.audio import TelegramAudioResolver
 from octoforge_telegram.bridge import RunnerProvider
-from octoforge_telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
+from octoforge_telegram.client import TELEGRAM_CHANNEL, USER_ID_PREFIX, TelegramBotClient
 from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.drafts import SqlAlchemyDraftStore
 from octoforge_telegram.images import TelegramImageResolver
@@ -273,10 +276,15 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
         ):
             llm_client = build_llm_client(llm_http, settings.to_llm_config())
             embedder = _build_embedder(settings, embed_http)
-            vision_client = _build_vision_client(settings, vision_http)
-            deep_vision_client = _build_deep_vision_client(settings, vision_http)
-            speech_client = _build_speech_client(settings, speech_http)
-            image_resolver = _build_telegram_image_resolver(telegram_settings, outbound_http)
+            vision_client, deep_vision_client, speech_client, image_resolver = (
+                _build_vision_client(settings, vision_http),
+                _build_deep_vision_client(settings, vision_http),
+                _build_speech_client(settings, speech_http),
+                _build_telegram_image_resolver(telegram_settings, outbound_http),
+            )
+            media_service = _build_media_service(
+                telegram_settings, outbound_http, vision_client, speech_client, limit_service
+            )
             instructions = build_instruction_service(
                 build_instruction_store(session_factory, vector_search=VECTOR in search_extensions),
                 embedder,
@@ -414,9 +422,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                                 if secret_store is not None
                                 else None
                             ),
-                            vision=vision_client,
-                            speech=speech_client,
-                            feature_gate=limit_service,
+                            media=PersonScopedMedia(media_service, identity, TELEGRAM_CHANNEL),
                             access=access,
                             admin_tool=admin_tool,
                             identities=identity,
@@ -466,6 +472,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     identity_store=identity,
                     settings_store=settings_store,
                     access=access,
+                    media_service=media_service,
                     channels=_served_channels(surfaces),
                     activation_notifier=(
                         TelegramActivationNotifier(
@@ -745,6 +752,46 @@ def _build_speech_client(
     return OpenAITranscriptionClient(http_client=http_client, config=settings.to_speech_config())
 
 
+class PersonScopedMedia:
+    """`MediaUnderstanding` that resolves the account before asking the core.
+
+    The one place where in-process ingestion turns a surface handle into a
+    person. It lives here rather than in `core/media/` because nothing inside
+    core resolves handles — plans, statuses and usage are all filed under
+    people, and `MediaService` must never be handed a `tg:<id>` (asked about
+    one it would find no binding and answer yes to everything, which is the
+    bug that let a free plan use paid vision for months).
+
+    Its counterpart in the split arrangement is the HTTP endpoint, where the
+    same resolution happens in `get_user_id`.
+    """
+
+    def __init__(self, media: MediaService, identities: IdentityStore, channel: str) -> None:
+        self._media = media
+        self._identities = identities
+        self._channel = channel
+
+    async def describe(self, user_id: str, refs: Sequence[str]) -> tuple[MediaResult, ...]:
+        return await self._media.describe(await self._person(user_id), refs)
+
+    async def transcribe(
+        self,
+        user_id: str,
+        ref: str,
+        seconds: int | None,
+        min_seconds: int,
+        max_seconds: float,
+    ) -> MediaResult:
+        return await self._media.transcribe(
+            await self._person(user_id), ref, seconds, min_seconds, max_seconds
+        )
+
+    async def _person(self, user_id: str) -> str:
+        return await self._identities.resolve_or_create(
+            self._channel, user_id.removeprefix(USER_ID_PREFIX)
+        )
+
+
 def _build_telegram_image_resolver(
     settings: TelegramSettings, http_client: httpx.AsyncClient
 ) -> ImageResolver | None:
@@ -761,6 +808,38 @@ def _build_telegram_image_resolver(
     if not settings.telegram_bot_token:
         return None
     return TelegramImageResolver(
+        TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token)
+    )
+
+
+def _build_media_service(
+    telegram_settings: TelegramSettings,
+    http_client: httpx.AsyncClient,
+    vision: VisionClient | None,
+    speech: TranscriptionClient | None,
+    limits: LimitGate,
+) -> MediaService:
+    """Every model call about a user's media, with its plan check and ledger.
+
+    The resolvers are Telegram's because that is the only transport whose
+    references exist today; a second surface would add its own here.
+    """
+    return MediaService(
+        vision=vision,
+        images=_build_telegram_image_resolver(telegram_settings, http_client),
+        speech=speech,
+        audio=_build_telegram_audio_resolver(telegram_settings, http_client),
+        limits=limits,
+    )
+
+
+def _build_telegram_audio_resolver(
+    settings: TelegramSettings, http_client: httpx.AsyncClient
+) -> AudioResolver | None:
+    """The recording half of the same story; None when the bot is not configured."""
+    if not settings.telegram_bot_token:
+        return None
+    return TelegramAudioResolver(
         TelegramBotClient(http_client=http_client, token=settings.telegram_bot_token)
     )
 
@@ -950,12 +1029,10 @@ class _TelegramExtras:
     admin_tool: Tool | None = None
     # turns a Telegram account into the person it belongs to
     identities: IdentityStore | None = None
-    # None: vision is off, Telegram keeps today's placeholder/text-only path
-    vision: VisionClient | None = None
-    # None: speech-to-text is off, a recording keeps the "text only" notice
-    speech: TranscriptionClient | None = None
-    # per-user tariff gate for voice transcription; None = everyone may
-    feature_gate: LimitGate | None = None
+    # Turns incoming pictures and recordings into text, through the core.
+    # None: media understanding is off, Telegram keeps today's
+    # placeholder/text-only path.
+    media: MediaUnderstanding | None = None
     # the waiting/active/banned gate; None = statuses are not enforced here
     access: AccessService | None = None
 
@@ -1069,9 +1146,7 @@ def _build_telegram_surface(
             secrets_link=resolved.secrets_link,
             directory=resolved.stores.directory if resolved.stores is not None else None,
             identities=resolved.identities,
-            vision=resolved.vision,
-            speech=resolved.speech,
-            feature_gate=resolved.feature_gate,
+            media=resolved.media,
             access=resolved.access,
             referrals=resolved.stores.referrals if resolved.stores is not None else None,
             bot_username=settings.resolved_bot_username(),

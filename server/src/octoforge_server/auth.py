@@ -65,8 +65,9 @@ OPEN_PATHS = frozenset({"/health", "/health/ready", "/secrets.html"})
 OPEN_PREFIXES = ("/api/secrets/",)
 
 #: Paths the service credential may open — submitting, cancelling and
-#: watching a dialog. Everything else stays operator-only.
-SERVICE_PREFIXES = ("/api/dialog/",)
+#: watching a dialog, plus asking the core to understand a picture or a
+#: recording on a user's behalf. Everything else stays operator-only.
+SERVICE_PREFIXES = ("/api/dialog/", "/api/media/")
 
 # Cross-site request forgery, in the shape Basic auth allows: a browser holding
 # the operator credential attaches it to every request to this origin, including

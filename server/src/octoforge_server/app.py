@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_server.api.cron import router as cron_router
 from octoforge_server.api.dialog import router as dialog_router
+from octoforge_server.api.media import router as media_router
 from octoforge_server.api.secrets import router as secrets_router
 from octoforge_server.auth import (
     CROSS_SITE_MESSAGE,
@@ -80,6 +81,7 @@ def build_app(
     # the service's own endpoints, present in every deployment
     app.include_router(dialog_router)
     app.include_router(cron_router)
+    app.include_router(media_router)
     app.include_router(secrets_router)
     for surface in routes:
         for router in surface.routers:
