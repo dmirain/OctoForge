@@ -8,6 +8,25 @@ plan carries the flag) — with no default marked they are unrestricted, the del
 private installation. A public installation should mark its freemium plan default: without it, every
 new user starts unlimited.
 
+## The two plans every installation starts with
+
+The schema bootstrap seeds a catalog rather than an empty tab: **`unlimited`** (every feature, no
+caps) and **`freemium`** (the conversation itself plus `web_search`, with day caps and small
+`max_cron_jobs` / `max_datasets` / `max_memory_chars`). They are ordinary rows — edit every number
+from the console, rename them, delete what you do not want. The seed only ever inserts what is
+missing and never edits a plan that already exists.
+
+Whether `freemium` arrives marked default depends on what the database looked like when the
+migration ran, and the rule is "protect whoever is already here":
+
+- **An installation that already had users** (an upgrade of a running deployment) is one being
+  opened to the public: `freemium` becomes the default, and every person who existed at that moment
+  is bound to `unlimited` explicitly. A binding beats the default, so nobody who was already using
+  the bot is moved onto a free tier by the upgrade — only newcomers land on `freemium`.
+- **A brand-new installation** gets both plans with **no default marked**, so it behaves exactly as
+  before: no binding, no limits. Somebody self-hosting for their own team must not discover a
+  30-messages-a-day cap they never set. Mark `freemium` default when you decide to open up.
+
 ## How it works
 
 Three tables (see [data-model.md](data-model.md)):

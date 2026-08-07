@@ -36,6 +36,7 @@ import octoforge_core.tariffs.models
 import octoforge_core.tasks.models  # noqa: F401
 from octoforge_core.db.base import Base
 from octoforge_core.db.search_extensions import ensure_bm25_indexes, ensure_search_extensions
+from octoforge_core.tariffs.seed import seed_starter_tariffs
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _BASELINE_REVISION = "675056c8fffd"
@@ -231,6 +232,9 @@ def _create_and_stamp(connection: Connection, config: Config) -> None:
     # after the tables: a BM25 index needs the table it indexes, and this path
     # never runs c7e2a91f4d38, which builds them for a database that exists
     ensure_bm25_indexes(connection)
+    # likewise b6c39d5e0f27: without this a fresh Postgres installation would
+    # have no plans at all, so the freemium default would quietly not exist
+    seed_starter_tariffs(connection)
     command.stamp(config, "head")
 
 

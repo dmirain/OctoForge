@@ -322,6 +322,126 @@ async def test_memories_migrate_into_instructions(tmp_path: Path) -> None:
     assert "memories" not in tables
 
 
+def _downgrade_below_starter_tariffs(connection: Connection) -> None:
+    command.downgrade(_alembic_config(connection), "a7f2d84c61b9")
+
+
+def _plans(connection: Connection) -> dict[str, tuple[int | None, bool]]:
+    rows = connection.execute(
+        sa.text("select code, daily_user_messages, is_default from tariffs")
+    ).all()
+    return {str(code): (messages, bool(default)) for code, messages, default in rows}
+
+
+def _plan_of_user(connection: Connection, user_id: str) -> str | None:
+    row = connection.execute(
+        sa.text(
+            "select t.code from user_tariffs b join tariffs t on t.id = b.tariff_id "
+            "where b.user_id = :user_id"
+        ),
+        {"user_id": user_id},
+    ).first()
+    return None if row is None else str(row[0])
+
+
+async def test_starter_plans_grandfather_todays_users_onto_unlimited(tmp_path: Path) -> None:
+    """Opening to the public must not demote the people already here.
+
+    Everyone present when the migration runs is bound to `unlimited`
+    explicitly, because after it the freemium plan is the default and an
+    unbound user would silently land on a free tier they never chose.
+    """
+    engine = create_engine(_database_url(tmp_path))
+    stamp = utc_now().isoformat()
+    try:
+        await bootstrap_schema(engine)
+        async with engine.begin() as connection:
+            await connection.run_sync(_downgrade_below_starter_tariffs)
+            await connection.execute(
+                sa.text(
+                    "insert into users (id, name, status, created_at) values "
+                    "('u-old', 'Old Timer', 'active', :now), ('u-two', '', 'active', :now)"
+                ),
+                {"now": stamp},
+            )
+        async with engine.begin() as connection:
+            await connection.run_sync(_upgrade_to_head)
+        async with engine.connect() as connection:
+            plans = await connection.run_sync(_plans)
+            old = await connection.run_sync(_plan_of_user, "u-old")
+            two = await connection.run_sync(_plan_of_user, "u-two")
+    finally:
+        await engine.dispose()
+    assert plans["unlimited"] == (None, False)
+    assert plans["freemium"][0] is not None  # a real cap, whatever the operator sets later
+    assert plans["freemium"][1] is True  # newcomers land here
+    assert old == "unlimited"
+    assert two == "unlimited"
+
+
+async def test_a_brand_new_installation_gets_the_plans_but_no_default(tmp_path: Path) -> None:
+    """Nobody to grandfather means nobody to protect from: the two plans are
+    there to use, and an installation with no users keeps today's behavior —
+    no binding, no limits — until its operator marks freemium default."""
+    engine = create_engine(_database_url(tmp_path))
+    try:
+        await bootstrap_schema(engine)  # a fresh database, never any users
+        async with engine.connect() as connection:
+            plans = await connection.run_sync(_plans)
+    finally:
+        await engine.dispose()
+    assert set(plans) == {"unlimited", "freemium"}
+    assert not any(is_default for _, is_default in plans.values())
+
+
+async def test_the_seed_leaves_an_operators_own_plans_alone(tmp_path: Path) -> None:
+    """Re-running the seed must not edit a plan or steal the default flag."""
+    engine = create_engine(_database_url(tmp_path))
+    stamp = utc_now().isoformat()
+    try:
+        await bootstrap_schema(engine)
+        async with engine.begin() as connection:
+            await connection.run_sync(_downgrade_below_starter_tariffs)
+            await connection.execute(
+                sa.text(
+                    "insert into tariffs (id, code, title, features, daily_user_messages, "
+                    "is_default, created_at, updated_at) values "
+                    "('t-own', 'freemium', 'Mine', '[]', 5, 0, :now, :now), "
+                    "('t-def', 'trial', 'Trial', '[]', 7, 1, :now, :now)"
+                ),
+                {"now": stamp},
+            )
+            await connection.execute(
+                sa.text(
+                    "insert into users (id, name, status, created_at) "
+                    "values ('u-one', '', 'active', :now)"
+                ),
+                {"now": stamp},
+            )
+        async with engine.begin() as connection:
+            await connection.run_sync(_upgrade_to_head)
+        async with engine.connect() as connection:
+            plans = await connection.run_sync(_plans)
+    finally:
+        await engine.dispose()
+    assert plans["freemium"] == (5, False)  # the operator's own row, untouched
+    assert plans["trial"] == (7, True)  # the seed never takes the default flag
+    assert plans["unlimited"] == (None, False)  # the missing one is still seeded
+
+
+async def test_starter_tariffs_downgrade_removes_the_seed(tmp_path: Path) -> None:
+    engine = create_engine(_database_url(tmp_path))
+    try:
+        await bootstrap_schema(engine)
+        async with engine.begin() as connection:
+            await connection.run_sync(_downgrade_below_starter_tariffs)
+        async with engine.connect() as connection:
+            plans = await connection.run_sync(_plans)
+    finally:
+        await engine.dispose()
+    assert plans == {}
+
+
 def _owner_of_identity(connection: Connection, surface: str, external_id: str) -> str:
     """The opaque user id the old handle was renumbered onto."""
     row = connection.execute(

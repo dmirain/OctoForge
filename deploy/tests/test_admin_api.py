@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from functools import partial
 from http import HTTPStatus
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -482,6 +482,9 @@ BASIC_TARIFF = {
     "daily_tokens": 100_000,
     "max_cron_jobs": 2,
 }
+#: Every schema bootstrap seeds these two (b6c39d5e0f27), so a catalog is
+#: never empty and a test asserting on plans has to look past them.
+STARTER_PLANS = frozenset({"unlimited", "freemium"})
 
 
 def test_tariff_crud_and_assignment_via_the_console(client: TestClient) -> None:
@@ -498,23 +501,33 @@ def test_tariff_crud_and_assignment_via_the_console(client: TestClient) -> None:
     assert created.status_code == HTTPStatus.OK
     assert created.json()["daily_tokens"] == BASIC_TARIFF["daily_tokens"]
     assert created.json()["daily_user_messages"] is None  # unnamed limits stay unlimited
-    (plan,) = listed["items"]
-    assert plan["code"] == "basic"
+    (plan,) = [item for item in listed["items"] if item["code"] == "basic"]
     assert plan["features"] == ["web_search"]
     assert "skill_create" in listed["features"]  # the vocabulary for the form
     assert assigned.status_code == HTTPStatus.OK
-    assert with_user["items"][0]["users"] == ["person-1"]
+    assert _plan(with_user, "basic")["users"] == ["person-1"]
     assert blocked.status_code == HTTPStatus.CONFLICT  # still assigned
     assert unassigned.status_code == HTTPStatus.OK
     assert deleted.status_code == HTTPStatus.OK
-    assert client.get("/api/admin/tariffs").json()["items"] == []
+    remaining = {item["code"] for item in client.get("/api/admin/tariffs").json()["items"]}
+    assert "basic" not in remaining
+    assert remaining == STARTER_PLANS  # the seeded catalog is all that is left
+
+
+def _plan(page: dict[str, Any], code: str) -> dict[str, Any]:
+    (found,) = [item for item in page["items"] if item["code"] == code]
+    return found
 
 
 def test_the_default_flag_moves_between_plans(client: TestClient) -> None:
     client.post("/api/admin/tariffs", json=BASIC_TARIFF | {"is_default": True})
     client.post("/api/admin/tariffs", json={"code": "trial", "title": "Trial", "is_default": True})
 
-    flags = {t["code"]: t["is_default"] for t in client.get("/api/admin/tariffs").json()["items"]}
+    flags = {
+        t["code"]: t["is_default"]
+        for t in client.get("/api/admin/tariffs").json()["items"]
+        if t["code"] not in STARTER_PLANS
+    }
 
     assert flags == {"basic": False, "trial": True}  # at most one default
 
