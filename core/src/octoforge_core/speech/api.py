@@ -46,6 +46,19 @@ class TranscriptionClient(Protocol):
         ...
 
 
+class AudioResolver(Protocol):
+    """Turns an attachment reference back into bytes (transport-owned).
+
+    The counterpart of `vision.api.ImageResolver`, deliberately the same
+    shape: the core holds a reference it cannot interpret, and the transport
+    that minted it knows how to fetch it.
+    """
+
+    async def fetch(self, ref: str) -> AudioData:
+        """Download the referenced recording; raises when the ref is unknown."""
+        ...
+
+
 class TranscriptionUnavailableError(Exception):
     """Speech-to-text is not configured, or the recording cannot be read."""
 
