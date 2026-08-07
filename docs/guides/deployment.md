@@ -126,8 +126,8 @@ Three roles, and it is worth being precise about which process is which:
 | Role | Runs | Where |
 |---|---|---|
 | **Balancer** | Caddy, TLS, affinity | the host the domain points at |
-| **Pod** | the app: dialogs, the agent loop, the HTTP API | that host and every other one (`docker-compose.pod.yml`) |
-| **Ingestion** | the Telegram long poll, the invite gate | exactly one host (`--profile ingest`) |
+| **Pod** | the app: dialogs, the agent loop, the HTTP API, and every model call — including describing an incoming picture and transcribing a recording | that host and every other one (`docker-compose.pod.yml`) |
+| **Ingestion** | the Telegram long poll, the invite gate; it asks the pods to understand media rather than calling a model itself | exactly one host (`--profile ingest`) |
 
 **The pods reach one database.** `OF_PRIMARY_HOST` points every pod at the **primary** over the
 private network — never at a standby. Replication is asynchronous, so a pod reading one would see a

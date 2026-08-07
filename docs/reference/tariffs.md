@@ -51,8 +51,8 @@ Three tables (see [data-model.md](data-model.md)):
 | `llm_routing` | the runner, from `RouteDecision.usage` — the router itself does not know whose message it routes | routing-call tokens |
 | `llm_compaction` | the compactor, on the dialog's user | summarization tokens |
 | `user_message` | every persisted submit (duplicates are not counted) | `quantity=1` |
-| `voice_transcription` | the Telegram poller, after a successful transcription | seconds of audio |
-| `vision` | the Telegram poller after ingest describes (only what was delivered), and `image_look` after a strong-tier call | images |
+| `voice_transcription` | `media/service.py`, after a successful transcription | seconds of audio |
+| `vision` | `media/service.py` after ingest describes (only the pictures actually described), and `image_look` after a strong-tier call | images |
 
 The public MCP skill-generation call (`mcp/skills.py`) has no user to attribute and is not metered.
 Metering runs outside any unit of work, after the persist commits, and a metering failure never fails
@@ -74,10 +74,11 @@ the run — the event is logged as lost instead.
   touching the core (below). The runner resolves the user's feature set once per run into
   `ToolContext.enabled_features`; each gated tool hides itself via the registry's `visible_to` hook
   and re-checks inside `execute`. Skill saves are gated per *kind*: the same tool still saves
-  knowledge on every plan. Telegram checks `voice_transcription` and `vision` before downloading a
-  byte, resolving the core person first — plans are never filed under a `tg:` handle; a denied
-  picture or recording still delivers its caption as text, and a denied forward keeps its
-  material path.
+  knowledge on every plan. `voice_transcription` and `vision` are checked in the core, before a byte
+  is downloaded, because that is where the person is known — plans are never filed under a `tg:`
+  handle, and a surface that checked them itself once stopped checking at all
+  ([vision-and-speech.md](vision-and-speech.md)). A denied picture or recording still delivers its
+  caption as text, and a denied forward keeps its material path.
 - **Count caps**: `max_cron_jobs` (enforced by `cron.api.create_job` and, through the shared
   `job_quota_refusal`, by `POST /api/cron/jobs` — HTTP 403) and `max_datasets` (enforced by the
   dataset service, so the agent's implicit create on a first `data_put` goes through the same gate).

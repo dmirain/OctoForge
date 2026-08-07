@@ -179,6 +179,11 @@ The hash uses `:` separators rather than `$` because docker compose interpolates
 
 ## Images and voice
 
+These are read **on the service**, and only there. Every model call about a user's media happens in
+the core next to the plan check and the ledger ([vision-and-speech.md](vision-and-speech.md)), so a
+standalone ingestion node holds no model client and its copies of these variables do nothing — it
+asks the service what it can do and logs the answer at startup.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `OF_VISION_MODEL` | `minimax-m3` | Model that describes incoming images; empty turns ingestion off and images arrive as placeholders |

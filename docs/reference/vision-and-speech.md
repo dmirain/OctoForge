@@ -19,11 +19,34 @@ ingestion. An empty `OF_VISION_MODEL` turns ingestion off and images arrive as t
 
 ### How an image travels
 
-1. The transport downloads the picture and asks the ingestion tier to describe it.
-2. The description enters the dialog as text, with the image kept as an `Attachment` on the message.
-3. If the user later asks about it, `image_look(question)` re-fetches the bytes through the
-   `ImageResolver` port (transport-owned, because only the transport can turn a reference back into
-   bytes) and asks the strong tier.
+1. The transport hands the core a **reference** (`tgfile:<id>`) and asks for a description.
+2. The core checks the person's plan, resolves the reference to bytes through the `ImageResolver`
+   port (transport-owned, because only the transport can turn a reference back into bytes), calls
+   the ingestion tier and ledgers the spend.
+3. The description enters the dialog as text, with the image kept as an `Attachment` on the message.
+4. If the user later asks about it, `image_look(question)` re-fetches through the same port and asks
+   the strong tier.
+
+### The model is only ever called from the core
+
+Every call to a vision or speech model happens in `core/media/` (`MediaService`), next to the plan
+check and the ledger entry — a surface asks, it never calls. This is not tidiness: a surface that
+called a model directly would have to check the plan itself, and a **surface cannot always do that**.
+Standalone Telegram ingestion knows accounts, not people, and plans are filed under people; it once
+held the model clients and the check simply dropped out, so a free plan got paid vision and voice for
+months with nothing in the ledger to show it.
+
+So the surface depends on the `MediaUnderstanding` port, and the deployment picks the implementation:
+
+| Arrangement | Implementation | Where the person is resolved |
+|---|---|---|
+| In-process | `MediaService` behind a resolving adapter in the composition root | the adapter, via the identity store |
+| Split ingestion | an HTTP client posting to `/api/media/…` | `get_user_id` on the service, which also admits |
+
+Either way the stage does not move — a picture is still described as it arrives, before the message
+enters the dialog. Only the caller changed. Refusals come back as outcomes rather than exceptions,
+because the surface answers them differently: a plan refusal is spoken out loud, a technical failure
+falls back to the text-only path in silence.
 
 `image_look` is bound into `ToolContext.image_inspector` only when both a vision client and a resolver are
 present for that dialog; otherwise the tool hides itself. In Telegram an album arrives as one message with
@@ -55,10 +78,15 @@ Two details that come from the real world rather than from the design:
 Recordings longer than `OF_VOICE_MAX_SECONDS` are refused before download — a guard on both latency and
 the provider's daily quota.
 
-Both capabilities sit behind the tariff gate as well: Telegram checks the person's plan
-(`voice_transcription` / `vision` feature codes) before downloading a byte, and successful work is
-ledgered — transcription as seconds of audio, ingest describes and `image_look` calls as image
-counts (see [tariffs.md](tariffs.md)).
+Both capabilities sit behind the tariff gate: the plan (`voice_transcription` / `vision` feature
+codes) is checked before a byte is downloaded, and successful work is ledgered — transcription as
+seconds of audio, ingest describes and `image_look` calls as image counts (see
+[tariffs.md](tariffs.md)).
+
+**The plan is answered before the duration.** Somebody whose tariff has no voice is told *that*, not
+that their recording was too short — no length would have worked for them, and the shorter answer
+would send them off to re-record for nothing. The bounds themselves are the surface's (it owns the
+number and the wording); the ordering is the core's.
 
 ## Invariants
 
@@ -69,7 +97,11 @@ counts (see [tariffs.md](tariffs.md)).
 - **A voice transcript is the user's message**; a caption-less picture is material. The transport decides,
   because it knows who produced what.
 - **Attachment bytes are never stored** by the core — the transport keeps the reference and can re-fetch.
-- **Duration is checked before download.**
+- **Duration is checked before download**, and after the plan.
+- **No surface calls a model.** The one way in is `MediaUnderstanding`; behind it the check, the call
+  and the ledger entry are inseparable. A surface holding a model client is the bug, not the feature.
+- **`MediaService` is only ever given a person**, never a surface handle — asked about `tg:<id>` it
+  would find no binding and answer yes to everything.
 
 ## Configuration
 
@@ -81,6 +113,10 @@ counts (see [tariffs.md](tariffs.md)).
 | `OF_STT_BASE_URL`, `OF_STT_MODEL` | Both required for transcription; no inheritance |
 | `OF_STT_API_KEY`, `OF_STT_LANGUAGE` | Key, and an optional language hint |
 | `OF_VOICE_MAX_SECONDS` | Longest accepted recording (default 600) |
+
+All of these are read **on the service**. In a split deployment the ingestion node no longer holds a
+model client, so its copies of them do nothing; it asks `GET /api/media/capabilities` at startup and
+logs what the service actually answers, which is the only report that can be trusted for that node.
 
 ## Failure modes
 
