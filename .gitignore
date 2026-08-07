@@ -13,6 +13,13 @@ dist/
 !.env.example
 octoforge.db
 telegram.db
+# SQLite writes these beside the database it is journalling; they are the
+# live state of a local run, and one committed by accident is a corrupt
+# database for whoever checks it out next
+*.db-shm
+*.db-wal
+# what ops/trace_queries.py leaves behind on the host it profiled
+octoforge_trace
 *.bak
 backups/
 OctoForgeBotToken.txt
