@@ -369,25 +369,42 @@ class AdminManageTool:
         )
 
     async def _disable_cron_jobs(self, invite: Invite) -> tuple[str, ...]:
-        if invite.claimed_by is None:
+        person = await self._person_of(invite)
+        if person is None:
             return ()
         disabled: list[str] = []
-        for job in await self._cron.list_for_user(invite.claimed_by):
+        for job in await self._cron.list_for_user(person):
             if job.enabled:
-                await self._cron.set_enabled(invite.claimed_by, job.id, enabled=False)
+                await self._cron.set_enabled(person, job.id, enabled=False)
                 disabled.append(job.id)
         await self._invites.set_disabled_cron_jobs(invite.id, tuple(disabled))
         return tuple(disabled)
+
+    async def _person_of(self, invite: Invite) -> str | None:
+        """The person behind a claimed invite; None when nobody claimed it.
+
+        `claimed_by` is a Telegram ACCOUNT (`tg:<id>`) — that is what the gate
+        knows — while cron jobs, like everything else the platform owns, are
+        filed under the person. Passing the account through found no jobs and
+        reported none, so revoking access left the scheduler running and said
+        it had stopped it.
+        """
+        if invite.claimed_by is None:
+            return None
+        external_id = invite.claimed_by.removeprefix(USER_ID_PREFIX)
+        identity = await self._identities.find_by_identity(TELEGRAM_CHANNEL, external_id)
+        return None if identity is None else identity.user_id
 
     async def _restore(self, arguments: dict[str, Any]) -> str:
         invite = await self._find_invite(arguments)
         if invite is None:
             return INVITE_NOT_FOUND_MESSAGE
         restored = await self._invites.restore(invite.id)
+        person = await self._person_of(restored)
         reenabled = 0
-        if restored.claimed_by is not None:
+        if person is not None:
             for job_id in restored.disabled_cron_job_ids:
-                await self._cron.set_enabled(restored.claimed_by, job_id, enabled=True)
+                await self._cron.set_enabled(person, job_id, enabled=True)
                 reenabled += 1
         await self._invites.set_disabled_cron_jobs(restored.id, ())
         return (

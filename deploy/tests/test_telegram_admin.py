@@ -274,12 +274,20 @@ async def test_list_users_reports_access_stats_and_cron(
 async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
     stores: StoresTuple,
 ) -> None:
-    invites, cron_store = stores[0], stores[1]
+    """The jobs are filed under the PERSON, the invite under the `tg:` handle.
+
+    This test used to create them under the handle, which is why it stayed
+    green while production did nothing: `claimed_by` went straight into
+    `list_for_user`, matched no job, and the tool reported "disabled cron
+    jobs: 0" while the scheduler kept running the revoked person's work.
+    """
+    invites, cron_store, identities = stores[0], stores[1], stores[5]
     invite_id = await claim_invite(stores)
-    await cron_store.create(make_cron_job("job-1", USER_ID))
-    await cron_store.create(make_cron_job("job-2", USER_ID))
+    person = await identities.resolve_or_create(TELEGRAM_CHANNEL, "111")
+    await cron_store.create(make_cron_job("job-1", person))
+    await cron_store.create(make_cron_job("job-2", person))
     # the user's own pause, predating the revoke: restore must not re-enable it
-    await cron_store.create(replace(make_cron_job("job-3", USER_ID), enabled=False))
+    await cron_store.create(replace(make_cron_job("job-3", person), enabled=False))
     tool = make_tool(stores)
 
     revoked = await tool.execute(
@@ -287,7 +295,7 @@ async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
     )
 
     assert "disabled cron jobs: 2" in revoked
-    jobs = {job.id: job for job in await cron_store.list_for_user(USER_ID)}
+    jobs = {job.id: job for job in await cron_store.list_for_user(person)}
     assert jobs["job-1"].enabled is False
     assert jobs["job-2"].enabled is False
     assert jobs["job-3"].enabled is False
@@ -299,13 +307,32 @@ async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
     )
 
     assert "re-enabled cron jobs: 2" in restored
-    jobs = {job.id: job for job in await cron_store.list_for_user(USER_ID)}
+    jobs = {job.id: job for job in await cron_store.list_for_user(person)}
     assert jobs["job-1"].enabled is True
     assert jobs["job-2"].enabled is True
     assert jobs["job-3"].enabled is False  # the user's own pause survived
     invite = await invites.get_by_id(invite_id)
     assert invite is not None and invite.status is InviteStatus.CLAIMED
     assert invite.disabled_cron_job_ids == ()
+
+
+async def test_revoking_an_account_with_no_person_yet_touches_nothing(
+    stores: StoresTuple,
+) -> None:
+    """Someone who claimed a code but never wrote has no person to file work
+    under; the revoke must be a quiet no-op rather than an error."""
+    invite_id = await claim_invite(stores)
+    tool = make_tool(stores)
+
+    revoked = await tool.execute(
+        {"action": ACTION_REVOKE_INVITE, "user_id": USER_ID}, ADMIN_CONTEXT
+    )
+    restored = await tool.execute(
+        {"action": ACTION_RESTORE_INVITE, "invite_id": invite_id}, ADMIN_CONTEXT
+    )
+
+    assert "disabled cron jobs: 0" in revoked
+    assert "re-enabled cron jobs: 0" in restored
 
 
 async def test_revoke_pending_invite_by_id(
