@@ -47,6 +47,25 @@ async def test_send_message_passes_parse_mode_in_the_payload() -> None:
         assert await client.send_message(CHAT_ID, "<b>hi</b>", parse_mode="HTML") == MESSAGE_ID
 
 
+async def test_set_my_commands_posts_the_menu_payload() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/bot{BOT_TOKEN}/setMyCommands"
+        payload = json.loads(request.content)
+        assert payload == {
+            "commands": [
+                {"command": "secrets", "description": "форма секретов"},
+                {"command": "invite", "description": "ссылка-приглашение"},
+            ]
+        }
+        return json_response({"ok": True, "result": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient(http_client=http, token=BOT_TOKEN)
+        await client.set_my_commands(
+            [("secrets", "форма секретов"), ("invite", "ссылка-приглашение")]
+        )
+
+
 async def test_send_message_retries_without_parse_mode_on_entity_errors() -> None:
     requests: list[dict[str, object]] = []
 

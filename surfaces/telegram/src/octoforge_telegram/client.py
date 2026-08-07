@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Any, NoReturn, Protocol
 
 import httpx
@@ -113,6 +114,10 @@ class TelegramClient(Protocol):
         """Download file bytes; raises `TelegramApiError` over the size cap or on failure."""
         ...
 
+    async def set_my_commands(self, commands: Sequence[tuple[str, str]]) -> None:
+        """Publish the bot's command menu as (name, description) pairs; empty clears it."""
+        ...
+
 
 class TelegramBotClient:
     """Bot API client: token in the method path, JSON payloads, long-poll timeouts."""
@@ -201,6 +206,14 @@ class TelegramBotClient:
                 await asyncio.sleep(exc.wait_seconds)
                 total_wait += exc.wait_seconds
         raise AssertionError("unreachable: the loop above always returns or raises")
+
+    async def set_my_commands(self, commands: Sequence[tuple[str, str]]) -> None:
+        payload = {
+            "commands": [
+                {"command": name, "description": description} for name, description in commands
+            ]
+        }
+        await self._call("setMyCommands", payload)
 
     async def _download_once(self, url: str) -> bytes:
         """Make one download attempt; raises `_RetryableCallError` for a transient failure.

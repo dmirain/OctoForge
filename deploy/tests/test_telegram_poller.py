@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import suppress
 from typing import cast
 
@@ -76,12 +76,14 @@ from octoforge_telegram.poller import (
     IMAGE_TAG_NUMBERED,
     INGESTION_PROMPT,
     INVITE_INVALID_TEXT,
+    INVITE_MENU_DESCRIPTION,
     MATERIAL_ATTRIBUTION_ANONYMOUS,
     MATERIAL_PLACEHOLDER,
     QUEUE_WAIT_TEXT,
     REFERRAL_PREFIX,
     REFERRALS_DISABLED_TEXT,
     SECRETS_DISABLED_TEXT,
+    SECRETS_MENU_DESCRIPTION,
     TEXT_ONLY_NOTICE,
     VISION_PLAN_NOTICE,
     VOICE_EMPTY_NOTICE,
@@ -140,6 +142,8 @@ class FakeTelegramClient:
         self.edited: list[tuple[int, int, str, str | None]] = []
         self.downloaded_file_ids: list[str] = []
         self.download_error: Exception | None = None
+        self.command_menus: list[list[tuple[str, str]]] = []
+        self.menu_failure: Exception | None = None
         self._next_message_id = 0
 
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[TelegramUpdate]:
@@ -191,6 +195,11 @@ class FakeTelegramClient:
             raise self.download_error
         self.downloaded_file_ids.append(file_path.removeprefix("path/"))
         return b"fake-image-bytes"
+
+    async def set_my_commands(self, commands: Sequence[tuple[str, str]]) -> None:
+        if self.menu_failure is not None:
+            raise self.menu_failure
+        self.command_menus.append(list(commands))
 
 
 class RecordingBridge:
@@ -1444,6 +1453,9 @@ class NoVoiceGate:
     async def max_datasets(self, user_id: str) -> int | None:
         return None
 
+    async def max_memory_chars(self, user_id: str) -> int | None:
+        return None
+
     async def record(self, event: UsageEvent) -> None:
         return None
 
@@ -1932,6 +1944,45 @@ async def test_invite_command_without_referrals_reports_not_set_up() -> None:
     assert client.sent == [(TELEGRAM_USER_ID, REFERRALS_DISABLED_TEXT, None)]
 
 
+# --- command menu ------------------------------------------------------------
+
+
+async def test_the_command_menu_lists_only_the_wired_commands(
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+) -> None:
+    _, referrals = telegram_stores
+    client = FakeTelegramClient()
+    poller = make_poller(
+        client, secrets_link=lambda account: f"https://forms.example/{account}", referrals=referrals
+    )
+
+    await poller._register_commands()
+
+    assert client.command_menus == [
+        [("secrets", SECRETS_MENU_DESCRIPTION), ("invite", INVITE_MENU_DESCRIPTION)]
+    ]
+
+
+async def test_a_bare_deployment_publishes_an_empty_menu() -> None:
+    """No wired commands = an empty registration, clearing any stale menu."""
+    client = FakeTelegramClient()
+    poller = make_poller(client)
+
+    await poller._register_commands()
+
+    assert client.command_menus == [[]]
+
+
+async def test_a_menu_registration_failure_does_not_stop_the_surface() -> None:
+    client = FakeTelegramClient()
+    client.menu_failure = TelegramApiError("flood control")
+    poller = make_poller(client, secrets_link=lambda account: f"https://forms.example/{account}")
+
+    await poller._register_commands()
+
+    assert client.command_menus == []
+
+
 # --- vision gate and ingest metering -----------------------------------------
 
 
@@ -1954,6 +2005,9 @@ class RecordingUsageGate:
         return None
 
     async def max_datasets(self, user_id: str) -> int | None:
+        return None
+
+    async def max_memory_chars(self, user_id: str) -> int | None:
         return None
 
     async def record(self, event: UsageEvent) -> None:

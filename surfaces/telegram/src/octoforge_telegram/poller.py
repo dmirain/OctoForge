@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 COMMAND_START = "/start"
 COMMAND_SECRETS = "/secrets"
 COMMAND_INVITE = "/invite"
+# what the client shows behind its "/" menu button; /start is deliberately
+# absent — it is the entry handshake, not something a member ever needs again
+SECRETS_MENU_DESCRIPTION = "Передать пароль или токен через защищённую форму"
+INVITE_MENU_DESCRIPTION = "Получить персональную ссылку-приглашение"
 # what a personal referral payload looks like in `/start ref_<code>`: the
 # prefix keeps referral codes and operator invite codes in separate namespaces
 REFERRAL_PREFIX = "ref_"
@@ -468,6 +472,7 @@ class TelegramPoller:
         didn't anticipate) — if it also killed the loop, the whole Telegram
         surface would go dark for every user until a process restart.
         """
+        await self._register_commands()
         await self._drain_backlog()
         try:
             while True:
@@ -480,6 +485,24 @@ class TelegramPoller:
             for inbox in tuple(self._inboxes.values()):
                 if inbox.worker is not None:
                     inbox.worker.cancel()  # shutdown: queued work is dropped
+
+    async def _register_commands(self) -> None:
+        """Publish the command menu for whatever this deployment actually wires.
+
+        Registered on every start (the call is idempotent), so the menu always
+        mirrors the configuration — including clearing a stale menu when a
+        capability was switched off. Best-effort: the menu is a convenience,
+        and a Bot API hiccup here must not keep the surface from starting.
+        """
+        commands: list[tuple[str, str]] = []
+        if self._secrets_link is not None:
+            commands.append((COMMAND_SECRETS.removeprefix("/"), SECRETS_MENU_DESCRIPTION))
+        if self._referrals is not None:
+            commands.append((COMMAND_INVITE.removeprefix("/"), INVITE_MENU_DESCRIPTION))
+        try:
+            await self._client.set_my_commands(commands)
+        except Exception:
+            logger.warning("Telegram setMyCommands failed; keeping the old menu", exc_info=True)
 
     async def _poll_once(self) -> None:
         try:

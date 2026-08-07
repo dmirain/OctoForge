@@ -135,6 +135,14 @@ asking to stop is a message like any other, and the router decides which exchang
 (see [routing.md](routing.md)). A command could not do that, because it has nowhere to say *which*
 of several running answers to stop.
 
+The commands are also published as the client's command menu (the `/` button next to the input
+field): on every start the poller calls `setMyCommands` with whatever this deployment actually
+wires — `/secrets` only when the secrets form is configured, `/invite` only when the referral
+store is — so the menu mirrors the configuration and a switched-off capability disappears from it
+on the next restart. `/start` is deliberately not listed: it is the entry handshake, not something
+a member ever needs again. The registration is best-effort — a Bot API failure is logged and the
+surface starts anyway, keeping whatever menu Telegram had before.
+
 Admins additionally get the `admin_manage` tool inside the chat — list users
 with names and invite attribution, generate, revoke and restore invites, search instructions across users,
 publish one. It hides itself from non-admins through the registry's visibility hook, and every action it
