@@ -28,7 +28,8 @@ dependency arrow pointing at this module.
 import json
 import uuid
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from http import HTTPStatus
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
@@ -36,10 +37,21 @@ import httpx
 
 from octoforge_core.config import DEFAULT_TIMEOUT_SECONDS
 from octoforge_core.instructions.api import InstructionService, InstructionType
-from octoforge_core.net.collections.ingest import ResponseSpill
+from octoforge_core.net.collections.api import REF_PREFIX as COLLECTION_REF_PREFIX
+from octoforge_core.net.collections.ingest import (
+    CollectionSink,
+    ParsedBody,
+    ResponseSpill,
+    dotted_get,
+    parse_structured,
+    render_passport,
+    shape_records,
+)
 from octoforge_core.net.errors import ExternalCallError
 from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
 from octoforge_core.net.tool_spec import (
+    PaginationKind,
+    PaginationSpec,
     ParamKind,
     TemplateRefs,
     ToolParamSpec,
@@ -89,6 +101,10 @@ PLACEMENT_BLOCKED_TEMPLATE = (
     "(it allows: {allowed}); the user can extend its placements in the secrets form"
 )
 UNAUTHENTICATED_STATUSES = frozenset({401, 403})
+COLLECT_UNAVAILABLE_MESSAGE = (
+    "collections are not available here (they need Postgres and a user in "
+    "context); call the endpoint without collect/into"
+)
 NO_CREDENTIAL_HINT = (
     "\n\n[octoforge] This request carried NO credential: the endpoint record "
     "references no secret, so nothing was attached. Do not guess at the secret's "
@@ -189,6 +205,83 @@ class _RenderPlan:
         return refs
 
 
+@dataclass(frozen=True, slots=True)
+class CallOptions:
+    """What the caller may ask of an external call beyond its params.
+
+    `collect` walks the record's declared pagination into one collection;
+    `max_pages` lowers (never raises) the configured page ceiling; `into`
+    appends the records to an existing collection — with or without collect —
+    which is how data from several endpoints ends up joinable in one place;
+    `label` names a freshly created collection for the operator's eyes.
+    """
+
+    collect: bool = False
+    max_pages: int | None = None
+    into: str | None = None
+    label: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _PageResult:
+    """One request's outcome, scrubbed and ready for either path."""
+
+    status: int
+    scrubbed: str
+    content_type: str
+    wire_truncated: bool
+    had_secrets: bool
+
+
+class _Cursor:
+    """Where the collect loop stands, per pagination kind.
+
+    Tracks every cursor value it has presented: a server that answers with a
+    cursor already seen would loop the walk forever, and the page ceiling is
+    a cost cap, not a correctness net.
+    """
+
+    def __init__(self, spec: PaginationSpec) -> None:
+        self._spec = spec
+        self._value: str = "" if spec.kind is PaginationKind.CURSOR else str(spec.start)
+        self._seen: set[str] = {self._value}
+
+    def param_value(self) -> str:
+        return self._value
+
+    def advance(self, parsed: ParsedBody, batch_size: int) -> bool:
+        """Move to the next page; False means the data says stop."""
+        if self._spec.kind is PaginationKind.PAGE:
+            self._value = str(int(self._value) + 1)
+            return True
+        if self._spec.kind is PaginationKind.OFFSET:
+            self._value = str(int(self._value) + batch_size)
+            return True
+        found = dotted_get(parsed.document, self._spec.cursor_path or "")
+        if found is None or isinstance(found, bool) or not isinstance(found, str | int):
+            return False
+        cursor = str(found)
+        if not cursor or cursor in self._seen:
+            return False
+        self._seen.add(cursor)
+        self._value = cursor
+        return True
+
+
+def _shaped(parsed: ParsedBody, spec: ToolSpec) -> ParsedBody:
+    """The record's declared projection/coercions applied, when any."""
+    if spec.response is None or not spec.response.fields:
+        return parsed
+    return replace(parsed, records=shape_records(parsed.records, spec.response.fields))
+
+
+def _reached_declared_total(pagination: PaginationSpec, parsed: ParsedBody, collected: int) -> bool:
+    if pagination.total_path is None:
+        return False
+    total = dotted_get(parsed.document, pagination.total_path)
+    return isinstance(total, int) and not isinstance(total, bool) and collected >= total
+
+
 class ExternalCallExecutor:
     """Executes endpoint records fetched through the instructions facade."""
 
@@ -219,17 +312,26 @@ class ExternalCallExecutor:
         name: str,
         params: dict[str, Any],
         user_id: str | None = None,
+        options: "CallOptions | None" = None,
     ) -> ExternalCallResult:
         """Run the endpoint call `name` with validated params and return status + body.
 
         Only endpoints visible to `user_id` resolve (the caller's own private
         records plus public ones); without a user id only public endpoints do.
+        `options` drives the collection paths: `collect` walks the declared
+        pagination, `into` pours the result into an existing collection.
         """
+        opts = options or CallOptions()
         instruction = await self._service.get_by_name(
             name, InstructionType.ENDPOINT, user_id=user_id
         )
         kind = _content_kind(instruction.content)
         if kind is not None:
+            if opts.collect or opts.into is not None:
+                raise ExternalCallError(
+                    f"endpoint '{name}' is a kind record ({kind!r}); "
+                    "collect/into apply to classic HTTP endpoints only"
+                )
             delegate = self._delegates.get(kind)
             if delegate is None:
                 raise ExternalCallError(
@@ -238,6 +340,10 @@ class ExternalCallExecutor:
                 )
             return await delegate.execute(instruction.content, params, user_id)
         spec = parse_tool_spec(instruction.content)
+        if opts.collect and spec.pagination is not None and spec.pagination.param not in params:
+            # the loop owns this param; a placeholder keeps validation honest
+            # about everything else without demanding what the loop provides
+            params = {**params, spec.pagination.param: ""}
         try:
             validated = _validate_params(spec, params)
         except ExternalCallError as exc:
@@ -248,6 +354,34 @@ class ExternalCallExecutor:
                 f"{exc}; the endpoint declares this contract: {instruction.content}"
             ) from exc
         plan = _collect_plan(spec)
+        if opts.collect:
+            return await self._collect_pages(name, spec, plan, validated, user_id, opts)
+        page = await self._request_once(spec, plan, validated, user_id)
+        if opts.into is not None:
+            return await self._pour_into(name, spec, page, user_id, opts)
+        result = await self._spill_or_truncate(
+            page.scrubbed, page.content_type, name, user_id, page.wire_truncated
+        )
+        if page.status in UNAUTHENTICATED_STATUSES and not page.had_secrets:
+            # a bare 401/403 reads as "wrong credential" and sends the model
+            # guessing at the value; when the record attached none at all,
+            # say so — that is a one-step fix in the record, not a mystery
+            result += NO_CREDENTIAL_HINT
+        return ExternalCallResult(status=page.status, body=result)
+
+    async def _request_once(
+        self,
+        spec: ToolSpec,
+        plan: "_RenderPlan",
+        validated: dict[str, str],
+        user_id: str | None,
+    ) -> "_PageResult":
+        """One rendered, guarded, scrubbed request — the unit both paths share.
+
+        Everything here happens per page on purpose: the pagination param
+        changes the URL, so the SSRF guard and the host binding judge every
+        page's destination, not just the first one's.
+        """
         user_values = await self._user_values(plan, user_id)
         # secrets ride the URL as unguessable sentinels until the guard and
         # the host binding have judged the real destination
@@ -284,14 +418,125 @@ class ExternalCallExecutor:
             raise ExternalCallError(
                 f"external call failed: {_scrub(str(exc), secrets.values())}"
             ) from exc
-        scrubbed = _scrub(raw, secrets.values())
-        result = await self._spill_or_truncate(scrubbed, content_type, name, user_id, truncated)
-        if status in UNAUTHENTICATED_STATUSES and not secrets:
-            # a bare 401/403 reads as "wrong credential" and sends the model
-            # guessing at the value; when the record attached none at all,
-            # say so — that is a one-step fix in the record, not a mystery
-            result += NO_CREDENTIAL_HINT
-        return ExternalCallResult(status=status, body=result)
+        return _PageResult(
+            status=status,
+            scrubbed=_scrub(raw, secrets.values()),
+            content_type=content_type,
+            wire_truncated=truncated,
+            had_secrets=bool(secrets),
+        )
+
+    async def _pour_into(
+        self,
+        name: str,
+        spec: ToolSpec,
+        page: "_PageResult",
+        user_id: str | None,
+        opts: "CallOptions",
+    ) -> ExternalCallResult:
+        """One call's records appended to an EXISTING collection.
+
+        Explicit intent beats the inline threshold: a body that would have
+        stayed inline is stored anyway, because the caller said where. This
+        is what lets records from a different endpoint land beside earlier
+        ones — the join happens in the database, not in context.
+        """
+        if self._spill is None or user_id is None:
+            raise ExternalCallError(COLLECT_UNAVAILABLE_MESSAGE)
+        assert opts.into is not None  # the caller branched on it
+        parsed = await parse_structured(
+            page.scrubbed,
+            page.content_type,
+            spec.response.items_path if spec.response is not None else None,
+        )
+        if parsed is None or not parsed.records.payloads:
+            raise ExternalCallError(
+                f"the response of '{name}' carried no records to add "
+                f"(HTTP {page.status}); nothing was appended"
+            )
+        sink = CollectionSink(
+            self._spill,
+            owner_id=user_id,
+            source=f"endpoint:{name}",
+            into=opts.into.removeprefix(COLLECTION_REF_PREFIX),
+        )
+        await sink.add(_shaped(parsed, spec), len(page.scrubbed))
+        passport = await sink.finish(truncated=page.wire_truncated)
+        assert passport is not None  # add() above stored a non-empty batch
+        return ExternalCallResult(status=page.status, body=render_passport(passport))
+
+    async def _collect_pages(  # noqa: PLR0913, PLR0917 — the loop's full input
+        self,
+        name: str,
+        spec: ToolSpec,
+        plan: "_RenderPlan",
+        validated: dict[str, str],
+        user_id: str | None,
+        opts: "CallOptions",
+    ) -> ExternalCallResult:
+        """Walk the declared pagination, filling one collection — no LLM inside.
+
+        Stop conditions, any of which ends the walk: an empty or unparseable
+        page, a repeated cursor (a server that loops must not loop us), the
+        declared total reached, an error status past the first page, and the
+        page ceiling — the last one marks the collection truncated, because
+        counts that silently reflect a cap read as the whole truth.
+        """
+        pagination = spec.pagination
+        if pagination is None:
+            raise ExternalCallError(
+                f"endpoint '{name}' declares no pagination section; collect needs one "
+                "(add it to the record: kind page/offset/cursor, the param to advance)"
+            )
+        if self._spill is None or user_id is None:
+            raise ExternalCallError(COLLECT_UNAVAILABLE_MESSAGE)
+        max_pages = min(
+            opts.max_pages if opts.max_pages is not None else self._spill.config.collect_max_pages,
+            self._spill.config.collect_max_pages,
+        )
+        sink = CollectionSink(
+            self._spill,
+            owner_id=user_id,
+            source=f"endpoint:{name}",
+            label=opts.label,
+            into=(opts.into.removeprefix(COLLECTION_REF_PREFIX) if opts.into is not None else None),
+        )
+        cursor = _Cursor(pagination)
+        pages = 0
+        status = 0
+        capped = False
+        while pages < max_pages:
+            call = dict(validated)
+            call[pagination.param] = cursor.param_value()
+            page = await self._request_once(spec, plan, call, user_id)
+            status = page.status
+            if page.status >= HTTPStatus.BAD_REQUEST:
+                if pages == 0:
+                    return ExternalCallResult(status=page.status, body=_truncate(page.scrubbed))
+                capped = True  # keep what arrived; the tail is missing
+                break
+            parsed = await parse_structured(
+                page.scrubbed,
+                page.content_type,
+                spec.response.items_path if spec.response is not None else None,
+            )
+            if parsed is None or not parsed.records.payloads:
+                break  # the natural end of the data
+            await sink.add(_shaped(parsed, spec), len(page.scrubbed))
+            pages += 1
+            if not cursor.advance(parsed, len(parsed.records.payloads)):
+                break
+            if _reached_declared_total(pagination, parsed, sink.record_count):
+                break
+        else:
+            capped = True  # the page ceiling, not the data, ended the walk
+        passport = await sink.finish(truncated=capped)
+        if passport is None:
+            return ExternalCallResult(
+                status=status, body=f"collect: '{name}' returned no records at all"
+            )
+        note = f"\ncollected {pages} page(s) this call"
+        return ExternalCallResult(status=status, body=render_passport(passport) + note)
 
     async def _spill_or_truncate(
         self, scrubbed: str, content_type: str, name: str, user_id: str | None, truncated: bool

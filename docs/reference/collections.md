@@ -26,12 +26,46 @@ already-scrubbed text to the spill (`ResponseSpill`). The spill answers one of t
 
 Unwrapping: a top-level array is the records; an object with exactly one array-of-objects member is
 an envelope around its records (the scalar siblings ride into the passport as `envelope`); any other
-object is a single record. CSV takes its keys from the header row and its values stay strings until
-an endpoint contract declares coercions (planned: the `response` section).
+object is a single record. CSV takes its keys from the header row; values stay strings unless the
+endpoint record declares coercions.
 
 The passport names the ref (`col:<id>`), the kind and source, the record count and size, the expiry,
 and the rendered record schema — knowing the shape of 1400 records is worth more per token than
 seeing one and a half of them.
+
+### The endpoint contract's two new sections
+
+An endpoint record (see [endpoints-and-net.md](endpoints-and-net.md)) may shape its own ingestion —
+sections the model writes when authoring the record, reading the API's own documentation:
+
+```json
+"response": {"items_path": "data.items",
+             "fields": {"id": "number", "name": "string", "amount": "number"}},
+"pagination": {"kind": "page", "param": "page", "start": 1, "total_path": "total"}
+```
+
+`response.items_path` names where the records live when the unwrap heuristic cannot see it;
+`response.fields` is a projection AND a coercion map — only these fields survive into the
+collection, and `"12.5"` becomes `12.5` before it is stored, which is what lets `sum(amount)` work.
+A value that refuses its coercion stays as it came, and the schema tells the truth about it.
+
+`pagination` is what the **collect loop** walks: `external_call(name, params, collect: true)` fetches
+page after page — advancing `param` by page number, item offset, or the cursor read from
+`cursor_path` — with **no LLM round-trip inside the loop**, pouring every page into one collection
+and answering with its passport. A thousand contractors served fifty at a time is one tool call.
+Stop conditions: an empty or unparseable page, a repeated cursor, `total_path` reached, an error
+status past the first page, and the page ceiling (`max_pages` argument, capped by
+`OF_COLLECTIONS_COLLECT_MAX_PAGES`) — the ceiling marks the collection truncated, because counts
+that silently reflect a cap read as the whole truth.
+
+### Appending across endpoints
+
+`external_call(…, into: "col:…")` pours a call's records into an EXISTING collection instead of
+creating one — with or without `collect`. Records keep a per-batch `source` tag (the endpoint
+name), so a collection can hold contractors from one endpoint and their contacts from another,
+queryable apart (`source` filter) or together — the join happens in the database, not in the
+context window. An explicit `into` beats the inline threshold: even a small body is stored,
+because the caller said where. `label` names a freshly created collection.
 
 ### Querying
 

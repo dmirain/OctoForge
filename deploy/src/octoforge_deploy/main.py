@@ -897,6 +897,7 @@ def _collections_config(settings: Settings) -> CollectionConfig:
         max_bytes_per_user=settings.collections_max_mb_per_user * 1024 * 1024,
         query_max_limit=settings.collections_query_max_limit,
         inline_max_chars=settings.collections_inline_max_chars,
+        collect_max_pages=settings.collections_collect_max_pages,
     )
 
 

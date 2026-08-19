@@ -39,6 +39,12 @@ which those protocols need:
  "headers": {"Depth": "1", "Content-Type": "application/xml"}}
 ```
 
+A record may also declare `response` (where the records live in the reply, which fields to keep,
+what to coerce) and `pagination` (how the endpoint pages, which the collect loop walks). Both
+belong to the collections feature and are documented in [collections.md](collections.md); the
+pagination `param` must name a declared parameter, and unknown section fields are refused like any
+other invented key.
+
 ### The template language
 
 `url_template`, `body_template` and every header value speak one placeholder language with three

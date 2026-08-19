@@ -22,6 +22,7 @@ DEFAULT_MAX_MB_PER_USER = 50
 DEFAULT_QUERY_LIMIT = 50
 DEFAULT_QUERY_MAX_LIMIT = 500
 DEFAULT_INLINE_MAX_CHARS = 2000
+DEFAULT_COLLECT_MAX_PAGES = 20
 
 #: How a collection is addressed by the model.
 REF_PREFIX = "col:"
@@ -156,6 +157,9 @@ class CollectionConfig:
     #: Bodies at or under this stay inline in the tool result; only bigger
     #: ones become collections (absorbs the old per-tool truncation caps).
     inline_max_chars: int = DEFAULT_INLINE_MAX_CHARS
+    #: The collect loop's page ceiling — what keeps one call from walking a
+    #: gigabyte API to the end. A call may ask for fewer pages, never more.
+    collect_max_pages: int = DEFAULT_COLLECT_MAX_PAGES
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +208,10 @@ class CollectionStore(Protocol):
 
     async def passport(self, owner_id: str, collection_id: str) -> CollectionPassport:
         """The passport, or `CollectionNotFoundError` (expired ones included)."""
+        ...
+
+    async def mark_truncated(self, owner_id: str, collection_id: str) -> None:
+        """Persist that the source was cut (page limit, wire limit) mid-fill."""
         ...
 
     async def delete_expired(self) -> int:

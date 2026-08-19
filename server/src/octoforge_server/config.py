@@ -63,6 +63,7 @@ DEFAULT_COLLECTIONS_MAX_PER_USER = 20
 DEFAULT_COLLECTIONS_MAX_MB_PER_USER = 50
 DEFAULT_COLLECTIONS_QUERY_MAX_LIMIT = 500
 DEFAULT_COLLECTIONS_SWEEP_INTERVAL_SECONDS = 300.0
+DEFAULT_COLLECTIONS_COLLECT_MAX_PAGES = 20
 DEFAULT_RERANKER_MODEL = ""
 DEFAULT_RERANKER_API_URL = "https://api.siliconflow.cn/v1/rerank"
 DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
@@ -171,6 +172,7 @@ class Settings(BaseSettings):
     collections_max_mb_per_user: int = DEFAULT_COLLECTIONS_MAX_MB_PER_USER
     collections_query_max_limit: int = DEFAULT_COLLECTIONS_QUERY_MAX_LIMIT
     collections_sweep_interval_seconds: float = DEFAULT_COLLECTIONS_SWEEP_INTERVAL_SECONDS
+    collections_collect_max_pages: int = DEFAULT_COLLECTIONS_COLLECT_MAX_PAGES
     cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
     cron_replay_limit: int = DEFAULT_CRON_REPLAY_LIMIT
     mcp_sync_interval_seconds: float = DEFAULT_MCP_SYNC_INTERVAL_SECONDS

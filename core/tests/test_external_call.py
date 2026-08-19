@@ -8,6 +8,7 @@ from http import HTTPStatus
 
 import httpx
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
@@ -24,6 +25,7 @@ from octoforge_core.net.external import (
     MAX_BODY_CHARS,
     TRUNCATED_SUFFIX,
     CallCredentials,
+    CallOptions,
     ExternalCallAuth,
     ExternalCallExecutor,
 )
@@ -1391,3 +1393,202 @@ async def test_a_small_json_answer_stays_inline_with_a_spill_wired() -> None:
 
     assert result.body == '{"ok": true}'
     await engine.dispose()
+
+
+# --- collect: the pagination walk ----------------------------------------------
+
+PAGED_TOOL_NAME = "crm_contractors"
+PAGED_TOOL_CONTENT = json.dumps(
+    {
+        "method": "GET",
+        "url_template": "https://crm.test/contractors?page={page}",
+        "params_schema": {"page": {"type": "string", "required": True}},
+        "auth": "none",
+        "response": {"items_path": "data", "fields": {"id": "number", "amount": "number"}},
+        "pagination": {"kind": "page", "param": "page", "start": 1, "total_path": "total"},
+    }
+)
+CURSOR_TOOL_NAME = "feed"
+CURSOR_TOOL_CONTENT = json.dumps(
+    {
+        "method": "GET",
+        "url_template": "https://feed.test/events?cursor={cursor}",
+        "params_schema": {"cursor": {"type": "string", "required": True}},
+        "auth": "none",
+        "pagination": {"kind": "cursor", "param": "cursor", "cursor_path": "next"},
+    }
+)
+PAGE_SIZE = 2
+TOTAL_ITEMS = 5
+
+
+def _paged_handler(request: httpx.Request) -> httpx.Response:
+    """Five items, two per page: pages 1-3 carry data, page 3 is short."""
+    page = int(request.url.params.get("page") or 1)
+    start = (page - 1) * PAGE_SIZE
+    items = [
+        {"id": str(index), "amount": f"{index}.5", "noise": "x" * 50}
+        for index in range(start, min(start + PAGE_SIZE, TOTAL_ITEMS))
+    ]
+    return httpx.Response(HTTPStatus.OK, json={"total": TOTAL_ITEMS, "data": items})
+
+
+async def _sqlite_spill() -> tuple[ResponseSpill, AsyncEngine]:
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    store = SqlAlchemyCollectionStore(create_session_factory(engine))
+    return ResponseSpill(store, CollectionConfig()), engine
+
+
+async def test_collect_walks_every_page_without_the_model() -> None:
+    """One tool call, the whole dataset: the loop is the executor's, not an
+    LLM round-trip per page — the thousand-contractors scenario."""
+    spill, engine = await _sqlite_spill()
+    executor = make_executor(
+        _paged_handler,
+        records={PAGED_TOOL_NAME: PAGED_TOOL_CONTENT},
+        options=ExecutorOptions(spill=spill),
+    )
+
+    result = await executor.execute(
+        PAGED_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True)
+    )
+
+    assert "col:" in result.body
+    assert "5 records" in result.body
+    assert "collected 3 page(s)" in result.body
+    assert "SOURCE CUT" not in result.body  # the data ended by itself
+    ref = result.body.split("col:", 1)[1].split("]", 1)[0]
+    passport = await spill.store.passport(USER_A, ref)
+    # the declared projection dropped the noise and coerced the strings
+    assert set(passport.schema["fields"]) == {"id", "amount"}
+    assert passport.schema["fields"]["amount"]["type"] == "number"
+    await engine.dispose()
+
+
+async def test_collect_page_ceiling_marks_the_collection_truncated() -> None:
+    """Counts that silently reflect a cap read as the whole truth; say it."""
+    spill, engine = await _sqlite_spill()
+    executor = make_executor(
+        _paged_handler,
+        records={PAGED_TOOL_NAME: PAGED_TOOL_CONTENT},
+        options=ExecutorOptions(spill=spill),
+    )
+
+    result = await executor.execute(
+        PAGED_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True, max_pages=1)
+    )
+
+    assert "2 records" in result.body
+    assert "SOURCE CUT" in result.body
+    await engine.dispose()
+
+
+async def test_collect_stops_on_a_repeated_cursor() -> None:
+    """A server that loops must not loop us; the ceiling is a cost cap, not
+    the correctness net."""
+    spill, engine = await _sqlite_spill()
+
+    def looping(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(HTTPStatus.OK, json={"next": "again", "items": [{"id": 1}]})
+
+    executor = make_executor(
+        looping,
+        records={CURSOR_TOOL_NAME: CURSOR_TOOL_CONTENT},
+        options=ExecutorOptions(spill=spill),
+    )
+
+    result = await executor.execute(
+        CURSOR_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True)
+    )
+
+    # page 1 with cursor "", page 2 with cursor "again", then the repeat stops it
+    assert "2 records" in result.body
+    await engine.dispose()
+
+
+async def test_collect_without_a_pagination_section_names_the_remedy() -> None:
+    spill, engine = await _sqlite_spill()
+    executor = make_executor(ok_handler("{}"), options=ExecutorOptions(spill=spill))
+
+    with pytest.raises(ExternalCallError, match="pagination section"):
+        await executor.execute(
+            TOOL_NAME, {"city": "London"}, user_id=USER_A, options=CallOptions(collect=True)
+        )
+    await engine.dispose()
+
+
+async def test_into_appends_records_from_another_endpoint() -> None:
+    """Fetch the contractors, then pour their contacts BESIDE them: the join
+    happens in the database, not in the context window."""
+    spill, engine = await _sqlite_spill()
+    contacts_content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://crm.test/contacts",
+            "params_schema": {},
+            "auth": "none",
+        }
+    )
+
+    def contacts_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "crm.test" and request.url.path == "/contacts":
+            return httpx.Response(HTTPStatus.OK, json=[{"contractor_id": 1, "email": "a@x"}])
+        return _paged_handler(request)
+
+    executor = make_executor(
+        contacts_handler,
+        records={PAGED_TOOL_NAME: PAGED_TOOL_CONTENT, "crm_contacts": contacts_content},
+        options=ExecutorOptions(spill=spill),
+    )
+    first = await executor.execute(
+        PAGED_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True)
+    )
+    ref = first.body.split("col:", 1)[1].split("]", 1)[0]
+
+    poured = await executor.execute(
+        "crm_contacts", {}, user_id=USER_A, options=CallOptions(into=f"col:{ref}")
+    )
+
+    assert f"col:{ref}" in poured.body
+    passport = await spill.store.passport(USER_A, ref)
+    assert passport.record_count == TOTAL_ITEMS + 1
+    assert "email" in passport.schema["fields"]  # the merged schema knows both shapes
+    await engine.dispose()
+
+
+async def test_collect_and_into_are_refused_for_kind_records() -> None:
+    spill, engine = await _sqlite_spill()
+    mirror_content = json.dumps({"kind": "mcp", "server": "s", "tool": "t", "input_schema": {}})
+    executor = make_executor(
+        ok_handler(), records={"mirror": mirror_content}, options=ExecutorOptions(spill=spill)
+    )
+
+    with pytest.raises(ExternalCallError, match="classic HTTP endpoints only"):
+        await executor.execute("mirror", {}, user_id=USER_A, options=CallOptions(collect=True))
+    await engine.dispose()
+
+
+def test_pagination_param_must_be_declared() -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://x.test/",
+            "params_schema": {},
+            "pagination": {"kind": "page", "param": "page"},
+        }
+    )
+    with pytest.raises(ToolSpecError, match="declared parameter"):
+        parse_tool_spec(content)
+
+
+def test_response_fields_reject_an_unknown_type() -> None:
+    content = json.dumps(
+        {
+            "method": "GET",
+            "url_template": "https://x.test/",
+            "response": {"fields": {"price": "decimal"}},
+        }
+    )
+    with pytest.raises(ToolSpecError, match="allowed: boolean, number, string"):
+        parse_tool_spec(content)

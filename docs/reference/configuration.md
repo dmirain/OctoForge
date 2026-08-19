@@ -136,6 +136,7 @@ and dataset search are unavailable — the system-record sync is skipped too.
 | `OF_COLLECTIONS_MAX_MB_PER_USER` | `50` | Per-user collection byte quota, same eviction |
 | `OF_COLLECTIONS_QUERY_MAX_LIMIT` | `500` | Page-size ceiling of `collection_query` |
 | `OF_COLLECTIONS_SWEEP_INTERVAL_SECONDS` | `300.0` | How often expired collections are dropped |
+| `OF_COLLECTIONS_COLLECT_MAX_PAGES` | `20` | Page ceiling of one `collect: true` walk (a call may lower it, never raise) |
 
 ## Secrets
 

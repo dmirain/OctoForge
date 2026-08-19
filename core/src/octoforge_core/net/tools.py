@@ -14,7 +14,7 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.errors import EgressBlockedError
-from octoforge_core.net.external import ExternalCallExecutor, read_capped_text
+from octoforge_core.net.external import CallOptions, ExternalCallExecutor, read_capped_text
 from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
 from octoforge_core.tariffs.api import FeatureCode, feature_enabled, feature_refusal
 from octoforge_core.tools.base import ToolContext, ToolSpec
@@ -130,6 +130,31 @@ CALL_SCHEMA: dict[str, Any] = {
                 "Parameters declared by the endpoint's contract: string values "
                 "for classic endpoints, schema-shaped values for mcp/ records"
             ),
+        },
+        "collect": {
+            "type": "boolean",
+            "description": (
+                "Walk the endpoint's declared pagination and gather EVERY page "
+                "into one collection (no round-trips through you); the result "
+                "is the collection's passport. Needs a pagination section in "
+                "the record"
+            ),
+        },
+        "max_pages": {
+            "type": "integer",
+            "description": "Lower the collect page ceiling for this call (never raises it)",
+        },
+        "into": {
+            "type": "string",
+            "description": (
+                "Append the records to this existing collection (col:… ref) "
+                "instead of creating one — data from several endpoints lands "
+                "side by side, queryable and joinable in the database"
+            ),
+        },
+        "label": {
+            "type": "string",
+            "description": "Human-readable name for a freshly created collection",
         },
     },
     "required": ["name"],
@@ -326,9 +351,32 @@ class ExternalCallTool:
         if not isinstance(name, str) or not name.strip():
             raise ToolArgumentsError("name must be a non-empty string")
         params = _parse_params(arguments.get("params"))
-        result = await self._executor.execute(name, params, user_id=context.user_id)
+        result = await self._executor.execute(
+            name, params, user_id=context.user_id, options=_parse_call_options(arguments)
+        )
         # status 0: the transport carried no HTTP status (a kind delegate)
         return f"HTTP {result.status}\n{result.body}" if result.status else result.body
+
+
+def _parse_call_options(arguments: dict[str, Any]) -> CallOptions:
+    collect = arguments.get("collect", False)
+    if not isinstance(collect, bool):
+        raise ToolArgumentsError("collect must be a boolean")
+    max_pages = arguments.get("max_pages")
+    if max_pages is not None and (isinstance(max_pages, bool) or not isinstance(max_pages, int)):
+        raise ToolArgumentsError("max_pages must be an integer")
+    into = arguments.get("into")
+    if into is not None and (not isinstance(into, str) or not into.strip()):
+        raise ToolArgumentsError("into must be a collection ref like 'col:…'")
+    label = arguments.get("label", "")
+    if not isinstance(label, str):
+        raise ToolArgumentsError("label must be a string")
+    return CallOptions(
+        collect=collect,
+        max_pages=max_pages,
+        into=into.strip() if isinstance(into, str) else None,
+        label=label,
+    )
 
 
 def _parse_params(raw: object) -> dict[str, Any]:

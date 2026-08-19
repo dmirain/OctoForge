@@ -95,6 +95,12 @@ class SqlAlchemyCollectionStore:
         async with read_session(self._session_factory) as session:
             return _to_passport(await self._live_row(session, owner_id, collection_id))
 
+    async def mark_truncated(self, owner_id: str, collection_id: str) -> None:
+        """Persist that the source was cut mid-fill (page or wire limit)."""
+        async with write_session(self._session_factory) as session:
+            row = await self._live_row(session, owner_id, collection_id)
+            row.truncated = True
+
     async def delete_expired(self) -> int:
         """Drop every collection past its TTL.
 

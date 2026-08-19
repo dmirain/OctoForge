@@ -92,7 +92,16 @@ SECRET_NAMESPACE = "secret"
 # is how a record ends up sending no credential and no body (see
 # `_reject_unknown_keys`).
 SPEC_KEYS = frozenset(
-    {"method", "url_template", "params_schema", "body_template", "headers", "auth"}
+    {
+        "method",
+        "url_template",
+        "params_schema",
+        "body_template",
+        "headers",
+        "auth",
+        "response",
+        "pagination",
+    }
 )
 # Free-form documentation the author may keep next to the contract. Ignored
 # by execution, allowed by name so a note never has to look like a feature.
@@ -150,6 +159,61 @@ class TemplateRefs:
         )
 
 
+class FieldCoercion(StrEnum):
+    """What a declared response field should become before storage.
+
+    APIs ship numbers as strings all the time; a record that declares
+    `"price": "number"` gets `"12.5"` folded into `12.5` at ingestion, which
+    is what lets `sum(price)` work later. A value that refuses the coercion
+    stays as it came — the derived schema then tells the truth about it.
+    """
+
+    STRING = "string"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseSpec:
+    """How a record's response becomes collection records.
+
+    `items_path` points at the array when the unwrap heuristic cannot find it
+    (nested envelopes). `fields` is a projection AND a coercion map: when
+    declared, only these fields survive into the collection — the author
+    (usually the model, reading the API's own contract) throws away the noise
+    before it is ever stored.
+    """
+
+    items_path: str | None = None
+    fields: dict[str, FieldCoercion] = field(default_factory=dict)
+
+
+class PaginationKind(StrEnum):
+    """How an endpoint pages: a page number, an item offset, or a cursor."""
+
+    PAGE = "page"
+    OFFSET = "offset"
+    CURSOR = "cursor"
+
+
+@dataclass(frozen=True, slots=True)
+class PaginationSpec:
+    """What the collect loop needs to walk every page of an endpoint.
+
+    `param` is the declared request parameter the loop advances; PAGE starts
+    at `start` and increments, OFFSET starts at `start` and grows by each
+    page's record count, CURSOR reads its next value from `cursor_path` in
+    the response (empty on the first request). `total_path`, when declared,
+    stops the loop once that many records are collected.
+    """
+
+    kind: PaginationKind
+    param: str
+    start: int = 0
+    cursor_path: str | None = None
+    total_path: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
     """Executable view of an endpoint instruction record.
@@ -166,6 +230,8 @@ class ToolSpec:
     auth: str = DEFAULT_AUTH
     body_template: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
+    response: ResponseSpec | None = None
+    pagination: PaginationSpec | None = None
 
 
 def collect_refs(template: str) -> TemplateRefs:
@@ -271,6 +337,73 @@ def parse_tool_spec(content: str) -> ToolSpec:
         auth=auth,
         body_template=body_template,
         headers=headers,
+        response=_parse_response_spec(data.get("response")),
+        pagination=_parse_pagination_spec(data.get("pagination"), params),
+    )
+
+
+def _parse_response_spec(raw: object) -> ResponseSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ToolSpecError("response must be an object: {items_path?, fields?}")
+    items_path = raw.get("items_path")
+    if items_path is not None and (not isinstance(items_path, str) or not items_path.strip()):
+        raise ToolSpecError("response.items_path must be a non-empty dotted path")
+    fields_raw = raw.get("fields")
+    fields: dict[str, FieldCoercion] = {}
+    if fields_raw is not None:
+        if not isinstance(fields_raw, dict):
+            raise ToolSpecError(
+                'response.fields must map field names to types, e.g. {"price": "number"}'
+            )
+        for name, kind in fields_raw.items():
+            try:
+                fields[str(name)] = FieldCoercion(str(kind))
+            except ValueError as exc:
+                allowed = ", ".join(sorted(member.value for member in FieldCoercion))
+                raise ToolSpecError(
+                    f"response.fields[{name!r}]: unknown type {kind!r}; allowed: {allowed}"
+                ) from exc
+    unknown = sorted(set(raw) - {"items_path", "fields"})
+    if unknown:
+        raise ToolSpecError(f"unknown field(s) in response: {', '.join(unknown)}")
+    return ResponseSpec(items_path=items_path, fields=fields)
+
+
+def _parse_pagination_spec(raw: object, params: dict[str, ToolParamSpec]) -> PaginationSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ToolSpecError("pagination must be an object: {kind, param, …}")
+    try:
+        kind = PaginationKind(str(raw.get("kind")))
+    except ValueError as exc:
+        allowed = ", ".join(member.value for member in PaginationKind)
+        raise ToolSpecError(f"pagination.kind must be one of: {allowed}") from exc
+    param = raw.get("param")
+    if not isinstance(param, str) or param not in params:
+        raise ToolSpecError(
+            "pagination.param must name a declared parameter (the collect loop advances it)"
+        )
+    start = raw.get("start", 1 if kind is PaginationKind.PAGE else 0)
+    if not isinstance(start, int) or isinstance(start, bool):
+        raise ToolSpecError("pagination.start must be an integer")
+    cursor_path = raw.get("cursor_path")
+    if kind is PaginationKind.CURSOR and not isinstance(cursor_path, str):
+        raise ToolSpecError("pagination.cursor_path is required for kind 'cursor'")
+    total_path = raw.get("total_path")
+    if total_path is not None and not isinstance(total_path, str):
+        raise ToolSpecError("pagination.total_path must be a dotted path string")
+    unknown = sorted(set(raw) - {"kind", "param", "start", "cursor_path", "total_path"})
+    if unknown:
+        raise ToolSpecError(f"unknown field(s) in pagination: {', '.join(unknown)}")
+    return PaginationSpec(
+        kind=kind,
+        param=param,
+        start=start,
+        cursor_path=cursor_path if isinstance(cursor_path, str) else None,
+        total_path=total_path,
     )
 
 

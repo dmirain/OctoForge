@@ -16,6 +16,8 @@ import csv
 import io
 import json
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -26,7 +28,8 @@ from octoforge_core.net.collections.api import (
     CollectionStore,
     NewRecords,
 )
-from octoforge_core.net.collections.schema_infer import infer_records, render
+from octoforge_core.net.collections.schema_infer import infer_records, merge_nodes, render
+from octoforge_core.net.tool_spec import FieldCoercion
 from octoforge_core.time import utc_now
 
 logger = logging.getLogger(__name__)
@@ -64,6 +67,14 @@ class ResponseSpill:
     def inline_max_chars(self) -> int:
         return self._config.inline_max_chars
 
+    @property
+    def config(self) -> CollectionConfig:
+        return self._config
+
+    @property
+    def store(self) -> CollectionStore:
+        return self._store
+
     async def spill(  # noqa: PLR0913, PLR0917 — the call-site boundary
         self,
         owner_id: str,
@@ -82,28 +93,27 @@ class ResponseSpill:
         if len(body) <= self._config.inline_max_chars:
             return None
         try:
-            parsed = await _parse(body, content_type)
-            if parsed is None:
+            parsed = await parse_structured(body, content_type)
+            if parsed is None or not parsed.records.payloads:
                 return None
-            kind, records, envelope = parsed
             passport = await self._store.create(
                 owner_id=owner_id,
                 label=label,
-                kind=kind,
+                kind=parsed.kind,
                 source=source,
-                schema=infer_records(records.payloads),
-                envelope=envelope,
-                records=records,
+                schema=infer_records(parsed.records.payloads),
+                envelope=parsed.envelope,
+                records=parsed.records,
                 byte_size=len(body),
                 truncated=wire_truncated,
-                expires_at=self._expiry(),
+                expires_at=self.expiry(),
             )
         except Exception:
             logger.exception("response spill failed; falling back to truncation")
             return None
         return render_passport(passport)
 
-    def _expiry(self) -> datetime:
+    def expiry(self) -> datetime:
         return utc_now() + timedelta(seconds=self._config.ttl_seconds)
 
 
@@ -141,10 +151,29 @@ def _human_size(chars: int) -> str:
     return f"{chars} chars"
 
 
-async def _parse(
-    body: str, content_type: str
-) -> tuple[CollectionKind, NewRecords, dict[str, Any]] | None:
-    """Sniff and parse; None means "keep the old truncation"."""
+@dataclass(frozen=True, slots=True)
+class ParsedBody:
+    """A structured body taken apart: the records, and what wrapped them.
+
+    `document` is the whole parsed JSON (None for CSV) — the collect loop
+    reads pagination cursors and totals off it by dotted path.
+    """
+
+    kind: CollectionKind
+    records: NewRecords
+    envelope: dict[str, Any]
+    document: Any = None
+
+
+async def parse_structured(
+    body: str, content_type: str, items_path: str | None = None
+) -> ParsedBody | None:
+    """Sniff and parse; None means "keep the old truncation".
+
+    An explicit `items_path` (the record's `response.items_path`) overrides
+    the unwrap heuristic — the author knows where the records live better
+    than any guess about single-array envelopes.
+    """
     declared = content_type.lower()
     if any(marker in declared for marker in CSV_CONTENT_MARKERS):
         return await asyncio.to_thread(_parse_csv, body)
@@ -161,10 +190,145 @@ async def _parse(
             value = json.loads(body)
     except ValueError:
         return None  # declared JSON that does not parse: the head is more honest
+    return _take_apart(value, items_path)
+
+
+def _take_apart(value: Any, items_path: str | None) -> ParsedBody | None:  # noqa: ANN401
+    if items_path is not None:
+        found = dotted_get(value, items_path)
+        if not isinstance(found, list):
+            return None  # the declared path missed; the raw head is more honest
+        return ParsedBody(
+            kind=CollectionKind.JSON,
+            records=_as_records(found),
+            envelope=_scalars_of(value),
+            document=value,
+        )
     records, envelope = _unwrap(value)
     if records is None:
         return None
-    return CollectionKind.JSON, records, envelope
+    return ParsedBody(kind=CollectionKind.JSON, records=records, envelope=envelope, document=value)
+
+
+def dotted_get(value: Any, path: str) -> Any:  # noqa: ANN401 — parsed JSON in and out
+    """Resolve a dotted path inside parsed JSON; None when any step misses."""
+    node = value
+    for part in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def shape_records(records: NewRecords, fields: Mapping[str, FieldCoercion]) -> NewRecords:
+    """Apply a record's declared projection and coercions.
+
+    With fields declared, only they survive (declared-but-absent ones are
+    simply absent); a value that refuses its coercion stays as it came, and
+    the derived schema then tells the truth about it.
+    """
+    if not fields:
+        return records
+    shaped = [
+        {name: _coerce(payload[name], kind) for name, kind in fields.items() if name in payload}
+        for payload in records.payloads
+    ]
+    return NewRecords(payloads=shaped, source=records.source)
+
+
+def _coerce(value: Any, kind: FieldCoercion) -> Any:  # noqa: ANN401 — parsed JSON in and out
+    if kind is FieldCoercion.NUMBER and isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return value
+        return int(number) if number.is_integer() else number
+    if kind is FieldCoercion.STRING and value is not None and not isinstance(value, str):
+        structured = isinstance(value, dict | list)
+        return json.dumps(value, ensure_ascii=False) if structured else str(value)
+    if kind is FieldCoercion.BOOLEAN and isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes"):
+            return True
+        if lowered in ("false", "0", "no"):
+            return False
+    return value
+
+
+class CollectionSink:
+    """Accumulates batches into one collection, created on the first batch.
+
+    The collect loop and the `into:` path both pour through this: it carries
+    the merged schema across batches (the store replaces, so somebody must
+    remember) and hides create-vs-append from the caller. `into` starts from
+    the existing collection's schema, which is what makes records from a
+    DIFFERENT endpoint mergeable — the join happens in the database later.
+    """
+
+    def __init__(
+        self,
+        spill: ResponseSpill,
+        owner_id: str,
+        source: str,
+        label: str = "",
+        into: str | None = None,
+    ) -> None:
+        self._spill = spill
+        self._owner_id = owner_id
+        self._source = source
+        self._label = label
+        self._collection_id = into
+        self._started_from_existing = into is not None
+        self._schema: dict[str, Any] | None = None
+        self._kind = CollectionKind.JSON
+        self.record_count = 0
+
+    async def add(self, parsed: ParsedBody, byte_size: int) -> None:
+        """Store one batch under this sink's source tag."""
+        batch = NewRecords(payloads=parsed.records.payloads, source=self._source)
+        if self._schema is None and self._started_from_existing:
+            assert self._collection_id is not None
+            existing = await self._spill.store.passport(self._owner_id, self._collection_id)
+            self._schema = existing.schema
+        merged = merge_nodes(self._schema, infer_records(batch.payloads))
+        store = self._spill.store
+        if self._collection_id is None:
+            passport = await store.create(
+                owner_id=self._owner_id,
+                label=self._label,
+                kind=parsed.kind,
+                source=self._source,
+                schema=merged,
+                envelope=parsed.envelope,
+                records=batch,
+                byte_size=byte_size,
+                truncated=False,
+                expires_at=self._spill.expiry(),
+            )
+            self._collection_id = passport.id
+        else:
+            await store.append(
+                self._owner_id,
+                self._collection_id,
+                batch,
+                schema=merged,
+                byte_size=byte_size,
+                expires_at=self._spill.expiry(),
+            )
+        self._schema = merged
+        self.record_count += len(batch.payloads)
+
+    async def finish(self, truncated: bool) -> CollectionPassport | None:
+        """The final passport (None when nothing was ever added).
+
+        `truncated` is persisted: a later `collection_get` must still say the
+        counts reflect what arrived, not what the API holds.
+        """
+        if self._collection_id is None:
+            return None
+        if truncated:
+            await self._spill.store.mark_truncated(self._owner_id, self._collection_id)
+        return await self._spill.store.passport(self._owner_id, self._collection_id)
 
 
 def _unwrap(value: Any) -> tuple[NewRecords | None, dict[str, Any]]:  # noqa: ANN401 — parsed JSON
@@ -185,14 +349,19 @@ def _unwrap(value: Any) -> tuple[NewRecords | None, dict[str, Any]]:  # noqa: AN
         ]
         if len(arrays) == 1:
             key = arrays[0]
-            envelope = {
-                name: member
-                for name, member in value.items()
-                if name != key and not isinstance(member, dict | list)
-            }
-            return _as_records(value[key]), envelope
+            return _as_records(value[key]), _scalars_of(value, except_key=key)
         return NewRecords(payloads=[value]), {}
     return None, {}
+
+
+def _scalars_of(value: Any, except_key: str | None = None) -> dict[str, Any]:  # noqa: ANN401
+    if not isinstance(value, dict):
+        return {}
+    return {
+        name: member
+        for name, member in value.items()
+        if name != except_key and not isinstance(member, dict | list)
+    }
 
 
 def _as_records(items: list[Any]) -> NewRecords:
@@ -202,8 +371,8 @@ def _as_records(items: list[Any]) -> NewRecords:
     return NewRecords(payloads=payloads)
 
 
-def _parse_csv(body: str) -> tuple[CollectionKind, NewRecords, dict[str, Any]] | None:
-    """Header-first CSV into records; values stay strings (coercion is phase 2)."""
+def _parse_csv(body: str) -> ParsedBody | None:
+    """Header-first CSV into records; values stay strings until coercions apply."""
     sample = body[:4096]
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
@@ -218,4 +387,4 @@ def _parse_csv(body: str) -> tuple[CollectionKind, NewRecords, dict[str, Any]] |
         {header[i]: cell for i, cell in enumerate(row) if i < len(header)}
         for row in rows[1 : MAX_RECORDS + 1]
     ]
-    return CollectionKind.CSV, NewRecords(payloads=payloads), {}
+    return ParsedBody(kind=CollectionKind.CSV, records=NewRecords(payloads=payloads), envelope={})
