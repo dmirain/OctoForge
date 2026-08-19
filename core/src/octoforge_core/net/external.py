@@ -36,6 +36,7 @@ import httpx
 
 from octoforge_core.config import DEFAULT_TIMEOUT_SECONDS
 from octoforge_core.instructions.api import InstructionService, InstructionType
+from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.errors import ExternalCallError
 from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
 from octoforge_core.net.tool_spec import (
@@ -199,6 +200,7 @@ class ExternalCallExecutor:
         credentials: CallCredentials | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         delegates: Mapping[str, KindCallDelegate] | None = None,
+        spill: ResponseSpill | None = None,
     ) -> None:
         resolved = credentials if credentials is not None else CallCredentials()
         self._service = service
@@ -209,6 +211,8 @@ class ExternalCallExecutor:
         self._secrets = resolved.secrets
         self._user_params = resolved.user_params
         self._delegates = dict(delegates or {})
+        # None: oversized structured bodies keep the truncation below
+        self._spill = spill
 
     async def execute(
         self,
@@ -274,20 +278,44 @@ class ExternalCallExecutor:
             ) as response:
                 raw, truncated = await read_capped_text(response, MAX_BODY_BYTES)
                 status = response.status_code
+                content_type = response.headers.get("content-type", "")
         except httpx.HTTPError as exc:
             # the exception text can carry the request URL, secrets included
             raise ExternalCallError(
                 f"external call failed: {_scrub(str(exc), secrets.values())}"
             ) from exc
-        result = _truncate(_scrub(raw, secrets.values()))
-        if truncated and not result.endswith(TRUNCATED_SUFFIX):
-            result += TRUNCATED_SUFFIX
+        scrubbed = _scrub(raw, secrets.values())
+        result = await self._spill_or_truncate(scrubbed, content_type, name, user_id, truncated)
         if status in UNAUTHENTICATED_STATUSES and not secrets:
             # a bare 401/403 reads as "wrong credential" and sends the model
             # guessing at the value; when the record attached none at all,
             # say so — that is a one-step fix in the record, not a mystery
             result += NO_CREDENTIAL_HINT
         return ExternalCallResult(status=status, body=result)
+
+    async def _spill_or_truncate(
+        self, scrubbed: str, content_type: str, name: str, user_id: str | None, truncated: bool
+    ) -> str:
+        """A collection passport for a big structured body, truncation otherwise.
+
+        The spill sees only the scrubbed text: whatever lands in the store is
+        exactly what the model may see, so a later query can never resurrect
+        a secret the response echoed.
+        """
+        if self._spill is not None and user_id is not None:
+            passport = await self._spill.spill(
+                owner_id=user_id,
+                body=scrubbed,
+                content_type=content_type,
+                source=f"endpoint:{name}",
+                wire_truncated=truncated,
+            )
+            if passport is not None:
+                return passport
+        result = _truncate(scrubbed)
+        if truncated and not result.endswith(TRUNCATED_SUFFIX):
+            result += TRUNCATED_SUFFIX
+        return result
 
     async def _user_values(self, plan: _RenderPlan, user_id: str | None) -> dict[str, str]:
         """The `{user.*}` values of this call, keyed by full field name."""

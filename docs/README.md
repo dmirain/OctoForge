@@ -52,6 +52,8 @@ failure modes, code anchors.
 - [reference/memory.md](reference/memory.md) — per-user memories
 - [reference/mcp.md](reference/mcp.md) — external MCP servers as records: `mcp_add`, tool mirrors,
   the periodic sync
+- [reference/collections.md](reference/collections.md) — large structured responses as queryable
+  collections: the spill, the passport, the query DSL over jsonb
 - [reference/endpoints-and-net.md](reference/endpoints-and-net.md) — outbound HTTP: `http_request`,
   `endpoint_get`, `external_call`, the SSRF guard
 - [reference/secrets.md](reference/secrets.md) — the encrypted per-user secret store

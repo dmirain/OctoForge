@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Self
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -11,6 +12,7 @@ from octoforge_core.instructions.api import (
     InstructionService,
     InstructionType,
 )
+from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.errors import EgressBlockedError
 from octoforge_core.net.external import ExternalCallExecutor, read_capped_text
 from octoforge_core.net.guard import SsrfGuard, matches_url_prefix
@@ -196,11 +198,14 @@ class HttpRequestTool:
         guard: SsrfGuard,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         allowed_origins: tuple[str, ...] = (),
+        spill: ResponseSpill | None = None,
     ) -> None:
         self._http = http_client
         self._guard = guard
         self._timeout = timeout_seconds
         self._allowed_origins = allowed_origins
+        # None: oversized structured bodies keep the truncation below
+        self._spill = spill
 
     @property
     def spec(self) -> ToolSpec:
@@ -230,6 +235,17 @@ class HttpRequestTool:
             timeout=self._timeout,
         ) as response:
             body, truncated = await read_capped_text(response, MAX_RESPONSE_BYTES)
+            content_type = response.headers.get("content-type", "")
+        if self._spill is not None:
+            passport = await self._spill.spill(
+                owner_id=context.user_id,
+                body=body,
+                content_type=content_type,
+                source=f"http:{urlsplit(params.url).hostname or ''}",
+                wire_truncated=truncated,
+            )
+            if passport is not None:
+                return f"HTTP {response.status_code}\n{passport}"
         if len(body) > MAX_RESPONSE_CHARS:
             body = body[:MAX_RESPONSE_CHARS] + TRUNCATED_SUFFIX
         elif truncated:

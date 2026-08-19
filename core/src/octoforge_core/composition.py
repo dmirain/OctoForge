@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.collecting import CollectingSweeper, CollectionPromoter
 from octoforge_core.agent.loop import DEFAULT_TOOL_TIMEOUT_SECONDS, AgentLoop
@@ -67,6 +67,11 @@ from octoforge_core.llm.openai import OpenAICompatibleClient
 from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.memory.tools import MemoryDeleteTool, MemoryStoreTool
+from octoforge_core.net.collections.api import CollectionConfig
+from octoforge_core.net.collections.engine import PostgresCollectionQueryEngine
+from octoforge_core.net.collections.ingest import ResponseSpill
+from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
+from octoforge_core.net.collections.tools import CollectionGetTool, CollectionQueryTool
 from octoforge_core.net.external import CallCredentials, ExternalCallExecutor, KindCallDelegate
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool, HttpRequestTool
@@ -138,6 +143,42 @@ class ToolServices:
     secret_list: Tool | None = None
     # pre-filled secrets-form links; None without secrets or a web surface
     secret_link: Tool | None = None
+    # the collections feature (Postgres only); None keeps plain truncation
+    collections: "CollectionsRuntime | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionsRuntime:
+    """The collections feature assembled: the spill and its tools.
+
+    Built by `build_collections`, which answers None off Postgres — the query
+    engine compiles to jsonb SQL and has no other implementation, so the
+    honest degradation is the feature's absence, not a slower copy of it.
+    """
+
+    store: SqlAlchemyCollectionStore
+    spill: ResponseSpill
+    query_tool: CollectionQueryTool
+    get_tool: CollectionGetTool
+
+
+def build_collections(
+    engine: AsyncEngine,
+    session_factory: async_sessionmaker[AsyncSession],
+    config: CollectionConfig,
+) -> CollectionsRuntime | None:
+    """Assemble the collections feature where the database can carry it."""
+    if engine.dialect.name != "postgresql":
+        return None
+    store = SqlAlchemyCollectionStore(session_factory, config)
+    return CollectionsRuntime(
+        store=store,
+        spill=ResponseSpill(store, config),
+        query_tool=CollectionQueryTool(
+            PostgresCollectionQueryEngine(session_factory, config), config
+        ),
+        get_tool=CollectionGetTool(store),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,17 +304,20 @@ def build_dataset_service(
     return LocalDatasetService(store, embedder, limits=limits)
 
 
-def build_external_executor(
+def build_external_executor(  # noqa: PLR0913, PLR0917 — the composition facade takes every port
     service: InstructionService,
     http_client: httpx.AsyncClient,
     guard: SsrfGuard,
     credentials: CallCredentials | None = None,
     delegates: Mapping[str, KindCallDelegate] | None = None,
+    spill: ResponseSpill | None = None,
 ) -> ExternalCallExecutor:
     """Build the executor of external calls described by tool records.
 
     `delegates` maps a record content `kind` to its executor (today: the MCP
     mirror delegate); records without a kind take the classic HTTP path.
+    `spill` turns oversized structured bodies into collections; None keeps
+    plain truncation.
     """
     return ExternalCallExecutor(
         service=service,
@@ -281,6 +325,7 @@ def build_external_executor(
         guard=guard,
         credentials=credentials,
         delegates=delegates,
+        spill=spill,
     )
 
 
@@ -302,8 +347,11 @@ def build_tool_registry(  # noqa: PLR0913, PLR0917 — the composition facade ta
     needed here.
     """
     registry = ToolRegistry()
-    _register_core_tools(registry, outbound_http, guard, stores, limits, limit_gate)
+    _register_core_tools(registry, outbound_http, guard, stores, limits, limit_gate, services)
     registry.register(ImageLookTool(meter=limit_gate))
+    if services.collections is not None:
+        registry.register(services.collections.query_tool)
+        registry.register(services.collections.get_tool)
     if services.search_provider is not None:
         registry.register(WebSearchTool(provider=services.search_provider))
     if services.mcp_add is not None:
@@ -439,13 +487,16 @@ def _register_core_tools(  # noqa: PLR0913, PLR0917 — internal registrar mirro
     stores: ToolStores,
     limits: ToolLimits,
     limit_gate: LimitGate | None = None,
+    services: ToolServices | None = None,
 ) -> None:
     """Register the HTTP and deferred-work (task/cron) tools."""
+    collections = services.collections if services is not None else None
     registry.register(
         HttpRequestTool(
             http_client=outbound_http,
             guard=guard,
             allowed_origins=limits.http_request_allowed_origins,
+            spill=collections.spill if collections is not None else None,
         )
     )
     registry.register(AskUserTool())

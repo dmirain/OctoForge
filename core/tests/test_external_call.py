@@ -9,12 +9,16 @@ from http import HTTPStatus
 import httpx
 import pytest
 
+from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
     Instruction,
     InstructionNotFoundError,
     InstructionType,
     SearchHit,
 )
+from octoforge_core.net.collections.api import CollectionConfig
+from octoforge_core.net.collections.ingest import ResponseSpill
+from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.errors import ExternalCallError, SsrfBlockedError, ToolSpecError
 from octoforge_core.net.external import (
     MAX_BODY_CHARS,
@@ -174,6 +178,7 @@ class ExecutorOptions:
     allowed_prefixes: tuple[str, ...] = ()
     secrets: SecretStore | None = None
     user_params: UserParamStore | None = None
+    spill: ResponseSpill | None = None
 
 
 def make_executor(
@@ -196,6 +201,7 @@ def make_executor(
             secrets=resolved.secrets,
             user_params=resolved.user_params,
         ),
+        spill=resolved.spill,
     )
 
 
@@ -1332,3 +1338,56 @@ def test_an_unknown_param_type_names_the_ones_that_exist() -> None:
 
     with pytest.raises(ToolSpecError, match="string, path, host"):
         parse_tool_spec(content)
+
+
+# --- the spill: big structured bodies become collections ----------------------
+
+
+BIG_JSON_BODY = json.dumps({"items": [{"id": index, "t": "x" * 20} for index in range(200)]})
+
+
+async def test_a_big_json_answer_comes_back_as_a_passport() -> None:
+    """The whole point: the model gets the shape and a ref, not 8000 chars."""
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    spill = ResponseSpill(
+        SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+    )
+    executor = make_executor(ok_handler(BIG_JSON_BODY), options=ExecutorOptions(spill=spill))
+
+    result = await executor.execute(TOOL_NAME, {"city": "London"}, user_id=USER_A)
+
+    assert "col:" in result.body
+    assert "200 records" in result.body
+    assert "…[truncated]" not in result.body
+    await engine.dispose()
+
+
+async def test_without_a_user_the_spill_stands_down() -> None:
+    """No user, no owner: collections are personal, truncation is not."""
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    spill = ResponseSpill(
+        SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+    )
+    executor = make_executor(ok_handler(BIG_JSON_BODY), options=ExecutorOptions(spill=spill))
+
+    result = await executor.execute(TOOL_NAME, {"city": "London"}, user_id=None)
+
+    assert "col:" not in result.body
+    assert result.body.endswith("...[truncated]")
+    await engine.dispose()
+
+
+async def test_a_small_json_answer_stays_inline_with_a_spill_wired() -> None:
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    spill = ResponseSpill(
+        SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+    )
+    executor = make_executor(ok_handler('{"ok": true}'), options=ExecutorOptions(spill=spill))
+
+    result = await executor.execute(TOOL_NAME, {"city": "London"}, user_id=USER_A)
+
+    assert result.body == '{"ok": true}'
+    await engine.dispose()

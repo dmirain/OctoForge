@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from octoforge_core.mcp.api import McpClient, McpError, McpServer, McpServerStore, parse_mirror
+from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.errors import ExternalCallError
 from octoforge_core.net.external import (
     MAX_BODY_CHARS,
@@ -48,10 +49,13 @@ class McpMirrorCallExecutor:
         store: McpServerStore,
         client: McpClient,
         secrets: SecretStore | None = None,
+        spill: ResponseSpill | None = None,
     ) -> None:
         self._store = store
         self._client = client
         self._secrets = secrets
+        # None: oversized structured results keep the truncation below
+        self._spill = spill
 
     async def execute(
         self, content: str, params: dict[str, Any], user_id: str | None
@@ -82,7 +86,19 @@ class McpMirrorCallExecutor:
                 f"MCP call failed: {exc}; {STALE_MIRROR_HINT}; "
                 f"the tool declares this contract: {content}"
             ) from exc
-        body = _truncate(_scrub(result.text, secret))
+        scrubbed = _scrub(result.text, secret)
+        body: str | None = None
+        if self._spill is not None and user_id is not None and not result.is_error:
+            # MCP results carry no content-type; the spill sniffs JSON itself
+            body = await self._spill.spill(
+                owner_id=user_id,
+                body=scrubbed,
+                content_type="",
+                source=f"mcp:{mirror.server}/{mirror.tool}",
+                wire_truncated=False,
+            )
+        if body is None:
+            body = _truncate(scrubbed)
         if result.is_error:
             body = TOOL_ERROR_TEMPLATE.format(text=body, contract=content)
         # status 0: no HTTP status worth showing — the tool renders body alone

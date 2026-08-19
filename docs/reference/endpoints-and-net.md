@@ -127,8 +127,11 @@ is exactly `"headers": {"Authorization": "Bearer {secret.gmail_token}"}`.
    `OF_EXTERNAL_CALL_AUTH_WHITELIST`, then the record's secret-bearing headers — so a plain record
    header never shadows a credential;
 10. perform the request with `follow_redirects=False`;
-11. truncate the response body to 8000 characters and scrub any echo of every resolved secret —
-    both the sent and the stored form — before returning it.
+11. scrub any echo of every resolved secret — both the sent and the stored form — then hand the
+    body to the collections spill: an oversized structured body (JSON, CSV) becomes a queryable
+    collection and the model receives its passport instead (see
+    [collections.md](collections.md)); anything the spill declines (small, unstructured, or the
+    installation is not on Postgres) is truncated to 8000 characters as before.
 
 Substitution of `user.*` and `secret.*` values happens **only** in the record's own templates —
 never in agent-supplied parameter values, which would hand a prompt-injected agent an exfiltration
@@ -181,8 +184,10 @@ rebinding). Closing it means connecting by resolved IP with an explicit `Host` h
   context or the logs.
 - **Redirects are never followed.**
 - **Every outbound URL goes through the guard**, except explicitly allowlisted origins.
-- **Response bodies are truncated** so one call cannot flood the context: 8000 characters for
-  `external_call`, 4000 for `http_request`.
+- **One call cannot flood the context.** A big structured body becomes a collection the model
+  queries in the database ([collections.md](collections.md)); everything else is truncated —
+  8000 characters for `external_call`, 4000 for `http_request`. The spill sees only the scrubbed
+  text, so a stored body can never resurrect a secret.
 
 ## Configuration
 

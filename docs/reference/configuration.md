@@ -130,6 +130,12 @@ and dataset search are unavailable — the system-record sync is skipped too.
 | `OF_DATASETS_QUERY_DEFAULT_LIMIT` | `50` | Default `data_query` page size |
 | `OF_DATASETS_QUERY_MAX_LIMIT` | `200` | Maximum it will return |
 | `OF_MCP_SYNC_INTERVAL_SECONDS` | `3600.0` | How often the MCP mirror sync re-lists every registered server's tools — see [mcp.md](mcp.md) |
+| `OF_COLLECTIONS_INLINE_MAX_CHARS` | `2000` | Response bodies at or under this stay inline; bigger structured ones become collections (Postgres only) — see [collections.md](collections.md) |
+| `OF_COLLECTIONS_TTL_SECONDS` | `3600.0` | How long a collection lives past its last touch |
+| `OF_COLLECTIONS_MAX_PER_USER` | `20` | Per-user collection count quota (LRU eviction over it) |
+| `OF_COLLECTIONS_MAX_MB_PER_USER` | `50` | Per-user collection byte quota, same eviction |
+| `OF_COLLECTIONS_QUERY_MAX_LIMIT` | `500` | Page-size ceiling of `collection_query` |
+| `OF_COLLECTIONS_SWEEP_INTERVAL_SECONDS` | `300.0` | How often expired collections are dropped |
 
 ## Secrets
 

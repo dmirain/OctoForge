@@ -52,6 +52,7 @@ from octoforge_core.composition import (
     ToolLimits,
     ToolServices,
     ToolStores,
+    build_collections,
 )
 from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
 from octoforge_core.context.compactor import CompactorConfig
@@ -96,6 +97,9 @@ from octoforge_core.mcp.sync import McpSyncLoop, McpToolSync
 from octoforge_core.mcp.tools import McpAddTool
 from octoforge_core.media.api import MediaResult, MediaUnderstanding
 from octoforge_core.media.service import MediaService
+from octoforge_core.net.collections.api import CollectionConfig
+from octoforge_core.net.collections.ingest import ResponseSpill
+from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.external import CallCredentials, ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.params.store import SqlAlchemyUserParamStore
@@ -302,6 +306,12 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             # target our loopback HTTP API (cron jobs) past the SSRF guard.
             guard = SsrfGuard(allowed_prefixes=(settings.self_base_url,))
             summary_store = build_summary_store(session_factory, lexical_search=lexical_backend)
+            # Postgres-only: elsewhere None, and every response keeps the old
+            # truncation — the capability pattern, decided here and nowhere else
+            collections_runtime = build_collections(
+                engine, session_factory, _collections_config(settings)
+            )
+            spill = collections_runtime.spill if collections_runtime is not None else None
             mcp = _build_mcp(
                 _McpDeps(
                     session_factory=session_factory,
@@ -310,6 +320,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     instructions=instructions,
                     secret_store=secret_store,
                     llm=llm_client,
+                    spill=spill,
                 )
             )
             registry = build_tool_registry(
@@ -324,6 +335,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 services=ToolServices(
                     instructions=instructions,
                     datasets=datasets,
+                    collections=collections_runtime,
                     executor=build_external_executor(
                         service=instructions,
                         http_client=outbound_http,
@@ -334,6 +346,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                             user_params=user_params,
                         ),
                         delegates={MIRROR_KIND: mcp.call_delegate},
+                        spill=spill,
                     ),
                     search_provider=_build_search_provider(settings, outbound_http),
                     mcp_add=mcp.add_tool,
@@ -444,6 +457,11 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                 _start_cron_scheduler(cron_store, manager, settings),
                 _start_collecting_sweeper(exchanges, dialogs, manager, settings),
                 _start_mcp_sync(mcp.sync, settings),
+                *(
+                    (_start_collections_sweeper(collections_runtime.store, settings),)
+                    if collections_runtime is not None
+                    else ()
+                ),
             )
             await _start_surfaces(surfaces)
             try:
@@ -871,6 +889,40 @@ def _build_search_provider(
     return SerperSearchProvider(http_client=outbound_http, api_key=settings.serper_token)
 
 
+def _collections_config(settings: Settings) -> CollectionConfig:
+    """Map the settings' collections knobs to the core config bundle."""
+    return CollectionConfig(
+        ttl_seconds=settings.collections_ttl_seconds,
+        max_per_user=settings.collections_max_per_user,
+        max_bytes_per_user=settings.collections_max_mb_per_user * 1024 * 1024,
+        query_max_limit=settings.collections_query_max_limit,
+        inline_max_chars=settings.collections_inline_max_chars,
+    )
+
+
+def _start_collections_sweeper(
+    store: SqlAlchemyCollectionStore, settings: Settings
+) -> asyncio.Task[None]:
+    """Drop expired collections on a timer.
+
+    Started only in assemblies where `build_collections` answered — the
+    sweep is the TTL's other half, and a TTL nobody enforces is a quota
+    that only ever grows.
+    """
+
+    async def run() -> None:
+        while True:
+            await asyncio.sleep(settings.collections_sweep_interval_seconds)
+            try:
+                dropped = await store.delete_expired()
+                if dropped:
+                    logger.info("collections sweep: %d expired dropped", dropped)
+            except Exception:
+                logger.exception("collections sweep failed; retrying next interval")
+
+    return asyncio.create_task(run())
+
+
 def _tool_limits(settings: Settings) -> ToolLimits:
     """Map the settings' tool limit fields to the core ToolLimits bundle."""
     return ToolLimits(
@@ -953,6 +1005,8 @@ class _McpDeps:
     # the group-skill generator's model: the crawler that turns a server's
     # tool list into one usage skill (or logs the shape it cannot classify)
     llm: LLMClient
+    # oversized structured results become collections; None = truncation
+    spill: ResponseSpill | None = None
 
 
 def _build_mcp(deps: _McpDeps) -> _McpRuntime:
@@ -968,7 +1022,7 @@ def _build_mcp(deps: _McpDeps) -> _McpRuntime:
     )
     return _McpRuntime(
         sync=sync,
-        call_delegate=McpMirrorCallExecutor(store, client, deps.secret_store),
+        call_delegate=McpMirrorCallExecutor(store, client, deps.secret_store, spill=deps.spill),
         add_tool=McpAddTool(store, sync, deps.guard, secrets=deps.secret_store),
     )
 

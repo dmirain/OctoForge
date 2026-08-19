@@ -28,6 +28,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from octoforge_core.composition import build_collections
 from octoforge_core.context.pg_store import PostgresSummaryStore
 from octoforge_core.cron.api import CronJob
 from octoforge_core.cron.store import SqlAlchemyCronStore
@@ -60,6 +61,20 @@ from octoforge_core.instructions.api import (
 )
 from octoforge_core.instructions.pg_store import PostgresInstructionStore
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
+from octoforge_core.net.collections.api import (
+    CollectionConfig,
+    CollectionKind,
+    CollectionNotFoundError,
+    CollectionQueryError,
+    FilterOp,
+    FilterPredicate,
+    NewRecords,
+    Query,
+    QueryOp,
+)
+from octoforge_core.net.collections.engine import PostgresCollectionQueryEngine
+from octoforge_core.net.collections.schema_infer import infer_records
+from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.settings.api import max_active_users
 from octoforge_core.settings.store import SqlAlchemySettingsStore
 from octoforge_core.tariffs.api import (
@@ -934,3 +949,209 @@ async def test_settings_roundtrip(session_factory: async_sessionmaker[AsyncSessi
 
     await store.delete("max_active_users")
     assert await max_active_users(store) is None
+
+
+# --- collections: the jsonb query engine --------------------------------------
+#
+# The engine compiles the op-DSL into `payload #>> path` SQL and exists ONLY on
+# Postgres — which is precisely why its behavior is asserted here and nowhere
+# else: SQLite cannot even parse these statements.
+
+CONTRACTORS = [
+    {"id": 1, "name": "Alpha", "amount": 100.0, "status": "active", "region": "north"},
+    {"id": 2, "name": "Beta", "amount": 250.5, "status": "active", "region": "south"},
+    {"id": 3, "name": "Gamma", "amount": 50.0, "status": "closed", "region": "north"},
+    {"id": 4, "name": "Delta", "amount": 300.0, "status": "active", "region": "north"},
+]
+ACTIVE_TOTAL = 650.5
+NORTH_TOTAL = 450.0
+COLLECTION_OWNER = "person-collections"
+
+
+async def _contractor_collection(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[SqlAlchemyCollectionStore, str]:
+    store = SqlAlchemyCollectionStore(session_factory)
+    passport = await store.create(
+        owner_id=COLLECTION_OWNER,
+        label="contractors",
+        kind=CollectionKind.JSON,
+        source="endpoint:crm",
+        schema=infer_records(CONTRACTORS),
+        envelope={},
+        records=NewRecords(payloads=CONTRACTORS, source="endpoint:crm"),
+        byte_size=1000,
+        truncated=False,
+        expires_at=utc_now() + timedelta(hours=1),
+    )
+    return store, passport.id
+
+
+async def test_collections_sum_filter_and_group_by(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The contractor scenario: aggregate in the database, not in context."""
+    _, ref = await _contractor_collection(session_factory)
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    total = await engine_.execute(
+        COLLECTION_OWNER,
+        ref,
+        Query(
+            op=QueryOp.SUM,
+            field="amount",
+            filters=(FilterPredicate(field="status", op=FilterOp.EQ, value="active"),),
+        ),
+    )
+    grouped = await engine_.execute(
+        COLLECTION_OWNER, ref, Query(op=QueryOp.SUM, field="amount", group_by="region")
+    )
+
+    assert total.rows == [ACTIVE_TOTAL]
+    by_region = {row["group"]: row["value"] for row in grouped.rows}
+    assert by_region["north"] == NORTH_TOTAL
+    assert grouped.total == len(by_region)
+
+
+async def test_collections_pluck_pages_in_element_order(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _, ref = await _contractor_collection(session_factory)
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    page = await engine_.execute(
+        COLLECTION_OWNER, ref, Query(op=QueryOp.PLUCK, field="name", limit=2, offset=1)
+    )
+
+    assert page.rows == ["Beta", "Gamma"]
+    assert page.total == len(CONTRACTORS)
+
+
+async def test_collections_numeric_filter_compares_as_numbers(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """'90' > '250.5' as text; the schema's number type must pick the cast."""
+    _, ref = await _contractor_collection(session_factory)
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    result = await engine_.execute(
+        COLLECTION_OWNER,
+        ref,
+        Query(
+            op=QueryOp.COUNT,
+            filters=(FilterPredicate(field="amount", op=FilterOp.GT, value=90),),
+        ),
+    )
+
+    assert result.rows == [3]
+
+
+async def test_collections_get_and_distinct(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _, ref = await _contractor_collection(session_factory)
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    records = await engine_.execute(COLLECTION_OWNER, ref, Query(op=QueryOp.GET, limit=1))
+    statuses = await engine_.execute(
+        COLLECTION_OWNER, ref, Query(op=QueryOp.DISTINCT, field="status")
+    )
+
+    assert records.rows == [CONTRACTORS[0]]
+    assert sorted(statuses.rows) == ["active", "closed"]
+
+
+async def test_collections_unknown_field_lists_the_real_ones(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The self-correction contract: the error carries what does exist."""
+    _, ref = await _contractor_collection(session_factory)
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    with pytest.raises(CollectionQueryError) as failure:
+        await engine_.execute(COLLECTION_OWNER, ref, Query(op=QueryOp.PLUCK, field="price"))
+
+    assert "amount" in str(failure.value)
+
+
+async def test_collections_sum_over_a_string_field_is_refused_with_the_remedy(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _, ref = await _contractor_collection(session_factory)
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    with pytest.raises(CollectionQueryError) as failure:
+        await engine_.execute(COLLECTION_OWNER, ref, Query(op=QueryOp.SUM, field="name"))
+
+    assert "response section" in str(failure.value)
+
+
+async def test_collections_are_walled_per_owner_and_expiry(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _, ref = await _contractor_collection(session_factory)
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    with pytest.raises(CollectionNotFoundError):
+        await engine_.execute("somebody-else", ref, Query(op=QueryOp.COUNT))
+
+
+async def test_collections_source_tag_narrows_a_merged_collection(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Records appended from another endpoint are queryable apart (the join stub)."""
+    store, ref = await _contractor_collection(session_factory)
+    contacts = [{"contractor_id": 1, "email": "a@x"}, {"contractor_id": 2, "email": "b@x"}]
+    merged_schema = infer_records(CONTRACTORS + contacts)
+    await store.append(
+        COLLECTION_OWNER,
+        ref,
+        NewRecords(payloads=contacts, source="endpoint:contacts"),
+        schema=merged_schema,
+        byte_size=100,
+        expires_at=utc_now() + timedelta(hours=1),
+    )
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    contacts_only = await engine_.execute(
+        COLLECTION_OWNER, ref, Query(op=QueryOp.COUNT, source="endpoint:contacts")
+    )
+    everything = await engine_.execute(COLLECTION_OWNER, ref, Query(op=QueryOp.COUNT))
+
+    assert contacts_only.rows == [2]
+    assert everything.rows == [len(CONTRACTORS) + 2]
+
+
+async def test_collections_dotted_paths_reach_nested_fields(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = SqlAlchemyCollectionStore(session_factory)
+    nested = [{"owner": {"city": "SPb"}}, {"owner": {"city": "Kazan"}}, {"owner": {"city": "SPb"}}]
+    passport = await store.create(
+        owner_id=COLLECTION_OWNER,
+        label="",
+        kind=CollectionKind.JSON,
+        source="endpoint:crm",
+        schema=infer_records(nested),
+        envelope={},
+        records=NewRecords(payloads=nested),
+        byte_size=100,
+        truncated=False,
+        expires_at=utc_now() + timedelta(hours=1),
+    )
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    grouped = await engine_.execute(
+        COLLECTION_OWNER, passport.id, Query(op=QueryOp.COUNT, group_by="owner.city")
+    )
+
+    assert {row["group"]: row["value"] for row in grouped.rows} == {"SPb": 2, "Kazan": 1}
+
+
+async def test_collections_feature_is_built_on_postgres(
+    engine: AsyncEngine, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """The composition-root capability check: here, and only here, it answers."""
+    runtime = build_collections(engine, session_factory, CollectionConfig())
+    assert runtime is not None
+    assert runtime.query_tool.spec.name == "collection_query"

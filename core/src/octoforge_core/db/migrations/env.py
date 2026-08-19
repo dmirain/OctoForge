@@ -27,6 +27,7 @@ import octoforge_core.identity.models  # noqa: E402,F401
 import octoforge_core.tasks.models  # noqa: E402,F401
 import octoforge_core.instructions.models  # noqa: E402,F401
 import octoforge_core.mcp.models  # noqa: E402,F401
+import octoforge_core.net.collections.models  # noqa: E402,F401
 import octoforge_core.params.models  # noqa: E402,F401
 import octoforge_core.secrets.models  # noqa: E402,F401
 import octoforge_core.settings.models  # noqa: E402,F401
