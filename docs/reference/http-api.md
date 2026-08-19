@@ -29,6 +29,19 @@ given a dialog of its own. A per-request channel is what lets one process serve 
 instead of needing a separate fleet for each. A dialog is created
 on first contact.
 
+### Identity endpoints
+
+| Method and path | Purpose |
+|---|---|
+| `PUT /api/identity/profile` | Mirror what a surface currently calls an account. Body: `name`, `username`. Selected by `X-User-Id`/`X-Channel` like a dialog; mints the person on first contact and answers `204` |
+
+This is how the out-of-process Telegram ingestion node names its people: names key on people, and
+that node cannot key anything by person. Deliberately **no status gate** — a person still waiting is
+precisely the one whose name the operator needs in the console's queue, and recording a name burns
+no model call, so there is nothing for a banned account to abuse. The identity's name follows the
+surface on every call; the person's own `users.name` is seeded only while still empty (see
+`core/src/octoforge_core/identity/api.py`).
+
 Submitting is deliberately asynchronous: the message is accepted, and the answer arrives on the event
 stream. A retry with an already-seen `client_message_id` is accepted and skipped, so a flaky network does
 not double-run anything.
@@ -101,8 +114,9 @@ The password is stored as a PBKDF2-HMAC-SHA256 hash in the format `pbkdf2_sha256
 (`:` rather than `$` because docker compose interpolates `$` in `.env`), verified in constant time. An
 empty hash answers **503** — it fails closed, never open.
 
-A second credential (`OF_SERVICE_USERNAME` / `OF_SERVICE_PASSWORD_HASH`) opens `/api/dialog/*` and
-nothing else. It exists so a process that merely relays a surface's traffic — the Telegram ingestion
+A second credential (`OF_SERVICE_USERNAME` / `OF_SERVICE_PASSWORD_HASH`) opens the relay's own
+traffic — `/api/dialog/*`, `/api/media/*` and `PUT /api/identity/profile` — and nothing else. It
+exists so a process that merely relays a surface's traffic — the Telegram ingestion
 node — need not carry operator power: a compromise there must not become a compromise of the console,
 the instructions and the secret store. Each credential has its own verification cache, so one verified
 on a dialog request cannot satisfy an admin one. Leaving it unset turns it off.
@@ -154,6 +168,7 @@ string: front the deployment with a proxy that authenticates people and sets tha
 
 - `deploy/src/octoforge_deploy/main.py` — `create_app()`, the middleware gate, health probes, static mounts
 - `server/src/octoforge_server/api/dialog.py` — messages, cancel, SSE
+- `server/src/octoforge_server/api/identity.py` — the profile mirror
 - `server/src/octoforge_server/api/sse.py` — frame encoding and event payloads
 - `server/src/octoforge_server/api/cron.py`, `surfaces/console/src/octoforge_console/routes.py`, `api/secrets.py` — the other routers
 - `server/src/octoforge_server/api/schemas.py` — request and response models

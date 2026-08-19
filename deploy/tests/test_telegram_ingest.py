@@ -12,12 +12,14 @@ import httpx
 import pytest
 from fastapi import HTTPException, Request
 from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
-from octoforge_server.auth import AuthGate, hash_password
+from octoforge_server.auth import AuthGate, allows_service_credential, hash_password
 from octoforge_server.config import Settings
 from octoforge_telegram.config import TelegramSettings
 from octoforge_telegram.gateway import (
+    PROFILE_PATH,
     AccessRefusedError,
     ApiGatewayRegistry,
+    ApiProfileMirror,
     basic_auth_header,
 )
 from octoforge_telegram.ingest import __main__ as ingest_main
@@ -86,6 +88,46 @@ async def test_forwarded_material_and_files_survive_the_boundary() -> None:
     assert body["kind"] == MessageKind.MATERIAL.value
     assert body["origin"] == "Иван"
     assert body["attachments"] == [{"kind": "image", "ref": "tgfile:abc"}]
+
+
+async def test_the_node_mirrors_the_senders_profile_to_the_service() -> None:
+    """Names key on people, and this process cannot key anything by person —
+    so the profile crosses the boundary like the messages do: account id in
+    the header, resolution on the service. Before this, everyone admitted
+    through a split deployment stayed a bare id in the console forever."""
+    seen: list[httpx.Request] = []
+    async with recording_client(seen) as client:
+        await ApiProfileMirror(client).update_profile(
+            "telegram", str(CHAT_ID), "Alice Smith", "alice"
+        )
+
+    assert seen[0].method == "PUT"
+    assert seen[0].url.path == PROFILE_PATH
+    assert seen[0].headers["X-User-Id"] == str(CHAT_ID)
+    assert seen[0].headers["X-Channel"] == "telegram"
+    assert json.loads(seen[0].content) == {"name": "Alice Smith", "username": "alice"}
+
+
+async def test_the_profile_path_is_one_the_nodes_credential_opens() -> None:
+    """The mirror is only as real as the gate's willingness to let it in: a
+    path the service credential cannot open turns every profile into a 401
+    nobody is watching (the credential-hash incident, in path form)."""
+    assert allows_service_credential(PROFILE_PATH)
+
+
+async def test_the_node_is_assembled_with_the_profile_mirror() -> None:
+    """Wiring, not behavior: `_record_member` mirrors only when the option is
+    there, so a node assembled without it degrades silently to bare ids."""
+    settings = Settings(service_username=SERVICE_USER, service_password=SERVICE_PASSWORD)
+    telegram = TelegramSettings(
+        telegram_bot_token="123:abc",
+        telegram_service_url="http://balancer",
+        telegram_database_url="sqlite+aiosqlite:///:memory:",
+    )
+    async with AsyncExitStack() as stack:
+        poller = await _build(stack, settings, telegram)
+
+    assert isinstance(poller._identities, ApiProfileMirror)
 
 
 async def test_the_node_carries_a_credential() -> None:

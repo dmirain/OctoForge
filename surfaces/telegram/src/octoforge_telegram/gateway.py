@@ -27,6 +27,7 @@ from octoforge_telegram.client import TELEGRAM_CHANNEL, USER_ID_PREFIX
 logger = logging.getLogger(__name__)
 
 MESSAGES_PATH = "/api/dialog/messages"
+PROFILE_PATH = "/api/identity/profile"
 USER_ID_HEADER = "X-User-Id"
 CHANNEL_HEADER = "X-Channel"
 #: What the service names the status behind a 403 (`octoforge_server.deps`).
@@ -131,6 +132,31 @@ class ApiDialogGateway:
         refusal = response.headers.get(ACCESS_STATUS_HEADER)
         if response.status_code == httpx.codes.FORBIDDEN and refusal:
             raise AccessRefusedError(refusal)
+        response.raise_for_status()
+
+
+class ApiProfileMirror:
+    """The core profile mirror, reached over HTTP (`ProfileMirror`).
+
+    The ingestion node knows what Telegram calls a sender but cannot write it
+    anywhere that matters — names key on people, and it has no core database.
+    So it sends the profile the same way it sends the messages: account id in
+    the header, and the service resolves the person on its own side. Before
+    this existed, everyone admitted through a split deployment stayed a bare
+    id in the console forever.
+    """
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self._client = client
+
+    async def update_profile(
+        self, surface: str, external_id: str, name: str, username: str | None
+    ) -> None:
+        response = await self._client.put(
+            PROFILE_PATH,
+            json={"name": name, "username": username},
+            headers={USER_ID_HEADER: external_id, CHANNEL_HEADER: surface},
+        )
         response.raise_for_status()
 
 

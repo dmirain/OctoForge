@@ -65,9 +65,11 @@ OPEN_PATHS = frozenset({"/health", "/health/ready", "/secrets.html"})
 OPEN_PREFIXES = ("/api/secrets/",)
 
 #: Paths the service credential may open — submitting, cancelling and
-#: watching a dialog, plus asking the core to understand a picture or a
-#: recording on a user's behalf. Everything else stays operator-only.
-SERVICE_PREFIXES = ("/api/dialog/", "/api/media/")
+#: watching a dialog, asking the core to understand a picture or a recording
+#: on a user's behalf, and mirroring what the surface calls its sender. The
+#: profile path is listed in full: the rest of `/api/identity/` (if it ever
+#: grows) stays operator-only by default. Everything else stays operator-only.
+SERVICE_PREFIXES = ("/api/dialog/", "/api/media/", "/api/identity/profile")
 
 # Cross-site request forgery, in the shape Basic auth allows: a browser holding
 # the operator credential attaches it to every request to this origin, including

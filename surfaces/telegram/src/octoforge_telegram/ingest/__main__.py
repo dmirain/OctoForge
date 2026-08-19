@@ -31,7 +31,7 @@ from octoforge_server.secret_links import SecretLinkService, secrets_link_builde
 
 from octoforge_telegram.client import TELEGRAM_CHANNEL, TelegramBotClient
 from octoforge_telegram.config import TelegramSettings
-from octoforge_telegram.gateway import ApiGatewayRegistry, basic_auth_header
+from octoforge_telegram.gateway import ApiGatewayRegistry, ApiProfileMirror, basic_auth_header
 from octoforge_telegram.invites.store import (
     SqlAlchemyInviteStore,
     SqlAlchemyMemberDirectory,
@@ -204,6 +204,10 @@ async def _build(
             poll_timeout_seconds=telegram.telegram_poll_timeout_seconds,
             membership=membership,
             directory=SqlAlchemyMemberDirectory(session_factory),
+            # this node cannot name a person itself, so the mirror posts the
+            # profile to the service; without it everyone admitted through a
+            # split deployment stayed a bare id in the console
+            identities=ApiProfileMirror(service),
             media=media,
             voice_max_seconds=telegram.voice_max_seconds,
             secrets_link=_secrets_link(settings),

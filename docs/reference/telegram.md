@@ -127,10 +127,13 @@ and no Alembic chain — invites are a Telegram-specific concept and core knows 
 
 Past the gate, every message upserts the sender's profile (name, `@username`) into a members table, so the
 console and the `admin_manage` tool can show who a `tg:<id>` actually is and which invite they came through.
-When the poller runs in-process it also pushes that profile into the identity store: the identity's
-`name`/`username` follow the Telegram profile, and a person whose `users.name` is still empty is christened
-by it. The standalone ingestion node cannot do this — it has no identity store — so in the split
-arrangement identity names refresh only from the pod side.
+The same profile is pushed into the identity store: the identity's `name`/`username` follow the
+Telegram profile, and a person whose `users.name` is still empty is christened by it — on the very
+first contact, since the mirror mints the person if nothing else has yet. In-process the poller
+writes the store directly; the standalone ingestion node cannot (it has no identity store), so it
+posts the profile to the service (`PUT /api/identity/profile`, see [http-api.md](http-api.md)),
+which resolves the account into a person on its own side. Before that endpoint existed, everyone
+admitted through a split deployment stayed a bare id in the console.
 
 ### Commands and the admin tool
 

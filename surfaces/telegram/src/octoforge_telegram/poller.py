@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Protocol
 
 import httpx
 from octoforge_core.agent.runner import ConversationRunner
@@ -384,6 +385,23 @@ class _Inbox:
     busy: bool = False
 
 
+class ProfileMirror(Protocol):
+    """Where the surface reports what it currently calls a sender.
+
+    The narrow slice of the identity port this loop actually needs — which is
+    what lets the split arrangement satisfy it over HTTP: the ingestion node
+    holds no core database, so its implementation posts to the service, and
+    the service (the only side that can key anything by person) does the
+    mirroring. In-process the identity store itself fits, structurally.
+    """
+
+    async def update_profile(
+        self, surface: str, external_id: str, name: str, username: str | None
+    ) -> None:
+        """Mirror the surface profile of one account."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramPollerOptions:
     """Behavior knobs of the poller beyond its two collaborators.
@@ -404,7 +422,7 @@ class TelegramPollerOptions:
     directory: MemberDirectory | None = None
     # the same mirror pushed into core: the identity's name/username follow
     # the Telegram profile, and a person still unnamed is christened by it
-    identities: IdentityStore | None = None
+    identities: ProfileMirror | None = None
     # Turns a picture or a recording into text — through the core, where the
     # plan check and the usage ledger live. None means this deployment does
     # no media understanding at all: pictures keep the placeholder path and
@@ -1059,9 +1077,17 @@ class TelegramPoller:
                 logger.exception("member profile record failed: user=%s", user_id)
         if self._identities is not None:
             try:
+                external_id = user_id.removeprefix(USER_ID_PREFIX)
+                # The person has to exist before the mirror can write to them:
+                # on first contact this runs before anything else has minted
+                # one, and a profile recorded into the void left every
+                # newcomer a bare id until their second message. In-process
+                # `person_of` mints; over HTTP it is an echo and the service
+                # mints when the profile arrives.
+                await self._registry.person_of(external_id)
                 await self._identities.update_profile(
                     TELEGRAM_CHANNEL,
-                    user_id.removeprefix(USER_ID_PREFIX),
+                    external_id,
                     display_name(user),
                     user.username,
                 )

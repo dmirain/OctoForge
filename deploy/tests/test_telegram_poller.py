@@ -987,13 +987,15 @@ async def test_gated_member_profile_reaches_the_identity(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """The identity's name/username follow the Telegram profile, and a person
-    still unnamed is christened by it."""
+    still unnamed is christened by it — on the very FIRST contact. Nothing has
+    minted the person when the mirror runs, so the mirror mints them itself;
+    written as a plain update it was a silent no-op and every newcomer stayed
+    a bare id in the console until their second message."""
     manager = await make_manager(
         [ChatMessage(role=MessageRole.ASSISTANT, content=REPLY)], session_factory
     )
     client = FakeTelegramClient()
     identities = SqlAlchemyIdentityStore(session_factory)
-    person = await identities.resolve_or_create(CHANNEL, str(TELEGRAM_USER_ID))
     registry = TelegramBridgeRegistry(
         runner_provider=manager.get_or_create_runner,
         client=client,
@@ -1024,7 +1026,7 @@ async def test_gated_member_profile_reaches_the_identity(
     identity = await identities.find_by_identity(CHANNEL, str(TELEGRAM_USER_ID))
     assert identity is not None
     assert (identity.name, identity.username) == ("Alice Smith", "alice")
-    assert (await identities.get_user(person)).name == "Alice Smith"
+    assert (await identities.get_user(identity.user_id)).name == "Alice Smith"
     await manager.stop_all()
 
 
