@@ -12,7 +12,7 @@ thing for ISO dates, where lexical and chronological order agree.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sqlalchemy import Text, bindparam, text
@@ -23,6 +23,7 @@ from octoforge_core.db.unit_of_work import read_session
 from octoforge_core.net.collections.api import (
     AGGREGATE_OPS,
     FIELD_OPS,
+    JOIN_OPS,
     NUMERIC_OPS,
     CollectionConfig,
     CollectionNotFoundError,
@@ -88,7 +89,12 @@ class PostgresCollectionQueryEngine:
         """Validate against the derived schema, compile, run."""
         async with read_session(self._session_factory) as session:
             schema = await self._record_schema(session, owner_id, collection_id)
-            plan = _validate(query, schema, self._config)
+            right_schema: dict[str, Any] | None = None
+            if query.join is not None:
+                # the same lookup as the left side: ownership and expiry are
+                # checked for BOTH collections, a stranger's ref answers not-found
+                right_schema = await self._record_schema(session, owner_id, query.join.ref)
+            plan = _validate(query, schema, right_schema, self._config)
             main = _compile(plan, schema, collection_id)
             rows = [tuple(row) for row in (await session.execute(_statement(main))).all()]
             total = await self._total(session, plan, schema, collection_id, len(rows))
@@ -144,8 +150,13 @@ def _statement(compiled: _Compiled) -> Any:  # noqa: ANN401 — SQLAlchemy's exe
     return statement.bindparams(*binds)
 
 
-def _validate(query: Query, schema: dict[str, Any], config: CollectionConfig) -> Query:
-    """Check every named field against the schema; clamp the page size."""
+def _validate(
+    query: Query,
+    schema: dict[str, Any],
+    right_schema: dict[str, Any] | None,
+    config: CollectionConfig,
+) -> Query:
+    """Check every named field against its side's schema; clamp the page size."""
     if query.op in FIELD_OPS:
         if query.field is None:
             raise CollectionQueryError(f"'{query.op.value}' needs a field")
@@ -154,21 +165,20 @@ def _validate(query: Query, schema: dict[str, Any], config: CollectionConfig) ->
         if query.op not in AGGREGATE_OPS:
             raise CollectionQueryError("group_by combines only with count/sum/avg/min/max")
         _require_field(schema, query.group_by)
+    if query.join is not None:
+        if query.op.value not in JOIN_OPS:
+            allowed = ", ".join(sorted(JOIN_OPS))
+            raise CollectionQueryError(f"join combines only with: {allowed}")
+        assert right_schema is not None  # the caller fetched it alongside
+        _require_field(schema, query.join.on_left)
+        _require_field(right_schema, query.join.on_right)
     for predicate in query.filters:
         _require_field(schema, predicate.field)
     limit = min(max(query.limit, 1), config.query_max_limit)
     offset = max(query.offset, 0)
     if limit == query.limit and offset == query.offset:
         return query
-    return Query(
-        op=query.op,
-        field=query.field,
-        filters=query.filters,
-        group_by=query.group_by,
-        source=query.source,
-        limit=limit,
-        offset=offset,
-    )
+    return replace(query, limit=limit, offset=offset)
 
 
 def _require_field(schema: dict[str, Any], path: str, numeric_for: QueryOp | None = None) -> None:
@@ -208,27 +218,36 @@ def _is_numeric(schema: dict[str, Any], dotted: str) -> bool:
     return node is not None and node.get("type") == TYPE_NUMBER
 
 
-def _where(plan: Query, collection_id: str, params: _Params, schema: dict[str, Any]) -> str:
-    parts = [f"collection_id = {params.value(collection_id)}"]
+def _where(
+    plan: Query,
+    collection_id: str,
+    params: _Params,
+    schema: dict[str, Any],
+    alias: str = "",
+) -> str:
+    prefix = f"{alias}." if alias else ""
+    parts = [f"{prefix}collection_id = {params.value(collection_id)}"]
     if plan.source is not None:
-        parts.append(f"source = {params.value(plan.source)}")
+        parts.append(f"{prefix}source = {params.value(plan.source)}")
     for predicate in plan.filters:
-        parts.append(_predicate_sql(predicate, params, schema))
+        parts.append(_predicate_sql(predicate, params, schema, prefix))
     return " AND ".join(parts)
 
 
-def _predicate_sql(predicate: FilterPredicate, params: _Params, schema: dict[str, Any]) -> str:
+def _predicate_sql(
+    predicate: FilterPredicate, params: _Params, schema: dict[str, Any], prefix: str = ""
+) -> str:
     node = field_node(schema, predicate.field)
     numeric = node is not None and node.get("type") == TYPE_NUMBER
     if predicate.value is None:
-        column = f"payload #>> {params.path(predicate.field)}"
+        column = f"{prefix}payload #>> {params.path(predicate.field)}"
         if predicate.op is FilterOp.EQ:
             return f"{column} IS NULL"
         if predicate.op is FilterOp.NE:
             return f"{column} IS NOT NULL"
         raise CollectionQueryError(f"'{predicate.op.value}' cannot compare with null")
     if predicate.op is FilterOp.CONTAINS:
-        column = f"payload #>> {params.path(predicate.field)}"
+        column = f"{prefix}payload #>> {params.path(predicate.field)}"
         return f"{column} ILIKE {params.value(f'%{predicate.value}%')}"
     comparison = COMPARISONS[predicate.op]
     if (
@@ -236,9 +255,9 @@ def _predicate_sql(predicate: FilterPredicate, params: _Params, schema: dict[str
         and isinstance(predicate.value, int | float)
         and not isinstance(predicate.value, bool)
     ):
-        column = f"(payload #>> {params.path(predicate.field)})::numeric"
+        column = f"({prefix}payload #>> {params.path(predicate.field)})::numeric"
         return f"{column} {comparison} {params.value(predicate.value)}"
-    column = f"payload #>> {params.path(predicate.field)}"
+    column = f"{prefix}payload #>> {params.path(predicate.field)}"
     rendered = (
         str(predicate.value).lower() if isinstance(predicate.value, bool) else str(predicate.value)
     )
@@ -253,6 +272,8 @@ def _compile(plan: Query, schema: dict[str, Any], collection_id: str) -> _Compil
     statement.
     """
     params = _Params()
+    if plan.join is not None:
+        return _compile_join(plan, schema, collection_id, params)
     where = _where(plan, collection_id, params, schema)
     if plan.op is QueryOp.GET:
         sql = (
@@ -287,6 +308,40 @@ def _page(plan: Query, params: _Params) -> str:
     return f"LIMIT {params.value(plan.limit)} OFFSET {params.value(plan.offset)}"
 
 
+def _join_clause(plan: Query, params: _Params) -> str:
+    """The JOIN … ON of both join statements; filters stay on the left side."""
+    assert plan.join is not None  # callers branched on it
+    condition = (
+        f"b.collection_id = {params.value(plan.join.ref)} "
+        f"AND b.payload #>> {params.path(plan.join.on_right)} = "
+        f"a.payload #>> {params.path(plan.join.on_left)}"
+    )
+    if plan.join.source is not None:
+        condition += f" AND b.source = {params.value(plan.join.source)}"
+    return f"JOIN collection_records b ON {condition}"
+
+
+def _compile_join(
+    plan: Query, schema: dict[str, Any], collection_id: str, params: _Params
+) -> _Compiled:
+    """Pairs of (left, right) records on field equality — SQL, not context.
+
+    Equality compares the fields' text forms (`#>>`), which is what ids are;
+    an inner join by design — a left record without a match is reachable as
+    plain `get`, and pairing is exactly what was asked for.
+    """
+    join = _join_clause(plan, params)
+    where = _where(plan, collection_id, params, schema, alias="a")
+    if plan.op is QueryOp.COUNT:
+        sql = f"SELECT count(*) FROM collection_records a {join} WHERE {where}"
+    else:
+        sql = (
+            f"SELECT a.payload, b.payload FROM collection_records a {join} "
+            f"WHERE {where} ORDER BY a.position, b.position {_page(plan, params)}"
+        )
+    return _Compiled(sql=sql, params=params.values, array_params=tuple(params.arrays))
+
+
 def _aggregate_sql(plan: Query, schema: dict[str, Any], params: _Params) -> str:
     if plan.op is QueryOp.COUNT:
         return "count(*)"
@@ -300,6 +355,11 @@ def _aggregate_sql(plan: Query, schema: dict[str, Any], params: _Params) -> str:
 def _compile_count(plan: Query, schema: dict[str, Any], collection_id: str) -> _Compiled:
     """COUNT of everything the main statement would return without paging."""
     params = _Params()
+    if plan.join is not None:
+        join = _join_clause(plan, params)
+        where = _where(plan, collection_id, params, schema, alias="a")
+        sql = f"SELECT count(*) FROM collection_records a {join} WHERE {where}"
+        return _Compiled(sql=sql, params=params.values, array_params=tuple(params.arrays))
     where = _where(plan, collection_id, params, schema)
     if plan.op is QueryOp.DISTINCT:
         assert plan.field is not None
@@ -319,6 +379,8 @@ def _shape_rows(plan: Query, rows: list[tuple[Any, ...]]) -> list[Any]:
     registers json codecs on every connection, raw `text()` statements
     included — so GET/PLUCK/DISTINCT values pass through untouched.
     """
+    if plan.join is not None and plan.op is QueryOp.GET:
+        return [{"left": row[0], "right": row[1]} for row in rows]
     if plan.op in (QueryOp.GET, QueryOp.PLUCK, QueryOp.DISTINCT):
         return [row[0] for row in rows]
     if plan.group_by is not None:

@@ -11,6 +11,7 @@ from octoforge_core.net.collections.api import (
     CollectionStore,
     FilterOp,
     FilterPredicate,
+    JoinSpec,
     Query,
     QueryEngine,
     QueryOp,
@@ -76,6 +77,24 @@ QUERY_SCHEMA: dict[str, Any] = {
         "source": {
             "type": "string",
             "description": "Only records that arrived from this source tag",
+        },
+        "join": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Right-hand collection (col:…)"},
+                "on_left": {"type": "string", "description": "Left record field"},
+                "on_right": {"type": "string", "description": "Right record field it must equal"},
+                "source": {
+                    "type": "string",
+                    "description": "Only right records of this source tag",
+                },
+            },
+            "required": ["ref", "on_left", "on_right"],
+            "description": (
+                "Pair every record with its matches from another collection (or the "
+                "same one, told apart by source) on field equality — the join runs "
+                "in the database. Combines with get (pairs) and count"
+            ),
         },
         "limit": {"type": "integer", "description": "Rows per page"},
         "offset": {"type": "integer", "description": "Rows to skip (paging)"},
@@ -170,8 +189,31 @@ def _parse_query(arguments: dict[str, Any], config: CollectionConfig) -> Query:
         filters=_parse_filters(arguments.get("filters")),
         group_by=group_by,
         source=source,
+        join=_parse_join(arguments.get("join")),
         limit=_parse_int(arguments.get("limit"), config.query_default_limit, "limit"),
         offset=_parse_int(arguments.get("offset"), 0, "offset"),
+    )
+
+
+def _parse_join(raw: object) -> JoinSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ToolArgumentsError("join must be an object: {ref, on_left, on_right, source?}")
+    ref = raw.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        raise ToolArgumentsError("join.ref must be a collection ref like 'col:…'")
+    on_left, on_right = raw.get("on_left"), raw.get("on_right")
+    if not isinstance(on_left, str) or not isinstance(on_right, str):
+        raise ToolArgumentsError("join.on_left and join.on_right must be field paths")
+    source = raw.get("source")
+    if source is not None and not isinstance(source, str):
+        raise ToolArgumentsError("join.source must be a string")
+    return JoinSpec(
+        ref=ref.strip().removeprefix(REF_PREFIX),
+        on_left=on_left,
+        on_right=on_right,
+        source=source,
     )
 
 

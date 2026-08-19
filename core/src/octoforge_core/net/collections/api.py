@@ -97,6 +97,30 @@ class FilterPredicate:
 
 
 @dataclass(frozen=True, slots=True)
+class JoinSpec:
+    """An equality join against a second record set.
+
+    `ref` may be another collection or the SAME one (then `source` usually
+    tells the two record kinds apart). The join is the point of `into:` —
+    records fetched from two endpoints meet in the database, not in the
+    context window.
+    """
+
+    #: The right-hand collection (a bare id; the tool strips `col:`).
+    ref: str
+    #: Left record field that must equal…
+    on_left: str
+    #: …this right record field.
+    on_right: str
+    #: Restrict the right side to records of this source tag.
+    source: str | None = None
+
+
+#: Operations a join combines with (row-shaped plus the plain count).
+JOIN_OPS = frozenset({"get", "count"})
+
+
+@dataclass(frozen=True, slots=True)
 class Query:
     """A validated query over one collection's records."""
 
@@ -108,6 +132,8 @@ class Query:
     group_by: str | None = None
     #: Restrict to records carrying this source tag (multi-endpoint collections).
     source: str | None = None
+    #: Pair every (filtered) record with matches from a second set.
+    join: JoinSpec | None = None
     limit: int = DEFAULT_QUERY_LIMIT
     offset: int = 0
 

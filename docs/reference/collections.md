@@ -90,6 +90,12 @@ and everything else in the statement comes from fixed vocabularies. The schema p
 semantics — `number` fields cast to numeric, everything else compares as text (which does the right
 thing for ISO dates).
 
+`join` pairs every (filtered) record with its matches from a second collection — or the same one,
+told apart by `source` — on field equality: `{ref, on_left, on_right, source?}`. It combines with
+`get` (rows come back as `{left, right}` pairs) and `count`; both sides' refs are checked for
+ownership and expiry, both join fields against their side's schema. An inner join by design: a
+record without a match is reachable as plain `get`, and pairing is exactly what was asked for.
+
 `collection_get(ref)` re-reads the passport — the schema reminder after context compaction.
 
 ### Lifecycle

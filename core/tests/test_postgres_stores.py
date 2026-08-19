@@ -68,6 +68,7 @@ from octoforge_core.net.collections.api import (
     CollectionQueryError,
     FilterOp,
     FilterPredicate,
+    JoinSpec,
     NewRecords,
     Query,
     QueryOp,
@@ -1155,3 +1156,98 @@ async def test_collections_feature_is_built_on_postgres(
     runtime = build_collections(engine, session_factory, CollectionConfig())
     assert runtime is not None
     assert runtime.query_tool.spec.name == "collection_query"
+
+
+CONTACTS = [
+    {"contractor_id": 1, "email": "alpha@x"},
+    {"contractor_id": 1, "email": "alpha2@x"},
+    {"contractor_id": 3, "email": "gamma@x"},
+]
+
+
+async def test_collections_join_pairs_records_across_collections(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Contractors from one endpoint, contacts from another: the join runs in
+    SQL and answers pairs — never a megabyte of both through the context."""
+    store, left_ref = await _contractor_collection(session_factory)
+    right = await store.create(
+        owner_id=COLLECTION_OWNER,
+        label="contacts",
+        kind=CollectionKind.JSON,
+        source="endpoint:contacts",
+        schema=infer_records(CONTACTS),
+        envelope={},
+        records=NewRecords(payloads=CONTACTS, source="endpoint:contacts"),
+        byte_size=300,
+        truncated=False,
+        expires_at=utc_now() + timedelta(hours=1),
+    )
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    pairs = await engine_.execute(
+        COLLECTION_OWNER,
+        left_ref,
+        Query(
+            op=QueryOp.GET,
+            join=JoinSpec(ref=right.id, on_left="id", on_right="contractor_id"),
+            filters=(FilterPredicate(field="status", op=FilterOp.EQ, value="active"),),
+        ),
+    )
+    counted = await engine_.execute(
+        COLLECTION_OWNER,
+        left_ref,
+        Query(
+            op=QueryOp.COUNT, join=JoinSpec(ref=right.id, on_left="id", on_right="contractor_id")
+        ),
+    )
+
+    # Alpha (active, id=1) matches two contacts; Gamma is filtered out (closed)
+    assert [(row["left"]["name"], row["right"]["email"]) for row in pairs.rows] == [
+        ("Alpha", "alpha@x"),
+        ("Alpha", "alpha2@x"),
+    ]
+    assert pairs.total == len(pairs.rows)
+    assert counted.rows == [len(CONTACTS)]  # unfiltered: both Alpha contacts plus Gamma's
+
+
+async def test_collections_join_validates_both_sides(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store, left_ref = await _contractor_collection(session_factory)
+    right = await store.create(
+        owner_id=COLLECTION_OWNER,
+        label="",
+        kind=CollectionKind.JSON,
+        source="endpoint:contacts",
+        schema=infer_records(CONTACTS),
+        envelope={},
+        records=NewRecords(payloads=CONTACTS),
+        byte_size=300,
+        truncated=False,
+        expires_at=utc_now() + timedelta(hours=1),
+    )
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+
+    with pytest.raises(CollectionQueryError, match="contractor_id"):
+        await engine_.execute(
+            COLLECTION_OWNER,
+            left_ref,
+            Query(op=QueryOp.GET, join=JoinSpec(ref=right.id, on_left="id", on_right="wrong")),
+        )
+    with pytest.raises(CollectionQueryError, match="join combines only"):
+        await engine_.execute(
+            COLLECTION_OWNER,
+            left_ref,
+            Query(
+                op=QueryOp.SUM,
+                field="amount",
+                join=JoinSpec(ref=right.id, on_left="id", on_right="contractor_id"),
+            ),
+        )
+    with pytest.raises(CollectionNotFoundError):
+        await engine_.execute(
+            COLLECTION_OWNER,
+            left_ref,
+            Query(op=QueryOp.GET, join=JoinSpec(ref="ghost", on_left="id", on_right="x")),
+        )
