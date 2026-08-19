@@ -239,8 +239,17 @@ class TelegramMembership:
     async def _claim(self, code: str, user_id: str) -> MembershipDecision:
         try:
             await self._invites.claim(code, user_id)
-        except (InviteAlreadyClaimedError, InviteExpiredError, InviteNotFoundError):
+        except (InviteAlreadyClaimedError, InviteExpiredError, InviteNotFoundError) as refusal:
+            # same reason as the referral log: with the door open a refused
+            # code still admits, and the lost attribution is invisible in data
+            logger.warning(
+                "invite: %s presented code %r refused (%s)",
+                user_id,
+                code,
+                type(refusal).__name__,
+            )
             return MembershipDecision.DENY_INVITE_INVALID
+        logger.info("invite: %s claimed code %s", user_id, code)
         return MembershipDecision.ALLOW_WITH_WELCOME
 
     async def _claim_referral(self, code: str, user_id: str) -> MembershipDecision:
@@ -249,14 +258,32 @@ class TelegramMembership:
         Self-referral is invalid — a way in must not be mintable from
         inside one's own pocket; a member clicking somebody's link passes
         (they are a member) but their original attribution stands.
+
+        Every outcome is logged: attribution is the whole point of these
+        links, and with registration open a lost one is otherwise invisible —
+        the person is admitted either way, and the operator's map quietly
+        misses an edge. Zero recorded claims looked exactly like "nobody uses
+        the links" until it was this log's absence.
         """
         assert self._referrals is not None  # only called when wired
         owner = await self._referrals.owner_of(code)
         if owner is None or owner == user_id:
+            logger.warning(
+                "referral: %s presented %s code %r; no attribution",
+                user_id,
+                "their own" if owner is not None else "an unknown",
+                code,
+            )
             return MembershipDecision.DENY_INVITE_INVALID
         if await self._is_member(user_id):
+            logger.info(
+                "referral: member %s tapped a link of %s; existing attribution stands",
+                user_id,
+                owner,
+            )
             return MembershipDecision.ALLOW
         await self._referrals.record_claim(user_id, owner, code)
+        logger.info("referral: %s brought by %s (code %s)", user_id, owner, code)
         return MembershipDecision.ALLOW_WITH_WELCOME
 
 
@@ -1014,6 +1041,10 @@ class TelegramPoller:
         """Route an allowed text: surface commands first, then the dialog bridge."""
         if text == COMMAND_START or _start_code(text) is not None:
             if text == COMMAND_START:
+                # the counterpart of the gate's invite/referral log lines:
+                # together they answer how people actually arrive — a bare
+                # START is an entry no link can ever be credited for
+                logger.info("start: %s arrived bare — no invite payload", user_id)
                 await self._client.send_message(chat_id, GREETING_TEXT)
             return  # a successful claim was already welcomed by the gate
         if text.strip() == COMMAND_SECRETS:

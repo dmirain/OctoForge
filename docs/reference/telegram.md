@@ -120,7 +120,14 @@ and no Alembic chain — invites are a Telegram-specific concept and core knows 
   whom lands in `referral_claims`, shown in the console's Telegram tab — but a referral is **never
   a way past the active-user cap**: behind this gate the invitee queues like anyone else (see
   [access.md](access.md)). The first attribution stands forever, self-referral is invalid, and the
-  link never burns out.
+  link never burns out. Two Telegram-shaped caveats. A deep link delivers its payload **only on the
+  very first START** — someone who has already talked to the bot can tap the link all day and the
+  client sends nothing; the recovery is sending `/start ref_<code>` as ordinary text, which
+  attributes at any time (someone who walked in through the open door is nobody's yet, so a code
+  they send later still draws the edge). And with registration open a mangled code still admits,
+  which makes a lost attribution invisible in the data — so every referral outcome (claimed,
+  already-a-member, unknown code) is logged by the gate, and zero recorded claims should be read
+  against that log, not as "nobody uses the links".
 - Past this gate sits the **status gate**: `waiting` users get the queue notice (never a
   position), `banned` users a closed door, each at most once per day — see
   [access.md](access.md).

@@ -2059,6 +2059,65 @@ async def test_the_first_attribution_stands(
     assert claim.referrer_user_id == REFERRER_HANDLE  # who brought them first
 
 
+async def test_a_referral_still_attributes_when_registration_is_open(
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+) -> None:
+    """Open registration is how production runs: the door no longer limits
+    anything, so the ONLY thing a referral link does is draw the edge on the
+    operator's map — and that must not get lost in the open-door shortcut."""
+    invites, referrals = telegram_stores
+    code = await referrals.code_of(REFERRER_HANDLE)
+    membership = TelegramMembership(invites, [], referrals=referrals, open_registration=True)
+
+    decision = await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
+
+    assert decision is MembershipDecision.ALLOW_WITH_WELCOME
+    claim = await referrals.claim_of(USER_ID)
+    assert claim is not None
+    assert claim.referrer_user_id == REFERRER_HANDLE
+
+
+async def test_a_bare_entrant_can_be_attributed_later(
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+) -> None:
+    """Somebody who walked in through the open door is nobody's yet — so a
+    referral code they send afterwards still draws the edge. This is also the
+    recovery path for Telegram's own limitation: a deep link only delivers
+    its payload on the very first START, but `/start ref_<code>` sent as text
+    works at any time."""
+    invites, referrals = telegram_stores
+    code = await referrals.code_of(REFERRER_HANDLE)
+    membership = TelegramMembership(invites, [], referrals=referrals, open_registration=True)
+
+    bare = await membership.check(USER_ID, "привет")
+    later = await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
+
+    assert bare is MembershipDecision.ALLOW
+    assert later is MembershipDecision.ALLOW_WITH_WELCOME
+    claim = await referrals.claim_of(USER_ID)
+    assert claim is not None
+    assert claim.referrer_user_id == REFERRER_HANDLE
+
+
+async def test_a_lost_attribution_is_loud_when_the_door_is_open(
+    telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With the door open a bad code still admits — deliberately — which
+    makes a mangled link indistinguishable from a bare entry. The log line is
+    the only witness; twelve days of silently lost attributions looked
+    exactly like 'nobody uses the links'."""
+    invites, referrals = telegram_stores
+    membership = TelegramMembership(invites, [], referrals=referrals, open_registration=True)
+
+    with caplog.at_level(logging.WARNING, logger="octoforge_telegram.poller"):
+        decision = await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}mangled")
+
+    assert decision is MembershipDecision.ALLOW  # admitted anyway: the door is open
+    assert await referrals.claim_of(USER_ID) is None
+    assert any("no attribution" in record.message for record in caplog.records)
+
+
 async def test_invite_command_hands_out_a_stable_personal_link(
     telegram_stores: tuple[SqlAlchemyInviteStore, SqlAlchemyReferralStore],
 ) -> None:
