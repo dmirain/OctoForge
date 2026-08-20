@@ -326,6 +326,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     llm=llm_client,
                     spill=spill,
                     truncate_chars=settings.http_body_max_chars,
+                    max_response_bytes=settings.response_memory_max_mb * 1024 * 1024,
                 )
             )
             registry = build_tool_registry(
@@ -1048,12 +1049,16 @@ class _McpDeps:
     spill: ResponseSpill | None = None
     # the fallback cut for unspilled MCP results
     truncate_chars: int = 8000
+    # the wire ceiling of an MCP tool response; aligned with the response tiers
+    max_response_bytes: int = 2 * 1024 * 1024
 
 
 def _build_mcp(deps: _McpDeps) -> _McpRuntime:
     """Assemble the MCP module: shared servers, mirror sync, call delegate."""
     store = SqlAlchemyMcpServerStore(deps.session_factory)
-    client = StreamableHttpMcpClient(deps.outbound_http, deps.guard)
+    client = StreamableHttpMcpClient(
+        deps.outbound_http, deps.guard, max_response_bytes=deps.max_response_bytes
+    )
     sync = McpToolSync(
         store,
         client,

@@ -40,7 +40,7 @@ DEFAULT_GET_CHARS = 8000
 DEFAULT_GET_MAX_CHARS = 100_000
 #: Passport rendering above this body size runs off the event loop.
 RENDER_IN_THREAD_CHARS = 256 * 1024
-#: The longest pattern response_find accepts (a runaway-regex backstop).
+#: The longest search substring accepted; a longer one is a mistake, not a search.
 MAX_PATTERN_CHARS = 512
 #: Token-estimate sample for very long texts.
 ESTIMATE_SAMPLE_CHARS = 100_000
@@ -224,7 +224,7 @@ class ResponseMemory:
             last_access=utc_now().timestamp(),
         )
         self._items[item.id] = item
-        self._evict()
+        self._evict(owner_id)
         return item
 
     def get(self, owner_id: str, ref: str) -> StoredResponse:
@@ -263,12 +263,21 @@ class ResponseMemory:
         for key in doomed:
             del self._items[key]
 
-    def _evict(self) -> None:
-        while sum(len(item.body) for item in self._items.values()) > self._config.budget_chars:
-            oldest = min(self._items.values(), key=lambda item: item.last_access)
-            if len(self._items) == 1:
-                return  # a single over-budget tenant stays; evicting it helps nobody
+    def _evict(self, owner_id: str) -> None:
+        """Hold ONE owner under the budget by dropping their own oldest.
+
+        Per-owner, not global: the budget is each user's working-set cap, and
+        a global sweep would let one busy user evict another's in-flight
+        document — a cross-tenant availability hit. Mirrors the database
+        tier's own per-owner quota (`SqlAlchemyCollectionStore._evict_for`).
+        """
+        mine = [item for item in self._items.values() if item.owner_id == owner_id]
+        while sum(len(item.body) for item in mine) > self._config.budget_chars:
+            if len(mine) == 1:
+                return  # a single over-budget document stays; evicting it helps nobody
+            oldest = min(mine, key=lambda item: item.last_access)
             del self._items[oldest.id]
+            mine.remove(oldest)
 
 
 # --- the passport -------------------------------------------------------------
@@ -368,11 +377,12 @@ GET_DESCRIPTION = (
     "with response_find instead of reading."
 )
 FIND_DESCRIPTION = (
-    "Search inside a remembered response ('resp:…'): a regex (or literal text) "
-    "with a window of characters around every match. Answers the match count, and "
-    "each match carries its 'at' position — widen a specific spot with "
-    "response_window(at). Narrow the pattern rather than paging when there are "
-    "too many matches."
+    "Find a literal substring inside a remembered response ('resp:…'), "
+    "case-insensitive, with a window of characters around every occurrence. "
+    "Answers the total count, and each match carries its 'at' position — widen a "
+    "specific spot with response_window(at). Use a longer, more distinctive "
+    "substring rather than paging when there are too many matches. Not a regex: "
+    "pass the exact text you expect to see."
 )
 WINDOW_DESCRIPTION = (
     "A window of a remembered response ('resp:…') around a position that "
@@ -398,7 +408,10 @@ FIND_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "ref": {"type": "string", "description": "Response ref (resp:…)"},
-        "pattern": {"type": "string", "description": "Regex; an invalid one is taken literally"},
+        "pattern": {
+            "type": "string",
+            "description": "Literal text to find (case-insensitive); not a regex",
+        },
         "key": {
             "type": "string",
             "description": "Search inside this key's text instead of the whole body",
@@ -512,7 +525,7 @@ class ResponseFindTool(_MemoryToolBase):
         if len(pattern) > MAX_PATTERN_CHARS:
             raise ToolArgumentsError(
                 f"pattern is longer than {MAX_PATTERN_CHARS} chars; search for a "
-                "distinctive fragment instead"
+                "shorter distinctive fragment instead"
             )
         key = _parse_optional_str(arguments.get("key"), "key")
         before = _parse_positive(arguments.get("before"), FIND_DEFAULT_BEFORE, "before")
@@ -576,12 +589,23 @@ class ResponseWindowTool(_MemoryToolBase):
 
 
 def _find_positions(target: str, pattern: str) -> list[tuple[int, int]]:
-    """(start, end) of every match; an invalid regex is searched literally."""
-    try:
-        compiled = re.compile(pattern, re.IGNORECASE)
-    except re.error:
-        compiled = re.compile(re.escape(pattern), re.IGNORECASE)
-    return [(match.start(), match.end()) for match in compiled.finditer(target)]
+    """(start, end) of every case-insensitive LITERAL occurrence of `pattern`.
+
+    Deliberately not a regex: the pattern is model-written and reachable from
+    attacker-influenced content, and a regex engine on it is a
+    catastrophic-backtracking DoS that would burn a shared worker thread (the
+    same pool that runs password verification). A literal scan is O(n·m) with
+    no backtracking cliff, and covers what search actually needs — find this
+    string. `str.find` runs in C, so even a 2 MB body is cheap.
+    """
+    hay = target.lower()
+    needle = pattern.lower()
+    positions: list[tuple[int, int]] = []
+    start = hay.find(needle)
+    while start != -1:
+        positions.append((start, start + len(pattern)))
+        start = hay.find(needle, start + 1)
+    return positions
 
 
 def _merge_windows(windows: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:

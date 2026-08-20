@@ -36,8 +36,9 @@ CLIENT_INFO = {"name": "octoforge", "version": "1.0"}
 ACCEPT = "application/json, text/event-stream"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_DATA_PREFIX = "data:"
-#: Byte ceiling for any single response, tools/list included: a hostile
-#: server must not flood the sync (mirrors net/external.MAX_BODY_BYTES).
+#: Default byte ceiling for any single response, tools/list included: a
+#: hostile server must not flood the sync. The composition root overrides it
+#: to match the response tiers' wire ceiling (OF_RESPONSE_MEMORY_MAX_MB).
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 #: tools/list pagination is followed at most this far — a runaway server
 #: handing out endless cursors must terminate anyway.
@@ -54,10 +55,14 @@ class StreamableHttpMcpClient:
         http_client: httpx.AsyncClient,
         guard: SsrfGuard,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> None:
         self._http = http_client
         self._guard = guard
         self._timeout = timeout_seconds
+        # the wire ceiling; the composition root aligns it with the response
+        # tiers' OF_RESPONSE_MEMORY_MAX_MB so a raised ceiling applies here too
+        self._max_response_bytes = max_response_bytes
 
     async def list_tools(self, url: str, headers: dict[str, str]) -> McpToolDescriptorList:
         """Handshake and fetch the complete tool list, following pagination."""
@@ -155,7 +160,7 @@ class StreamableHttpMcpClient:
                 follow_redirects=False,  # a redirect would bypass the guard's URL check
                 timeout=self._timeout,
             ) as response:
-                body, truncated = await read_capped_text(response, MAX_RESPONSE_BYTES)
+                body, truncated = await read_capped_text(response, self._max_response_bytes)
                 status = response.status_code
                 content_type = response.headers.get("content-type", "")
                 session_id = response.headers.get(SESSION_ID_HEADER)

@@ -25,7 +25,13 @@ from octoforge_core.net.collections.api import (
     Query,
     QueryResult,
 )
-from octoforge_core.net.collections.ingest import ResponseSpill, render_passport
+from octoforge_core.net.collections.ingest import (
+    MAX_RECORDS,
+    ResponseSpill,
+    _take_apart,
+    parse_structured,
+    render_passport,
+)
 from octoforge_core.net.collections.schema_infer import (
     field_node,
     infer_records,
@@ -34,6 +40,7 @@ from octoforge_core.net.collections.schema_infer import (
 )
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.collections.tools import CollectionQueryTool
+from octoforge_core.net.response_memory import ResponseMemory, ResponseMemoryConfig
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 
@@ -333,3 +340,30 @@ async def test_query_result_size_is_the_models_choice() -> None:
     assert "raise max_chars" in modest and len(modest) < modest_bound
     assert len(deliberate) > len(modest)
     assert len(greedy) < ceiling_bound  # the ceiling held
+
+
+async def test_over_max_records_marks_the_collection_truncated(
+    store: SqlAlchemyCollectionStore,
+) -> None:
+    """A huge array under the byte limit must not report a complete count when
+    the record tail was dropped at MAX_RECORDS (bug A)."""
+    small_body = json.dumps([{"id": i} for i in range(5)])
+    parsed = await parse_structured(small_body, "application/json")
+    assert parsed is not None and parsed.record_truncated is False
+
+    # simulate the boundary without building a 100k-element body: the flag is
+    # derived from len(items) > MAX_RECORDS, checked directly
+    oversize = _take_apart(list(range(MAX_RECORDS + 1)), None)
+    assert oversize is not None and oversize.record_truncated is True
+    assert len(oversize.records.payloads) == MAX_RECORDS
+
+
+async def test_ram_budget_is_per_owner_not_global() -> None:
+    """One user's fetches must not evict another user's in-flight document."""
+    memory = ResponseMemory(ResponseMemoryConfig(budget_chars=3000))
+    theirs = memory.store("user-b", "task-b", "text", "src", "b" * 2000).ref
+    # user-a fills their OWN budget; user-b's document must survive
+    memory.store("user-a", "task-a", "text", "src", "a" * 2000)
+    memory.store("user-a", "task-a", "text", "src", "a" * 2000)
+
+    assert memory.get("user-b", theirs).body[0] == "b"

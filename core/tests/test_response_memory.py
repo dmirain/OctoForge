@@ -1,6 +1,7 @@
 """Task memory: the store, the passport's numbers, and the three verbs."""
 
 import json
+from urllib.parse import quote
 
 import pytest
 
@@ -12,6 +13,7 @@ from octoforge_core.net.collections.engine import PostgresCollectionQueryEngine
 from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.collections.tools import CollectionGetTool, CollectionQueryTool
+from octoforge_core.net.external import _scrub
 from octoforge_core.net.response_memory import (
     ResponseFindTool,
     ResponseGetTool,
@@ -21,6 +23,7 @@ from octoforge_core.net.response_memory import (
     ResponseWindowTool,
     estimate_tokens,
 )
+from octoforge_core.secrets.api import ResolvedSecret
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
 
@@ -402,3 +405,31 @@ async def test_build_response_layer_falls_back_to_ram_without_collections() -> N
 
     assert passport is not None and "resp:" in passport
     assert "lives until this task ends" in passport  # the RAM home's lifetime
+
+
+async def test_find_is_literal_not_regex_and_shrugs_off_a_redos_pattern() -> None:
+    """The pattern is model-written; a catastrophic-backtracking regex must be
+    a harmless literal miss, not a wedged worker thread (bug C)."""
+    memory = ResponseMemory()
+    item = memory.store(OWNER, SCOPE, "text", SOURCE, "a" * 5000 + " price: $10")
+    tool = ResponseFindTool(memory)
+
+    # a classic ReDoS trigger — as a LITERAL it simply is not present
+    evil = await tool.execute({"ref": item.ref, "pattern": "(a+)+$"}, make_context())
+    literal = await tool.execute({"ref": item.ref, "pattern": "price: $10"}, make_context())
+
+    assert "no matches" in evil  # taken literally, found nowhere
+    assert "1 match(es)" in literal  # the dollar and parens are just text
+
+
+def test_scrub_masks_the_percent_encoded_form_of_a_url_secret() -> None:
+    """A URL-placed secret rides the wire quoted; a server reflecting the raw
+    URL must not leak the encoded form past the scrub (bug G)."""
+    secret = ResolvedSecret(value="a+b/c=", plain="a+b/c=", placements=frozenset())
+    reflected = f"error: called ?token={quote('a+b/c=', safe='')} failed"
+
+    scrubbed = _scrub(reflected, [secret])
+
+    assert "a%2Bb%2Fc%3D" not in scrubbed
+    assert "a+b/c=" not in scrubbed
+    assert "[secret]" in scrubbed

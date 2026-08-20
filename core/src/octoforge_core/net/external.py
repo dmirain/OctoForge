@@ -506,7 +506,7 @@ class ExternalCallExecutor:
             raise ExternalCallError(
                 f"nothing appended: {full}; drop an old collection or query what is there"
             ) from full
-        passport = await sink.finish(truncated=page.wire_truncated)
+        passport = await sink.finish(truncated=page.wire_truncated or parsed.record_truncated)
         assert passport is not None  # add() above stored a non-empty batch
         return ExternalCallResult(status=page.status, body=render_passport(passport))
 
@@ -560,6 +560,9 @@ class ExternalCallExecutor:
             if parsed is None:
                 break  # the natural end of the data
             pages += 1
+            if parsed.record_truncated:
+                capped = True  # one page held more than MAX_RECORDS; the tail is gone
+                break
             if not cursor.advance(parsed, len(parsed.records.payloads)):
                 break
             if _reached_declared_total(pagination, parsed, sink.record_count):
@@ -881,14 +884,27 @@ def _is_header_safe(value: str) -> bool:
 def _scrub(body: str, secrets: Iterable[ResolvedSecret]) -> str:
     """Remove echoes of the injected secrets from text headed to the model.
 
-    Some APIs reflect request material (echo endpoints, error pages); both
-    the substituted form and the stored plain value are masked — an API that
-    inverts the transform (Basic auth decodes the base64) can echo the plain
-    value, not just what was sent.
+    Some APIs reflect request material (echo endpoints, error pages), so
+    every form the secret could have travelled in is masked: the substituted
+    value, the stored plain value (an API that inverts the transform — Basic
+    auth decodes the base64 — can echo the plain form), AND the
+    percent-encoded form of each, because a URL-placed secret rides the wire
+    quoted (`_substitute_url_secrets`) and a server that reflects the raw URL
+    would otherwise leak the encoded value straight past this scrub — now
+    that a reflected body can be PERSISTED in a collection or document for
+    the TTL, that gap is worth closing.
     """
-    for secret in secrets:
-        body = body.replace(secret.value, SECRET_SCRUBBED)
-        body = body.replace(secret.plain, SECRET_SCRUBBED)
+    forms = {
+        form
+        for secret in secrets
+        for value in (secret.value, secret.plain)
+        for form in (value, quote(value, safe=""))
+        if value
+    }
+    # longest first: masking a value never leaves a shorter form of another
+    # secret half-visible inside the placeholder
+    for form in sorted(forms, key=len, reverse=True):
+        body = body.replace(form, SECRET_SCRUBBED)
     return body
 
 

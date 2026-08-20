@@ -1251,3 +1251,44 @@ async def test_collections_join_validates_both_sides(
             left_ref,
             Query(op=QueryOp.GET, join=JoinSpec(ref="ghost", on_left="id", on_right="x")),
         )
+
+
+async def test_collections_concurrent_appends_do_not_lose_records(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two appends to the same collection race; the advisory lock must let
+    both land with distinct positions, not one clobber the other (bug E)."""
+    store = SqlAlchemyCollectionStore(session_factory)
+    passport = await store.create(
+        owner_id=COLLECTION_OWNER,
+        label="",
+        kind=CollectionKind.JSON,
+        source="endpoint:a",
+        schema=infer_records([{"id": 0}]),
+        envelope={},
+        records=NewRecords(payloads=[{"id": 0}]),
+        byte_size=100,
+        truncated=False,
+        expires_at=utc_now() + timedelta(hours=1),
+    )
+
+    async def append_one(marker: int) -> None:
+        await store.append(
+            COLLECTION_OWNER,
+            passport.id,
+            NewRecords(payloads=[{"id": marker}], source=f"src-{marker}"),
+            schema=infer_records([{"id": marker}]),
+            byte_size=100,
+            expires_at=utc_now() + timedelta(hours=1),
+        )
+
+    await asyncio.gather(*(append_one(n) for n in range(1, 6)))
+
+    final = await store.passport(COLLECTION_OWNER, passport.id)
+    expected_total = 6  # the seed plus all five appends, none lost
+    assert final.record_count == expected_total
+    engine_ = PostgresCollectionQueryEngine(session_factory)
+    ids = await engine_.execute(
+        COLLECTION_OWNER, passport.id, Query(op=QueryOp.PLUCK, field="id", limit=100)
+    )
+    assert sorted(ids.rows) == [0, 1, 2, 3, 4, 5]  # every record present, once

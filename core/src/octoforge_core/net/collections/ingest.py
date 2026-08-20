@@ -43,6 +43,24 @@ DB_WIRE_LIMIT_BYTES = 2 * 1024 * 1024
 MAX_RECORDS = 100_000
 #: The envelope is a courtesy, not a second body.
 MAX_ENVELOPE_CHARS = 1000
+#: Above this record count, schema inference runs off the event loop — the
+#: recursive fold's cost grows with data, same as the json.loads next to it.
+INFER_IN_THREAD_RECORDS = 2000
+
+
+async def _infer(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive the record schema, off the loop for a big batch (no-stop-the-world)."""
+    if len(payloads) > INFER_IN_THREAD_RECORDS:
+        return await asyncio.to_thread(infer_records, payloads)
+    return infer_records(payloads)
+
+
+async def _merge(current: dict[str, Any] | None, payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold a batch into the running schema, off the loop when the batch is big."""
+    if len(payloads) > INFER_IN_THREAD_RECORDS:
+        return await asyncio.to_thread(lambda: merge_nodes(current, infer_records(payloads)))
+    return merge_nodes(current, infer_records(payloads))
+
 
 JSON_CONTENT_MARKERS = ("application/json", "text/json", "+json")
 CSV_CONTENT_MARKERS = ("text/csv", "application/csv")
@@ -183,11 +201,13 @@ class ResponseSpill:
             label=label,
             kind=parsed.kind,
             source=source,
-            schema=infer_records(records.payloads),
+            schema=await _infer(records.payloads),
             envelope=parsed.envelope,
             records=records,
             byte_size=len(body),
-            truncated=wire_truncated,
+            # either the wire cut the bytes or the parser cut the record tail:
+            # the passport must not claim a complete count in either case
+            truncated=wire_truncated or parsed.record_truncated,
             expires_at=self.expiry(),
         )
         return render_passport(passport)
@@ -258,6 +278,9 @@ class ParsedBody:
     #: True when the body was one JSON object taken whole as one record —
     #: the shape whose home is task memory, not the database.
     single_document: bool = False
+    #: True when the source held MORE than MAX_RECORDS elements and the tail
+    #: was dropped — the passport must not then claim the count is complete.
+    record_truncated: bool = False
 
 
 async def parse_structured(
@@ -298,8 +321,9 @@ def _take_apart(value: Any, items_path: str | None) -> ParsedBody | None:  # noq
             records=_as_records(found),
             envelope=_scalars_of(value),
             document=value,
+            record_truncated=len(found) > MAX_RECORDS,
         )
-    records, envelope = _unwrap(value)
+    records, envelope, dropped = _unwrap(value)
     if records is None:
         return None
     single = isinstance(value, dict) and len(records.payloads) == 1 and records.payloads[0] is value
@@ -309,6 +333,7 @@ def _take_apart(value: Any, items_path: str | None) -> ParsedBody | None:  # noq
         envelope=envelope,
         document=value,
         single_document=single,
+        record_truncated=dropped,
     )
 
 
@@ -394,7 +419,7 @@ class CollectionSink:
             assert self._collection_id is not None
             existing = await store.passport(self._owner_id, self._collection_id)
             self._schema = existing.schema
-        merged = merge_nodes(self._schema, infer_records(batch.payloads))
+        merged = await _merge(self._schema, batch.payloads)
         if self._collection_id is None:
             passport = await store.create(
                 owner_id=self._owner_id,
@@ -436,16 +461,19 @@ class CollectionSink:
         return await store.passport(self._owner_id, self._collection_id)
 
 
-def _unwrap(value: Any) -> tuple[NewRecords | None, dict[str, Any]]:  # noqa: ANN401 — parsed JSON
+def _unwrap(
+    value: Any,  # noqa: ANN401 — parsed JSON
+) -> tuple[NewRecords | None, dict[str, Any], bool]:
     """Find the records inside a parsed body.
 
     A top-level array IS the records. An object with exactly one array-of-
     objects member is an envelope around its records — the scalar siblings
     ride into the passport. Anything else is a single record; a scalar body
-    is nobody's collection.
+    is nobody's collection. The third element is True when the record tail
+    was dropped at MAX_RECORDS.
     """
     if isinstance(value, list):
-        return _as_records(value), {}
+        return _as_records(value), {}, len(value) > MAX_RECORDS
     if isinstance(value, dict):
         arrays = [
             key
@@ -454,9 +482,10 @@ def _unwrap(value: Any) -> tuple[NewRecords | None, dict[str, Any]]:  # noqa: AN
         ]
         if len(arrays) == 1:
             key = arrays[0]
-            return _as_records(value[key]), _scalars_of(value, except_key=key)
-        return NewRecords(payloads=[value]), {}
-    return None, {}
+            items = value[key]
+            return _as_records(items), _scalars_of(value, except_key=key), len(items) > MAX_RECORDS
+        return NewRecords(payloads=[value]), {}, False
+    return None, {}, False
 
 
 def _scalars_of(value: Any, except_key: str | None = None) -> dict[str, Any]:  # noqa: ANN401
@@ -492,4 +521,9 @@ def _parse_csv(body: str) -> ParsedBody | None:
         {header[i]: cell for i, cell in enumerate(row) if i < len(header)}
         for row in rows[1 : MAX_RECORDS + 1]
     ]
-    return ParsedBody(kind=CollectionKind.CSV, records=NewRecords(payloads=payloads), envelope={})
+    return ParsedBody(
+        kind=CollectionKind.CSV,
+        records=NewRecords(payloads=payloads),
+        envelope={},
+        record_truncated=len(rows) - 1 > MAX_RECORDS,
+    )

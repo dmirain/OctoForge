@@ -9,7 +9,7 @@ by an error — a fetch must not fail because an old fetch still lingers.
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.unit_of_work import read_session, write_session
@@ -84,8 +84,14 @@ class SqlAlchemyCollectionStore:
         The byte quota holds here too — but by refusal, not eviction: a
         growing collection must not push OTHER collections out to feed its
         own growth. The caller stops and keeps what fits.
+
+        Concurrent appends to the SAME collection are serialized on Postgres
+        by a transaction advisory lock keyed on the collection id: without it
+        two appends read the same record_count, write records at colliding
+        positions and lose one update. SQLite serializes writers itself.
         """
         async with write_session(self._session_factory) as session:
+            await self._lock_collection(session, collection_id)
             owned = await session.scalar(
                 select(func.coalesce(func.sum(CollectionRow.byte_size), 0)).where(
                     CollectionRow.owner_id == owner_id
@@ -168,6 +174,16 @@ class SqlAlchemyCollectionStore:
             )
             for index, payload in enumerate(records.payloads)
         )
+
+    @staticmethod
+    async def _lock_collection(session: AsyncSession, collection_id: str) -> None:
+        """Serialize writers to one collection on Postgres; a no-op elsewhere."""
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))").bindparams(
+                    key=f"collection:{collection_id}"
+                )
+            )
 
     async def _live_row(
         self, session: AsyncSession, owner_id: str, collection_id: str
