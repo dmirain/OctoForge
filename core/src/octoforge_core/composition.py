@@ -68,6 +68,7 @@ from octoforge_core.llm.reranker import RerankerClient
 from octoforge_core.llm.retry import RetryingLLMClient
 from octoforge_core.memory.tools import MemoryDeleteTool, MemoryStoreTool
 from octoforge_core.net.collections.api import CollectionConfig
+from octoforge_core.net.collections.documents import DatabaseDocumentHome
 from octoforge_core.net.collections.engine import PostgresCollectionQueryEngine
 from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
@@ -76,6 +77,7 @@ from octoforge_core.net.external import MAX_BODY_CHARS as EXTERNAL_BODY_MAX_CHAR
 from octoforge_core.net.external import CallCredentials, ExternalCallExecutor, KindCallDelegate
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.response_memory import (
+    DocumentHome,
     ResponseFindTool,
     ResponseGetTool,
     ResponseMemory,
@@ -213,14 +215,29 @@ def build_response_layer(
     config: CollectionConfig,
     memory_config: ResponseMemoryConfig | None = None,
 ) -> ResponseLayer:
-    """Assemble the response layer; unlike the database tier, it always exists."""
+    """Assemble the response layer; unlike the database tier, it always exists.
+
+    Where the database tier exists, documents park THERE — search, like
+    filtration, is database-level work and survives a task boundary. The RAM
+    memory is the documents' home only without Postgres.
+    """
     memory = ResponseMemory(memory_config)
+    home: DocumentHome = (
+        DatabaseDocumentHome(collections.store, config, memory.config)
+        if collections is not None
+        else memory
+    )
     return ResponseLayer(
         memory=memory,
-        spill=ResponseSpill(collections.store if collections is not None else None, config, memory),
-        get_tool=ResponseGetTool(memory),
-        find_tool=ResponseFindTool(memory),
-        window_tool=ResponseWindowTool(memory),
+        spill=ResponseSpill(
+            collections.store if collections is not None else None,
+            config,
+            memory,
+            documents=home,
+        ),
+        get_tool=ResponseGetTool(home, memory.config),
+        find_tool=ResponseFindTool(home, memory.config),
+        window_tool=ResponseWindowTool(home, memory.config),
     )
 
 

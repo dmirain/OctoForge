@@ -78,5 +78,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_table("collection_records")
-    op.drop_table("collections")
+    inspector = sa.inspect(op.get_bind())
+    if inspector.has_table("collection_records"):
+        op.drop_table("collection_records")
+    if inspector.has_table("collections"):
+        op.drop_table("collections")

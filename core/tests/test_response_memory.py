@@ -4,11 +4,14 @@ import json
 
 import pytest
 
+from octoforge_core.composition import CollectionsRuntime, build_response_layer
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.net.collections.api import CollectionConfig
 from octoforge_core.net.collections.documents import DatabaseDocumentHome
+from octoforge_core.net.collections.engine import PostgresCollectionQueryEngine
 from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
+from octoforge_core.net.collections.tools import CollectionGetTool, CollectionQueryTool
 from octoforge_core.net.response_memory import (
     ResponseFindTool,
     ResponseGetTool,
@@ -363,3 +366,39 @@ async def test_with_a_database_the_spill_parks_documents_there() -> None:
     with pytest.raises(ResponseNotFoundError):
         memory.get(OWNER, ref)  # nothing was parked in RAM
     await engine.dispose()
+
+
+async def test_build_response_layer_wires_the_database_home_when_collections_exist() -> None:
+    """The wiring itself, through the composition builder — a hand-built home
+    in a test once masked a layer that silently kept parking into RAM."""
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    factory = create_session_factory(engine)
+    store = SqlAlchemyCollectionStore(factory)
+    runtime = CollectionsRuntime(
+        store=store,
+        query_tool=CollectionQueryTool(PostgresCollectionQueryEngine(factory)),
+        get_tool=CollectionGetTool(store),
+    )
+
+    layer = build_response_layer(runtime, CollectionConfig())
+    body = json.dumps({"title": "issue", "body": "т" * 5000})
+    passport = await layer.spill.spill(OWNER, body, "application/json", SOURCE, False, scope=SCOPE)
+
+    assert passport is not None and "resp:" in passport
+    ref = "resp:" + passport.split("resp:", 1)[1].split("]", 1)[0]
+    # the READING tools resolve the same ref: same home on both sides
+    answer = await layer.get_tool.execute({"ref": ref, "key": "title"}, make_context())
+    assert answer == "issue"
+    with pytest.raises(ResponseNotFoundError):
+        layer.memory.get(OWNER, ref)  # RAM stayed empty: the database home took it
+    await engine.dispose()
+
+
+async def test_build_response_layer_falls_back_to_ram_without_collections() -> None:
+    layer = build_response_layer(None, CollectionConfig())
+    body = json.dumps({"title": "issue", "body": "т" * 5000})
+    passport = await layer.spill.spill(OWNER, body, "application/json", SOURCE, False, scope=SCOPE)
+
+    assert passport is not None and "resp:" in passport
+    assert "lives until this task ends" in passport  # the RAM home's lifetime

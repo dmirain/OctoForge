@@ -23,6 +23,7 @@ from octoforge_core.net.collections.api import (
 )
 from octoforge_core.net.collections.schema_infer import infer_records
 from octoforge_core.net.response_memory import (
+    REF_PREFIX,
     RENDER_IN_THREAD_CHARS,
     ResponseMemoryConfig,
     ResponseNotFoundError,
@@ -34,7 +35,6 @@ from octoforge_core.time import utc_now
 #: The wrapper key of a text document's single record. Unambiguous against a
 #: JSON document {"text": …} because the KIND tells them apart, not the shape.
 TEXT_PAYLOAD_KEY = "text"
-REF_PREFIX = "resp:"
 
 
 class DatabaseDocumentHome:
