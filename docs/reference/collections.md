@@ -117,11 +117,9 @@ and everything else in the statement comes from fixed vocabularies. The schema p
 semantics — `number` fields cast to numeric, everything else compares as text (which does the right
 thing for ISO dates).
 
-`join` pairs every (filtered) record with its matches from a second collection — or the same one,
-told apart by `source` — on field equality: `{ref, on_left, on_right, source?}`. It combines with
-`get` (rows come back as `{left, right}` pairs) and `count`; both sides' refs are checked for
-ownership and expiry, both join fields against their side's schema. An inner join by design: a
-record without a match is reachable as plain `get`, and pairing is exactly what was asked for.
+A `join` between collections exists in the engine (pairs on field equality, tested against
+Postgres) but is **not exposed to the agent yet** — it ships in a later stage, once the base
+workflow has survived real users.
 
 `collection_get(ref)` re-reads the passport — the schema reminder after context compaction.
 
@@ -145,7 +143,7 @@ expired, evicted or foreign ref answers not-found with one remedy: run the call 
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OF_RESPONSE_MEMORY_MAX_MB` | `8` | Wire ceiling of one remembered response (RAM, not context) |
+| `OF_RESPONSE_MEMORY_MAX_MB` | `2` | Wire ceiling of one remembered response; raise it consciously for genuinely bigger documents |
 | `OF_RESPONSE_MEMORY_BUDGET_MB` | `200` | Process-wide LRU budget of task memory |
 | `OF_RESPONSE_GET_DEFAULT_CHARS` | `8000` | What `response_get` answers when the model does not choose |
 | `OF_RESPONSE_GET_MAX_CHARS` | `100000` | The most one deliberate read may take |

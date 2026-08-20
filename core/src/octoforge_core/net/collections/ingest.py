@@ -29,8 +29,12 @@ from octoforge_core.net.collections.api import (
     NewRecords,
 )
 from octoforge_core.net.collections.schema_infer import infer_records, merge_nodes, render
-from octoforge_core.net.response_memory import ResponseMemory, render_memory_passport
-from octoforge_core.net.tool_spec import FieldCoercion
+from octoforge_core.net.response_memory import (
+    RENDER_IN_THREAD_CHARS,
+    ResponseMemory,
+    render_memory_passport,
+)
+from octoforge_core.net.tool_spec import FieldCoercion, ResponseSpec
 from octoforge_core.time import utc_now
 
 logger = logging.getLogger(__name__)
@@ -101,8 +105,10 @@ class ResponseSpill:
     def wire_limit_bytes(self) -> int:
         """How much one response may pull off the wire before the cut.
 
-        The memory tier raises it: RAM is the budget there, not context, and
-        scenario three of this design is literally "the API answers 3 MB".
+        The default is 2 MB on both tiers: an API answering more per call is
+        an API to page, not to buffer. An operator raises the memory tier's
+        knob (OF_RESPONSE_MEMORY_MAX_MB) consciously when a bigger single
+        document is genuinely the shape of their data.
         """
         if self._memory is not None:
             return self._memory.config.max_response_chars
@@ -117,8 +123,13 @@ class ResponseSpill:
         wire_truncated: bool,
         label: str = "",
         scope: str = "",
+        response: ResponseSpec | None = None,
     ) -> str | None:
         """The passport text, or None for "keep the body inline/truncated".
+
+        `response` is the endpoint record's own ingestion contract — the SAME
+        one the collect loop honors, so a plain call and a collect of one
+        endpoint produce identically shaped records.
 
         Never raises: a spill failure must not fail the call that produced
         the data — the caller's truncation path is always there to fall back
@@ -128,7 +139,7 @@ class ResponseSpill:
             return None
         try:
             return await self._route(
-                owner_id, body, content_type, source, wire_truncated, label, scope
+                owner_id, body, content_type, source, wire_truncated, label, scope, response
             )
         except Exception:
             logger.exception("response spill failed; falling back to truncation")
@@ -143,16 +154,18 @@ class ResponseSpill:
         wire_truncated: bool,
         label: str,
         scope: str,
+        response: ResponseSpec | None,
     ) -> str | None:
-        parsed = await parse_structured(body, content_type)
+        items_path = response.items_path if response is not None else None
+        parsed = await parse_structured(body, content_type, items_path)
         if parsed is None:
             # unstructured (text, HTML, broken JSON): memory holds it verbatim
-            return self._remember(owner_id, scope, "text", source, body)
+            return await self._remember(owner_id, scope, source, body)
         if not parsed.records.payloads:
             return None
         if parsed.single_document:
-            remembered = self._remember(
-                owner_id, scope, "json", source, body, document=parsed.document
+            remembered = await self._remember(
+                owner_id, scope, source, body, document=parsed.document
             )
             if remembered is not None:
                 return remembered
@@ -160,35 +173,48 @@ class ResponseSpill:
             # a one-record collection, when the database tier exists
         if self._store is None:
             # no database tier: an array is still a readable document
-            return self._remember(owner_id, scope, "json", source, body, document=parsed.document)
+            return await self._remember(owner_id, scope, source, body, document=parsed.document)
+        records = parsed.records
+        if response is not None and response.fields:
+            # the record's own coercions/projection — the SAME shaping the
+            # collect loop applies, or one endpoint would produce two record
+            # shapes depending on how it was called
+            records = shape_records(records, response.fields)
         passport = await self._store.create(
             owner_id=owner_id,
             label=label,
             kind=parsed.kind,
             source=source,
-            schema=infer_records(parsed.records.payloads),
+            schema=infer_records(records.payloads),
             envelope=parsed.envelope,
-            records=parsed.records,
+            records=records,
             byte_size=len(body),
             truncated=wire_truncated,
             expires_at=self.expiry(),
         )
         return render_passport(passport)
 
-    def _remember(  # noqa: PLR0913, PLR0917 — mirrors the memory's identity
+    async def _remember(
         self,
         owner_id: str,
         scope: str,
-        kind: str,
         source: str,
         body: str,
         document: Any = None,  # noqa: ANN401 — parsed JSON
     ) -> str | None:
+        """Park in task memory; the kind is what the document says it is.
+
+        A big document's passport costs a token-estimate pass over its text,
+        so past the threshold it renders off the event loop.
+        """
         if self._memory is None:
             return None
+        kind = "json" if document is not None else "text"
         item = self._memory.store(
             owner_id=owner_id, scope=scope, kind=kind, source=source, body=body, document=document
         )
+        if len(body) > RENDER_IN_THREAD_CHARS:
+            return await asyncio.to_thread(render_memory_passport, item, self._memory.config)
         return render_memory_passport(item, self._memory.config)
 
     def expiry(self) -> datetime:

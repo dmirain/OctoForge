@@ -264,9 +264,36 @@ async def test_without_any_tier_the_old_truncation_stays() -> None:
     assert await spill.spill(OWNER, body, "application/json", SOURCE, False) is None
 
 
-def test_the_memory_tier_raises_the_wire_limit() -> None:
-    """Scenario three is literally "the API answers 3 MB": it must fit."""
-    with_memory = ResponseSpill(None, CollectionConfig(), ResponseMemory())
-    without = ResponseSpill(None, CollectionConfig(), None)
-    assert with_memory.wire_limit_bytes == 8 * 1024 * 1024
-    assert without.wire_limit_bytes == 2 * 1024 * 1024
+def test_the_wire_limit_is_two_megabytes_unless_raised_consciously() -> None:
+    """An API answering more per call is an API to page, not to buffer; the
+    operator raises OF_RESPONSE_MEMORY_MAX_MB for genuinely bigger documents."""
+    default = ResponseSpill(None, CollectionConfig(), ResponseMemory())
+    raised = ResponseSpill(
+        None,
+        CollectionConfig(),
+        ResponseMemory(ResponseMemoryConfig(max_response_chars=8 * 1024 * 1024)),
+    )
+    assert default.wire_limit_bytes == 2 * 1024 * 1024
+    assert raised.wire_limit_bytes == 8 * 1024 * 1024
+
+
+async def test_find_refuses_a_runaway_pattern() -> None:
+    """The pattern is model-written; a 512-char one is not a search, it is a
+    mistake — and the regex engine must never see it."""
+    memory = ResponseMemory()
+    item = memory.store(OWNER, SCOPE, "text", SOURCE, "haystack")
+    tool = ResponseFindTool(memory)
+
+    with pytest.raises(ToolArgumentsError, match="distinctive fragment"):
+        await tool.execute({"ref": item.ref, "pattern": "a" * 600}, make_context())
+
+
+async def test_csv_without_a_database_is_remembered_as_text() -> None:
+    """No parsed document means kind=text — the passport must not claim JSON
+    keys it cannot answer for."""
+    spill = ResponseSpill(None, CollectionConfig(), ResponseMemory())
+    lines = ["name;amount"] + [f"row-{i};{i}" for i in range(400)]
+
+    passport = await spill.spill(OWNER, "\n".join(lines), "text/csv", SOURCE, False, scope=SCOPE)
+
+    assert passport is not None and "kind=text" in passport

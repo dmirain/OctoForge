@@ -34,12 +34,14 @@ from octoforge_core.tools.errors import ToolArgumentsError
 
 REF_PREFIX = "resp:"
 
-DEFAULT_MAX_RESPONSE_MB = 8
+DEFAULT_MAX_RESPONSE_MB = 2
 DEFAULT_BUDGET_MB = 200
 DEFAULT_GET_CHARS = 8000
 DEFAULT_GET_MAX_CHARS = 100_000
-#: Search/parse work above this runs off the event loop.
-CPU_IN_THREAD_CHARS = 256 * 1024
+#: Passport rendering above this body size runs off the event loop.
+RENDER_IN_THREAD_CHARS = 256 * 1024
+#: The longest pattern response_find accepts (a runaway-regex backstop).
+MAX_PATTERN_CHARS = 512
 #: Token-estimate sample for very long texts.
 ESTIMATE_SAMPLE_CHARS = 100_000
 #: String leaves at least this big are called out in the passport.
@@ -69,7 +71,10 @@ class ResponseNotFoundError(Exception):
 class ResponseMemoryConfig:
     """Behavior knobs, mapped from the deployment's settings."""
 
-    #: The wire ceiling of one remembered response (RAM, not context).
+    #: The wire ceiling of one remembered response. Deliberately the same
+    #: 2 MB as the database tier by default: an API that answers more per
+    #: call is an API to page, not to buffer — an operator raises this knob
+    #: consciously, not the code.
     max_response_chars: int = DEFAULT_MAX_RESPONSE_MB * MEGABYTE
     #: Process-wide LRU budget across every dialog this node runs.
     budget_chars: int = DEFAULT_BUDGET_MB * MEGABYTE
@@ -429,6 +434,11 @@ class ResponseFindTool(_MemoryToolBase):
         pattern = arguments.get("pattern")
         if not isinstance(pattern, str) or not pattern:
             raise ToolArgumentsError("pattern must be a non-empty string")
+        if len(pattern) > MAX_PATTERN_CHARS:
+            raise ToolArgumentsError(
+                f"pattern is longer than {MAX_PATTERN_CHARS} chars; search for a "
+                "distinctive fragment instead"
+            )
         key = _parse_optional_str(arguments.get("key"), "key")
         before = _parse_positive(arguments.get("before"), FIND_DEFAULT_BEFORE, "before")
         after = _parse_positive(arguments.get("after"), FIND_DEFAULT_AFTER, "after")
@@ -442,10 +452,10 @@ class ResponseFindTool(_MemoryToolBase):
         except ResponseNotFoundError:
             return NOT_FOUND_TEMPLATE.format(ref=arguments.get("ref"))
         target = self._target(item, key)
-        if len(target) > CPU_IN_THREAD_CHARS:
-            positions = await asyncio.to_thread(_find_positions, target, pattern)
-        else:
-            positions = _find_positions(target, pattern)
+        # ALWAYS off the event loop: the pattern is model-written, and a
+        # catastrophically backtracking regex must burn one worker thread,
+        # never the loop every dialog of this node runs on
+        positions = await asyncio.to_thread(_find_positions, target, pattern)
         if not positions:
             return f"no matches for {pattern!r} in {len(target)} chars"
         shown = positions[offset : offset + max_matches]

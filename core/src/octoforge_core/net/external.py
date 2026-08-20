@@ -54,6 +54,7 @@ from octoforge_core.net.tool_spec import (
     PaginationKind,
     PaginationSpec,
     ParamKind,
+    ResponseSpec,
     TemplateRefs,
     ToolParamSpec,
     ToolSpec,
@@ -226,6 +227,16 @@ class CallOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class _SpillContext:
+    """What one spill decision needs to know about its call."""
+
+    name: str
+    user_id: str | None
+    scope: str
+    response: "ResponseSpec | None"
+
+
+@dataclass(frozen=True, slots=True)
 class _PageResult:
     """One request's outcome, scrubbed and ready for either path."""
 
@@ -366,7 +377,13 @@ class ExternalCallExecutor:
         if opts.into is not None:
             return await self._pour_into(name, spec, page, user_id, opts)
         result = await self._spill_or_truncate(
-            page.scrubbed, page.content_type, name, user_id, page.wire_truncated, opts.scope
+            _SpillContext(
+                name=name,
+                user_id=user_id,
+                scope=opts.scope,
+                response=spec.response,
+            ),
+            page,
         )
         if page.status in UNAUTHENTICATED_STATUSES and not page.had_secrets:
             # a bare 401/403 reads as "wrong credential" and sends the model
@@ -575,34 +592,29 @@ class ExternalCallExecutor:
         """How much is read off the wire; the memory tier raises the ceiling."""
         return self._spill.wire_limit_bytes if self._spill is not None else MAX_BODY_BYTES
 
-    async def _spill_or_truncate(  # noqa: PLR0913, PLR0917 — one response's context
-        self,
-        scrubbed: str,
-        content_type: str,
-        name: str,
-        user_id: str | None,
-        truncated: bool,
-        scope: str = "",
-    ) -> str:
+    async def _spill_or_truncate(self, context: "_SpillContext", page: "_PageResult") -> str:
         """A passport for a big body (collection or task memory), truncation otherwise.
 
         The spill sees only the scrubbed text: whatever lands in a store or
         in memory is exactly what the model may see, so a later read can
-        never resurrect a secret the response echoed.
+        never resurrect a secret the response echoed. The record's `response`
+        section rides along — a plain call and a collect of one endpoint must
+        produce identically shaped records.
         """
-        if self._spill is not None and user_id is not None:
+        if self._spill is not None and context.user_id is not None:
             passport = await self._spill.spill(
-                owner_id=user_id,
-                body=scrubbed,
-                content_type=content_type,
-                source=f"endpoint:{name}",
-                wire_truncated=truncated,
-                scope=scope,
+                owner_id=context.user_id,
+                body=page.scrubbed,
+                content_type=page.content_type,
+                source=f"endpoint:{context.name}",
+                wire_truncated=page.wire_truncated,
+                scope=context.scope,
+                response=context.response,
             )
             if passport is not None:
                 return passport
-        result = self._truncate(scrubbed)
-        if truncated and not result.endswith(TRUNCATED_SUFFIX):
+        result = self._truncate(page.scrubbed)
+        if page.wire_truncated and not result.endswith(TRUNCATED_SUFFIX):
             result += TRUNCATED_SUFFIX
         return result
 

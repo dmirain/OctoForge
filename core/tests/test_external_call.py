@@ -1615,3 +1615,30 @@ async def test_collect_stops_and_says_cut_when_the_byte_quota_fills() -> None:
     # two pages fit under the 400-byte quota, the third was refused
     assert "4 records" in result.body
     await engine.dispose()
+
+
+async def test_a_plain_call_applies_the_records_response_section_too() -> None:
+    """One endpoint, one record shape: a plain call must coerce and project
+    exactly as the collect loop does, or the same collection ends up holding
+    strings from one path and numbers from the other."""
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    # a low inline threshold: one page is small, and inline is not the point here
+    tiny_inline = CollectionConfig(inline_max_chars=100)
+    store = SqlAlchemyCollectionStore(create_session_factory(engine), tiny_inline)
+    spill = ResponseSpill(store, tiny_inline, None)
+    executor = make_executor(
+        _paged_handler,
+        records={PAGED_TOOL_NAME: PAGED_TOOL_CONTENT},
+        options=ExecutorOptions(spill=spill),
+    )
+
+    result = await executor.execute(PAGED_TOOL_NAME, {"page": "1"}, user_id=USER_A)
+
+    ref = result.body.split("col:", 1)[1].split("]", 1)[0]
+    passport = await store.passport(USER_A, ref)
+    # items_path found the records, fields projected the noise away and
+    # coerced the string amounts — identical to what collect produces
+    assert set(passport.schema["fields"]) == {"id", "amount"}
+    assert passport.schema["fields"]["amount"]["type"] == "number"
+    await engine.dispose()
