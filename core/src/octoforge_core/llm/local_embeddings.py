@@ -19,12 +19,19 @@ from typing import TYPE_CHECKING
 from octoforge_core.config import DEFAULT_EMBEDDING_BATCH_SIZE
 
 if TYPE_CHECKING:
-    from sentence_transformers import SentenceTransformer as _SentenceTransformerType
-
-try:
     from sentence_transformers import SentenceTransformer
-except ImportError:  # pragma: no cover - exercised by installs without the extra
-    SentenceTransformer = None  # type: ignore[misc]
+    from sentence_transformers import SentenceTransformer as _SentenceTransformerType
+else:
+    # The runtime fallback is hidden from the type checker: analysing the
+    # `= None` reassignment produced a different error code with the extra
+    # installed (mypy sees the real type) than without it (missing import),
+    # so no single `type: ignore` covered both — CI (no extra) and a local
+    # install disagreed. Under TYPE_CHECKING mypy always sees the real
+    # import; at runtime this branch runs and the guard below stays honest.
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:  # pragma: no cover - exercised by installs without the extra
+        SentenceTransformer = None
 
 _INSTALL_HINT = 'install the optional extra: pip install "octoforge-core[local-embeddings]"'
 
