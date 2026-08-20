@@ -4,8 +4,11 @@ import json
 
 import pytest
 
+from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.net.collections.api import CollectionConfig
+from octoforge_core.net.collections.documents import DatabaseDocumentHome
 from octoforge_core.net.collections.ingest import ResponseSpill
+from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.response_memory import (
     ResponseFindTool,
     ResponseGetTool,
@@ -14,7 +17,6 @@ from octoforge_core.net.response_memory import (
     ResponseNotFoundError,
     ResponseWindowTool,
     estimate_tokens,
-    render_memory_passport,
 )
 from octoforge_core.tools.base import ToolContext
 from octoforge_core.tools.errors import ToolArgumentsError
@@ -86,13 +88,13 @@ def test_lru_eviction_keeps_the_budget_and_the_newcomer() -> None:
 # --- the passport -------------------------------------------------------------
 
 
-def test_json_passport_gives_the_numbers_to_decide_with() -> None:
+async def test_json_passport_gives_the_numbers_to_decide_with() -> None:
     """Sizes in chars AND tokens — what the model weighs against its budget."""
     memory = ResponseMemory()
     document = {"title": "short", "body": RUSSIAN, "comments": [1, 2], "user": {"id": 1}}
-    item = memory.get(OWNER, store_json(memory, document))
+    body = json.dumps(document, ensure_ascii=False)
 
-    passport = render_memory_passport(item, memory.config)
+    passport = await memory.park(OWNER, SCOPE, SOURCE, body, document=document)
 
     assert "body: string(1100 chars)" in passport
     assert "comments: array[2]" in passport
@@ -102,10 +104,9 @@ def test_json_passport_gives_the_numbers_to_decide_with() -> None:
     assert "response_find" in passport  # the way out for what no budget fits
 
 
-def test_text_passport_carries_a_preview() -> None:
+async def test_text_passport_carries_a_preview() -> None:
     memory = ResponseMemory()
-    item = memory.store(OWNER, SCOPE, "text", SOURCE, "<html>" + "word " * 500)
-    passport = render_memory_passport(item, memory.config)
+    passport = await memory.park(OWNER, SCOPE, SOURCE, "<html>" + "word " * 500)
     assert "kind=text" in passport
     assert "preview: <html>" in passport
 
@@ -116,7 +117,7 @@ def test_text_passport_carries_a_preview() -> None:
 async def test_get_reads_a_key_in_full_when_asked() -> None:
     memory = ResponseMemory(SMALL_CONFIG)
     ref = store_json(memory, {"body": "x" * 400, "id": 7})
-    tool = ResponseGetTool(memory)
+    tool = ResponseGetTool(memory, SMALL_CONFIG)
 
     modest = await tool.execute({"ref": ref, "key": "body"}, make_context())
     deliberate = await tool.execute({"ref": ref, "key": "body", "max_chars": 400}, make_context())
@@ -129,7 +130,7 @@ async def test_get_reads_a_key_in_full_when_asked() -> None:
 async def test_get_ceiling_holds_whatever_is_asked() -> None:
     memory = ResponseMemory(SMALL_CONFIG)  # ceiling 500
     ref = store_json(memory, {"body": "x" * 900})
-    tool = ResponseGetTool(memory)
+    tool = ResponseGetTool(memory, SMALL_CONFIG)
     answer = await tool.execute({"ref": ref, "key": "body", "max_chars": 9000}, make_context())
     assert answer.startswith("x" * 500)
     assert "showing 500 of 900" in answer
@@ -297,3 +298,68 @@ async def test_csv_without_a_database_is_remembered_as_text() -> None:
     passport = await spill.spill(OWNER, "\n".join(lines), "text/csv", SOURCE, False, scope=SCOPE)
 
     assert passport is not None and "kind=text" in passport
+
+
+# --- the database home: search survives the task boundary ----------------------
+
+
+async def _sqlite_home() -> "tuple[DatabaseDocumentHome, ResponseMemory, object]":
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    store = SqlAlchemyCollectionStore(create_session_factory(engine))
+    memory = ResponseMemory()
+    return DatabaseDocumentHome(store, CollectionConfig(), memory.config), memory, engine
+
+
+async def test_a_parked_document_survives_the_task_that_fetched_it() -> None:
+    """The point of the database home: 'поищи ещё в том же документе' as the
+    NEXT message must not force a refetch — the TTL governs, not the task."""
+    home, memory, engine = await _sqlite_home()
+    passport = await home.park(
+        OWNER, SCOPE, SOURCE, json.dumps({"body": "т" * 3000}), document={"body": "т" * 3000}
+    )
+    ref = "resp:" + passport.split("resp:", 1)[1].split("]", 1)[0]
+
+    memory.drop_scope(SCOPE)  # the task ended; the RAM sweep must not matter
+
+    fetched = await home.fetch(OWNER, ref)
+    assert fetched.kind == "json"
+    assert fetched.document == {"body": "т" * 3000}
+    assert "expires in" in passport  # lifetime is the TTL, not the task
+    await engine.dispose()  # type: ignore[union-attr]
+
+
+async def test_the_database_home_round_trips_text_verbatim() -> None:
+    home, _, engine = await _sqlite_home()
+    page = "<html>" + "content " * 500
+    passport = await home.park(OWNER, SCOPE, SOURCE, page)
+    ref = "resp:" + passport.split("resp:", 1)[1].split("]", 1)[0]
+
+    fetched = await home.fetch(OWNER, ref)
+
+    assert fetched.kind == "text" and fetched.body == page
+    tool = ResponseFindTool(home)
+    answer = await tool.execute({"ref": ref, "pattern": "content"}, make_context())
+    assert "match(es)" in answer
+    await engine.dispose()  # type: ignore[union-attr]
+
+
+async def test_with_a_database_the_spill_parks_documents_there() -> None:
+    """RAM is the degradation, not the default: with a store present, a single
+    document lands in the database and the RAM memory stays empty."""
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    store = SqlAlchemyCollectionStore(create_session_factory(engine))
+    memory = ResponseMemory()
+    home = DatabaseDocumentHome(store, CollectionConfig(), memory.config)
+    spill = ResponseSpill(store, CollectionConfig(), memory, documents=home)
+    body = json.dumps({"title": "issue", "body": "т" * 5000})
+
+    passport = await spill.spill(OWNER, body, "application/json", SOURCE, False, scope=SCOPE)
+
+    assert passport is not None and "resp:" in passport
+    ref = "resp:" + passport.split("resp:", 1)[1].split("]", 1)[0]
+    assert (await home.fetch(OWNER, ref)).kind == "json"
+    with pytest.raises(ResponseNotFoundError):
+        memory.get(OWNER, ref)  # nothing was parked in RAM
+    await engine.dispose()

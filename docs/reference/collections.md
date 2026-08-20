@@ -4,10 +4,13 @@ What happens to a large HTTP response instead of truncation. Two tiers, picked b
 
 - an **array of records** becomes a **collection** in the database — its value is queries
   (filter, aggregate, join), and it survives task boundaries;
-- a **single document** — one JSON object, an article, any unstructured text — goes to
-  **task memory**: RAM, no database, alive exactly as long as the task that fetched it. Its value
-  is being *read* (in full, when the model decides its budget affords it) or *searched* (when no
-  budget should swallow it whole).
+- a **single document** — one JSON object, an article, any unstructured text — is parked for
+  *reading* (in full, when the model decides its budget affords it) and *searching* (when no
+  budget should swallow it whole). On Postgres it parks **in the database** — a one-record
+  collection (kind `doc_json`/`doc_text`) under the same TTL, quotas and sweeper — because search,
+  like filtration, is database-level work and must survive a task boundary: "поищи ещё в том же
+  документе" arriving as the next message must not force a refetch. Without Postgres the document
+  parks in **task RAM** instead and dies with the task that fetched it.
 
 Either way the model receives a **passport** — the shape and the sizes — instead of the first
 8000 characters of a body whose tail used to be thrown away.
@@ -24,11 +27,12 @@ stump.
 
 ## Task memory
 
-A remembered response gets a `resp:` ref and a passport with the numbers the model needs to decide
+A parked document gets a `resp:` ref and a passport with the numbers the model needs to decide
 what to spend: per-key sizes in characters AND an estimated token cost (Cyrillic tokenizes at
-~2.4 chars/token, Latin at ~4 — a plain char budget starves Russian text). It lives until the task
-that fetched it terminates (the runner sweeps by task id), under a process-wide LRU budget; a
-restart loses it, and the remedy is the remedy for everything here — fetch again.
+~2.4 chars/token, Latin at ~4 — a plain char budget starves Russian text). The passport names its
+lifetime: the collections TTL in the database home, "until this task ends" in the RAM home (which
+also runs a process-wide LRU budget and is swept by the runner at process termination). Either way
+a dead ref has one remedy — fetch again.
 
 Three verbs, and deliberately **no sequential window-paging** (reading a megabyte in slices costs
 the same tokens as reading it whole, just slower):
@@ -159,7 +163,7 @@ expired, evicted or foreign ref answers not-found with one remedy: run the call 
 | Situation | Outcome |
 |---|---|
 | Ref expired, evicted or someone else's (`col:` or `resp:`) | Not-found text naming the remedy (fetch again) |
-| Process restart / dialog migration | Task memory is gone with the process; collections survive |
+| Process restart / dialog migration | RAM-parked documents are gone with the process; database-parked ones and collections survive |
 | Unknown field in a query | Error listing the fields the schema does have |
 | `sum`/`avg` over a non-numeric field | Error naming the coercion remedy |
 | Body declared JSON but does not parse | Old truncation (the head is more honest) |
@@ -174,5 +178,6 @@ expired, evicted or foreign ref answers not-found with one remedy: run the call 
 - `core/src/octoforge_core/net/collections/engine.py` — DSL → jsonb SQL
 - `core/src/octoforge_core/net/collections/store.py` — rows, quotas, TTL
 - `core/src/octoforge_core/net/collections/tools.py` — `collection_query`, `collection_get`
-- `core/src/octoforge_core/net/response_memory.py` — task memory: the store, the passport, the three verbs
+- `core/src/octoforge_core/net/response_memory.py` — the document port, the RAM home, the passport, the three verbs
+- `core/src/octoforge_core/net/collections/documents.py` — the database home of parked documents
 - `core/src/octoforge_core/composition.py` — `build_collections` (Postgres check), `build_response_layer` (always)

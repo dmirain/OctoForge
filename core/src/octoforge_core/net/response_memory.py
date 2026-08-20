@@ -54,8 +54,8 @@ FIND_NAME = "response_find"
 WINDOW_NAME = "response_window"
 
 NOT_FOUND_TEMPLATE = (
-    "response '{ref}' is gone — it lived only for the task that fetched it "
-    "(process restarts drop it too): run the call again for fresh data"
+    "response '{ref}' is gone (expired, swept or never yours): run the call "
+    "again for fresh data and a fresh ref"
 )
 NO_KEY_TEMPLATE = "key '{key}' is not in this response; it has: {known}"
 TEXT_HAS_NO_KEYS = "this response is plain text; call without a key"
@@ -102,6 +102,47 @@ class StoredResponse:
     @property
     def ref(self) -> str:
         return f"{REF_PREFIX}{self.id}"
+
+
+@dataclass(frozen=True, slots=True)
+class StoredDocument:
+    """One parked document as the reading tools see it, wherever it lives.
+
+    The tools speak this shape only; whether it came from task RAM or from a
+    database row is the home's business.
+    """
+
+    ref: str
+    #: "json" (document parsed) or "text" (held verbatim).
+    kind: str
+    source: str
+    body: str
+    document: Any = None
+
+
+class DocumentHome(Protocol):
+    """Where a document too big for the context lives, and for how long.
+
+    Two implementations: the database home (a one-record collection under the
+    collections TTL — search and filtration are both database-level work and
+    both survive a task boundary) and this module's RAM home (the degradation
+    for installations without Postgres; dies with the task).
+    """
+
+    async def park(
+        self,
+        owner_id: str,
+        scope: str,
+        source: str,
+        body: str,
+        document: Any = None,  # noqa: ANN401 — parsed JSON
+    ) -> str:
+        """Store the document and answer its passport text."""
+        ...
+
+    async def fetch(self, owner_id: str, ref: str) -> StoredDocument:
+        """The document, or `ResponseNotFoundError`."""
+        ...
 
 
 def dotted_get(value: Any, path: str) -> Any:  # noqa: ANN401 — parsed JSON in and out
@@ -194,6 +235,28 @@ class ResponseMemory:
         item.last_access = utc_now().timestamp()
         return item
 
+    async def park(
+        self,
+        owner_id: str,
+        scope: str,
+        source: str,
+        body: str,
+        document: Any = None,  # noqa: ANN401 — parsed JSON
+    ) -> str:
+        """`DocumentHome`: park in RAM for the task's lifetime."""
+        kind = "json" if document is not None else "text"
+        item = self.store(owner_id, scope, kind, source, body, document)
+        doc = _to_document(item)
+        if len(body) > RENDER_IN_THREAD_CHARS:
+            return await asyncio.to_thread(
+                render_document_passport, doc, self._config, RAM_LIFETIME_NOTE
+            )
+        return render_document_passport(doc, self._config, RAM_LIFETIME_NOTE)
+
+    async def fetch(self, owner_id: str, ref: str) -> StoredDocument:
+        """`DocumentHome`: the parked document (LRU-touched)."""
+        return _to_document(self.get(owner_id, ref))
+
     def drop_scope(self, scope: str) -> None:
         """Forget every response of one task (the runner's termination hook)."""
         doomed = [key for key, item in self._items.items() if item.scope == scope]
@@ -211,17 +274,28 @@ class ResponseMemory:
 # --- the passport -------------------------------------------------------------
 
 
-def render_memory_passport(item: StoredResponse, config: ResponseMemoryConfig) -> str:
-    """What the model sees instead of the body: numbers to decide with."""
-    tokens = _human_tokens(estimate_tokens(item.body))
-    head = (
-        f"[response {item.ref}] kind={item.kind} · source={item.source or '-'} · "
-        f"{_human_size(len(item.body))} · {tokens} · lives until this task ends\n"
+RAM_LIFETIME_NOTE = "lives until this task ends"
+
+
+def _to_document(item: StoredResponse) -> StoredDocument:
+    return StoredDocument(
+        ref=item.ref, kind=item.kind, source=item.source, body=item.body, document=item.document
     )
-    if item.kind == "json":
-        details = _describe_document(item.document)
+
+
+def render_document_passport(
+    doc: StoredDocument, config: ResponseMemoryConfig, lifetime: str
+) -> str:
+    """What the model sees instead of the body: numbers to decide with."""
+    tokens = _human_tokens(estimate_tokens(doc.body))
+    head = (
+        f"[response {doc.ref}] kind={doc.kind} · source={doc.source or '-'} · "
+        f"{_human_size(len(doc.body))} · {tokens} · {lifetime}\n"
+    )
+    if doc.kind == "json":
+        details = _describe_document(doc.document)
     else:
-        preview = item.body[:PREVIEW_CHARS].replace("\n", " ")
+        preview = doc.body[:PREVIEW_CHARS].replace("\n", " ")
         details = f"preview: {preview}…\n"
     hint = (
         f"Read deliberately: response_get(key, max_chars up to {config.get_max_chars}) "
@@ -367,14 +441,15 @@ class _MemoryTool(Protocol):
 
 
 class _MemoryToolBase:
-    def __init__(self, memory: ResponseMemory) -> None:
-        self._memory = memory
+    def __init__(self, home: DocumentHome, config: ResponseMemoryConfig | None = None) -> None:
+        self._home = home
+        self._config = config or ResponseMemoryConfig()
 
     def visible_to(self, context: ToolContext) -> bool:
         """Responses only arrive through HTTP calls; same plan gate."""
         return feature_enabled(context.enabled_features, FeatureCode.HTTP_ENDPOINTS)
 
-    def _target(self, item: StoredResponse, key: str | None) -> str:
+    def _target(self, item: StoredDocument, key: str | None) -> str:
         """The text a verb operates on: the whole body, or one key's value."""
         if key is None:
             return item.body
@@ -403,11 +478,11 @@ class ResponseGetTool(_MemoryToolBase):
             return feature_refusal(FeatureCode.HTTP_ENDPOINTS)
         ref = _parse_ref(arguments.get("ref"))
         key = _parse_optional_str(arguments.get("key"), "key")
-        config = self._memory.config
+        config = self._config
         asked = _parse_positive(arguments.get("max_chars"), config.get_default_chars, "max_chars")
         cap = min(asked, config.get_max_chars)
         try:
-            item = self._memory.get(context.user_id, ref)
+            item = await self._home.fetch(context.user_id, ref)
         except ResponseNotFoundError:
             return NOT_FOUND_TEMPLATE.format(ref=arguments.get("ref"))
         target = self._target(item, key)
@@ -448,7 +523,7 @@ class ResponseFindTool(_MemoryToolBase):
         )
         offset = _parse_positive(arguments.get("match_offset"), 0, "match_offset", floor=0)
         try:
-            item = self._memory.get(context.user_id, ref)
+            item = await self._home.fetch(context.user_id, ref)
         except ResponseNotFoundError:
             return NOT_FOUND_TEMPLATE.format(ref=arguments.get("ref"))
         target = self._target(item, key)
@@ -490,7 +565,7 @@ class ResponseWindowTool(_MemoryToolBase):
         before = _parse_positive(arguments.get("before"), WINDOW_DEFAULT_BEFORE, "before")
         after = _parse_positive(arguments.get("after"), WINDOW_DEFAULT_AFTER, "after")
         try:
-            item = self._memory.get(context.user_id, ref)
+            item = await self._home.fetch(context.user_id, ref)
         except ResponseNotFoundError:
             return NOT_FOUND_TEMPLATE.format(ref=arguments.get("ref"))
         target = self._target(item, key)

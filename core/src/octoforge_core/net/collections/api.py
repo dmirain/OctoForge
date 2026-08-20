@@ -57,10 +57,18 @@ class CollectionQuotaError(CollectionError):
 
 
 class CollectionKind(StrEnum):
-    """What the source body was; decides nothing at query time."""
+    """What the source body was; decides nothing at query time.
+
+    The DOC kinds are single documents parked for reading and searching (the
+    response_* tools): one record holding the whole payload. They live in the
+    same tables under the same TTL and quotas — search and filtration are both
+    database-level work, and both must survive a task boundary.
+    """
 
     JSON = "json"
     CSV = "csv"
+    DOC_JSON = "doc_json"
+    DOC_TEXT = "doc_text"
 
 
 class QueryOp(StrEnum):
@@ -253,6 +261,14 @@ class CollectionStore(Protocol):
 
     async def mark_truncated(self, owner_id: str, collection_id: str) -> None:
         """Persist that the source was cut (page limit, wire limit) mid-fill."""
+        ...
+
+    async def single_payload(self, owner_id: str, collection_id: str) -> dict[str, Any]:
+        """The first record's payload — how a parked document is read back.
+
+        Raises `CollectionNotFoundError` (a document with no record counts
+        as gone: there is nothing to read).
+        """
         ...
 
     async def delete_expired(self) -> int:

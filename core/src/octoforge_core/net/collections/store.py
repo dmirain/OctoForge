@@ -117,6 +117,20 @@ class SqlAlchemyCollectionStore:
             row = await self._live_row(session, owner_id, collection_id)
             row.truncated = True
 
+    async def single_payload(self, owner_id: str, collection_id: str) -> dict[str, Any]:
+        """The first record's payload — how a parked document is read back."""
+        async with read_session(self._session_factory) as session:
+            await self._live_row(session, owner_id, collection_id)
+            payload = await session.scalar(
+                select(CollectionRecordRow.payload)
+                .where(CollectionRecordRow.collection_id == collection_id)
+                .order_by(CollectionRecordRow.position)
+                .limit(1)
+            )
+            if payload is None:
+                raise CollectionNotFoundError(collection_id)
+            return dict(payload)
+
     async def delete_expired(self) -> int:
         """Drop every collection past its TTL.
 

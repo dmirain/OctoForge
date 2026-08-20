@@ -29,11 +29,7 @@ from octoforge_core.net.collections.api import (
     NewRecords,
 )
 from octoforge_core.net.collections.schema_infer import infer_records, merge_nodes, render
-from octoforge_core.net.response_memory import (
-    RENDER_IN_THREAD_CHARS,
-    ResponseMemory,
-    render_memory_passport,
-)
+from octoforge_core.net.response_memory import DocumentHome, ResponseMemory
 from octoforge_core.net.tool_spec import FieldCoercion, ResponseSpec
 from octoforge_core.time import utc_now
 
@@ -84,10 +80,14 @@ class ResponseSpill:
         store: CollectionStore | None,
         config: CollectionConfig,
         memory: ResponseMemory | None = None,
+        documents: "DocumentHome | None" = None,
     ) -> None:
         self._store = store
         self._config = config
         self._memory = memory
+        # where a single document parks: the database home when the tier
+        # exists (search must survive the task), else the RAM memory itself
+        self._documents: DocumentHome | None = documents if documents is not None else memory
 
     @property
     def inline_max_chars(self) -> int:
@@ -159,21 +159,19 @@ class ResponseSpill:
         items_path = response.items_path if response is not None else None
         parsed = await parse_structured(body, content_type, items_path)
         if parsed is None:
-            # unstructured (text, HTML, broken JSON): memory holds it verbatim
-            return await self._remember(owner_id, scope, source, body)
+            # unstructured (text, HTML, broken JSON): a document, verbatim
+            return await self._park(owner_id, scope, source, body)
         if not parsed.records.payloads:
             return None
         if parsed.single_document:
-            remembered = await self._remember(
-                owner_id, scope, source, body, document=parsed.document
-            )
-            if remembered is not None:
-                return remembered
-            # no memory wired: a single document still beats truncation as
+            parked = await self._park(owner_id, scope, source, body, document=parsed.document)
+            if parked is not None:
+                return parked
+            # no home at all: a single document still beats truncation as
             # a one-record collection, when the database tier exists
         if self._store is None:
-            # no database tier: an array is still a readable document
-            return await self._remember(owner_id, scope, source, body, document=parsed.document)
+            # no database tier: an array is still a readable document (RAM)
+            return await self._park(owner_id, scope, source, body, document=parsed.document)
         records = parsed.records
         if response is not None and response.fields:
             # the record's own coercions/projection — the SAME shaping the
@@ -194,7 +192,7 @@ class ResponseSpill:
         )
         return render_passport(passport)
 
-    async def _remember(
+    async def _park(
         self,
         owner_id: str,
         scope: str,
@@ -202,20 +200,10 @@ class ResponseSpill:
         body: str,
         document: Any = None,  # noqa: ANN401 — parsed JSON
     ) -> str | None:
-        """Park in task memory; the kind is what the document says it is.
-
-        A big document's passport costs a token-estimate pass over its text,
-        so past the threshold it renders off the event loop.
-        """
-        if self._memory is None:
+        """Hand the document to its home; None when no home is wired."""
+        if self._documents is None:
             return None
-        kind = "json" if document is not None else "text"
-        item = self._memory.store(
-            owner_id=owner_id, scope=scope, kind=kind, source=source, body=body, document=document
-        )
-        if len(body) > RENDER_IN_THREAD_CHARS:
-            return await asyncio.to_thread(render_memory_passport, item, self._memory.config)
-        return render_memory_passport(item, self._memory.config)
+        return await self._documents.park(owner_id, scope, source, body, document)
 
     def expiry(self) -> datetime:
         return utc_now() + timedelta(seconds=self._config.ttl_seconds)
@@ -314,7 +302,14 @@ def _take_apart(value: Any, items_path: str | None) -> ParsedBody | None:  # noq
     records, envelope = _unwrap(value)
     if records is None:
         return None
-    return ParsedBody(kind=CollectionKind.JSON, records=records, envelope=envelope, document=value)
+    single = isinstance(value, dict) and len(records.payloads) == 1 and records.payloads[0] is value
+    return ParsedBody(
+        kind=CollectionKind.JSON,
+        records=records,
+        envelope=envelope,
+        document=value,
+        single_document=single,
+    )
 
 
 def dotted_get(value: Any, path: str) -> Any:  # noqa: ANN401 — parsed JSON in and out
