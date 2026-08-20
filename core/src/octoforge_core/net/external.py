@@ -38,6 +38,7 @@ import httpx
 from octoforge_core.config import DEFAULT_TIMEOUT_SECONDS
 from octoforge_core.instructions.api import InstructionService, InstructionType
 from octoforge_core.net.collections.api import REF_PREFIX as COLLECTION_REF_PREFIX
+from octoforge_core.net.collections.api import CollectionQuotaError
 from octoforge_core.net.collections.ingest import (
     CollectionSink,
     ParsedBody,
@@ -296,6 +297,7 @@ class ExternalCallExecutor:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         delegates: Mapping[str, KindCallDelegate] | None = None,
         spill: ResponseSpill | None = None,
+        truncate_chars: int = MAX_BODY_CHARS,
     ) -> None:
         resolved = credentials if credentials is not None else CallCredentials()
         self._service = service
@@ -308,6 +310,8 @@ class ExternalCallExecutor:
         self._delegates = dict(delegates or {})
         # None: oversized structured bodies keep the truncation below
         self._spill = spill
+        # the fallback cut for what neither tier takes (config, not a constant)
+        self._truncate_chars = truncate_chars
 
     async def execute(
         self,
@@ -428,6 +432,23 @@ class ExternalCallExecutor:
             had_secrets=bool(secrets),
         )
 
+    async def _store_page(
+        self, sink: CollectionSink, spec: ToolSpec, page: "_PageResult"
+    ) -> ParsedBody | None:
+        """Parse and store one collect page; None = nothing there, stop the walk.
+
+        `CollectionQuotaError` passes through — the loop turns it into a cap.
+        """
+        parsed = await parse_structured(
+            page.scrubbed,
+            page.content_type,
+            spec.response.items_path if spec.response is not None else None,
+        )
+        if parsed is None or not parsed.records.payloads:
+            return None
+        await sink.add(_shaped(parsed, spec), len(page.scrubbed))
+        return parsed
+
     async def _pour_into(
         self,
         name: str,
@@ -462,7 +483,12 @@ class ExternalCallExecutor:
             source=f"endpoint:{name}",
             into=opts.into.removeprefix(COLLECTION_REF_PREFIX),
         )
-        await sink.add(_shaped(parsed, spec), len(page.scrubbed))
+        try:
+            await sink.add(_shaped(parsed, spec), len(page.scrubbed))
+        except CollectionQuotaError as full:
+            raise ExternalCallError(
+                f"nothing appended: {full}; drop an old collection or query what is there"
+            ) from full
         passport = await sink.finish(truncated=page.wire_truncated)
         assert passport is not None  # add() above stored a non-empty batch
         return ExternalCallResult(status=page.status, body=render_passport(passport))
@@ -484,18 +510,8 @@ class ExternalCallExecutor:
         page ceiling — the last one marks the collection truncated, because
         counts that silently reflect a cap read as the whole truth.
         """
-        pagination = spec.pagination
-        if pagination is None:
-            raise ExternalCallError(
-                f"endpoint '{name}' declares no pagination section; collect needs one "
-                "(add it to the record: kind page/offset/cursor, the param to advance)"
-            )
-        if self._spill is None or self._spill.store is None or user_id is None:
-            raise ExternalCallError(COLLECT_UNAVAILABLE_MESSAGE)
-        max_pages = min(
-            opts.max_pages if opts.max_pages is not None else self._spill.config.collect_max_pages,
-            self._spill.config.collect_max_pages,
-        )
+        pagination, max_pages = self._collect_prerequisites(name, spec, user_id, opts)
+        assert self._spill is not None and user_id is not None  # prerequisites verified
         sink = CollectionSink(
             self._spill,
             owner_id=user_id,
@@ -514,17 +530,18 @@ class ExternalCallExecutor:
             status = page.status
             if page.status >= HTTPStatus.BAD_REQUEST:
                 if pages == 0:
-                    return ExternalCallResult(status=page.status, body=_truncate(page.scrubbed))
+                    return ExternalCallResult(
+                        status=page.status, body=self._truncate(page.scrubbed)
+                    )
                 capped = True  # keep what arrived; the tail is missing
                 break
-            parsed = await parse_structured(
-                page.scrubbed,
-                page.content_type,
-                spec.response.items_path if spec.response is not None else None,
-            )
-            if parsed is None or not parsed.records.payloads:
+            try:
+                parsed = await self._store_page(sink, spec, page)
+            except CollectionQuotaError:
+                capped = True  # keep what fits; the passport says it was cut
+                break
+            if parsed is None:
                 break  # the natural end of the data
-            await sink.add(_shaped(parsed, spec), len(page.scrubbed))
             pages += 1
             if not cursor.advance(parsed, len(parsed.records.payloads)):
                 break
@@ -539,6 +556,20 @@ class ExternalCallExecutor:
             )
         note = f"\ncollected {pages} page(s) this call"
         return ExternalCallResult(status=status, body=render_passport(passport) + note)
+
+    def _collect_prerequisites(
+        self, name: str, spec: ToolSpec, user_id: str | None, opts: "CallOptions"
+    ) -> tuple[PaginationSpec, int]:
+        """The declared pagination and the page ceiling, or the reason there is none."""
+        if spec.pagination is None:
+            raise ExternalCallError(
+                f"endpoint '{name}' declares no pagination section; collect needs one "
+                "(add it to the record: kind page/offset/cursor, the param to advance)"
+            )
+        if self._spill is None or self._spill.store is None or user_id is None:
+            raise ExternalCallError(COLLECT_UNAVAILABLE_MESSAGE)
+        ceiling = self._spill.config.collect_max_pages
+        return spec.pagination, min(opts.max_pages or ceiling, ceiling)
 
     def _wire_limit(self) -> int:
         """How much is read off the wire; the memory tier raises the ceiling."""
@@ -570,10 +601,15 @@ class ExternalCallExecutor:
             )
             if passport is not None:
                 return passport
-        result = _truncate(scrubbed)
+        result = self._truncate(scrubbed)
         if truncated and not result.endswith(TRUNCATED_SUFFIX):
             result += TRUNCATED_SUFFIX
         return result
+
+    def _truncate(self, body: str) -> str:
+        if len(body) <= self._truncate_chars:
+            return body
+        return body[: self._truncate_chars] + TRUNCATED_SUFFIX
 
     async def _user_values(self, plan: _RenderPlan, user_id: str | None) -> dict[str, str]:
         """The `{user.*}` values of this call, keyed by full field name."""

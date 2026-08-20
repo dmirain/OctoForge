@@ -141,6 +141,10 @@ and dataset search are unavailable — the system-record sync is skipped too.
 | `OF_RESPONSE_MEMORY_BUDGET_MB` | `200` | Process-wide LRU budget of task memory |
 | `OF_RESPONSE_GET_DEFAULT_CHARS` | `8000` | Default `response_get` answer size |
 | `OF_RESPONSE_GET_MAX_CHARS` | `100000` | Ceiling of one deliberate `response_get` read |
+| `OF_HTTP_REQUEST_MAX_CHARS` | `8000` | Fallback cut of an `http_request` body neither tier takes (was a hard-coded 4000) |
+| `OF_HTTP_BODY_MAX_CHARS` | `8000` | Fallback cut of `external_call`/MCP bodies neither tier takes |
+| `OF_COLLECTIONS_QUERY_DEFAULT_CHARS` | `8000` | Default size of a `collection_query` answer |
+| `OF_COLLECTIONS_QUERY_MAX_CHARS` | `32000` | The most one deliberate `collection_query` answer may take (`max_chars`) |
 
 ## Secrets
 

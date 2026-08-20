@@ -217,13 +217,14 @@ class HttpRequestTool:
     which is the default because a general assistant needs the open web.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917 — the tool's full knob surface
         self,
         http_client: httpx.AsyncClient,
         guard: SsrfGuard,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         allowed_origins: tuple[str, ...] = (),
         spill: ResponseSpill | None = None,
+        max_chars: int = MAX_RESPONSE_CHARS,
     ) -> None:
         self._http = http_client
         self._guard = guard
@@ -231,6 +232,8 @@ class HttpRequestTool:
         self._allowed_origins = allowed_origins
         # None: oversized structured bodies keep the truncation below
         self._spill = spill
+        # the fallback cut for what neither tier takes (config, not a constant)
+        self._max_chars = max_chars
 
     @property
     def spec(self) -> ToolSpec:
@@ -275,8 +278,8 @@ class HttpRequestTool:
             )
             if passport is not None:
                 return f"HTTP {response.status_code}\n{passport}"
-        if len(body) > MAX_RESPONSE_CHARS:
-            body = body[:MAX_RESPONSE_CHARS] + TRUNCATED_SUFFIX
+        if len(body) > self._max_chars:
+            body = body[: self._max_chars] + TRUNCATED_SUFFIX
         elif truncated:
             body += BODY_TOO_LARGE_SUFFIX
         return f"HTTP {response.status_code}\n{body}"

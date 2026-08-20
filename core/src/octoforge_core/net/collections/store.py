@@ -9,7 +9,7 @@ by an error — a fetch must not fail because an old fetch still lingers.
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.unit_of_work import read_session, write_session
@@ -18,6 +18,7 @@ from octoforge_core.net.collections.api import (
     CollectionKind,
     CollectionNotFoundError,
     CollectionPassport,
+    CollectionQuotaError,
     NewRecords,
 )
 from octoforge_core.net.collections.models import CollectionRecordRow, CollectionRow
@@ -78,8 +79,23 @@ class SqlAlchemyCollectionStore:
         byte_size: int,
         expires_at: datetime,
     ) -> CollectionPassport:
-        """Append a batch, replace the derived schema, refresh the TTL."""
+        """Append a batch, replace the derived schema, refresh the TTL.
+
+        The byte quota holds here too — but by refusal, not eviction: a
+        growing collection must not push OTHER collections out to feed its
+        own growth. The caller stops and keeps what fits.
+        """
         async with write_session(self._session_factory) as session:
+            owned = await session.scalar(
+                select(func.coalesce(func.sum(CollectionRow.byte_size), 0)).where(
+                    CollectionRow.owner_id == owner_id
+                )
+            )
+            if int(owned or 0) + byte_size > self._config.max_bytes_per_user:
+                raise CollectionQuotaError(
+                    f"appending {byte_size} bytes would pass the "
+                    f"{self._config.max_bytes_per_user}-byte quota"
+                )
             row = await self._live_row(session, owner_id, collection_id)
             self._add_records(session, row.id, records, position=row.record_count)
             row.record_count += len(records.payloads)

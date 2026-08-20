@@ -20,7 +20,10 @@ from octoforge_core.net.collections.api import (
     CollectionKind,
     CollectionNotFoundError,
     CollectionPassport,
+    CollectionQuotaError,
     NewRecords,
+    Query,
+    QueryResult,
 )
 from octoforge_core.net.collections.ingest import ResponseSpill, render_passport
 from octoforge_core.net.collections.schema_infer import (
@@ -30,7 +33,9 @@ from octoforge_core.net.collections.schema_infer import (
     render,
 )
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
+from octoforge_core.net.collections.tools import CollectionQueryTool
 from octoforge_core.time import utc_now
+from octoforge_core.tools.base import ToolContext
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 OWNER = "person-1"
@@ -287,3 +292,44 @@ async def test_the_feature_is_absent_off_postgres() -> None:
     await init_db(engine)
     assert build_collections(engine, create_session_factory(engine), CollectionConfig()) is None
     await engine.dispose()
+
+
+async def test_append_refuses_past_the_byte_quota(store: SqlAlchemyCollectionStore) -> None:
+    """The quota holds on BOTH write paths: create evicts, append refuses —
+    a growing collection must not evict others to feed its own growth."""
+    passport = await _create(store, OWNER, byte_size=9_000)
+
+    with pytest.raises(CollectionQuotaError):
+        await store.append(
+            OWNER,
+            passport.id,
+            NewRecords(payloads=[{"id": 99}]),
+            schema=infer_records([{"id": 99}]),
+            byte_size=2_000,
+            expires_at=utc_now() + timedelta(hours=1),
+        )
+    # what was there before the refusal is untouched
+    untouched = 2
+    assert (await store.passport(OWNER, passport.id)).record_count == untouched
+
+
+async def test_query_result_size_is_the_models_choice() -> None:
+    """The default is conservative; a deliberate max_chars takes more, the
+    config ceiling holds whatever is asked."""
+
+    class CannedEngine:
+        async def execute(self, owner_id: str, ref: str, query: Query) -> QueryResult:
+            return QueryResult(rows=[{"text": "x" * 300} for _ in range(10)], total=10)
+
+    config = CollectionConfig(query_default_chars=200, query_max_chars=1000)
+    tool = CollectionQueryTool(CannedEngine(), config)
+    context = ToolContext(user_id=OWNER, channel="web", dialog_id="dialog-1")
+
+    modest = await tool.execute({"ref": "col:x", "op": "get"}, context)
+    deliberate = await tool.execute({"ref": "col:x", "op": "get", "max_chars": 900}, context)
+    greedy = await tool.execute({"ref": "col:x", "op": "get", "max_chars": 90_000}, context)
+
+    modest_bound, ceiling_bound = 500, 1500
+    assert "raise max_chars" in modest and len(modest) < modest_bound
+    assert len(deliberate) > len(modest)
+    assert len(greedy) < ceiling_bound  # the ceiling held

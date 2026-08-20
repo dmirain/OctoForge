@@ -50,12 +50,14 @@ class McpMirrorCallExecutor:
         client: McpClient,
         secrets: SecretStore | None = None,
         spill: ResponseSpill | None = None,
+        truncate_chars: int = MAX_BODY_CHARS,
     ) -> None:
         self._store = store
         self._client = client
         self._secrets = secrets
         # None: oversized structured results keep the truncation below
         self._spill = spill
+        self._truncate_chars = truncate_chars
 
     async def execute(
         self, content: str, params: dict[str, Any], user_id: str | None, scope: str = ""
@@ -99,7 +101,7 @@ class McpMirrorCallExecutor:
                 scope=scope,
             )
         if body is None:
-            body = _truncate(scrubbed)
+            body = _truncate(scrubbed, self._truncate_chars)
         if result.is_error:
             body = TOOL_ERROR_TEMPLATE.format(text=body, contract=content)
         # status 0: no HTTP status worth showing — the tool renders body alone
@@ -150,7 +152,7 @@ def _scrub(body: str, secret: ResolvedSecret | None) -> str:
     return body.replace(secret.value, SECRET_SCRUBBED).replace(secret.plain, SECRET_SCRUBBED)
 
 
-def _truncate(body: str) -> str:
-    if len(body) <= MAX_BODY_CHARS:
+def _truncate(body: str, limit: int) -> str:
+    if len(body) <= limit:
         return body
-    return body[:MAX_BODY_CHARS] + TRUNCATED_SUFFIX
+    return body[:limit] + TRUNCATED_SUFFIX

@@ -68,6 +68,12 @@ DEFAULT_RESPONSE_MEMORY_MAX_MB = 8
 DEFAULT_RESPONSE_MEMORY_BUDGET_MB = 200
 DEFAULT_RESPONSE_GET_DEFAULT_CHARS = 8000
 DEFAULT_RESPONSE_GET_MAX_CHARS = 100_000
+# The fallback cuts for what neither response tier takes; http_request used to
+# be a hard-coded 4000, half its neighbor for no reason.
+DEFAULT_HTTP_REQUEST_MAX_CHARS = 8000
+DEFAULT_HTTP_BODY_MAX_CHARS = 8000
+DEFAULT_COLLECTIONS_QUERY_DEFAULT_CHARS = 8000
+DEFAULT_COLLECTIONS_QUERY_MAX_CHARS = 32_000
 DEFAULT_RERANKER_MODEL = ""
 DEFAULT_RERANKER_API_URL = "https://api.siliconflow.cn/v1/rerank"
 DEFAULT_RERANKER_TIMEOUT_SECONDS = 30.0
@@ -184,6 +190,10 @@ class Settings(BaseSettings):
     response_memory_budget_mb: int = DEFAULT_RESPONSE_MEMORY_BUDGET_MB
     response_get_default_chars: int = DEFAULT_RESPONSE_GET_DEFAULT_CHARS
     response_get_max_chars: int = DEFAULT_RESPONSE_GET_MAX_CHARS
+    http_request_max_chars: int = DEFAULT_HTTP_REQUEST_MAX_CHARS
+    http_body_max_chars: int = DEFAULT_HTTP_BODY_MAX_CHARS
+    collections_query_default_chars: int = DEFAULT_COLLECTIONS_QUERY_DEFAULT_CHARS
+    collections_query_max_chars: int = DEFAULT_COLLECTIONS_QUERY_MAX_CHARS
     cron_lease_ttl_seconds: float = DEFAULT_CRON_LEASE_TTL_SECONDS
     cron_replay_limit: int = DEFAULT_CRON_REPLAY_LIMIT
     mcp_sync_interval_seconds: float = DEFAULT_MCP_SYNC_INTERVAL_SECONDS

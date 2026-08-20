@@ -325,6 +325,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     secret_store=secret_store,
                     llm=llm_client,
                     spill=spill,
+                    truncate_chars=settings.http_body_max_chars,
                 )
             )
             registry = build_tool_registry(
@@ -352,6 +353,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         ),
                         delegates={MIRROR_KIND: mcp.call_delegate},
                         spill=spill,
+                        truncate_chars=settings.http_body_max_chars,
                     ),
                     search_provider=_build_search_provider(settings, outbound_http),
                     mcp_add=mcp.add_tool,
@@ -904,6 +906,8 @@ def _collections_config(settings: Settings) -> CollectionConfig:
         query_max_limit=settings.collections_query_max_limit,
         inline_max_chars=settings.collections_inline_max_chars,
         collect_max_pages=settings.collections_collect_max_pages,
+        query_default_chars=settings.collections_query_default_chars,
+        query_max_chars=settings.collections_query_max_chars,
     )
 
 
@@ -966,6 +970,7 @@ def _tool_limits(settings: Settings) -> ToolLimits:
         history_search_default_limit=settings.history_search_default_limit,
         history_search_max_limit=settings.history_search_max_limit,
         http_request_allowed_origins=tuple(settings.http_request_allowlist),
+        http_request_max_chars=settings.http_request_max_chars,
     )
 
 
@@ -1041,6 +1046,8 @@ class _McpDeps:
     llm: LLMClient
     # oversized structured results become collections; None = truncation
     spill: ResponseSpill | None = None
+    # the fallback cut for unspilled MCP results
+    truncate_chars: int = 8000
 
 
 def _build_mcp(deps: _McpDeps) -> _McpRuntime:
@@ -1056,7 +1063,9 @@ def _build_mcp(deps: _McpDeps) -> _McpRuntime:
     )
     return _McpRuntime(
         sync=sync,
-        call_delegate=McpMirrorCallExecutor(store, client, deps.secret_store, spill=deps.spill),
+        call_delegate=McpMirrorCallExecutor(
+            store, client, deps.secret_store, spill=deps.spill, truncate_chars=deps.truncate_chars
+        ),
         add_tool=McpAddTool(store, sync, deps.guard, secrets=deps.secret_store),
     )
 

@@ -23,6 +23,8 @@ DEFAULT_QUERY_LIMIT = 50
 DEFAULT_QUERY_MAX_LIMIT = 500
 DEFAULT_INLINE_MAX_CHARS = 2000
 DEFAULT_COLLECT_MAX_PAGES = 20
+DEFAULT_QUERY_DEFAULT_CHARS = 8000
+DEFAULT_QUERY_MAX_CHARS = 32_000
 
 #: How a collection is addressed by the model.
 REF_PREFIX = "col:"
@@ -43,6 +45,15 @@ class CollectionNotFoundError(CollectionError):
 
 class CollectionQueryError(CollectionError):
     """The query does not fit the collection (unknown field, wrong type)."""
+
+
+class CollectionQuotaError(CollectionError):
+    """An append would push the owner past the byte quota.
+
+    Only `append` raises it: `create` evicts the least recently used instead,
+    but a growing collection must not evict OTHER collections to feed its own
+    growth — the collect loop stops and marks itself truncated instead.
+    """
 
 
 class CollectionKind(StrEnum):
@@ -186,6 +197,10 @@ class CollectionConfig:
     #: The collect loop's page ceiling — what keeps one call from walking a
     #: gigabyte API to the end. A call may ask for fewer pages, never more.
     collect_max_pages: int = DEFAULT_COLLECT_MAX_PAGES
+    #: What a collection_query answer takes when the caller does not choose,
+    #: and the most it may deliberately ask for.
+    query_default_chars: int = DEFAULT_QUERY_DEFAULT_CHARS
+    query_max_chars: int = DEFAULT_QUERY_MAX_CHARS
 
 
 @dataclass(frozen=True, slots=True)

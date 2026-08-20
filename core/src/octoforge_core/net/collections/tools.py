@@ -40,8 +40,6 @@ NOT_FOUND_TEMPLATE = (
     "collection '{ref}' is gone (expired, evicted or never yours): run the call that "
     "produced it again to get fresh data and a fresh ref"
 )
-#: The rendered result is capped; pages continue with offset.
-MAX_RESULT_CHARS = 8000
 RESULT_TEMPLATE = "{rows} of {total} matched (offset {offset})\n{body}"
 
 QUERY_SCHEMA: dict[str, Any] = {
@@ -98,6 +96,13 @@ QUERY_SCHEMA: dict[str, Any] = {
         },
         "limit": {"type": "integer", "description": "Rows per page"},
         "offset": {"type": "integer", "description": "Rows to skip (paging)"},
+        "max_chars": {
+            "type": "integer",
+            "description": (
+                "How much of the rendered result you choose to take (the default "
+                "is conservative; raise it deliberately for big reads)"
+            ),
+        },
     },
     "required": ["ref", "op"],
 }
@@ -132,11 +137,14 @@ class CollectionQueryTool:
             return feature_refusal(FeatureCode.HTTP_ENDPOINTS)
         ref = _parse_ref(arguments.get("ref"))
         query = _parse_query(arguments, self._config)
+        asked = _parse_int(
+            arguments.get("max_chars"), self._config.query_default_chars, "max_chars"
+        )
         try:
             result = await self._engine.execute(context.user_id, ref, query)
         except CollectionError as failure:
             return _failure_text(failure, arguments.get("ref"))
-        return _render_result(query, result)
+        return _render_result(query, result, min(asked, self._config.query_max_chars))
 
 
 class CollectionGetTool:
@@ -251,10 +259,12 @@ def _failure_text(failure: CollectionError, ref: object) -> str:
     return f"query refused: {failure}"
 
 
-def _render_result(query: Query, result: QueryResult) -> str:
+def _render_result(query: Query, result: QueryResult, max_chars: int) -> str:
     body = json.dumps(result.rows, ensure_ascii=False, default=str)
-    if len(body) > MAX_RESULT_CHARS:
-        body = body[:MAX_RESULT_CHARS] + "\n…[cut: narrow the query or page with offset/limit]"
+    if len(body) > max_chars:
+        body = body[:max_chars] + (
+            "\n…[cut: narrow the query, page with offset/limit, or raise max_chars]"
+        )
     return RESULT_TEMPLATE.format(
         rows=len(result.rows), total=result.total, offset=query.offset, body=body
     )

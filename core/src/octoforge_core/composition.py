@@ -72,6 +72,7 @@ from octoforge_core.net.collections.engine import PostgresCollectionQueryEngine
 from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.collections.tools import CollectionGetTool, CollectionQueryTool
+from octoforge_core.net.external import MAX_BODY_CHARS as EXTERNAL_BODY_MAX_CHARS
 from octoforge_core.net.external import CallCredentials, ExternalCallExecutor, KindCallDelegate
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.response_memory import (
@@ -81,6 +82,7 @@ from octoforge_core.net.response_memory import (
     ResponseMemoryConfig,
     ResponseWindowTool,
 )
+from octoforge_core.net.tools import MAX_RESPONSE_CHARS as HTTP_REQUEST_MAX_CHARS
 from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool, HttpRequestTool
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
@@ -120,6 +122,8 @@ class ToolLimits:
     history_search_max_limit: int
     # origins `http_request` may call; empty means the open web (see net/tools.py)
     http_request_allowed_origins: tuple[str, ...] = ()
+    # the fallback cut of an http_request body neither response tier takes
+    http_request_max_chars: int = HTTP_REQUEST_MAX_CHARS
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +356,7 @@ def build_external_executor(  # noqa: PLR0913, PLR0917 — the composition facad
     credentials: CallCredentials | None = None,
     delegates: Mapping[str, KindCallDelegate] | None = None,
     spill: ResponseSpill | None = None,
+    truncate_chars: int = EXTERNAL_BODY_MAX_CHARS,
 ) -> ExternalCallExecutor:
     """Build the executor of external calls described by tool records.
 
@@ -367,6 +372,7 @@ def build_external_executor(  # noqa: PLR0913, PLR0917 — the composition facad
         credentials=credentials,
         delegates=delegates,
         spill=spill,
+        truncate_chars=truncate_chars,
     )
 
 
@@ -543,6 +549,7 @@ def _register_core_tools(  # noqa: PLR0913, PLR0917 — internal registrar mirro
             guard=guard,
             allowed_origins=limits.http_request_allowed_origins,
             spill=responses.spill if responses is not None else None,
+            max_chars=limits.http_request_max_chars,
         )
     )
     registry.register(AskUserTool())

@@ -1592,3 +1592,26 @@ def test_response_fields_reject_an_unknown_type() -> None:
     )
     with pytest.raises(ToolSpecError, match="allowed: boolean, number, string"):
         parse_tool_spec(content)
+
+
+async def test_collect_stops_and_says_cut_when_the_byte_quota_fills() -> None:
+    """A quota that only create respects is not a quota; the loop keeps what
+    fits and the passport admits the cut."""
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    tight = CollectionConfig(max_bytes_per_user=400)
+    spill = ResponseSpill(SqlAlchemyCollectionStore(create_session_factory(engine), tight), tight)
+    executor = make_executor(
+        _paged_handler,
+        records={PAGED_TOOL_NAME: PAGED_TOOL_CONTENT},
+        options=ExecutorOptions(spill=spill),
+    )
+
+    result = await executor.execute(
+        PAGED_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True)
+    )
+
+    assert "SOURCE CUT" in result.body
+    # two pages fit under the 400-byte quota, the third was refused
+    assert "4 records" in result.body
+    await engine.dispose()
