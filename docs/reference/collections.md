@@ -55,10 +55,14 @@ already-scrubbed text to the spill (`ResponseSpill`). The spill answers one of t
 - a JSON **single object**, or unstructured/malformed text → **task memory** (see above);
 - no user in context, or neither tier available → the old **truncation**.
 
-Unwrapping: a top-level array is the records; an object with exactly one array-of-objects member is
-an envelope around its records (the scalar siblings ride into the passport as `envelope`); any other
-object is a single record. CSV takes its keys from the header row; values stay strings unless the
-endpoint record declares coercions.
+Unwrapping: a top-level array is the records. Otherwise the records are the array of objects nearest
+the root — a breadth-first descent through wrapper objects (`{ok, data:{meta, items:[…]}}` is the
+dominant REST shape), stopping at the first level that holds one and taking the largest by element
+count if a level holds several. The descent never enters a list's elements, so an inner array of a
+record (a product's `images:[…]`) is never mistaken for the collection; the scalar and `meta`
+wrappers ride into the passport `envelope`. When nothing array-shaped is found the whole object is a
+single document. CSV takes its keys from the header row; values stay strings unless the endpoint
+record declares coercions.
 
 The passport names the ref (`col:<id>`), the kind and source, the record count and size, the expiry,
 and the rendered record schema — knowing the shape of 1400 records is worth more per token than

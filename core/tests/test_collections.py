@@ -29,6 +29,7 @@ from octoforge_core.net.collections.ingest import (
     MAX_RECORDS,
     ResponseSpill,
     _take_apart,
+    _unwrap,
     parse_structured,
     render_passport,
 )
@@ -367,3 +368,75 @@ async def test_ram_budget_is_per_owner_not_global() -> None:
     memory.store("user-a", "task-a", "text", "src", "a" * 2000)
 
     assert memory.get("user-b", theirs).body[0] == "b"
+
+
+# --- nested record location (the ВкусВилл {ok, data:{meta, items:[…]}} case) ---
+
+
+async def test_records_are_found_inside_a_nested_wrapper(spill: ResponseSpill) -> None:
+    """The real MCP shape that shipped as one doc_json: items live at
+    data.items, two levels down — the BFS must find them and make a
+    collection, not a single searchable document."""
+    body = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "meta": {"total": 115, "pages": 12},
+                "items": [
+                    {"id": i, "name": f"tvorog-{i:04d} " + "x" * 40, "price": i * 10}
+                    for i in range(60)
+                ],
+            },
+        }
+    )
+    passport = await spill.spill(OWNER, body, "application/json", SOURCE, False)
+
+    assert passport is not None
+    assert "col:" in passport  # a collection, not a resp: document
+    assert "60 records" in passport
+    # the scalar wrapper and the meta block rode into the envelope
+    assert '"ok": true' in passport
+    assert '"total": 115' in passport
+
+
+def test_bfs_never_dives_into_a_record_s_own_array() -> None:
+    """A product's images:[…] is inside a list element; the descent must not
+    enter list elements, so it can never be mistaken for the collection."""
+    doc = {
+        "data": {
+            "items": [
+                {"name": "a", "images": [{"url": "1"}, {"url": "2"}, {"url": "3"}]},
+                {"name": "b", "images": [{"url": "4"}]},
+            ]
+        }
+    }
+    records, _envelope, _dropped = _unwrap(doc)
+    assert records is not None
+    names = [p["name"] for p in records.payloads]
+    assert names == ["a", "b"]  # the two products, not the four images
+
+
+def test_the_record_array_nearest_the_root_wins() -> None:
+    """BFS stops at the first level with an array: a shallow list beats a
+    deeper one regardless of size."""
+    doc = {
+        "top": [{"id": 1}],  # depth 1
+        "nested": {"deep": [{"id": 2}, {"id": 3}, {"id": 4}]},  # depth 2, bigger
+    }
+    records, _, _ = _unwrap(doc)
+    assert records is not None
+    assert [p["id"] for p in records.payloads] == [1]  # the shallow one
+
+
+def test_largest_array_wins_on_the_same_level() -> None:
+    doc = {"few": [{"id": 1}], "many": [{"id": 2}, {"id": 3}]}
+    records, _, _ = _unwrap(doc)
+    assert records is not None
+    bigger_sibling = 2
+    assert len(records.payloads) == bigger_sibling
+
+
+def test_an_object_with_no_array_stays_a_single_document() -> None:
+    doc = {"id": 1, "title": "one thing", "meta": {"a": 1}}
+    records, _envelope, _dropped = _unwrap(doc)
+    assert records is not None and records.payloads == [doc]  # itself, one record

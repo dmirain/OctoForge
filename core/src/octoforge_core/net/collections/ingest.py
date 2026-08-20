@@ -461,31 +461,85 @@ class CollectionSink:
         return await store.passport(self._owner_id, self._collection_id)
 
 
+#: How deep the record hunt descends into wrapper objects before giving up.
+MAX_UNWRAP_DEPTH = 5
+#: A dict-node budget: a pathological wide/deep object must not walk forever.
+MAX_UNWRAP_NODES = 2000
+
+
 def _unwrap(
     value: Any,  # noqa: ANN401 — parsed JSON
 ) -> tuple[NewRecords | None, dict[str, Any], bool]:
     """Find the records inside a parsed body.
 
-    A top-level array IS the records. An object with exactly one array-of-
-    objects member is an envelope around its records — the scalar siblings
-    ride into the passport. Anything else is a single record; a scalar body
-    is nobody's collection. The third element is True when the record tail
-    was dropped at MAX_RECORDS.
+    A top-level array IS the records. Otherwise the records are the array of
+    objects nearest the root — a breadth-first descent through wrapper objects
+    (`{ok, data:{meta, items:[…]}}` is the dominant REST shape), stopping at
+    the FIRST level that holds one, and taking the largest by element count if
+    a level holds several. The descent never enters a list's elements, so an
+    inner array inside a record (a product's `images:[…]`) is never mistaken
+    for the collection. When nothing array-shaped is found the whole object is
+    one record. The third element is True when the record tail was dropped at
+    MAX_RECORDS.
     """
     if isinstance(value, list):
         return _as_records(value), {}, len(value) > MAX_RECORDS
-    if isinstance(value, dict):
-        arrays = [
-            key
-            for key, member in value.items()
-            if isinstance(member, list) and member and all(isinstance(x, dict) for x in member)
-        ]
-        if len(arrays) == 1:
-            key = arrays[0]
-            items = value[key]
-            return _as_records(items), _scalars_of(value, except_key=key), len(items) > MAX_RECORDS
+    if not isinstance(value, dict):
+        return None, {}, False
+    located = _locate_records(value)
+    if located is None:
         return NewRecords(payloads=[value]), {}, False
-    return None, {}, False
+    items, envelope = located
+    return _as_records(items), envelope, len(items) > MAX_RECORDS
+
+
+def _locate_records(root: dict[str, Any]) -> tuple[list[Any], dict[str, Any]] | None:
+    """The array of objects nearest the root, with the surrounding envelope.
+
+    Breadth-first over dict nodes only. Returns None when no level holds an
+    array of objects — then the body is a single document, not a collection.
+    """
+    root_scalars = _scalars_of(root)
+    frontier: list[dict[str, Any]] = [root]
+    visited = 0
+    for _ in range(MAX_UNWRAP_DEPTH):
+        candidates: list[tuple[list[Any], dict[str, Any]]] = []
+        deeper: list[dict[str, Any]] = []
+        for node in frontier:
+            visited += 1
+            if visited > MAX_UNWRAP_NODES:
+                break
+            for member in node.values():
+                if _is_object_array(member):
+                    candidates.append((member, node))
+                elif isinstance(member, dict):
+                    deeper.append(member)
+        if candidates:
+            items, parent = max(candidates, key=lambda pair: len(pair[0]))
+            envelope = {**root_scalars, **_envelope_of(parent, items)}
+            return items, envelope
+        if visited > MAX_UNWRAP_NODES or not deeper:
+            return None
+        frontier = deeper
+    return None
+
+
+def _is_object_array(member: Any) -> bool:  # noqa: ANN401 — parsed JSON
+    return isinstance(member, list) and bool(member) and all(isinstance(x, dict) for x in member)
+
+
+def _envelope_of(parent: dict[str, Any], records: list[Any]) -> dict[str, Any]:
+    """The parent's siblings of the records array, minus that array itself.
+
+    Scalars and small wrapper objects (a `meta` block with total/pages) ride
+    into the passport; other arrays and the records array do not — the render
+    caps the whole thing at MAX_ENVELOPE_CHARS anyway.
+    """
+    return {
+        name: member
+        for name, member in parent.items()
+        if member is not records and not isinstance(member, list)
+    }
 
 
 def _scalars_of(value: Any, except_key: str | None = None) -> dict[str, Any]:  # noqa: ANN401
