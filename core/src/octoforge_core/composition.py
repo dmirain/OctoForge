@@ -74,6 +74,13 @@ from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.collections.tools import CollectionGetTool, CollectionQueryTool
 from octoforge_core.net.external import CallCredentials, ExternalCallExecutor, KindCallDelegate
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.net.response_memory import (
+    ResponseFindTool,
+    ResponseGetTool,
+    ResponseMemory,
+    ResponseMemoryConfig,
+    ResponseWindowTool,
+)
 from octoforge_core.net.tools import EndpointGetTool, ExternalCallTool, HttpRequestTool
 from octoforge_core.ports import LLMClient
 from octoforge_core.search.api import SearchProvider
@@ -143,13 +150,15 @@ class ToolServices:
     secret_list: Tool | None = None
     # pre-filled secrets-form links; None without secrets or a web surface
     secret_link: Tool | None = None
-    # the collections feature (Postgres only); None keeps plain truncation
+    # the collections feature (Postgres only); None = no database tier
     collections: "CollectionsRuntime | None" = None
+    # the response layer (task memory + the spill router); always buildable
+    responses: "ResponseLayer | None" = None
 
 
 @dataclass(frozen=True, slots=True)
 class CollectionsRuntime:
-    """The collections feature assembled: the spill and its tools.
+    """The database tier assembled: the store, the engine, its two tools.
 
     Built by `build_collections`, which answers None off Postgres — the query
     engine compiles to jsonb SQL and has no other implementation, so the
@@ -157,9 +166,24 @@ class CollectionsRuntime:
     """
 
     store: SqlAlchemyCollectionStore
-    spill: ResponseSpill
     query_tool: CollectionQueryTool
     get_tool: CollectionGetTool
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseLayer:
+    """Everything a fetched response may become, assembled.
+
+    The memory tier is universal (RAM, no database); the spill routes each
+    body to its shape's home — arrays to the database tier when one exists,
+    single documents and unstructured text to task memory.
+    """
+
+    memory: ResponseMemory
+    spill: ResponseSpill
+    get_tool: ResponseGetTool
+    find_tool: ResponseFindTool
+    window_tool: ResponseWindowTool
 
 
 def build_collections(
@@ -167,17 +191,32 @@ def build_collections(
     session_factory: async_sessionmaker[AsyncSession],
     config: CollectionConfig,
 ) -> CollectionsRuntime | None:
-    """Assemble the collections feature where the database can carry it."""
+    """Assemble the database tier where the database can carry it."""
     if engine.dialect.name != "postgresql":
         return None
     store = SqlAlchemyCollectionStore(session_factory, config)
     return CollectionsRuntime(
         store=store,
-        spill=ResponseSpill(store, config),
         query_tool=CollectionQueryTool(
             PostgresCollectionQueryEngine(session_factory, config), config
         ),
         get_tool=CollectionGetTool(store),
+    )
+
+
+def build_response_layer(
+    collections: CollectionsRuntime | None,
+    config: CollectionConfig,
+    memory_config: ResponseMemoryConfig | None = None,
+) -> ResponseLayer:
+    """Assemble the response layer; unlike the database tier, it always exists."""
+    memory = ResponseMemory(memory_config)
+    return ResponseLayer(
+        memory=memory,
+        spill=ResponseSpill(collections.store if collections is not None else None, config, memory),
+        get_tool=ResponseGetTool(memory),
+        find_tool=ResponseFindTool(memory),
+        window_tool=ResponseWindowTool(memory),
     )
 
 
@@ -198,6 +237,8 @@ class RunnerOptions:
     image_resolver: ImageResolver | None = None
     # tariff limit checks and usage metering; None = unlimited and unmetered
     limits: LimitGate | None = None
+    # task-scoped response memory the runner sweeps at process termination
+    response_memory: ResponseMemory | None = None
 
 
 def build_llm_client(http_client: httpx.AsyncClient, config: LLMConfig) -> LLMClient:
@@ -352,6 +393,10 @@ def build_tool_registry(  # noqa: PLR0913, PLR0917 — the composition facade ta
     if services.collections is not None:
         registry.register(services.collections.query_tool)
         registry.register(services.collections.get_tool)
+    if services.responses is not None:
+        registry.register(services.responses.get_tool)
+        registry.register(services.responses.find_tool)
+        registry.register(services.responses.window_tool)
     if services.search_provider is not None:
         registry.register(WebSearchTool(provider=services.search_provider))
     if services.mcp_add is not None:
@@ -439,6 +484,7 @@ def build_runner_config(
         vision=options.vision,
         image_resolver=options.image_resolver,
         limits=options.limits,
+        response_memory=options.response_memory,
     )
 
 
@@ -490,13 +536,13 @@ def _register_core_tools(  # noqa: PLR0913, PLR0917 — internal registrar mirro
     services: ToolServices | None = None,
 ) -> None:
     """Register the HTTP and deferred-work (task/cron) tools."""
-    collections = services.collections if services is not None else None
+    responses = services.responses if services is not None else None
     registry.register(
         HttpRequestTool(
             http_client=outbound_http,
             guard=guard,
             allowed_origins=limits.http_request_allowed_origins,
-            spill=collections.spill if collections is not None else None,
+            spill=responses.spill if responses is not None else None,
         )
     )
     registry.register(AskUserTool())

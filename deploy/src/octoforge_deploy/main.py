@@ -47,12 +47,15 @@ from octoforge_core import (
 from octoforge_core.admin.store import SqlAlchemyAdminStore
 from octoforge_core.agent.prompts import PromptProvider, StaticPromptProvider
 from octoforge_core.composition import (
+    CollectionsRuntime,
     LexicalBackend,
+    ResponseLayer,
     RunnerOptions,
     ToolLimits,
     ToolServices,
     ToolStores,
     build_collections,
+    build_response_layer,
 )
 from octoforge_core.config import EmbeddingBackend, HttpRerankerConfig, RerankerConfig
 from octoforge_core.context.compactor import CompactorConfig
@@ -102,6 +105,7 @@ from octoforge_core.net.collections.ingest import ResponseSpill
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.external import CallCredentials, ExternalCallAuth
 from octoforge_core.net.guard import SsrfGuard
+from octoforge_core.net.response_memory import ResponseMemoryConfig
 from octoforge_core.params.store import SqlAlchemyUserParamStore
 from octoforge_core.ports import LLMClient
 from octoforge_core.retention_sweep import RetentionSweeper
@@ -308,10 +312,10 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
             summary_store = build_summary_store(session_factory, lexical_search=lexical_backend)
             # Postgres-only: elsewhere None, and every response keeps the old
             # truncation — the capability pattern, decided here and nowhere else
-            collections_runtime = build_collections(
-                engine, session_factory, _collections_config(settings)
+            collections_runtime, response_layer = _build_data_tiers(
+                settings, engine, session_factory
             )
-            spill = collections_runtime.spill if collections_runtime is not None else None
+            spill = response_layer.spill
             mcp = _build_mcp(
                 _McpDeps(
                     session_factory=session_factory,
@@ -336,6 +340,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                     instructions=instructions,
                     datasets=datasets,
                     collections=collections_runtime,
+                    responses=response_layer,
                     executor=build_external_executor(
                         service=instructions,
                         http_client=outbound_http,
@@ -411,6 +416,7 @@ async def runtime(settings: Settings) -> AsyncIterator[Runtime]:
                         vision=deep_vision_client,
                         image_resolver=image_resolver,
                         limits=limit_service,
+                        response_memory=response_layer.memory,
                     ),
                 ),
                 stores=manager_stores,
@@ -898,6 +904,33 @@ def _collections_config(settings: Settings) -> CollectionConfig:
         query_max_limit=settings.collections_query_max_limit,
         inline_max_chars=settings.collections_inline_max_chars,
         collect_max_pages=settings.collections_collect_max_pages,
+    )
+
+
+def _build_data_tiers(
+    settings: Settings,
+    engine: AsyncEngine,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[CollectionsRuntime | None, ResponseLayer]:
+    """The two homes of a fetched response: the database tier (Postgres only,
+    None elsewhere) and the always-present task-memory layer over it."""
+    collections_runtime = build_collections(engine, session_factory, _collections_config(settings))
+    response_layer = build_response_layer(
+        collections_runtime,
+        _collections_config(settings),
+        _response_memory_config(settings),
+    )
+    return collections_runtime, response_layer
+
+
+def _response_memory_config(settings: Settings) -> ResponseMemoryConfig:
+    """Map the settings' response-memory knobs to the core config bundle."""
+    megabyte = 1024 * 1024
+    return ResponseMemoryConfig(
+        max_response_chars=settings.response_memory_max_mb * megabyte,
+        budget_chars=settings.response_memory_budget_mb * megabyte,
+        get_default_chars=settings.response_get_default_chars,
+        get_max_chars=settings.response_get_max_chars,
     )
 
 

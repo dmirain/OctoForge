@@ -1,16 +1,43 @@
-# Collections
+# Collections and task memory
 
-What happens to a large structured HTTP response instead of truncation: it becomes a **collection**
-the agent queries in the database, and the model receives a **passport** — the shape and the counts —
-instead of the first 8000 characters of a body whose tail used to be thrown away.
+What happens to a large HTTP response instead of truncation. Two tiers, picked by the body's shape:
+
+- an **array of records** becomes a **collection** in the database — its value is queries
+  (filter, aggregate, join), and it survives task boundaries;
+- a **single document** — one JSON object, an article, any unstructured text — goes to
+  **task memory**: RAM, no database, alive exactly as long as the task that fetched it. Its value
+  is being *read* (in full, when the model decides its budget affords it) or *searched* (when no
+  budget should swallow it whole).
+
+Either way the model receives a **passport** — the shape and the sizes — instead of the first
+8000 characters of a body whose tail used to be thrown away.
 
 A collection is **not a table**. One migration created two fixed tables (`collections`,
 `collection_records`) once; every collection of every user is rows in them. "Create a collection" is
 an INSERT, its schema is a JSON *value* derived from the data, and no DDL ever runs at runtime.
 
-**Postgres only.** The query engine compiles the DSL into SQL over jsonb and has no other
-implementation; on SQLite the feature is simply not wired (the composition root's
-`build_collections` answers None), the tools do not exist, and responses keep the old truncation.
+**The database tier is Postgres only.** The query engine compiles the DSL into SQL over jsonb and
+has no other implementation; on SQLite `build_collections` answers None and the collection tools do
+not exist. **Task memory is universal** — it needs no database, so every installation gets it, and
+off Postgres an oversized array degrades into a readable memory document instead of a truncated
+stump.
+
+## Task memory
+
+A remembered response gets a `resp:` ref and a passport with the numbers the model needs to decide
+what to spend: per-key sizes in characters AND an estimated token cost (Cyrillic tokenizes at
+~2.4 chars/token, Latin at ~4 — a plain char budget starves Russian text). It lives until the task
+that fetched it terminates (the runner sweeps by task id), under a process-wide LRU budget; a
+restart loses it, and the remedy is the remedy for everything here — fetch again.
+
+Three verbs, and deliberately **no sequential window-paging** (reading a megabyte in slices costs
+the same tokens as reading it whole, just slower):
+
+| Tool | Behavior |
+|---|---|
+| `response_get(ref, key?, max_chars?)` | The whole body or one dotted key. The default is conservative; the model raises `max_chars` up to the configured ceiling when the passport's numbers say it fits the budget |
+| `response_find(ref, pattern, before?, after?, max_matches?, match_offset?)` | Regex (invalid ones taken literally, case-insensitive) with a window around every match; answers the full match count, merges overlapping windows, and each match carries its `at` position |
+| `response_window(ref, at, key?, before?, after?)` | A wider look around a position a find returned — how "the window was too small" is fixed without re-searching |
 
 ## How it works
 
@@ -18,11 +45,11 @@ Every path a response body takes — `external_call`, `http_request`, an MCP mir
 already-scrubbed text to the spill (`ResponseSpill`). The spill answers one of three ways:
 
 - the body is at or under `OF_COLLECTIONS_INLINE_MAX_CHARS` → **inline**, exactly as before;
-- the body parses as JSON or CSV → a **collection**: elements become one row each, a schema is
-  derived by folding every record (a field missing somewhere is `optional`, mixed scalar types
-  degrade to `string`, sometimes-null keeps its type plus `nullable`), and the tool result is the
-  passport;
-- anything else (unstructured, malformed, no user in context) → the old **truncation**.
+- a JSON **array** (or CSV) → a **collection**: elements become one row each, a schema is derived
+  by folding every record (a field missing somewhere is `optional`, mixed scalar types degrade to
+  `string`, sometimes-null keeps its type plus `nullable`), and the tool result is the passport;
+- a JSON **single object**, or unstructured/malformed text → **task memory** (see above);
+- no user in context, or neither tier available → the old **truncation**.
 
 Unwrapping: a top-level array is the records; an object with exactly one array-of-objects member is
 an envelope around its records (the scalar siblings ride into the passport as `envelope`); any other
@@ -118,6 +145,10 @@ expired, evicted or foreign ref answers not-found with one remedy: run the call 
 
 | Variable | Default | Effect |
 |---|---|---|
+| `OF_RESPONSE_MEMORY_MAX_MB` | `8` | Wire ceiling of one remembered response (RAM, not context) |
+| `OF_RESPONSE_MEMORY_BUDGET_MB` | `200` | Process-wide LRU budget of task memory |
+| `OF_RESPONSE_GET_DEFAULT_CHARS` | `8000` | What `response_get` answers when the model does not choose |
+| `OF_RESPONSE_GET_MAX_CHARS` | `100000` | The most one deliberate read may take |
 | `OF_COLLECTIONS_INLINE_MAX_CHARS` | `2000` | Bodies at or under this stay inline in the tool result |
 | `OF_COLLECTIONS_TTL_SECONDS` | `3600` | How long a collection lives past its last touch |
 | `OF_COLLECTIONS_MAX_PER_USER` | `20` | Count quota; over it the oldest is evicted |
@@ -129,7 +160,8 @@ expired, evicted or foreign ref answers not-found with one remedy: run the call 
 
 | Situation | Outcome |
 |---|---|
-| Ref expired, evicted or someone else's | Not-found text naming the remedy (fetch again) |
+| Ref expired, evicted or someone else's (`col:` or `resp:`) | Not-found text naming the remedy (fetch again) |
+| Process restart / dialog migration | Task memory is gone with the process; collections survive |
 | Unknown field in a query | Error listing the fields the schema does have |
 | `sum`/`avg` over a non-numeric field | Error naming the coercion remedy |
 | Body declared JSON but does not parse | Old truncation (the head is more honest) |
@@ -144,4 +176,5 @@ expired, evicted or foreign ref answers not-found with one remedy: run the call 
 - `core/src/octoforge_core/net/collections/engine.py` — DSL → jsonb SQL
 - `core/src/octoforge_core/net/collections/store.py` — rows, quotas, TTL
 - `core/src/octoforge_core/net/collections/tools.py` — `collection_query`, `collection_get`
-- `core/src/octoforge_core/composition.py` — `build_collections`, the Postgres capability check
+- `core/src/octoforge_core/net/response_memory.py` — task memory: the store, the passport, the three verbs
+- `core/src/octoforge_core/composition.py` — `build_collections` (Postgres check), `build_response_layer` (always)

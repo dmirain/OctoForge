@@ -83,7 +83,13 @@ from octoforge_core.tariffs.api import (
 from octoforge_core.tasks.api import Task, TaskKind, TaskNotFoundError, TaskStatus
 from octoforge_core.tasks.store import TaskList, TaskStore
 from octoforge_core.time import utc_now
-from octoforge_core.tools.base import TaskDeleteOutcome, TaskDeleter, TaskSpawner, ToolContext
+from octoforge_core.tools.base import (
+    TaskDeleteOutcome,
+    TaskDeleter,
+    TaskScopedResponses,
+    TaskSpawner,
+    ToolContext,
+)
 from octoforge_core.vision.api import ImageResolver, VisionClient, VisionUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -568,6 +574,9 @@ class RunnerConfig:
     # back into bytes; either being None turns `image_look` off entirely
     vision: VisionClient | None = None
     image_resolver: ImageResolver | None = None
+    # task-scoped response memory, swept when a task's process terminates;
+    # None = the feature is not wired and there is nothing to sweep
+    response_memory: TaskScopedResponses | None = None
 
 
 class ConversationRunner:
@@ -601,6 +610,7 @@ class ConversationRunner:
         self._vision = config.vision
         self._image_resolver = config.image_resolver
         self._task_outcome_listener = config.task_outcome_listener
+        self._response_memory = config.response_memory
         self._limits = config.limits
         self._compactor = config.compactor
         self._messages = messages
@@ -2414,6 +2424,10 @@ class ConversationRunner:
             status.value,
         )
         self._remove_process(process)
+        if self._response_memory is not None:
+            # the task is over; its remembered responses go with it (sync
+            # dict move — termination must not await a cleanup)
+            self._response_memory.drop_scope(process.task_id)
         self._broadcast(
             ProcessCompleted(process_id=process.id, title=process.title, status=status.value),
             exchange_id=process.exchange_id,

@@ -618,6 +618,7 @@ class ManagerOptions:
     vision: VisionClient | None = None
     image_resolver: ImageResolver | None = None
     limits: RecordingLimitGate | None = None
+    response_memory: "RecordingScopedResponses | None" = None
     #: How long a claim may go unrefreshed before its owner reads as dead.
     stale_after_seconds: float = CLAIM_STALE_AFTER_SECONDS
 
@@ -642,6 +643,7 @@ def make_manager(
         vision=resolved.vision,
         image_resolver=resolved.image_resolver,
         limits=resolved.limits,
+        response_memory=resolved.response_memory,
     )
     return ConversationManager(
         config=config,
@@ -5282,4 +5284,39 @@ async def test_a_failed_finalize_takes_the_persisted_answer_with_it(
         ).all()
     # the question alone survives; the answer rolled back with the unit
     assert [row.role for row in rows] == [MessageRole.USER.value]
+    await manager.stop_all()
+
+
+class RecordingScopedResponses:
+    """TaskScopedResponses fake capturing every swept scope."""
+
+    def __init__(self) -> None:
+        self.dropped: list[str] = []
+
+    def drop_scope(self, scope: str) -> None:
+        self.dropped.append(scope)
+
+
+async def test_a_terminated_process_sweeps_its_response_memory(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Responses live exactly as long as the task that fetched them: the
+    termination hook must fire with the process's own task id — that id is
+    what `ToolContext.owner_task_id` handed the fetching tools as the scope."""
+    memory = RecordingScopedResponses()
+    store = SqlAlchemyTaskStore(session_factory)
+    manager = make_manager(
+        ScriptedLLM([reply()]),
+        ToolRegistry(),
+        session_factory,
+        ManagerOptions(store=store, response_memory=memory),
+    )
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+
+    await runner.submit("hi")
+    await collect_until(queue, is_completed)
+
+    task = await single_task(store, runner.dialog_id)
+    assert memory.dropped == [task.id]
     await manager.stop_all()

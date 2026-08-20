@@ -137,6 +137,10 @@ and dataset search are unavailable — the system-record sync is skipped too.
 | `OF_COLLECTIONS_QUERY_MAX_LIMIT` | `500` | Page-size ceiling of `collection_query` |
 | `OF_COLLECTIONS_SWEEP_INTERVAL_SECONDS` | `300.0` | How often expired collections are dropped |
 | `OF_COLLECTIONS_COLLECT_MAX_PAGES` | `20` | Page ceiling of one `collect: true` walk (a call may lower it, never raise) |
+| `OF_RESPONSE_MEMORY_MAX_MB` | `8` | Wire ceiling of one response remembered in task memory |
+| `OF_RESPONSE_MEMORY_BUDGET_MB` | `200` | Process-wide LRU budget of task memory |
+| `OF_RESPONSE_GET_DEFAULT_CHARS` | `8000` | Default `response_get` answer size |
+| `OF_RESPONSE_GET_MAX_CHARS` | `100000` | Ceiling of one deliberate `response_get` read |
 
 ## Secrets
 

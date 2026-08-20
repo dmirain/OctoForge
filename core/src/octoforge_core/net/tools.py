@@ -1,6 +1,6 @@
 """Outbound HTTP tools: http_request, endpoint_get and endpoint-driven external_call."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Self
 from urllib.parse import urlsplit
@@ -259,7 +259,10 @@ class HttpRequestTool:
             follow_redirects=False,
             timeout=self._timeout,
         ) as response:
-            body, truncated = await read_capped_text(response, MAX_RESPONSE_BYTES)
+            body, truncated = await read_capped_text(
+                response,
+                self._spill.wire_limit_bytes if self._spill is not None else MAX_RESPONSE_BYTES,
+            )
             content_type = response.headers.get("content-type", "")
         if self._spill is not None:
             passport = await self._spill.spill(
@@ -268,6 +271,7 @@ class HttpRequestTool:
                 content_type=content_type,
                 source=f"http:{urlsplit(params.url).hostname or ''}",
                 wire_truncated=truncated,
+                scope=context.owner_task_id or "",
             )
             if passport is not None:
                 return f"HTTP {response.status_code}\n{passport}"
@@ -351,8 +355,9 @@ class ExternalCallTool:
         if not isinstance(name, str) or not name.strip():
             raise ToolArgumentsError("name must be a non-empty string")
         params = _parse_params(arguments.get("params"))
+        options = replace(_parse_call_options(arguments), scope=context.owner_task_id or "")
         result = await self._executor.execute(
-            name, params, user_id=context.user_id, options=_parse_call_options(arguments)
+            name, params, user_id=context.user_id, options=options
         )
         # status 0: the transport carried no HTTP status (a kind delegate)
         return f"HTTP {result.status}\n{result.body}" if result.status else result.body

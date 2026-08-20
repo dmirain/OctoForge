@@ -29,6 +29,7 @@ from octoforge_core.net.collections.api import (
     NewRecords,
 )
 from octoforge_core.net.collections.schema_infer import infer_records, merge_nodes, render
+from octoforge_core.net.response_memory import ResponseMemory, render_memory_passport
 from octoforge_core.net.tool_spec import FieldCoercion
 from octoforge_core.time import utc_now
 
@@ -36,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 #: Bodies longer than this are parsed in a worker thread.
 PARSE_IN_THREAD_CHARS = 64 * 1024
+#: The wire ceiling without a memory tier (the database tier's own cap).
+DB_WIRE_LIMIT_BYTES = 2 * 1024 * 1024
 #: A record-count backstop against pathological inputs (2 MB of `[1,1,1,…]`).
 MAX_RECORDS = 100_000
 #: The envelope is a courtesy, not a second body.
@@ -57,11 +60,30 @@ TRUNCATED_NOTE = " · SOURCE CUT at the wire limit: counts reflect what arrived"
 
 
 class ResponseSpill:
-    """Turns an oversized structured body into a collection + passport."""
+    """Routes an oversized body to where its shape belongs.
 
-    def __init__(self, store: CollectionStore, config: CollectionConfig) -> None:
+    Two tiers with different fates: an ARRAY of records goes to the database
+    (its value is queries, and it must survive task boundaries), while a
+    SINGLE document — one JSON object, an article, a page of anything — goes
+    to task memory (its value is being read or searched, and it dies with
+    the task). Unstructured text takes the memory tier verbatim, which is
+    what finally makes a fetched HTML page or markdown file workable.
+
+    Either tier may be absent: without Postgres there is no database tier
+    (arrays fall back to memory as one readable document), and without a
+    memory a document keeps the old truncation. The caller never learns any
+    of this from an exception — the truncation path is always the fallback.
+    """
+
+    def __init__(
+        self,
+        store: CollectionStore | None,
+        config: CollectionConfig,
+        memory: ResponseMemory | None = None,
+    ) -> None:
         self._store = store
         self._config = config
+        self._memory = memory
 
     @property
     def inline_max_chars(self) -> int:
@@ -72,8 +94,19 @@ class ResponseSpill:
         return self._config
 
     @property
-    def store(self) -> CollectionStore:
+    def store(self) -> CollectionStore | None:
         return self._store
+
+    @property
+    def wire_limit_bytes(self) -> int:
+        """How much one response may pull off the wire before the cut.
+
+        The memory tier raises it: RAM is the budget there, not context, and
+        scenario three of this design is literally "the API answers 3 MB".
+        """
+        if self._memory is not None:
+            return self._memory.config.max_response_chars
+        return DB_WIRE_LIMIT_BYTES
 
     async def spill(  # noqa: PLR0913, PLR0917 — the call-site boundary
         self,
@@ -83,8 +116,9 @@ class ResponseSpill:
         source: str,
         wire_truncated: bool,
         label: str = "",
+        scope: str = "",
     ) -> str | None:
-        """The passport text, or None when the body is small or not structured.
+        """The passport text, or None for "keep the body inline/truncated".
 
         Never raises: a spill failure must not fail the call that produced
         the data — the caller's truncation path is always there to fall back
@@ -93,25 +127,69 @@ class ResponseSpill:
         if len(body) <= self._config.inline_max_chars:
             return None
         try:
-            parsed = await parse_structured(body, content_type)
-            if parsed is None or not parsed.records.payloads:
-                return None
-            passport = await self._store.create(
-                owner_id=owner_id,
-                label=label,
-                kind=parsed.kind,
-                source=source,
-                schema=infer_records(parsed.records.payloads),
-                envelope=parsed.envelope,
-                records=parsed.records,
-                byte_size=len(body),
-                truncated=wire_truncated,
-                expires_at=self.expiry(),
+            return await self._route(
+                owner_id, body, content_type, source, wire_truncated, label, scope
             )
         except Exception:
             logger.exception("response spill failed; falling back to truncation")
             return None
+
+    async def _route(  # noqa: PLR0913, PLR0917 — the spill's own arguments
+        self,
+        owner_id: str,
+        body: str,
+        content_type: str,
+        source: str,
+        wire_truncated: bool,
+        label: str,
+        scope: str,
+    ) -> str | None:
+        parsed = await parse_structured(body, content_type)
+        if parsed is None:
+            # unstructured (text, HTML, broken JSON): memory holds it verbatim
+            return self._remember(owner_id, scope, "text", source, body)
+        if not parsed.records.payloads:
+            return None
+        if parsed.single_document:
+            remembered = self._remember(
+                owner_id, scope, "json", source, body, document=parsed.document
+            )
+            if remembered is not None:
+                return remembered
+            # no memory wired: a single document still beats truncation as
+            # a one-record collection, when the database tier exists
+        if self._store is None:
+            # no database tier: an array is still a readable document
+            return self._remember(owner_id, scope, "json", source, body, document=parsed.document)
+        passport = await self._store.create(
+            owner_id=owner_id,
+            label=label,
+            kind=parsed.kind,
+            source=source,
+            schema=infer_records(parsed.records.payloads),
+            envelope=parsed.envelope,
+            records=parsed.records,
+            byte_size=len(body),
+            truncated=wire_truncated,
+            expires_at=self.expiry(),
+        )
         return render_passport(passport)
+
+    def _remember(  # noqa: PLR0913, PLR0917 — mirrors the memory's identity
+        self,
+        owner_id: str,
+        scope: str,
+        kind: str,
+        source: str,
+        body: str,
+        document: Any = None,  # noqa: ANN401 — parsed JSON
+    ) -> str | None:
+        if self._memory is None:
+            return None
+        item = self._memory.store(
+            owner_id=owner_id, scope=scope, kind=kind, source=source, body=body, document=document
+        )
+        return render_memory_passport(item, self._memory.config)
 
     def expiry(self) -> datetime:
         return utc_now() + timedelta(seconds=self._config.ttl_seconds)
@@ -163,6 +241,9 @@ class ParsedBody:
     records: NewRecords
     envelope: dict[str, Any]
     document: Any = None
+    #: True when the body was one JSON object taken whole as one record —
+    #: the shape whose home is task memory, not the database.
+    single_document: bool = False
 
 
 async def parse_structured(
@@ -286,12 +367,13 @@ class CollectionSink:
     async def add(self, parsed: ParsedBody, byte_size: int) -> None:
         """Store one batch under this sink's source tag."""
         batch = NewRecords(payloads=parsed.records.payloads, source=self._source)
+        store = self._spill.store
+        assert store is not None  # the collect/into paths refuse before building a sink
         if self._schema is None and self._started_from_existing:
             assert self._collection_id is not None
-            existing = await self._spill.store.passport(self._owner_id, self._collection_id)
+            existing = await store.passport(self._owner_id, self._collection_id)
             self._schema = existing.schema
         merged = merge_nodes(self._schema, infer_records(batch.payloads))
-        store = self._spill.store
         if self._collection_id is None:
             passport = await store.create(
                 owner_id=self._owner_id,
@@ -326,9 +408,11 @@ class CollectionSink:
         """
         if self._collection_id is None:
             return None
+        store = self._spill.store
+        assert store is not None  # add() above required it
         if truncated:
-            await self._spill.store.mark_truncated(self._owner_id, self._collection_id)
-        return await self._spill.store.passport(self._owner_id, self._collection_id)
+            await store.mark_truncated(self._owner_id, self._collection_id)
+        return await store.passport(self._owner_id, self._collection_id)
 
 
 def _unwrap(value: Any) -> tuple[NewRecords | None, dict[str, Any]]:  # noqa: ANN401 — parsed JSON

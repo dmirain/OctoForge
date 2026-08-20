@@ -58,7 +58,7 @@ class McpMirrorCallExecutor:
         self._spill = spill
 
     async def execute(
-        self, content: str, params: dict[str, Any], user_id: str | None
+        self, content: str, params: dict[str, Any], user_id: str | None, scope: str = ""
     ) -> ExternalCallResult:
         """Validate against the mirrored schema, call the server, cap and scrub."""
         try:
@@ -96,6 +96,7 @@ class McpMirrorCallExecutor:
                 content_type="",
                 source=f"mcp:{mirror.server}/{mirror.tool}",
                 wire_truncated=False,
+                scope=scope,
             )
         if body is None:
             body = _truncate(scrubbed)

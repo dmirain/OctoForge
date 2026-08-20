@@ -183,7 +183,7 @@ class KindCallDelegate(Protocol):
     """Executes endpoint records of one content `kind` (e.g. MCP mirrors)."""
 
     async def execute(
-        self, content: str, params: dict[str, Any], user_id: str | None
+        self, content: str, params: dict[str, Any], user_id: str | None, scope: str = ""
     ) -> ExternalCallResult:
         """Run the call the record's content describes, params as given."""
         ...
@@ -220,6 +220,8 @@ class CallOptions:
     max_pages: int | None = None
     into: str | None = None
     label: str = ""
+    #: The task the call runs under — the lifetime of a remembered response.
+    scope: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,7 +340,7 @@ class ExternalCallExecutor:
                     f"endpoint '{name}' declares kind {kind!r}, which this "
                     "installation has no executor for"
                 )
-            return await delegate.execute(instruction.content, params, user_id)
+            return await delegate.execute(instruction.content, params, user_id, opts.scope)
         spec = parse_tool_spec(instruction.content)
         if opts.collect and spec.pagination is not None and spec.pagination.param not in params:
             # the loop owns this param; a placeholder keeps validation honest
@@ -360,7 +362,7 @@ class ExternalCallExecutor:
         if opts.into is not None:
             return await self._pour_into(name, spec, page, user_id, opts)
         result = await self._spill_or_truncate(
-            page.scrubbed, page.content_type, name, user_id, page.wire_truncated
+            page.scrubbed, page.content_type, name, user_id, page.wire_truncated, opts.scope
         )
         if page.status in UNAUTHENTICATED_STATUSES and not page.had_secrets:
             # a bare 401/403 reads as "wrong credential" and sends the model
@@ -410,7 +412,7 @@ class ExternalCallExecutor:
                 follow_redirects=False,  # a redirect would bypass the guard's URL check
                 timeout=self._timeout,
             ) as response:
-                raw, truncated = await read_capped_text(response, MAX_BODY_BYTES)
+                raw, truncated = await read_capped_text(response, self._wire_limit())
                 status = response.status_code
                 content_type = response.headers.get("content-type", "")
         except httpx.HTTPError as exc:
@@ -441,7 +443,7 @@ class ExternalCallExecutor:
         is what lets records from a different endpoint land beside earlier
         ones — the join happens in the database, not in context.
         """
-        if self._spill is None or user_id is None:
+        if self._spill is None or self._spill.store is None or user_id is None:
             raise ExternalCallError(COLLECT_UNAVAILABLE_MESSAGE)
         assert opts.into is not None  # the caller branched on it
         parsed = await parse_structured(
@@ -488,7 +490,7 @@ class ExternalCallExecutor:
                 f"endpoint '{name}' declares no pagination section; collect needs one "
                 "(add it to the record: kind page/offset/cursor, the param to advance)"
             )
-        if self._spill is None or user_id is None:
+        if self._spill is None or self._spill.store is None or user_id is None:
             raise ExternalCallError(COLLECT_UNAVAILABLE_MESSAGE)
         max_pages = min(
             opts.max_pages if opts.max_pages is not None else self._spill.config.collect_max_pages,
@@ -538,14 +540,24 @@ class ExternalCallExecutor:
         note = f"\ncollected {pages} page(s) this call"
         return ExternalCallResult(status=status, body=render_passport(passport) + note)
 
-    async def _spill_or_truncate(
-        self, scrubbed: str, content_type: str, name: str, user_id: str | None, truncated: bool
-    ) -> str:
-        """A collection passport for a big structured body, truncation otherwise.
+    def _wire_limit(self) -> int:
+        """How much is read off the wire; the memory tier raises the ceiling."""
+        return self._spill.wire_limit_bytes if self._spill is not None else MAX_BODY_BYTES
 
-        The spill sees only the scrubbed text: whatever lands in the store is
-        exactly what the model may see, so a later query can never resurrect
-        a secret the response echoed.
+    async def _spill_or_truncate(  # noqa: PLR0913, PLR0917 — one response's context
+        self,
+        scrubbed: str,
+        content_type: str,
+        name: str,
+        user_id: str | None,
+        truncated: bool,
+        scope: str = "",
+    ) -> str:
+        """A passport for a big body (collection or task memory), truncation otherwise.
+
+        The spill sees only the scrubbed text: whatever lands in a store or
+        in memory is exactly what the model may see, so a later read can
+        never resurrect a secret the response echoed.
         """
         if self._spill is not None and user_id is not None:
             passport = await self._spill.spill(
@@ -554,6 +566,7 @@ class ExternalCallExecutor:
                 content_type=content_type,
                 source=f"endpoint:{name}",
                 wire_truncated=truncated,
+                scope=scope,
             )
             if passport is not None:
                 return passport
