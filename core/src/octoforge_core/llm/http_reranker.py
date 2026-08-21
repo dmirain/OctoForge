@@ -12,7 +12,7 @@ import httpx
 from octoforge_core.config import HttpRerankerConfig
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.llm.errors import TransportError, raise_for_error_status
-from octoforge_core.llm.retry import Sleeper, retry_transient
+from octoforge_core.llm.retry import ShortRetryPolicy, Sleeper, retry_transient
 
 __all__ = ["HttpRerankerClient", "HttpRerankerConfig"]
 
@@ -55,7 +55,7 @@ class HttpRerankerClient:
         """Score one query group, retrying transient failures once."""
         return await retry_transient(
             lambda: self._score_one_query(query, documents),
-            sleeper=self._sleeper,
+            ShortRetryPolicy(sleeper=self._sleeper),
         )
 
     async def _score_one_query(self, query: str, documents: tuple[str, ...]) -> list[float]:

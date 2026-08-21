@@ -22,6 +22,7 @@ from octoforge_core.db.sqlite_fts import has_sqlite_fts, match_expression
 from octoforge_core.instructions.api import (
     InstructionDraft,
     InstructionLexicalSearch,
+    InstructionTextQuery,
     InstructionType,
 )
 from octoforge_core.instructions.sqlite_store import SqliteInstructionStore
@@ -79,7 +80,7 @@ async def test_a_saved_record_becomes_searchable(
     store = SqliteInstructionStore(session_factory)
     saved = await store.upsert(draft("billing", "При ошибке E_INVOICE_4021 повторите запрос"))
 
-    hits = await store.search_by_text("E_INVOICE_4021", limit=LIMIT, user_id=OWNER)
+    hits = await store.search_by_text(InstructionTextQuery("E_INVOICE_4021", LIMIT, OWNER))
 
     assert [hit.instruction.id for hit in hits] == [saved.id]
 
@@ -93,7 +94,7 @@ async def test_an_edited_record_stops_matching_its_old_text(
 
     await store.upsert(draft("billing", "совершенно другое содержимое"))
 
-    assert await store.search_by_text("корвалол", limit=LIMIT, user_id=OWNER) == []
+    assert await store.search_by_text(InstructionTextQuery("корвалол", LIMIT, OWNER)) == []
 
 
 async def test_a_deleted_record_leaves_no_trace(
@@ -104,7 +105,7 @@ async def test_a_deleted_record_leaves_no_trace(
 
     await store.delete_by_id(saved.id, OWNER)
 
-    assert await store.search_by_text("корвалол", limit=LIMIT, user_id=OWNER) == []
+    assert await store.search_by_text(InstructionTextQuery("корвалол", LIMIT, OWNER)) == []
 
 
 async def test_search_honours_visibility_and_kind(
@@ -114,9 +115,9 @@ async def test_search_honours_visibility_and_kind(
     mine = await store.upsert(draft("mine", "уникальное слово корвалол"))
     await store.upsert(draft("theirs", "уникальное слово корвалол", owner_id=OTHER))
 
-    visible = await store.search_by_text("корвалол", limit=LIMIT, user_id=OWNER)
+    visible = await store.search_by_text(InstructionTextQuery("корвалол", LIMIT, OWNER))
     wrong_kind = await store.search_by_text(
-        "корвалол", limit=LIMIT, user_id=OWNER, kinds=(InstructionType.ENDPOINT,)
+        InstructionTextQuery("корвалол", LIMIT, OWNER, (InstructionType.ENDPOINT,))
     )
 
     assert [hit.instruction.id for hit in visible] == [mine.id]
@@ -135,8 +136,8 @@ async def test_trigram_matches_a_stem_but_not_a_longer_inflection(
     store = SqliteInstructionStore(session_factory)
     saved = await store.upsert(draft("tasks", "Агент создаёт отложенные задачи"))
 
-    by_stem = await store.search_by_text("задач", limit=LIMIT, user_id=OWNER)
-    by_longer_form = await store.search_by_text("задача", limit=LIMIT, user_id=OWNER)
+    by_stem = await store.search_by_text(InstructionTextQuery("задач", LIMIT, OWNER))
+    by_longer_form = await store.search_by_text(InstructionTextQuery("задача", LIMIT, OWNER))
 
     assert [hit.instruction.id for hit in by_stem] == [saved.id]
     assert by_longer_form == []

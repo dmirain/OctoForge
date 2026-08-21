@@ -1,7 +1,7 @@
 """Tests for the tool spec parser and the external call executor."""
 
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -13,12 +13,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
     Instruction,
+    InstructionDefinition,
     InstructionNotFoundError,
+    InstructionSearchRequest,
     InstructionType,
     SearchHit,
 )
 from octoforge_core.net.collections.api import CollectionConfig
-from octoforge_core.net.collections.ingest import ResponseSpill
+from octoforge_core.net.collections.ingest import ResponseSpill, ResponseSpillOptions
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.errors import ExternalCallError, SsrfBlockedError, ToolSpecError
 from octoforge_core.net.external import (
@@ -27,7 +29,10 @@ from octoforge_core.net.external import (
     CallCredentials,
     CallOptions,
     ExternalCallAuth,
+    ExternalCallConfig,
+    ExternalCallContext,
     ExternalCallExecutor,
+    ExternalCallServices,
 )
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tool_spec import parse_tool_spec
@@ -42,6 +47,7 @@ from octoforge_core.secrets.api import (
     SecretPlacement,
     SecretStore,
     SecretTransform,
+    SecretWrite,
     apply_transform,
 )
 from octoforge_core.tools.base import ToolContext
@@ -134,19 +140,14 @@ class FakeInstructionService:
     async def search(
         self,
         user_id: str,
-        query: str,
-        k: int,
-        kind: InstructionType | None = None,
+        request: InstructionSearchRequest,
     ) -> list[SearchHit]:
         raise NotImplementedError
 
     async def save(
         self,
         user_id: str,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...] = (),
+        definition: InstructionDefinition,
     ) -> Instruction:
         raise NotImplementedError
 
@@ -193,18 +194,29 @@ def make_executor(
         resolved = replace(resolved, records=records)
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return ExternalCallExecutor(
-        service=FakeInstructionService(resolved.records or {TOOL_NAME: WEATHER_TOOL_CONTENT}),
-        http_client=http_client,
-        guard=SsrfGuard(
-            resolver=StubResolver(resolved.ips), allowed_prefixes=resolved.allowed_prefixes
+        ExternalCallServices(
+            FakeInstructionService(resolved.records or {TOOL_NAME: WEATHER_TOOL_CONTENT}),
+            http_client,
+            SsrfGuard(
+                resolver=StubResolver(resolved.ips),
+                allowed_prefixes=resolved.allowed_prefixes,
+            ),
         ),
-        credentials=CallCredentials(
-            auth_whitelist=resolved.whitelist,
-            secrets=resolved.secrets,
-            user_params=resolved.user_params,
+        ExternalCallConfig(
+            credentials=CallCredentials(
+                auth_whitelist=resolved.whitelist,
+                secrets=resolved.secrets,
+                user_params=resolved.user_params,
+            ),
+            spill=resolved.spill,
         ),
-        spill=resolved.spill,
     )
+
+
+def call_context(
+    user_id: str | None = None, options: CallOptions | None = None
+) -> ExternalCallContext:
+    return ExternalCallContext(user_id, options or CallOptions())
 
 
 def ok_handler(body: str = "{}") -> Callable[[httpx.Request], httpx.Response]:
@@ -432,12 +444,14 @@ async def test_unknown_tool_name_raises_not_found() -> None:
 async def test_executor_passes_the_user_id_to_the_service_lookup() -> None:
     service = FakeInstructionService({TOOL_NAME: WEATHER_TOOL_CONTENT})
     executor = ExternalCallExecutor(
-        service=service,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(ok_handler())),
-        guard=SsrfGuard(resolver=StubResolver((PUBLIC_IP,))),
+        ExternalCallServices(
+            service,
+            httpx.AsyncClient(transport=httpx.MockTransport(ok_handler())),
+            SsrfGuard(resolver=StubResolver((PUBLIC_IP,))),
+        )
     )
 
-    await executor.execute(TOOL_NAME, {"city": "London"}, user_id="user-test")
+    await executor.execute(TOOL_NAME, {"city": "London"}, call_context("user-test"))
 
     assert service.get_by_name_calls == [(TOOL_NAME, InstructionType.ENDPOINT, "user-test")]
 
@@ -568,7 +582,7 @@ async def test_user_id_template_is_substituted_into_the_auth_header() -> None:
     captured: list[httpx.Request] = []
     executor = make_self_executor(captured)
 
-    result = await executor.execute(SELF_TOOL_NAME, {}, user_id=USER_A)
+    result = await executor.execute(SELF_TOOL_NAME, {}, call_context(USER_A))
 
     assert result.status == HTTPStatus.OK  # loopback passed the guard via the allowlist
     assert captured[0].headers[USER_ID_HEADER] == USER_A
@@ -587,7 +601,7 @@ async def test_static_auth_value_is_sent_unchanged_even_with_a_user() -> None:
     captured: list[httpx.Request] = []
     executor = make_self_executor(captured, header_value=AUTH_VALUE)
 
-    await executor.execute(SELF_TOOL_NAME, {}, user_id=USER_A)
+    await executor.execute(SELF_TOOL_NAME, {}, call_context(USER_A))
 
     assert captured[0].headers[USER_ID_HEADER] == AUTH_VALUE
 
@@ -640,7 +654,7 @@ async def test_auth_header_is_not_sent_to_a_userinfo_spoofed_origin() -> None:
         ),
     )
 
-    result = await executor.execute(SPOOF_TOOL_NAME, {}, user_id=USER_A)
+    result = await executor.execute(SPOOF_TOOL_NAME, {}, call_context(USER_A))
 
     assert result.status == HTTPStatus.OK  # a public host, so the request went out
     assert captured[0].url.host == SPOOFED_HOST
@@ -707,6 +721,12 @@ SECRET_TOOL_CONTENT = json.dumps(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class FakeSecretOptions:
+    placements: frozenset[SecretPlacement] = DEFAULT_PLACEMENTS
+    transform: SecretTransform | None = None
+
+
 class FakeSecretStore:
     """SecretStore stub with one scripted secret and recorded resolutions."""
 
@@ -714,25 +734,16 @@ class FakeSecretStore:
         self,
         code: str = SECRET_CODE,
         host: str = SECRET_HOST,
-        placements: frozenset[SecretPlacement] = DEFAULT_PLACEMENTS,
-        transform: SecretTransform | None = None,
+        options: FakeSecretOptions | None = None,
     ) -> None:
+        resolved = options or FakeSecretOptions()
         self._code = code
         self._host = host
-        self._placements = placements
-        self._transform = transform
+        self._placements = resolved.placements
+        self._transform = resolved.transform
         self.resolutions: list[tuple[str, str, str]] = []
 
-    async def put(  # noqa: PLR0913, PLR0917 — mirrors the port
-        self,
-        user_id: str,
-        code: str,
-        value: str,
-        allowed_host: str,
-        description: str,
-        placements: Iterable[str] = (),
-        transform: str | None = None,
-    ) -> SecretInfo:
+    async def put(self, request: SecretWrite) -> SecretInfo:
         raise NotImplementedError
 
     async def list(self, user_id: str) -> list[SecretInfo]:
@@ -768,7 +779,7 @@ async def test_secret_is_injected_as_the_declared_header() -> None:
         options=ExecutorOptions(secrets=store),
     )
 
-    await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+    await executor.execute(SECRET_TOOL_NAME, {}, call_context("user-test"))
 
     assert captured[0].headers["X-Api-Key"] == f"Key {SECRET_VALUE}"
     assert store.resolutions == [("user-test", SECRET_CODE, SECRET_HOST)]
@@ -798,7 +809,7 @@ async def test_a_record_header_never_shadows_the_secret_header() -> None:
         options=ExecutorOptions(secrets=FakeSecretStore()),
     )
 
-    await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+    await executor.execute(SECRET_TOOL_NAME, {}, call_context("user-test"))
 
     assert captured[0].headers["X-Api-Key"] == f"Key {SECRET_VALUE}"
 
@@ -813,7 +824,7 @@ async def test_secret_echo_is_scrubbed_from_the_response() -> None:
         options=ExecutorOptions(secrets=FakeSecretStore()),
     )
 
-    result = await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+    result = await executor.execute(SECRET_TOOL_NAME, {}, call_context("user-test"))
 
     assert SECRET_VALUE not in result.body
     assert "[secret]" in result.body
@@ -827,14 +838,14 @@ async def test_missing_secret_guides_the_agent() -> None:
     )
 
     with pytest.raises(ExternalCallError, match="/secrets"):
-        await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+        await executor.execute(SECRET_TOOL_NAME, {}, call_context("user-test"))
 
 
 async def test_secrets_disabled_is_a_clear_error() -> None:
     executor = make_executor(ok_handler(), records={SECRET_TOOL_NAME: SECRET_TOOL_CONTENT})
 
     with pytest.raises(ExternalCallError, match="not configured"):
-        await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+        await executor.execute(SECRET_TOOL_NAME, {}, call_context("user-test"))
 
 
 async def test_host_mismatch_error_reaches_the_agent_without_the_value() -> None:
@@ -853,7 +864,7 @@ async def test_host_mismatch_error_reaches_the_agent_without_the_value() -> None
     )
 
     with pytest.raises(ExternalCallError, match="bound to") as denied:
-        await executor.execute("other_api", {}, user_id="user-test")
+        await executor.execute("other_api", {}, call_context("user-test"))
 
     assert SECRET_VALUE not in str(denied.value)
 
@@ -919,7 +930,7 @@ async def test_user_params_are_substituted_into_the_url() -> None:
         ),
     )
 
-    await executor.execute(PARAMS_TOOL_NAME, {}, user_id="user-test")
+    await executor.execute(PARAMS_TOOL_NAME, {}, call_context("user-test"))
 
     assert str(captured[0].url) == "https://cal.example.com/acc-1/events?tz=Europe%2FBerlin"
 
@@ -932,7 +943,7 @@ async def test_missing_user_param_guides_the_agent() -> None:
     )
 
     with pytest.raises(ExternalCallError, match="admin console") as denied:
-        await executor.execute(PARAMS_TOOL_NAME, {}, user_id="user-test")
+        await executor.execute(PARAMS_TOOL_NAME, {}, call_context("user-test"))
 
     assert "'timezone'" in str(denied.value)
 
@@ -941,7 +952,7 @@ async def test_user_params_unwired_is_a_clear_error() -> None:
     executor = make_executor(ok_handler(), records={PARAMS_TOOL_NAME: PARAMS_TOOL_CONTENT})
 
     with pytest.raises(ExternalCallError, match="not wired"):
-        await executor.execute(PARAMS_TOOL_NAME, {}, user_id="user-test")
+        await executor.execute(PARAMS_TOOL_NAME, {}, call_context("user-test"))
 
 
 QUERY_SECRET_TOOL_NAME = "query_key_api"
@@ -963,9 +974,10 @@ async def test_secret_in_url_requires_the_url_placement() -> None:
     )
 
     with pytest.raises(ExternalCallError, match="url") as denied:
-        await executor.execute(QUERY_SECRET_TOOL_NAME, {}, user_id="user-test")
+        await executor.execute(QUERY_SECRET_TOOL_NAME, {}, call_context("user-test"))
 
     assert SECRET_VALUE not in str(denied.value)
+    assert "secrets form" in str(denied.value)
 
 
 async def test_secret_in_url_is_injected_when_the_placement_allows() -> None:
@@ -980,12 +992,14 @@ async def test_secret_in_url_is_injected_when_the_placement_allows() -> None:
         records={QUERY_SECRET_TOOL_NAME: QUERY_SECRET_TOOL_CONTENT},
         options=ExecutorOptions(
             secrets=FakeSecretStore(
-                placements=frozenset({SecretPlacement.HEADER, SecretPlacement.URL})
+                options=FakeSecretOptions(
+                    placements=frozenset({SecretPlacement.HEADER, SecretPlacement.URL})
+                )
             )
         ),
     )
 
-    await executor.execute(QUERY_SECRET_TOOL_NAME, {}, user_id="user-test")
+    await executor.execute(QUERY_SECRET_TOOL_NAME, {}, call_context("user-test"))
 
     assert captured[0].url.params["api_key"] == SECRET_VALUE
 
@@ -1011,12 +1025,14 @@ async def test_secret_in_body_is_injected_when_the_placement_allows() -> None:
         records={"rpc": content},
         options=ExecutorOptions(
             secrets=FakeSecretStore(
-                placements=frozenset({SecretPlacement.HEADER, SecretPlacement.BODY})
+                options=FakeSecretOptions(
+                    placements=frozenset({SecretPlacement.HEADER, SecretPlacement.BODY})
+                )
             )
         ),
     )
 
-    await executor.execute("rpc", {"query": "hello"}, user_id="user-test")
+    await executor.execute("rpc", {"query": "hello"}, call_context("user-test"))
 
     assert json.loads(captured[0].content) == {"token": SECRET_VALUE, "q": "hello"}
 
@@ -1040,10 +1056,12 @@ async def test_transform_applies_before_substitution() -> None:
     executor = make_executor(
         handler,
         records={SECRET_TOOL_NAME: content},
-        options=ExecutorOptions(secrets=FakeSecretStore(transform=SecretTransform.BASE64)),
+        options=ExecutorOptions(
+            secrets=FakeSecretStore(options=FakeSecretOptions(transform=SecretTransform.BASE64))
+        ),
     )
 
-    await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+    await executor.execute(SECRET_TOOL_NAME, {}, call_context("user-test"))
 
     expected = apply_transform(SECRET_VALUE, SecretTransform.BASE64)
     assert captured[0].headers["Authorization"] == f"Basic {expected}"
@@ -1057,10 +1075,12 @@ async def test_scrub_masks_both_the_sent_and_the_plain_value() -> None:
             HTTPStatus.OK, text=f'{{"sent": "{encoded}", "decoded": "{SECRET_VALUE}"}}'
         ),
         records={SECRET_TOOL_NAME: SECRET_TOOL_CONTENT},
-        options=ExecutorOptions(secrets=FakeSecretStore(transform=SecretTransform.BASE64)),
+        options=ExecutorOptions(
+            secrets=FakeSecretStore(options=FakeSecretOptions(transform=SecretTransform.BASE64))
+        ),
     )
 
-    result = await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+    result = await executor.execute(SECRET_TOOL_NAME, {}, call_context("user-test"))
 
     assert SECRET_VALUE not in result.body
     assert encoded not in result.body
@@ -1079,7 +1099,9 @@ async def test_model_param_in_header_must_render_header_safe() -> None:
     executor = make_executor(ok_handler(), records={"traced": content})
 
     with pytest.raises(ExternalCallError, match="illegal value"):
-        await executor.execute("traced", {"trace": "evil\r\nX-Injected: 1"}, user_id="user-test")
+        await executor.execute(
+            "traced", {"trace": "evil\r\nX-Injected: 1"}, call_context("user-test")
+        )
 
 
 @pytest.mark.parametrize(
@@ -1185,10 +1207,12 @@ async def test_a_401_without_any_secret_says_no_credential_was_sent() -> None:
         records={"bare": content},
     )
 
-    result = await executor.execute("bare", {}, user_id="user-test")
+    result = await executor.execute("bare", {}, call_context("user-test"))
 
     assert result.status == HTTPStatus.UNAUTHORIZED
     assert "NO credential" in result.body
+    assert 'auth: {"secret": "<code>"}' in result.body
+    assert "{secret.<code>}" in result.body
     assert "secret_list" in result.body
 
 
@@ -1200,7 +1224,7 @@ async def test_a_401_with_a_secret_attached_keeps_the_body_alone() -> None:
         options=ExecutorOptions(secrets=FakeSecretStore()),
     )
 
-    result = await executor.execute(SECRET_TOOL_NAME, {}, user_id="user-test")
+    result = await executor.execute(SECRET_TOOL_NAME, {}, call_context("user-test"))
 
     assert "NO credential" not in result.body
 
@@ -1235,7 +1259,7 @@ async def test_a_path_param_keeps_its_separators() -> None:
     await executor.execute(
         DISCOVERY_TOOL_NAME,
         {"host": "p124-caldav.icloud.com", "calendar_home_path": "1056456520/calendars/"},
-        user_id="user-test",
+        call_context("user-test"),
     )
 
     assert str(captured[0].url) == "https://p124-caldav.icloud.com/1056456520/calendars/"
@@ -1251,7 +1275,7 @@ async def test_a_string_param_stays_one_segment() -> None:
 
     executor = make_executor(handler, records={TOOL_NAME: WEATHER_TOOL_CONTENT})
 
-    await executor.execute(TOOL_NAME, {"city": "a/b"}, user_id="user-test")
+    await executor.execute(TOOL_NAME, {"city": "a/b"}, call_context("user-test"))
 
     assert "a%2Fb" in str(captured[0].url)
 
@@ -1264,7 +1288,7 @@ async def test_a_host_param_is_confined_to_the_records_allowlist() -> None:
         await executor.execute(
             DISCOVERY_TOOL_NAME,
             {"host": "evil.example.com", "calendar_home_path": "x/"},
-            user_id="user-test",
+            call_context("user-test"),
         )
 
 
@@ -1284,7 +1308,7 @@ async def test_malformed_path_and_host_values_are_refused(
     executor = make_executor(ok_handler(), records={DISCOVERY_TOOL_NAME: DISCOVERY_TOOL_CONTENT})
 
     with pytest.raises(ExternalCallError, match=message):
-        await executor.execute(DISCOVERY_TOOL_NAME, params, user_id="user-test")
+        await executor.execute(DISCOVERY_TOOL_NAME, params, call_context("user-test"))
 
 
 def test_only_a_host_param_may_stand_in_the_url_host() -> None:
@@ -1353,11 +1377,13 @@ async def test_a_big_json_answer_comes_back_as_a_passport() -> None:
     engine = create_engine("sqlite+aiosqlite:///:memory:")
     await init_db(engine)
     spill = ResponseSpill(
-        SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+        ResponseSpillOptions(
+            SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+        )
     )
     executor = make_executor(ok_handler(BIG_JSON_BODY), options=ExecutorOptions(spill=spill))
 
-    result = await executor.execute(TOOL_NAME, {"city": "London"}, user_id=USER_A)
+    result = await executor.execute(TOOL_NAME, {"city": "London"}, call_context(USER_A))
 
     assert "col:" in result.body
     assert "200 records" in result.body
@@ -1370,11 +1396,13 @@ async def test_without_a_user_the_spill_stands_down() -> None:
     engine = create_engine("sqlite+aiosqlite:///:memory:")
     await init_db(engine)
     spill = ResponseSpill(
-        SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+        ResponseSpillOptions(
+            SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+        )
     )
     executor = make_executor(ok_handler(BIG_JSON_BODY), options=ExecutorOptions(spill=spill))
 
-    result = await executor.execute(TOOL_NAME, {"city": "London"}, user_id=None)
+    result = await executor.execute(TOOL_NAME, {"city": "London"}, call_context())
 
     assert "col:" not in result.body
     assert result.body.endswith("...[truncated]")
@@ -1385,11 +1413,13 @@ async def test_a_small_json_answer_stays_inline_with_a_spill_wired() -> None:
     engine = create_engine("sqlite+aiosqlite:///:memory:")
     await init_db(engine)
     spill = ResponseSpill(
-        SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+        ResponseSpillOptions(
+            SqlAlchemyCollectionStore(create_session_factory(engine)), CollectionConfig()
+        )
     )
     executor = make_executor(ok_handler('{"ok": true}'), options=ExecutorOptions(spill=spill))
 
-    result = await executor.execute(TOOL_NAME, {"city": "London"}, user_id=USER_A)
+    result = await executor.execute(TOOL_NAME, {"city": "London"}, call_context(USER_A))
 
     assert result.body == '{"ok": true}'
     await engine.dispose()
@@ -1437,7 +1467,7 @@ async def _sqlite_spill() -> tuple[ResponseSpill, AsyncEngine]:
     engine = create_engine("sqlite+aiosqlite:///:memory:")
     await init_db(engine)
     store = SqlAlchemyCollectionStore(create_session_factory(engine))
-    return ResponseSpill(store, CollectionConfig()), engine
+    return ResponseSpill(ResponseSpillOptions(store, CollectionConfig())), engine
 
 
 async def test_collect_walks_every_page_without_the_model() -> None:
@@ -1451,7 +1481,7 @@ async def test_collect_walks_every_page_without_the_model() -> None:
     )
 
     result = await executor.execute(
-        PAGED_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True)
+        PAGED_TOOL_NAME, {}, call_context(USER_A, CallOptions(collect=True))
     )
 
     assert "col:" in result.body
@@ -1476,7 +1506,7 @@ async def test_collect_page_ceiling_marks_the_collection_truncated() -> None:
     )
 
     result = await executor.execute(
-        PAGED_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True, max_pages=1)
+        PAGED_TOOL_NAME, {}, call_context(USER_A, CallOptions(collect=True, max_pages=1))
     )
 
     assert "2 records" in result.body
@@ -1499,7 +1529,7 @@ async def test_collect_stops_on_a_repeated_cursor() -> None:
     )
 
     result = await executor.execute(
-        CURSOR_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True)
+        CURSOR_TOOL_NAME, {}, call_context(USER_A, CallOptions(collect=True))
     )
 
     # page 1 with cursor "", page 2 with cursor "again", then the repeat stops it
@@ -1513,7 +1543,9 @@ async def test_collect_without_a_pagination_section_names_the_remedy() -> None:
 
     with pytest.raises(ExternalCallError, match="pagination section"):
         await executor.execute(
-            TOOL_NAME, {"city": "London"}, user_id=USER_A, options=CallOptions(collect=True)
+            TOOL_NAME,
+            {"city": "London"},
+            call_context(USER_A, CallOptions(collect=True)),
         )
     await engine.dispose()
 
@@ -1542,12 +1574,12 @@ async def test_into_appends_records_from_another_endpoint() -> None:
         options=ExecutorOptions(spill=spill),
     )
     first = await executor.execute(
-        PAGED_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True)
+        PAGED_TOOL_NAME, {}, call_context(USER_A, CallOptions(collect=True))
     )
     ref = first.body.split("col:", 1)[1].split("]", 1)[0]
 
     poured = await executor.execute(
-        "crm_contacts", {}, user_id=USER_A, options=CallOptions(into=f"col:{ref}")
+        "crm_contacts", {}, call_context(USER_A, CallOptions(into=f"col:{ref}"))
     )
 
     assert f"col:{ref}" in poured.body
@@ -1565,7 +1597,7 @@ async def test_collect_and_into_are_refused_for_kind_records() -> None:
     )
 
     with pytest.raises(ExternalCallError, match="classic HTTP endpoints only"):
-        await executor.execute("mirror", {}, user_id=USER_A, options=CallOptions(collect=True))
+        await executor.execute("mirror", {}, call_context(USER_A, CallOptions(collect=True)))
     await engine.dispose()
 
 
@@ -1600,7 +1632,11 @@ async def test_collect_stops_and_says_cut_when_the_byte_quota_fills() -> None:
     engine = create_engine("sqlite+aiosqlite:///:memory:")
     await init_db(engine)
     tight = CollectionConfig(max_bytes_per_user=400)
-    spill = ResponseSpill(SqlAlchemyCollectionStore(create_session_factory(engine), tight), tight)
+    spill = ResponseSpill(
+        ResponseSpillOptions(
+            SqlAlchemyCollectionStore(create_session_factory(engine), tight), tight
+        )
+    )
     executor = make_executor(
         _paged_handler,
         records={PAGED_TOOL_NAME: PAGED_TOOL_CONTENT},
@@ -1608,7 +1644,7 @@ async def test_collect_stops_and_says_cut_when_the_byte_quota_fills() -> None:
     )
 
     result = await executor.execute(
-        PAGED_TOOL_NAME, {}, user_id=USER_A, options=CallOptions(collect=True)
+        PAGED_TOOL_NAME, {}, call_context(USER_A, CallOptions(collect=True))
     )
 
     assert "SOURCE CUT" in result.body
@@ -1626,14 +1662,14 @@ async def test_a_plain_call_applies_the_records_response_section_too() -> None:
     # a low inline threshold: one page is small, and inline is not the point here
     tiny_inline = CollectionConfig(inline_max_chars=100)
     store = SqlAlchemyCollectionStore(create_session_factory(engine), tiny_inline)
-    spill = ResponseSpill(store, tiny_inline, None)
+    spill = ResponseSpill(ResponseSpillOptions(store, tiny_inline))
     executor = make_executor(
         _paged_handler,
         records={PAGED_TOOL_NAME: PAGED_TOOL_CONTENT},
         options=ExecutorOptions(spill=spill),
     )
 
-    result = await executor.execute(PAGED_TOOL_NAME, {"page": "1"}, user_id=USER_A)
+    result = await executor.execute(PAGED_TOOL_NAME, {"page": "1"}, call_context(USER_A))
 
     ref = result.body.split("col:", 1)[1].split("]", 1)[0]
     passport = await store.passport(USER_A, ref)

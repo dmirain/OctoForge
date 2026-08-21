@@ -8,11 +8,20 @@ two functions.
 
 ```python
 runner = await manager.get_or_create_runner(user_id, channel)
-events = runner.subscribe()          # subscribe BEFORE submitting, or you lose the first events
-await runner.submit(text, client_message_id=..., reply_to_exchange_id=...)
+events = runner.subscribe()  # subscribe BEFORE submitting, or you lose the first events
+await runner.submit(
+    DialogSubmission(
+        text,
+        client_message_id=...,
+        reply_to_exchange_id=...,
+        source=...,
+    )
+)
 
 while True:
-    event = await events.get()       # ConversationEvent(dialog_id, seq, exchange_id, payload)
+    event = (
+        await events.get()
+    )  # ConversationEvent(dialog_id, seq, exchange_id, payload)
     render(event)
 ```
 
@@ -23,7 +32,7 @@ job.
 |---|---|
 | `get_or_create_runner(user_id, channel)` | Pick the dialog. Choose a stable `channel` string for your surface |
 | `subscribe()` / `unsubscribe(queue)` | Attach and detach. Attaching also drains anything waiting in the outbox |
-| `submit(text, kind=…, client_message_id=…, reply_to_exchange_id=…)` | Deliver a user message |
+| `submit(DialogSubmission(...))` | Deliver one typed user message |
 | `cancel()` | Stop the dialog's live answer runs |
 
 ## Four things a good surface gets right
@@ -95,5 +104,7 @@ appending to whatever bubble happens to be last.
   (REST + SSE)
 - `surfaces/telegram/src/octoforge_telegram/bridge.py` — the thorough one: drafts, throttling, reply threading, chunking
 - `surfaces/telegram/src/octoforge_telegram/poller.py` — ingestion, per-user queues, message-kind decisions
-- `core/src/octoforge_core/agent/runner.py` — `subscribe`, `submit`, `cancel`, `ConversationEvent`
+- `core/src/octoforge_core/agent/runner.py` — the stable actor API facade
+- `core/src/octoforge_core/agent/runner_api.py` — `DialogSubmission` and `ConversationEvent`
+- `core/src/octoforge_core/agent/runner_facade.py` — `subscribe`, `submit` and `cancel`
 - [../reference/conversation-actor.md](../reference/conversation-actor.md) — delivery guarantees in detail

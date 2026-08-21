@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import pytest
 
@@ -60,12 +61,18 @@ def awaiting_user() -> ExchangeInfo:
     )
 
 
-def route_reply(
-    action: str = "new",
-    exchange_id: str | None = None,
-    cancel: list[str] | None = None,
-    title: str | None = None,
-) -> ChatMessage:
+@dataclass(frozen=True, slots=True)
+class RouteReply:
+    action: str = "new"
+    exchange_id: str | None = None
+    cancel: tuple[str, ...] = ()
+    title: str | None = None
+
+
+DEFAULT_ROUTE_REPLY = RouteReply()
+
+
+def route_reply(reply: RouteReply = DEFAULT_ROUTE_REPLY) -> ChatMessage:
     return ChatMessage(
         role=MessageRole.ASSISTANT,
         content="",
@@ -74,10 +81,10 @@ def route_reply(
                 id="call-1",
                 name=ROUTE_TOOL_NAME,
                 arguments={
-                    "action": action,
-                    "exchange_id": exchange_id,
-                    "cancel_exchange_ids": cancel or [],
-                    "title": title,
+                    "action": reply.action,
+                    "exchange_id": reply.exchange_id,
+                    "cancel_exchange_ids": list(reply.cancel),
+                    "title": reply.title,
                 },
             ),
         ),
@@ -166,7 +173,7 @@ async def test_no_live_exchanges_skips_the_llm() -> None:
 
 
 async def test_continue_into_a_known_exchange() -> None:
-    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=WAITING_ID))
+    llm = ScriptedLLM(reply=route_reply(RouteReply(action="continue", exchange_id=WAITING_ID)))
     router = make_router(llm)
 
     decision = await router.route((in_progress(), awaiting_user()), "Moscow", MAX_EXCHANGES)
@@ -178,7 +185,9 @@ async def test_continue_into_a_known_exchange() -> None:
 async def test_decision_carries_the_calls_usage() -> None:
     """The caller attributes the spend, so the decision must hand it over."""
     usage = Usage(prompt_tokens=20, completion_tokens=5)
-    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=WAITING_ID), usage=usage)
+    llm = ScriptedLLM(
+        reply=route_reply(RouteReply(action="continue", exchange_id=WAITING_ID)), usage=usage
+    )
     router = make_router(llm)
 
     decision = await router.route((in_progress(),), MESSAGE, MAX_EXCHANGES)
@@ -192,7 +201,7 @@ async def test_continue_into_an_unknown_exchange_degrades_to_new(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Safe default: a redundant answer is visible, a swallowed message is not."""
-    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=UNKNOWN_ID))
+    llm = ScriptedLLM(reply=route_reply(RouteReply(action="continue", exchange_id=UNKNOWN_ID)))
     router = make_router(llm)
 
     with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
@@ -206,7 +215,9 @@ async def test_continue_into_an_unknown_exchange_degrades_to_new(
 async def test_unknown_action_degrades_to_new_keeping_cancels(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    llm = ScriptedLLM(reply=route_reply(action="nonsense", cancel=[OPEN_ID, UNKNOWN_ID]))
+    llm = ScriptedLLM(
+        reply=route_reply(RouteReply(action="nonsense", cancel=(OPEN_ID, UNKNOWN_ID)))
+    )
     router = make_router(llm)
 
     with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
@@ -218,7 +229,7 @@ async def test_unknown_action_degrades_to_new_keeping_cancels(
 
 
 async def test_command_action_answers_nothing() -> None:
-    llm = ScriptedLLM(reply=route_reply(action="command", cancel=[OPEN_ID]))
+    llm = ScriptedLLM(reply=route_reply(RouteReply(action="command", cancel=(OPEN_ID,))))
     router = make_router(llm)
 
     decision = await router.route((in_progress(),), "stop", MAX_EXCHANGES)
@@ -356,7 +367,9 @@ async def test_a_candidate_without_a_preview_shows_only_its_title() -> None:
 
 
 async def test_continue_carries_the_renamed_exchange() -> None:
-    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=WAITING_ID, title=NEW_TITLE))
+    llm = ScriptedLLM(
+        reply=route_reply(RouteReply(action="continue", exchange_id=WAITING_ID, title=NEW_TITLE))
+    )
     router = make_router(llm)
 
     decision = await router.route((awaiting_user(),), MESSAGE, MAX_EXCHANGES)
@@ -367,7 +380,7 @@ async def test_continue_carries_the_renamed_exchange() -> None:
 async def test_a_new_exchange_is_never_renamed() -> None:
     """`title` belongs to continue: a new exchange is named from the message
     that opens it, and command renames nothing."""
-    llm = ScriptedLLM(reply=route_reply(action="new", title=NEW_TITLE))
+    llm = ScriptedLLM(reply=route_reply(RouteReply(action="new", title=NEW_TITLE)))
     router = make_router(llm)
 
     decision = await router.route((awaiting_user(),), MESSAGE, MAX_EXCHANGES)
@@ -379,7 +392,9 @@ async def test_a_multiline_title_is_collapsed_to_one_line() -> None:
     """The title lands in every later candidate line: a newline in it would
     split one exchange into two."""
     llm = ScriptedLLM(
-        reply=route_reply(action="continue", exchange_id=WAITING_ID, title="  two\n lines  ")
+        reply=route_reply(
+            RouteReply(action="continue", exchange_id=WAITING_ID, title="  two\n lines  ")
+        )
     )
     router = make_router(llm)
 
@@ -389,7 +404,9 @@ async def test_a_multiline_title_is_collapsed_to_one_line() -> None:
 
 
 async def test_an_overlong_title_is_cut_to_the_stored_length() -> None:
-    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=WAITING_ID, title="x" * 200))
+    llm = ScriptedLLM(
+        reply=route_reply(RouteReply(action="continue", exchange_id=WAITING_ID, title="x" * 200))
+    )
     router = make_router(llm)
 
     decision = await router.route((awaiting_user(),), MESSAGE, MAX_EXCHANGES)
@@ -399,7 +416,9 @@ async def test_an_overlong_title_is_cut_to_the_stored_length() -> None:
 
 async def test_an_unusable_title_leaves_the_name_alone() -> None:
     """Blank or non-string means "nothing better to offer", never "clear it"."""
-    llm = ScriptedLLM(reply=route_reply(action="continue", exchange_id=WAITING_ID, title="   "))
+    llm = ScriptedLLM(
+        reply=route_reply(RouteReply(action="continue", exchange_id=WAITING_ID, title="   "))
+    )
     router = make_router(llm)
 
     decision = await router.route((awaiting_user(),), MESSAGE, MAX_EXCHANGES)

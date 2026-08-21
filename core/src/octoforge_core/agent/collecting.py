@@ -13,6 +13,7 @@ question that is already starting a run on the same exchange.
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Protocol
 
 from octoforge_core.dialogs.api import DialogRepository, ExchangeRepository
@@ -21,6 +22,25 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_QUIET_SECONDS = 30.0
 DEFAULT_INTERVAL_SECONDS = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class CollectingSources:
+    """Repositories consulted by the collecting sweep."""
+
+    exchanges: ExchangeRepository
+    dialogs: DialogRepository
+
+
+@dataclass(frozen=True, slots=True)
+class CollectingSweepConfig:
+    """Timing of the collecting sweep."""
+
+    quiet_seconds: float = DEFAULT_QUIET_SECONDS
+    interval_seconds: float = DEFAULT_INTERVAL_SECONDS
+
+
+DEFAULT_SWEEP_CONFIG = CollectingSweepConfig()
 
 
 class CollectionPromoter(Protocol):
@@ -36,17 +56,13 @@ class CollectingSweeper:
 
     def __init__(
         self,
-        exchanges: ExchangeRepository,
-        dialogs: DialogRepository,
+        sources: CollectingSources,
         promoter: CollectionPromoter,
-        quiet_seconds: float = DEFAULT_QUIET_SECONDS,
-        interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
+        config: CollectingSweepConfig = DEFAULT_SWEEP_CONFIG,
     ) -> None:
-        self._exchanges = exchanges
-        self._dialogs = dialogs
+        self._sources = sources
         self._promoter = promoter
-        self._quiet_seconds = quiet_seconds
-        self._interval_seconds = interval_seconds
+        self._config = config
 
     async def run_forever(self) -> None:
         """Sweep until cancelled; a failing tick never stops the loop."""
@@ -55,15 +71,15 @@ class CollectingSweeper:
                 await self.tick()
             except Exception:  # a sweep failure must not end the surface
                 logger.exception("collecting sweep tick failed")
-            await asyncio.sleep(self._interval_seconds)
+            await asyncio.sleep(self._config.interval_seconds)
 
     async def tick(self) -> int:
         """Nominate every settled collection; return how many were handed over."""
-        stale = await self._exchanges.list_stale_collecting(self._quiet_seconds)
+        stale = await self._sources.exchanges.list_stale_collecting(self._config.quiet_seconds)
         promoted = 0
         for exchange in stale:
             try:
-                dialog = await self._dialogs.get(exchange.dialog_id)
+                dialog = await self._sources.dialogs.get(exchange.dialog_id)
                 await self._promoter.promote_collection(dialog.user_id, dialog.channel, exchange.id)
                 promoted += 1
             except Exception:  # one broken dialog must not stall the others

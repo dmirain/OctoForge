@@ -10,7 +10,9 @@ import pytest
 
 from octoforge_core.instructions.api import (
     Instruction,
+    InstructionDefinition,
     InstructionNotFoundError,
+    InstructionSearchRequest,
     InstructionType,
     SearchHit,
 )
@@ -26,7 +28,7 @@ from octoforge_core.instructions.tools import (
     InstructionSaveTool,
     InstructionSearchTool,
 )
-from octoforge_core.net.external import ExternalCallExecutor
+from octoforge_core.net.external import ExternalCallExecutor, ExternalCallServices
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import CALL_NAME as EXTERNAL_CALL_NAME
 from octoforge_core.net.tools import ExternalCallTool
@@ -73,30 +75,28 @@ class FakeInstructionService:
     async def search(
         self,
         user_id: str,
-        query: str,
-        k: int,
-        kind: InstructionType | None = None,
+        request: InstructionSearchRequest,
     ) -> list[SearchHit]:
-        self.search_calls.append((user_id, query, k, kind))
+        self.search_calls.append((user_id, request.query, request.limit, request.kind))
         return self.hits
 
-    async def search_all(
-        self,
-        query: str,
-        k: int,
-        kind: InstructionType | None = None,
-    ) -> list[SearchHit]:
+    async def search_all(self, request: InstructionSearchRequest) -> list[SearchHit]:
         raise NotImplementedError
 
     async def save(
         self,
         user_id: str,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...] = (),
+        definition: InstructionDefinition,
     ) -> Instruction:
-        self.saved.append((user_id, kind, title, content, tags))
+        self.saved.append(
+            (
+                user_id,
+                definition.kind,
+                definition.title,
+                definition.content,
+                definition.tags,
+            )
+        )
         assert self.save_result is not None
         return self.save_result
 
@@ -157,9 +157,11 @@ def make_external_call_tool(body: str = "{}") -> ExternalCallTool:
         )
     }
     executor = ExternalCallExecutor(
-        service=_ToolServingService(records),
-        http_client=http_client,
-        guard=SsrfGuard(resolver=StubResolver((PUBLIC_IP,))),
+        ExternalCallServices(
+            _ToolServingService(records),
+            http_client,
+            SsrfGuard(resolver=StubResolver((PUBLIC_IP,))),
+        )
     )
     return ExternalCallTool(executor=executor)
 

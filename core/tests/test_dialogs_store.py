@@ -2,12 +2,13 @@
 
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from octoforge_core.context.api import INTERRUPTED_NOTE
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
@@ -17,6 +18,7 @@ from octoforge_core.dialogs.api import (
     DialogRepository,
     ExchangeNotFoundError,
     ExchangeStatus,
+    MessageAppend,
     MessageRepository,
 )
 from octoforge_core.dialogs.models import ExchangeRow, MessageRow
@@ -64,6 +66,12 @@ COLLECTING_TITLE = "forwarded material"
 STALE_QUIET_SECONDS = 30.0
 
 
+@dataclass(frozen=True, slots=True)
+class AppendPairCase:
+    factory: async_sessionmaker[AsyncSession]
+    dialog_id: str
+
+
 @pytest.fixture
 async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     engine = create_engine(MEMORY_DATABASE_URL)
@@ -72,20 +80,39 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     await engine.dispose()
 
 
-def make_task(
-    dialog_id: str = DIALOG_ID,
-    title: str = TASK_TITLE,
-    created_at: datetime = CREATED_EARLIER,
-    status: TaskStatus = TaskStatus.PENDING,
-) -> Task:
-    return Task(
-        dialog_id=dialog_id,
-        title=title,
+def make_task(**overrides: object) -> Task:
+    task = Task(
+        dialog_id=DIALOG_ID,
+        title=TASK_TITLE,
         kind=TaskKind.RUN,
-        input={"title": title, "prompt": "solve 2+2"},
-        created_at=created_at,
-        status=status,
+        input={"title": TASK_TITLE, "prompt": "solve 2+2"},
+        created_at=CREATED_EARLIER,
+        status=TaskStatus.PENDING,
     )
+    return replace(task, **overrides)
+
+
+async def message_rows(
+    session_factory: async_sessionmaker[AsyncSession], dialog_id: str
+) -> list[MessageRow]:
+    async with session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(MessageRow).where(MessageRow.dialog_id == dialog_id).order_by(MessageRow.seq)
+            )
+        ).all()
+    return list(rows)
+
+
+async def prepare_append_pair_case(engine: AsyncEngine) -> AppendPairCase:
+    factory = create_session_factory(engine)
+    dialogs = SqlAlchemyDialogRepository(factory)
+    messages = SqlAlchemyMessageRepository(factory)
+    dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="question"))
+    )
+    return AppendPairCase(factory=factory, dialog_id=dialog.id)
 
 
 async def test_get_or_create_creates_then_reuses_dialog(
@@ -168,8 +195,12 @@ async def test_appending_a_message_does_not_write_the_dialog_row(
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="hello"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+    )
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="hello"))
+    )
 
     assert (await dialogs.get(dialog.id)).updated_at == dialog.updated_at
 
@@ -183,8 +214,12 @@ async def test_last_activity_reads_the_message_log(
     first = await dialogs.get_or_create(USER_ID, CHANNEL)
     second = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
     elsewhere = await dialogs.get_or_create(USER_ID, OTHER_CHANNEL)
-    await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="one"))
-    await messages.append(elsewhere.id, ChatMessage(role=MessageRole.USER, content="other channel"))
+    await messages.append(
+        MessageAppend(first.id, ChatMessage(role=MessageRole.USER, content="one"))
+    )
+    await messages.append(
+        MessageAppend(elsewhere.id, ChatMessage(role=MessageRole.USER, content="other channel"))
+    )
 
     activity = await messages.last_activity_by_channel(CHANNEL)
 
@@ -201,10 +236,18 @@ async def test_message_stats_by_channel(
     first = await dialogs.get_or_create(USER_ID, CHANNEL)
     second = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
     other_channel = await dialogs.get_or_create(USER_ID, OTHER_CHANNEL)
-    await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="one"))
-    await messages.append(first.id, ChatMessage(role=MessageRole.ASSISTANT, content="three"))
-    await messages.append(second.id, ChatMessage(role=MessageRole.USER, content="four"))
-    await messages.append(other_channel.id, ChatMessage(role=MessageRole.USER, content="ignored"))
+    await messages.append(
+        MessageAppend(first.id, ChatMessage(role=MessageRole.USER, content="one"))
+    )
+    await messages.append(
+        MessageAppend(first.id, ChatMessage(role=MessageRole.ASSISTANT, content="three"))
+    )
+    await messages.append(
+        MessageAppend(second.id, ChatMessage(role=MessageRole.USER, content="four"))
+    )
+    await messages.append(
+        MessageAppend(other_channel.id, ChatMessage(role=MessageRole.USER, content="ignored"))
+    )
 
     stats = {entry.user_id: entry for entry in await messages.stats_by_channel(CHANNEL)}
 
@@ -225,10 +268,16 @@ async def test_user_activity_counts_only_the_persons_own_recent_writing(
     dialogs = SqlAlchemyDialogRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="old"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="old"))
+    )
     cutoff = utc_now()  # everything above is before it, everything below after
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="fresh"))
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="fresh"))
+    )
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+    )
 
     activity = {
         entry.user_id: entry for entry in await messages.user_activity_by_channel(CHANNEL, cutoff)
@@ -250,9 +299,15 @@ async def test_messages_get_monotonic_seq_and_order(
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="two"))
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="three"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
+    )
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="two"))
+    )
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="three"))
+    )
 
     stored = await messages.list(dialog.id)
     assert [m.content for m in stored] == ["one", "two", "three"]
@@ -274,7 +329,9 @@ async def test_append_returns_and_round_trips_the_row_id(
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
-    message_id = await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
+    message_id = await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
+    )
 
     (stored,) = await messages.list(dialog.id)
     assert stored.id == message_id
@@ -293,30 +350,20 @@ async def test_append_pair_writes_both_messages_in_one_transaction() -> None:
 
     event.listen(engine.sync_engine, "commit", _count_commit)
     try:
-        factory = create_session_factory(engine)
-        dialogs = SqlAlchemyDialogRepository(factory)
-        messages = SqlAlchemyMessageRepository(factory)
-        dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
-        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="question"))
+        case = await prepare_append_pair_case(engine)
         commits_before = commits
+        messages = SqlAlchemyMessageRepository(case.factory)
 
         await messages.append_pair(
-            dialog.id,
+            case.dialog_id,
             ChatMessage(role=MessageRole.ASSISTANT, content="partial answer"),
             ChatMessage(role=MessageRole.SYSTEM, content=INTERRUPTED_NOTE),
         )
 
         assert commits == commits_before + 1  # one transaction for the whole pair
-        stored = await messages.list(dialog.id)
+        stored = await messages.list(case.dialog_id)
         assert [m.content for m in stored] == ["question", "partial answer", INTERRUPTED_NOTE]
-        async with factory() as session:
-            rows = (
-                await session.scalars(
-                    select(MessageRow)
-                    .where(MessageRow.dialog_id == dialog.id)
-                    .order_by(MessageRow.seq)
-                )
-            ).all()
+        rows = await message_rows(case.factory, case.dialog_id)
         assert [row.seq for row in rows] == [FIRST_SEQ, SECOND_SEQ, THIRD_SEQ]
     finally:
         await engine.dispose()
@@ -330,11 +377,15 @@ async def test_message_usage_round_trip(
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     await messages.append(
-        dialog.id,
-        ChatMessage(role=MessageRole.ASSISTANT, content="answer"),
-        usage=Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS),
+        MessageAppend(
+            dialog.id,
+            ChatMessage(role=MessageRole.ASSISTANT, content="answer"),
+            Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS),
+        )
     )
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="plain"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="plain"))
+    )
 
     async with session_factory() as session:
         rows = (
@@ -356,10 +407,14 @@ async def test_message_task_id_round_trip(
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     await messages.append(
-        dialog.id,
-        ChatMessage(role=MessageRole.ASSISTANT, content="task answer", task_id="task-1"),
+        MessageAppend(
+            dialog.id,
+            ChatMessage(role=MessageRole.ASSISTANT, content="task answer", task_id="task-1"),
+        )
     )
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="plain"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="plain"))
+    )
 
     stored = await messages.list(dialog.id)
     assert stored[0].task_id == "task-1"
@@ -383,22 +438,30 @@ async def test_client_message_id_dedup_round_trip(
 
     assert not await messages.find_by_client_id(dialog.id, CLIENT_MESSAGE_ID)
     await messages.append(
-        dialog.id,
-        ChatMessage(role=MessageRole.USER, content="hi"),
-        client_message_id=CLIENT_MESSAGE_ID,
+        MessageAppend(
+            dialog.id,
+            ChatMessage(role=MessageRole.USER, content="hi"),
+            client_message_id=CLIENT_MESSAGE_ID,
+        )
     )
     assert await messages.find_by_client_id(dialog.id, CLIENT_MESSAGE_ID)
 
     with pytest.raises(IntegrityError):  # the unique constraint is the backstop
         await messages.append(
-            dialog.id,
-            ChatMessage(role=MessageRole.USER, content="hi again"),
-            client_message_id=CLIENT_MESSAGE_ID,
+            MessageAppend(
+                dialog.id,
+                ChatMessage(role=MessageRole.USER, content="hi again"),
+                client_message_id=CLIENT_MESSAGE_ID,
+            )
         )
 
     # unkeyed messages coexist freely (NULLs are distinct in SQLite)
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="no key"))
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="no key 2"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="no key"))
+    )
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="no key 2"))
+    )
     assert len(await messages.list(dialog.id)) == EXPECTED_UNKEYED_PLUS_ONE
 
 
@@ -410,12 +473,16 @@ async def test_message_tool_calls_round_trip(
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
 
     await messages.append(
-        dialog.id,
-        ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=(TOOL_CALL,)),
+        MessageAppend(
+            dialog.id,
+            ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=(TOOL_CALL,)),
+        )
     )
     await messages.append(
-        dialog.id,
-        ChatMessage(role=MessageRole.TOOL, content="output", tool_call_id=TOOL_CALL.id),
+        MessageAppend(
+            dialog.id,
+            ChatMessage(role=MessageRole.TOOL, content="output", tool_call_id=TOOL_CALL.id),
+        )
     )
 
     stored = await messages.list(dialog.id)
@@ -449,7 +516,9 @@ async def test_append_retries_a_transient_seq_conflict(
 
     monkeypatch.setattr(AsyncSession, "commit", flaky_commit)
 
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hello"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="hello"))
+    )
 
     assert calls == EXPECTED_RETRY_COMMIT_ATTEMPTS  # lost the race, then the retry succeeded
     stored = await messages.list(dialog.id)
@@ -495,7 +564,9 @@ async def test_messages_are_isolated_per_dialog(
     first = await dialogs.get_or_create(USER_ID, CHANNEL)
     second = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
 
-    await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="private"))
+    await messages.append(
+        MessageAppend(first.id, ChatMessage(role=MessageRole.USER, content="private"))
+    )
 
     assert await messages.list(second.id) == []
 
@@ -688,8 +759,12 @@ async def test_delete_removes_the_dialog_and_its_messages(
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
     other = await dialogs.get_or_create(OTHER_USER_ID, CHANNEL)
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
-    await messages.append(other.id, ChatMessage(role=MessageRole.USER, content="keep"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+    )
+    await messages.append(
+        MessageAppend(other.id, ChatMessage(role=MessageRole.USER, content="keep"))
+    )
 
     await dialogs.delete(dialog.id)
 
@@ -722,15 +797,19 @@ async def test_delete_for_dialog_removes_only_that_dialogs_tasks(
     assert [task.title for task in await store.list(OTHER_DIALOG_ID)] == ["keep"]
 
 
-async def _insert_exchange(  # noqa: PLR0913 — mirrors the ExchangeRow columns it sets
+@dataclass(frozen=True, slots=True)
+class ExchangeDraft:
+    status: ExchangeStatus
+    created_at: datetime
+    dialog_id: str = DIALOG_ID
+    title: str = EXCHANGE_TITLE
+    updated_at: datetime | None = None
+    pending_question: str | None = None
+
+
+async def _insert_exchange(
     session_factory: async_sessionmaker[AsyncSession],
-    *,
-    dialog_id: str = DIALOG_ID,
-    title: str = EXCHANGE_TITLE,
-    status: ExchangeStatus,
-    created_at: datetime,
-    updated_at: datetime | None = None,
-    pending_question: str | None = None,
+    draft: ExchangeDraft,
 ) -> str:
     """Insert an ExchangeRow directly, controlling `created_at`/`updated_at`.
 
@@ -743,12 +822,12 @@ async def _insert_exchange(  # noqa: PLR0913 — mirrors the ExchangeRow columns
         session.add(
             ExchangeRow(
                 id=row_id,
-                dialog_id=dialog_id,
-                status=status.value,
-                title=title,
-                pending_question=pending_question,
-                created_at=created_at,
-                updated_at=updated_at if updated_at is not None else created_at,
+                dialog_id=draft.dialog_id,
+                status=draft.status.value,
+                title=draft.title,
+                pending_question=draft.pending_question,
+                created_at=draft.created_at,
+                updated_at=draft.updated_at if draft.updated_at is not None else draft.created_at,
             )
         )
         await session.commit()
@@ -807,21 +886,23 @@ async def test_exchange_list_live_excludes_terminal_statuses_and_orders_oldest_f
 ) -> None:
     open_id = await _insert_exchange(
         session_factory,
-        title="open",
-        status=ExchangeStatus.OPEN,
-        created_at=CREATED_EARLIER,
+        ExchangeDraft(ExchangeStatus.OPEN, CREATED_EARLIER, title="open"),
     )
     in_progress_id = await _insert_exchange(
         session_factory,
-        title="in progress",
-        status=ExchangeStatus.IN_PROGRESS,
-        created_at=CREATED_EARLIER + timedelta(seconds=1),
+        ExchangeDraft(
+            ExchangeStatus.IN_PROGRESS,
+            CREATED_EARLIER + timedelta(seconds=1),
+            title="in progress",
+        ),
     )
     awaiting_id = await _insert_exchange(
         session_factory,
-        title="awaiting",
-        status=ExchangeStatus.AWAITING_USER,
-        created_at=CREATED_EARLIER + timedelta(seconds=2),
+        ExchangeDraft(
+            ExchangeStatus.AWAITING_USER,
+            CREATED_EARLIER + timedelta(seconds=2),
+            title="awaiting",
+        ),
     )
     for terminal_title, status, offset in (
         ("answered", ExchangeStatus.ANSWERED, 3),
@@ -830,9 +911,11 @@ async def test_exchange_list_live_excludes_terminal_statuses_and_orders_oldest_f
     ):
         await _insert_exchange(
             session_factory,
-            title=terminal_title,
-            status=status,
-            created_at=CREATED_EARLIER + timedelta(seconds=offset),
+            ExchangeDraft(
+                status,
+                CREATED_EARLIER + timedelta(seconds=offset),
+                title=terminal_title,
+            ),
         )
     repo = SqlAlchemyExchangeRepository(session_factory)
 
@@ -1073,24 +1156,30 @@ async def test_list_stale_collecting_only_returns_exchanges_past_the_quiet_windo
     now = utc_now()
     stale_id = await _insert_exchange(
         session_factory,
-        title="stale",
-        status=ExchangeStatus.COLLECTING,
-        created_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
-        updated_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 1),
+        ExchangeDraft(
+            ExchangeStatus.COLLECTING,
+            now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+            title="stale",
+            updated_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 1),
+        ),
     )
     await _insert_exchange(  # touched too recently: must not come back yet
         session_factory,
-        title="fresh",
-        status=ExchangeStatus.COLLECTING,
-        created_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
-        updated_at=now,
+        ExchangeDraft(
+            ExchangeStatus.COLLECTING,
+            now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+            title="fresh",
+            updated_at=now,
+        ),
     )
     await _insert_exchange(  # not a collection at all, however stale
         session_factory,
-        title="open",
-        status=ExchangeStatus.OPEN,
-        created_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
-        updated_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+        ExchangeDraft(
+            ExchangeStatus.OPEN,
+            now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+            title="open",
+            updated_at=now - timedelta(seconds=STALE_QUIET_SECONDS + 60),
+        ),
     )
 
     stale = await repo.list_stale_collecting(STALE_QUIET_SECONDS)
@@ -1105,10 +1194,12 @@ async def test_touch_moves_updated_at_forward(
     old_timestamp = CREATED_EARLIER
     exchange_id = await _insert_exchange(
         session_factory,
-        title=COLLECTING_TITLE,
-        status=ExchangeStatus.COLLECTING,
-        created_at=old_timestamp,
-        updated_at=old_timestamp,
+        ExchangeDraft(
+            ExchangeStatus.COLLECTING,
+            old_timestamp,
+            title=COLLECTING_TITLE,
+            updated_at=old_timestamp,
+        ),
     )
 
     await repo.touch(exchange_id)
@@ -1130,7 +1221,9 @@ async def test_sql_stores_satisfy_the_dialogs_ports(
     messages: MessageRepository = SqlAlchemyMessageRepository(session_factory)
 
     dialog = await dialogs.get_or_create("port-user", "web")
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+    )
 
     assert [m.content for m in await messages.list(dialog.id)] == ["hi"]
     assert await messages.list_after(dialog.id, 1) == []
@@ -1144,10 +1237,14 @@ async def test_message_kind_round_trips_and_legacy_rows_are_own(
     dialogs = SqlAlchemyDialogRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="мой вопрос"))
     await messages.append(
-        dialog.id,
-        ChatMessage(role=MessageRole.USER, content="чужой текст", kind=MessageKind.MATERIAL),
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="мой вопрос"))
+    )
+    await messages.append(
+        MessageAppend(
+            dialog.id,
+            ChatMessage(role=MessageRole.USER, content="чужой текст", kind=MessageKind.MATERIAL),
+        )
     )
 
     own, material = await messages.list(dialog.id)

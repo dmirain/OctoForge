@@ -1,18 +1,23 @@
 """Tests for the admin_manage tool of the Telegram surface."""
 
 from collections.abc import AsyncIterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import pytest
 from octoforge_core.cron.api import CronJob
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.api import DialogRepository, MessageRepository
+from octoforge_core.dialogs.api import DialogRepository, MessageAppend, MessageRepository
 from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, MessageRole
+from octoforge_core.identity.api import IdentityKey, IdentityProfile
 from octoforge_core.identity.store import SqlAlchemyIdentityStore
-from octoforge_core.instructions.api import InstructionService, InstructionType
+from octoforge_core.instructions.api import (
+    InstructionDefinition,
+    InstructionService,
+    InstructionType,
+)
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.time import utc_now
@@ -32,7 +37,12 @@ from octoforge_telegram.admin import (
     AdminStores,
 )
 from octoforge_telegram.client import TELEGRAM_CHANNEL
-from octoforge_telegram.invites.api import InviteStatus, MemberDirectory, MemberProfile
+from octoforge_telegram.invites.api import (
+    InviteStatus,
+    MemberDirectory,
+    MemberProfile,
+    MemberProfileUpdate,
+)
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore
 from octoforge_telegram.schema import TelegramSurfaceBase
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -76,6 +86,20 @@ class LenientEmbedder:
         return tuple((1.0, 0.0) for _ in texts)
 
 
+@dataclass(frozen=True)
+class RevokeScenario:
+    invite_id: str
+    person: str
+    tool: AdminManageTool
+
+
+@dataclass(frozen=True)
+class ExpectedInviteState:
+    invite_id: str
+    status: InviteStatus
+    disabled_job_ids: tuple[str, ...]
+
+
 @pytest.fixture
 async def stores() -> AsyncIterator[StoresTuple]:
     core_engine = create_engine(MEMORY_DATABASE_URL)
@@ -113,6 +137,31 @@ def make_tool(
         directory=directory,
     )
     return AdminManageTool(backends, access)
+
+
+async def _build_revoke_scenario(stores: StoresTuple) -> RevokeScenario:
+    cron_store, identities = stores[1], stores[5]
+    invite_id = await claim_invite(stores)
+    person = await identities.resolve_or_create(TELEGRAM_CHANNEL, "111")
+    await cron_store.create(make_cron_job("job-1", person))
+    await cron_store.create(make_cron_job("job-2", person))
+    await cron_store.create(replace(make_cron_job("job-3", person), enabled=False))
+    return RevokeScenario(invite_id=invite_id, person=person, tool=make_tool(stores))
+
+
+async def _job_enabled_map(cron_store: SqlAlchemyCronStore, person: str) -> dict[str, bool]:
+    return {job.id: job.enabled for job in await cron_store.list_for_user(person)}
+
+
+async def _assert_invite_state(
+    invites: SqlAlchemyInviteStore,
+    expected: ExpectedInviteState,
+) -> None:
+    invite = await invites.get_by_id(expected.invite_id)
+
+    assert invite is not None
+    assert invite.status is expected.status
+    assert invite.disabled_cron_job_ids == expected.disabled_job_ids
 
 
 def make_cron_job(job_id: str, user_id: str, enabled: bool = True) -> CronJob:
@@ -252,7 +301,9 @@ async def test_list_users_reports_access_stats_and_cron(
     await claim_invite(stores)
     person = await identities.resolve_or_create(TELEGRAM_CHANNEL, "111")
     dialog = await dialogs.get_or_create(person, TELEGRAM_CHANNEL)
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hello"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="hello"))
+    )
     await cron_store.create(make_cron_job("job-1", person))
     await cron_store.create(replace(make_cron_job("job-2", person), enabled=False))
     tool = make_tool(stores)
@@ -281,39 +332,38 @@ async def test_revoke_disables_cron_jobs_and_restore_reenables_exactly_them(
     `list_for_user`, matched no job, and the tool reported "disabled cron
     jobs: 0" while the scheduler kept running the revoked person's work.
     """
-    invites, cron_store, identities = stores[0], stores[1], stores[5]
-    invite_id = await claim_invite(stores)
-    person = await identities.resolve_or_create(TELEGRAM_CHANNEL, "111")
-    await cron_store.create(make_cron_job("job-1", person))
-    await cron_store.create(make_cron_job("job-2", person))
-    # the user's own pause, predating the revoke: restore must not re-enable it
-    await cron_store.create(replace(make_cron_job("job-3", person), enabled=False))
-    tool = make_tool(stores)
+    invites, cron_store = stores[0], stores[1]
+    scenario = await _build_revoke_scenario(stores)
 
-    revoked = await tool.execute(
+    revoked = await scenario.tool.execute(
         {"action": ACTION_REVOKE_INVITE, "user_id": USER_ID}, ADMIN_CONTEXT
     )
 
     assert "disabled cron jobs: 2" in revoked
-    jobs = {job.id: job for job in await cron_store.list_for_user(person)}
-    assert jobs["job-1"].enabled is False
-    assert jobs["job-2"].enabled is False
-    assert jobs["job-3"].enabled is False
-    invite = await invites.get_by_id(invite_id)
-    assert invite is not None and invite.status is InviteStatus.REVOKED
+    assert await _job_enabled_map(cron_store, scenario.person) == {
+        "job-1": False,
+        "job-2": False,
+        "job-3": False,
+    }
+    await _assert_invite_state(
+        invites,
+        ExpectedInviteState(scenario.invite_id, InviteStatus.REVOKED, ("job-1", "job-2")),
+    )
 
-    restored = await tool.execute(
-        {"action": ACTION_RESTORE_INVITE, "invite_id": invite_id}, ADMIN_CONTEXT
+    restored = await scenario.tool.execute(
+        {"action": ACTION_RESTORE_INVITE, "invite_id": scenario.invite_id}, ADMIN_CONTEXT
     )
 
     assert "re-enabled cron jobs: 2" in restored
-    jobs = {job.id: job for job in await cron_store.list_for_user(person)}
-    assert jobs["job-1"].enabled is True
-    assert jobs["job-2"].enabled is True
-    assert jobs["job-3"].enabled is False  # the user's own pause survived
-    invite = await invites.get_by_id(invite_id)
-    assert invite is not None and invite.status is InviteStatus.CLAIMED
-    assert invite.disabled_cron_job_ids == ()
+    assert await _job_enabled_map(cron_store, scenario.person) == {
+        "job-1": True,
+        "job-2": True,
+        "job-3": False,
+    }
+    await _assert_invite_state(
+        invites,
+        ExpectedInviteState(scenario.invite_id, InviteStatus.CLAIMED, ()),
+    )
 
 
 async def test_revoking_an_account_with_no_person_yet_touches_nothing(
@@ -365,7 +415,10 @@ async def test_search_instructions_finds_records_of_everyone(
     stores: StoresTuple,
 ) -> None:
     instructions = stores[4]
-    await instructions.save(USER_ID, InstructionType.SKILL, "weather scenario", "call wttr.in")
+    await instructions.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, "weather scenario", "call wttr.in"),
+    )
     tool = make_tool(stores)
 
     result = await tool.execute(
@@ -391,7 +444,10 @@ async def test_publish_instruction_makes_a_private_record_public(
     stores: StoresTuple,
 ) -> None:
     instructions = stores[4]
-    saved = await instructions.save(USER_ID, InstructionType.SKILL, "weather scenario", "steps")
+    saved = await instructions.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, "weather scenario", "steps"),
+    )
     tool = make_tool(stores)
 
     result = await tool.execute(
@@ -430,9 +486,7 @@ class OneProfileDirectory:
     def __init__(self, profile: MemberProfile) -> None:
         self._profile = profile
 
-    async def record(
-        self, user_id: str, first_name: str, last_name: str, username: str | None
-    ) -> None:
+    async def record(self, profile: MemberProfileUpdate) -> None:
         raise AssertionError("the admin tool must not write profiles")
 
     async def get(self, user_id: str) -> MemberProfile | None:
@@ -450,7 +504,9 @@ async def test_list_users_shows_name_and_invite_attribution(stores: StoresTuple)
     invite = await invites.get_by_id(invite_id)
     assert invite is not None
     await identities.resolve_or_create(TELEGRAM_CHANNEL, "111")
-    await identities.update_profile(TELEGRAM_CHANNEL, "111", "Alice Smith", "alice")
+    await identities.update_profile(
+        IdentityProfile(IdentityKey(TELEGRAM_CHANNEL, "111"), "Alice Smith", "alice")
+    )
     tool = make_tool(stores)
 
     output = await tool.execute({"action": ACTION_LIST_USERS}, ADMIN_CONTEXT)

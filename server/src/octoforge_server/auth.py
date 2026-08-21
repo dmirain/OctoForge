@@ -1,274 +1,52 @@
-"""HTTP Basic authentication for the operator console and the dialog API.
-
-Until now every HTTP endpoint trusted an `X-User-Id` header, which is fine on a
-loopback deployment and indefensible the moment the host answers on a public
-name: anyone could pass another user's id and read their dialogs. So the whole
-surface (everything except the health probes, which the container healthcheck
-and any uptime monitor need unauthenticated) sits behind one credential.
-
-The password is stored as a PBKDF2-HMAC-SHA256 hash
-(`pbkdf2_sha256:iterations:salt:digest`), verified in constant time.
-Hashing is stdlib (`hashlib.pbkdf2_hmac`) rather than passlib/bcrypt on purpose:
-one operator credential does not justify a new dependency, and PBKDF2 with a
-six-figure iteration count is the right tool for a high-entropy generated
-secret. Generate one with `tools/hash_password.py`.
-
-That iteration count is also a weapon pointed at the server: one verification
-costs ~60 ms of CPU, and this process serves every dialog on one event loop, so
-an unauthenticated flood of wrong passwords used to freeze the whole
-installation (~17 requests per second saturated a core). Three things keep that
-from happening, in this order:
-
-1. `AttemptLimiter` — a per-client budget of failures. Once a client has burned
-   it, the next attempts are refused for a cooldown *without* hashing anything.
-2. `verify_password` runs in a worker thread (`authenticate`), so even the
-   attempts that do hash never block the loop.
-3. `CredentialCache` — a successful credential is remembered for a short while,
-   so the console's normal traffic pays the hash once rather than per request.
-
-This is deliberately not a user system: it authenticates *the operator*, not the
-agent's users. `X-User-Id` keeps selecting which dialog the chat UI talks to.
-"""
+"""Rate-limited HTTP Basic gate for operator and surface credentials."""
 
 import asyncio
-import base64
-import hashlib
 import hmac
 import logging
-import secrets
-import time
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from http import HTTPStatus
 
 from fastapi import HTTPException, Request
 
+from octoforge_server.auth_basic import (
+    BASIC_PREFIX,
+    UNKNOWN_CLIENT,
+    WWW_AUTHENTICATE,
+    client_address,
+    decode_basic,
+    unauthorized,
+)
+from octoforge_server.auth_cache import MAX_FAILED_ATTEMPTS, AttemptLimiter, CredentialCache
+from octoforge_server.auth_request_policy import (
+    CROSS_SITE_MESSAGE,
+    allows_service_credential,
+    is_cross_site_mutation,
+    is_open_path,
+)
+from octoforge_server.passwords import hash_password, verify_password
+
 logger = logging.getLogger(__name__)
 
-HASH_SCHEME = "pbkdf2_sha256"
-HASH_ITERATIONS = 240_000
-# Not the conventional "$" of PHC strings: docker compose interpolates "$" in
-# .env, and a hash written there arrives truncated in the container (its
-# segments are read as unset variable references). ":" cannot appear in the
-# base64 alphabet, so it separates unambiguously and survives every consumer.
-HASH_SEPARATOR = ":"
-SALT_BYTES = 16
-WWW_AUTHENTICATE = {"WWW-Authenticate": 'Basic realm="OctoForge"'}
-BASIC_PREFIX = "basic "
-UNAUTHORIZED_MESSAGE = "authentication required"
 MISCONFIGURED_MESSAGE = "admin credentials are not configured"
 TOO_MANY_ATTEMPTS_MESSAGE = "too many failed attempts; try again later"
-OPEN_PATHS = frozenset({"/health", "/health/ready", "/secrets.html"})
-# The self-service secrets surface authenticates with its own one-time token
-# (see api/secrets.py): dialog users have no operator credential, so these
-# endpoints must be reachable without Basic auth.
-OPEN_PREFIXES = ("/api/secrets/",)
 
-#: Paths the service credential may open — submitting, cancelling and
-#: watching a dialog, asking the core to understand a picture or a recording
-#: on a user's behalf, and mirroring what the surface calls its sender. The
-#: profile path is listed in full: the rest of `/api/identity/` (if it ever
-#: grows) stays operator-only by default. Everything else stays operator-only.
-SERVICE_PREFIXES = ("/api/dialog/", "/api/media/", "/api/identity/profile")
-
-# Cross-site request forgery, in the shape Basic auth allows: a browser holding
-# the operator credential attaches it to every request to this origin, including
-# one an attacker's page submits — so a form on any site could publish a record
-# or disable a cron job as the operator.
-#
-# The check reads the browser's own account of where the request came from
-# (`Sec-Fetch-Site`, sent by every current browser, falling back to `Origin`)
-# and refuses state-changing requests that did not originate here. Requests with
-# neither header are not from a browser — curl, the agent's own `external_call`,
-# a deployment script — and are left alone: they carry no ambient credential to
-# abuse, and demanding a custom header from them would break every API client.
-MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-FETCH_SITE_HEADER = "sec-fetch-site"
-ORIGIN_HEADER = "origin"
-SAME_SITE_VALUES = frozenset({"same-origin", "none"})
-CROSS_SITE_MESSAGE = "cross-site state-changing requests are refused"
-
-# Failure budget per client before the cooldown starts, and how long that
-# cooldown lasts. Generous enough that a human retyping a password never meets
-# it, tight enough that a flood costs the server nothing after five tries.
-MAX_FAILED_ATTEMPTS = 5
-ATTEMPT_COOLDOWN_SECONDS = 60.0
-# Bounded so a spray from many addresses cannot grow memory without limit.
-MAX_TRACKED_CLIENTS = 10_000
-# How long a verified credential stays accepted without re-hashing. Short
-# enough that a rotated password takes effect within a minute.
-CREDENTIAL_CACHE_SECONDS = 60.0
-MAX_CACHED_CREDENTIALS = 32
-UNKNOWN_CLIENT = "unknown"
-
-
-def hash_password(password: str, *, iterations: int = HASH_ITERATIONS) -> str:
-    """Return a `scheme:iterations:salt:digest` string for `OF_ADMIN_PASSWORD_HASH`."""
-    salt = secrets.token_bytes(SALT_BYTES)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
-    return HASH_SEPARATOR.join(
-        (
-            HASH_SCHEME,
-            str(iterations),
-            base64.b64encode(salt).decode(),
-            base64.b64encode(digest).decode(),
-        )
-    )
-
-
-def verify_password(password: str, encoded: str) -> bool:
-    """Check a password against a stored hash; a malformed hash never passes.
-
-    Costs ~60 ms by design. Call it through `authenticate`, never inline on the
-    event loop.
-    """
-    try:
-        scheme, raw_iterations, raw_salt, raw_digest = encoded.split(HASH_SEPARATOR)
-        if scheme != HASH_SCHEME:
-            return False
-        expected = base64.b64decode(raw_salt), base64.b64decode(raw_digest)
-        iterations = int(raw_iterations)
-    except (ValueError, TypeError):
-        logger.warning("admin password hash is malformed; refusing every login")
-        return False
-    salt, digest = expected
-    candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
-    return hmac.compare_digest(candidate, digest)
-
-
-def is_open_path(path: str) -> bool:
-    """Whether the path is served without the operator credential.
-
-    Health probes plus the token-authenticated self-service secrets surface.
-    """
-    return path in OPEN_PATHS or path.startswith(OPEN_PREFIXES)
-
-
-def allows_service_credential(path: str) -> bool:
-    """Whether the service credential may authenticate this path.
-
-    The dialog endpoints and nothing else: relaying a surface's traffic is
-    all the ingestion node does, so that is all its credential opens.
-    """
-    return path.startswith(SERVICE_PREFIXES)
-
-
-def is_cross_site_mutation(request: Request) -> bool:
-    """Whether a browser is submitting a state-changing request from another site."""
-    if request.method.upper() not in MUTATING_METHODS:
-        return False
-    fetch_site = request.headers.get(FETCH_SITE_HEADER, "").lower()
-    if fetch_site:
-        return fetch_site not in SAME_SITE_VALUES
-    origin = request.headers.get(ORIGIN_HEADER)
-    if not origin:
-        return False  # not a browser: no ambient credential to forge with
-    return origin.rstrip("/").lower() != _own_origin(request)
-
-
-def _own_origin(request: Request) -> str:
-    """The origin this request was addressed to, as a browser would spell it."""
-    url = request.url
-    host = request.headers.get("host") or url.netloc
-    return f"{url.scheme}://{host}".rstrip("/").lower()
-
-
-@dataclass(slots=True)
-class AttemptLimiter:
-    """Per-client failure budget: refuses further attempts without hashing.
-
-    Keyed by client address. The point is not to stop a determined attacker
-    from guessing (a generated password has far too much entropy for that) but
-    to make failing cheap for the server: past the budget an attempt costs a
-    dict lookup instead of a PBKDF2 run.
-    """
-
-    max_failures: int = MAX_FAILED_ATTEMPTS
-    cooldown_seconds: float = ATTEMPT_COOLDOWN_SECONDS
-    max_clients: int = MAX_TRACKED_CLIENTS
-    _failures: OrderedDict[str, tuple[int, float]] = field(default_factory=OrderedDict)
-
-    def blocked(self, client: str, now: float | None = None) -> bool:
-        """Whether this client is inside its cooldown right now."""
-        moment = time.monotonic() if now is None else now
-        entry = self._failures.get(client)
-        if entry is None:
-            return False
-        count, last = entry
-        if moment - last >= self.cooldown_seconds:
-            del self._failures[client]
-            return False
-        return count >= self.max_failures
-
-    def record_failure(self, client: str, now: float | None = None) -> None:
-        """Count a failed attempt, starting or extending the cooldown."""
-        moment = time.monotonic() if now is None else now
-        count, last = self._failures.get(client, (0, moment))
-        if moment - last >= self.cooldown_seconds:
-            count = 0
-        self._failures[client] = (count + 1, moment)
-        self._failures.move_to_end(client)
-        while len(self._failures) > self.max_clients:
-            self._failures.popitem(last=False)
-
-    def record_success(self, client: str) -> None:
-        """Forget a client's failures once it proves it knows the password."""
-        self._failures.pop(client, None)
-
-
-@dataclass(slots=True)
-class CredentialCache:
-    """Remembers verified credentials briefly so hashing is not per-request.
-
-    The key is a digest of what the client presented, so a wrong password can
-    never hit an entry created by the right one. Only successes are stored:
-    caching failures would let a flood fill the map.
-    """
-
-    ttl_seconds: float = CREDENTIAL_CACHE_SECONDS
-    max_entries: int = MAX_CACHED_CREDENTIALS
-    _entries: OrderedDict[str, float] = field(default_factory=OrderedDict)
-
-    def valid(self, header: str, now: float | None = None) -> bool:
-        """Whether this exact credential was verified within the TTL."""
-        moment = time.monotonic() if now is None else now
-        key = _credential_key(header)
-        expires_at = self._entries.get(key)
-        if expires_at is None:
-            return False
-        if expires_at <= moment:
-            del self._entries[key]
-            return False
-        return True
-
-    def remember(self, header: str, now: float | None = None) -> None:
-        """Accept this credential without hashing until the TTL runs out."""
-        moment = time.monotonic() if now is None else now
-        self._entries[_credential_key(header)] = moment + self.ttl_seconds
-        while len(self._entries) > self.max_entries:
-            self._entries.popitem(last=False)
-
-    def clear(self) -> None:
-        """Drop every remembered credential (configuration changed)."""
-        self._entries.clear()
+__all__ = [
+    "CROSS_SITE_MESSAGE",
+    "MAX_FAILED_ATTEMPTS",
+    "UNKNOWN_CLIENT",
+    "AttemptLimiter",
+    "AuthGate",
+    "CredentialCache",
+    "allows_service_credential",
+    "hash_password",
+    "is_cross_site_mutation",
+    "is_open_path",
+    "verify_password",
+]
 
 
 @dataclass(frozen=True, slots=True)
 class AuthGate:
-    """The gate: a limiter, caches, and the credentials to check against.
-
-    Two credentials, deliberately unequal. The **operator** one opens
-    everything. The **service** one opens only the dialog endpoints, and
-    exists so a machine that merely relays a surface's traffic — the Telegram
-    ingestion node — does not have to carry operator power to do it: a
-    compromise there must not become a compromise of the console, the
-    instructions and the secret store. Leaving it unset turns it off.
-
-    Each credential has its own cache. Sharing one would be a hole rather
-    than an optimization: a service credential verified on a dialog request
-    would then satisfy the cache check on an admin one.
-    """
-
     username: str
     password_hash: str
     service_username: str = ""
@@ -277,48 +55,37 @@ class AuthGate:
     cache: CredentialCache = field(default_factory=CredentialCache)
     service_cache: CredentialCache = field(default_factory=CredentialCache)
 
-    def _service_configured(self) -> bool:
-        return bool(self.service_username and self.service_password_hash)
-
     async def authenticate(self, request: Request, service_allowed: bool = False) -> None:
-        """Authenticate the request or raise; hashing happens off the event loop.
-
-        `service_allowed` says whether the service credential is acceptable
-        here — decided by the path, never by the caller's own claim about
-        itself.
-
-        A missing configuration fails closed with 503: an operator console with
-        an empty password would otherwise be reachable from the internet.
-        """
         if not self.username or not self.password_hash:
             raise HTTPException(
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=MISCONFIGURED_MESSAGE
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=MISCONFIGURED_MESSAGE,
             )
         header = request.headers.get("authorization", "")
         if not header.lower().startswith(BASIC_PREFIX):
-            raise _unauthorized()
-        if self.cache.valid(header):
+            raise unauthorized()
+        if self._cached(header, service_allowed):
             return
-        if service_allowed and self._service_configured() and self.service_cache.valid(header):
-            return
-        client = _client(request)
-        if self.limiter.blocked(client):
-            logger.warning("admin login refused (cooldown) from %s", client)
-            raise HTTPException(
-                status_code=HTTPStatus.TOO_MANY_REQUESTS,
-                detail=TOO_MANY_ATTEMPTS_MESSAGE,
-                headers=dict(WWW_AUTHENTICATE),
-            )
-        candidate = _decode_basic(header)
+        client = client_address(request)
+        self._enforce_attempt_budget(client)
+        candidate = decode_basic(header)
         if candidate is None:
             self.limiter.record_failure(client)
-            raise _unauthorized()
+            raise unauthorized()
+        valid, as_service, candidate_user = await self._verify(candidate, service_allowed)
+        if not valid:
+            self.limiter.record_failure(client)
+            logger.warning("failed login for %r from %s", candidate_user, client)
+            raise unauthorized()
+        self.limiter.record_success(client)
+        (self.service_cache if as_service else self.cache).remember(header)
+
+    async def _verify(
+        self,
+        candidate: tuple[str, str],
+        service_allowed: bool,
+    ) -> tuple[bool, bool, str]:
         candidate_user, candidate_password = candidate
-        # Exactly ONE hash per attempt, whichever credential was named: two
-        # would double the cost of every wrong guess, which is the thing the
-        # limiter exists to bound. Which username exists is not treated as a
-        # secret — the operator's is configured by the same person who reads
-        # this — but the password check is uniform either way.
         as_service = (
             service_allowed
             and self._service_configured()
@@ -326,40 +93,27 @@ class AuthGate:
         )
         expected = self.service_password_hash if as_service else self.password_hash
         user_ok = as_service or hmac.compare_digest(candidate_user, self.username)
-        # PBKDF2 is ~60 ms of CPU: on the loop it would stall every dialog in
-        # the process, so it runs in a worker thread. Both checks always run —
-        # skipping the hash on a wrong user would leak which half failed.
         password_ok = await asyncio.to_thread(verify_password, candidate_password, expected)
-        if not (user_ok and password_ok):
-            self.limiter.record_failure(client)
-            logger.warning("failed login for %r from %s", candidate_user, client)
-            raise _unauthorized()
-        self.limiter.record_success(client)
-        (self.service_cache if as_service else self.cache).remember(header)
+        return user_ok and password_ok, as_service, candidate_user
 
+    def _service_configured(self) -> bool:
+        return bool(self.service_username and self.service_password_hash)
 
-def _decode_basic(header: str) -> tuple[str, str] | None:
-    """Split a Basic header into (user, password); None when it does not decode."""
-    try:
-        decoded = base64.b64decode(header[len(BASIC_PREFIX) :].strip()).decode()
-    except (ValueError, UnicodeDecodeError):
-        return None
-    user, _, password = decoded.partition(":")
-    return user, password
+    def _cached(self, header: str, service_allowed: bool) -> bool:
+        if self.cache.valid(header):
+            return True
+        return service_allowed and self._service_configured() and self.service_cache.valid(header)
 
-
-def _credential_key(header: str) -> str:
-    """Digest of a credential header: the cache never stores the credential itself."""
-    return hashlib.sha256(header.encode()).hexdigest()
-
-
-def _unauthorized() -> HTTPException:
-    return HTTPException(
-        status_code=HTTPStatus.UNAUTHORIZED,
-        detail=UNAUTHORIZED_MESSAGE,
-        headers=dict(WWW_AUTHENTICATE),
-    )
+    def _enforce_attempt_budget(self, client: str) -> None:
+        if not self.limiter.blocked(client):
+            return
+        logger.warning("admin login refused (cooldown) from %s", client)
+        raise HTTPException(
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+            detail=TOO_MANY_ATTEMPTS_MESSAGE,
+            headers=dict(WWW_AUTHENTICATE),
+        )
 
 
 def _client(request: Request) -> str:
-    return UNKNOWN_CLIENT if request.client is None else request.client.host
+    return client_address(request)

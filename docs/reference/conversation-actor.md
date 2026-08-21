@@ -166,8 +166,12 @@ would make it await the task it is running in — the dialog would hang on first
 
 ## Code anchors
 
-- `core/src/octoforge_core/agent/runner.py` — `ConversationRunner`, `ConversationManager`, `_Process`,
-  `DialogSurface`, the inbox commands and the outbox
+- `core/src/octoforge_core/agent/runner.py` — the stable actor API facade
+- `core/src/octoforge_core/agent/runner_facade.py`,
+  `core/src/octoforge_core/agent/runner_manager.py` — the runner and manager facades
+- `core/src/octoforge_core/agent/runner_actor.py`,
+  `core/src/octoforge_core/agent/runner_outbox.py`,
+  `core/src/octoforge_core/agent/runner_process.py` — the inbox, delivery and process state
 - `core/src/octoforge_core/agent/branch.py` — branch rendering and role marks
 - `core/src/octoforge_core/dialogs/api.py`, `core/src/octoforge_core/dialogs/store.py` — dialog,
   message and exchange persistence

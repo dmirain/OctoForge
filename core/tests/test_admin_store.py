@@ -7,16 +7,16 @@ import pytest
 from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.admin.api import MAX_PAGE_SIZE, clamp_page
+from octoforge_core.admin.api import MAX_PAGE_SIZE, ExchangeListing, TaskListing, clamp_page
 from octoforge_core.admin.store import SqlAlchemyAdminStore
 from octoforge_core.context.api import DialogueSummary
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.cron.api import CronJob
 from octoforge_core.cron.store import SqlAlchemyCronStore
-from octoforge_core.datasets.api import DatasetSchema
+from octoforge_core.datasets.api import DatasetDefinition, DatasetSchema
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
-from octoforge_core.dialogs.api import ExchangeStatus
+from octoforge_core.dialogs.api import ExchangeStatus, MessageAppend
 from octoforge_core.dialogs.models import MessageRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
@@ -114,7 +114,7 @@ async def test_totals_counts_every_entity(
     dialogs = SqlAlchemyDialogRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_A, CHANNEL)
     await SqlAlchemyMessageRepository(session_factory).append(
-        dialog.id, ChatMessage(role=MessageRole.USER, content="hi")
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
     )
     await SqlAlchemyTaskStore(session_factory).add(task(dialog.id, TaskStatus.DONE))
     await SqlAlchemyCronStore(session_factory).create(cron_job("j1", USER_A, NOW))
@@ -136,9 +136,15 @@ async def test_dialogs_carry_counters_and_newest_activity_first(
     messages = SqlAlchemyMessageRepository(session_factory)
     first = await dialogs.get_or_create(USER_A, CHANNEL)
     second = await dialogs.get_or_create(USER_B, TELEGRAM)
-    await messages.append(first.id, ChatMessage(role=MessageRole.USER, content="one"))
-    await messages.append(second.id, ChatMessage(role=MessageRole.USER, content="two"))
-    await messages.append(second.id, ChatMessage(role=MessageRole.ASSISTANT, content="three"))
+    await messages.append(
+        MessageAppend(first.id, ChatMessage(role=MessageRole.USER, content="one"))
+    )
+    await messages.append(
+        MessageAppend(second.id, ChatMessage(role=MessageRole.USER, content="two"))
+    )
+    await messages.append(
+        MessageAppend(second.id, ChatMessage(role=MessageRole.ASSISTANT, content="three"))
+    )
     await SqlAlchemyTaskStore(session_factory).add(task(second.id, TaskStatus.RUNNING))
 
     page = await store.list_dialogs(DEFAULT_LIMIT, 0)
@@ -161,12 +167,18 @@ async def test_dialogs_split_the_users_last_day_of_writing(
     dialogs = SqlAlchemyDialogRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_A, CHANNEL)
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="old"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="old"))
+    )
     async with session_factory() as session:  # push the first message out of the day window
         await session.execute(sql_update(MessageRow).values(created_at=NOW - timedelta(days=365)))
         await session.commit()
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="fresh"))
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="fresh"))
+    )
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+    )
 
     page = await store.list_dialogs(DEFAULT_LIMIT, 0)
 
@@ -184,7 +196,9 @@ async def test_messages_are_paginated_by_seq(
     dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
     messages = SqlAlchemyMessageRepository(session_factory)
     for index in range(3):
-        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content=f"m{index}"))
+        await messages.append(
+            MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content=f"m{index}"))
+        )
 
     first_page = await store.list_messages(dialog.id, 2, 0)
     second_page = await store.list_messages(dialog.id, 2, 2)
@@ -205,9 +219,9 @@ async def test_tasks_filter_by_status_and_kind(
     await tasks.add(task(dialog.id, TaskStatus.FAILED))
     await tasks.add(task(dialog.id, TaskStatus.DONE, kind=TaskKind.ANSWER))
 
-    done = await store.list_tasks(DEFAULT_LIMIT, 0, status=TaskStatus.DONE.value)
-    answers = await store.list_tasks(DEFAULT_LIMIT, 0, kind=TaskKind.ANSWER.value)
-    everything = await store.list_tasks(DEFAULT_LIMIT, 0)
+    done = await store.list_tasks(TaskListing(DEFAULT_LIMIT, 0, status=TaskStatus.DONE.value))
+    answers = await store.list_tasks(TaskListing(DEFAULT_LIMIT, 0, kind=TaskKind.ANSWER.value))
+    everything = await store.list_tasks(TaskListing(DEFAULT_LIMIT, 0))
 
     assert done.total == TWO_ITEMS
     assert answers.total == 1
@@ -259,7 +273,8 @@ async def test_datasets_and_their_records(
 ) -> None:
     datasets = SqlAlchemyDatasetStore(session_factory)
     dataset = await datasets.create(
-        USER_A, "meals", "meal log", DatasetSchema(()), "", "", EMBEDDING
+        DatasetDefinition(USER_A, "meals", "meal log", DatasetSchema(())),
+        EMBEDDING,
     )
     await datasets.add_record(dataset.id, USER_A, {"dish": "soup"})
     await datasets.add_record(dataset.id, USER_A, {"dish": "salad"})
@@ -353,10 +368,10 @@ async def test_exchanges_join_dialog_identity_and_filter(
         pending_question="which one?",
     )
 
-    everything = await store.list_exchanges(DEFAULT_LIMIT, 0)
-    for_bob = await store.list_exchanges(DEFAULT_LIMIT, 0, user_id=USER_B)
+    everything = await store.list_exchanges(ExchangeListing(DEFAULT_LIMIT, 0))
+    for_bob = await store.list_exchanges(ExchangeListing(DEFAULT_LIMIT, 0, user_id=USER_B))
     awaiting_only = await store.list_exchanges(
-        DEFAULT_LIMIT, 0, status=ExchangeStatus.AWAITING_USER.value
+        ExchangeListing(DEFAULT_LIMIT, 0, status=ExchangeStatus.AWAITING_USER.value)
     )
 
     assert everything.total == TWO_ITEMS

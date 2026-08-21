@@ -8,7 +8,7 @@ import httpx
 from octoforge_core.config import SpeechConfig
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.llm.errors import TransportError, raise_for_error_status
-from octoforge_core.llm.retry import Sleeper, retry_transient
+from octoforge_core.llm.retry import ShortRetryPolicy, Sleeper, retry_transient
 from octoforge_core.speech.api import AudioData, upload_name
 
 TRANSCRIPTIONS_PATH = "/audio/transcriptions"
@@ -39,7 +39,10 @@ class OpenAITranscriptionClient:
         """Transcribe the recording; retries only transient failures."""
         if not audio.content:
             return ""
-        return await retry_transient(lambda: self._request(audio), sleeper=self._sleeper)
+        return await retry_transient(
+            lambda: self._request(audio),
+            ShortRetryPolicy(sleeper=self._sleeper),
+        )
 
     async def _request(self, audio: AudioData) -> str:
         data: dict[str, str] = {"model": self._config.model}

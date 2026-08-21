@@ -11,7 +11,7 @@ import logging
 
 from octoforge_core.identity.api import IdentityStore
 
-from octoforge_telegram.client import TELEGRAM_CHANNEL, TelegramClient
+from octoforge_telegram.client import TELEGRAM_CHANNEL, SendMessage, TelegramClient
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class TelegramActivationNotifier:
         if chat_id is None:
             return False
         try:
-            await self._client.send_message(chat_id, ACCESS_GRANTED_TEXT)
+            await self._client.send_message(SendMessage(chat_id, ACCESS_GRANTED_TEXT))
         except Exception:
             logger.warning("activation notice failed for user %r", user_id, exc_info=True)
             return False

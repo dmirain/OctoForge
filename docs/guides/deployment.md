@@ -250,4 +250,6 @@ A standby is not a backup: a deletion replicates in milliseconds. Keep `tools/pg
 - `surfaces/telegram/src/octoforge_telegram/ingest/__main__.py` — the ingestion node
 - `docker/postgres-init/` — the extra databases
 - `tools/pg_backup.sh`, `tools/sqlite_to_postgres.py` — backups and the one-off migration
-- `deploy/src/octoforge_deploy/main.py` — startup, migrations, health probes
+- `deploy/src/octoforge_deploy/main.py`, `deploy/src/octoforge_deploy/runtime_entry.py` — entry points
+- `deploy/src/octoforge_deploy/runtime_database.py`,
+  `deploy/src/octoforge_deploy/runtime_database_probe.py` — startup, migrations and database probes

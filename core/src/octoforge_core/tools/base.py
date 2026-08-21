@@ -44,18 +44,6 @@ class UserPrompter(Protocol):
         ...
 
 
-class TaskScopedResponses(Protocol):
-    """Response memory the runner sweeps when a task's process terminates.
-
-    Synchronous by contract: termination must not await a cleanup, and the
-    implementation is a dict move (net/response_memory).
-    """
-
-    def drop_scope(self, scope: str) -> None:
-        """Forget every remembered response of one task."""
-        ...
-
-
 class TaskDeleteOutcome(StrEnum):
     """Result of a dialog-bound task stop request."""
 

@@ -11,7 +11,7 @@ not by stem, so "задач" finds "задачи" but "задача" does not.
 import sqlalchemy as sa
 from sqlalchemy import select
 
-from octoforge_core.context.api import ArchivedMessage, ArchiveFilter
+from octoforge_core.context.api import ArchivedMessage, ArchiveFilter, ArchiveSearch
 from octoforge_core.context.store import SqlAlchemySummaryStore, to_archived
 from octoforge_core.db.sqlite_fts import FTS_TABLES, match_expression, rank_expression
 from octoforge_core.dialogs.models import MessageRow
@@ -22,27 +22,21 @@ MESSAGES_FTS = FTS_TABLES[1]
 class SqliteSummaryStore(SqlAlchemySummaryStore):
     """SqlAlchemySummaryStore whose `search` ranks by BM25 over the FTS5 mirror."""
 
-    async def search(
-        self,
-        dialog_id: str,
-        query: str,
-        *,
-        filters: ArchiveFilter | None = None,
-        limit: int,
-    ) -> list[ArchivedMessage]:
+    async def search(self, request: ArchiveSearch) -> list[ArchivedMessage]:
         """Return the messages most relevant to the query, best first."""
-        expression = match_expression(query)
-        restriction = filters if filters is not None else ArchiveFilter()
-        if expression is None or restriction.seq_ranges == () or limit <= 0:
+        expression = match_expression(request.query)
+        restriction = request.filters if request.filters is not None else ArchiveFilter()
+        if expression is None or restriction.seq_ranges == () or request.limit <= 0:
             return []
-        seqs = await self._matching_seqs(dialog_id, expression, restriction, limit)
+        seqs = await self._matching_seqs(request, expression)
         if not seqs:
             return []
         async with self._session_factory() as session:
             rows = (
                 await session.scalars(
                     select(MessageRow).where(
-                        MessageRow.dialog_id == dialog_id, MessageRow.seq.in_(seqs)
+                        MessageRow.dialog_id == request.dialog_id,
+                        MessageRow.seq.in_(seqs),
                     )
                 )
             ).all()
@@ -51,17 +45,16 @@ class SqliteSummaryStore(SqlAlchemySummaryStore):
 
     async def _matching_seqs(
         self,
-        dialog_id: str,
+        request: ArchiveSearch,
         expression: str,
-        restriction: ArchiveFilter,
-        limit: int,
     ) -> list[int]:
         """Ask the FTS5 mirror for the matching seqs of this dialog, best first."""
+        restriction = request.filters if request.filters is not None else ArchiveFilter()
         clauses = [f"{MESSAGES_FTS.name} MATCH :expression", "m.dialog_id = :dialog_id"]
         params: dict[str, object] = {
             "expression": expression,
-            "dialog_id": dialog_id,
-            "limit": limit,
+            "dialog_id": request.dialog_id,
+            "limit": request.limit,
         }
         if restriction.seq_ranges is not None:
             ranges = [

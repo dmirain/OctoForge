@@ -8,8 +8,15 @@ dropped out. Every test here pins one of the things that made that possible.
 
 import pytest
 
-from octoforge_core.media.api import MediaOutcome, none_understood, refused_by_plan
-from octoforge_core.media.service import INGESTION_PROMPT, MediaService
+from octoforge_core.media.api import (
+    AudioDuration,
+    MediaOutcome,
+    TranscriptionRequest,
+    none_understood,
+    refused_by_plan,
+)
+from octoforge_core.media.prompt import INGESTION_PROMPT
+from octoforge_core.media.service import AudioUnderstanding, ImageUnderstanding, MediaService
 from octoforge_core.speech.api import AudioData, TranscriptionUnavailableError
 from octoforge_core.tariffs.api import FeatureCode, LimitVerdict, UsageEvent, UsageKind
 from octoforge_core.vision.api import ImageData, VisionUnavailableError
@@ -102,18 +109,30 @@ class FakeAudio:
 
 def make_service(
     gate: RecordingGate | None = None,
-    images: FakeImages | None = None,
-    audio: FakeAudio | None = None,
-    vision: FakeVision | None = None,
-    speech: FakeSpeech | None = None,
+    images: ImageUnderstanding | None = None,
+    audio: AudioUnderstanding | None = None,
 ) -> MediaService:
     return MediaService(
-        vision=vision if vision is not None else FakeVision(),
-        images=images if images is not None else FakeImages(),
-        speech=speech if speech is not None else FakeSpeech(),
-        audio=audio if audio is not None else FakeAudio(),
+        images=images if images is not None else ImageUnderstanding(FakeVision(), FakeImages()),
+        audio=audio if audio is not None else AudioUnderstanding(FakeSpeech(), FakeAudio()),
         limits=gate,
     )
+
+
+def image_understanding(
+    resolver: FakeImages | None = None, client: FakeVision | None = None
+) -> ImageUnderstanding:
+    return ImageUnderstanding(client or FakeVision(), resolver or FakeImages())
+
+
+def audio_understanding(
+    resolver: FakeAudio | None = None, client: FakeSpeech | None = None
+) -> AudioUnderstanding:
+    return AudioUnderstanding(client or FakeSpeech(), resolver or FakeAudio())
+
+
+def transcription(seconds: int | None = RECORDING_SECONDS) -> TranscriptionRequest:
+    return TranscriptionRequest(PERSON, AUDIO_REF, AudioDuration(seconds, MIN_SECONDS, MAX_SECONDS))
 
 
 # --- the plan decides before anything is spent -------------------------------
@@ -123,7 +142,7 @@ async def test_a_plan_without_vision_costs_nothing() -> None:
     """The check comes before the fetch: a refusal must not download a byte."""
     images = FakeImages()
     gate = RecordingGate(denied=frozenset({FeatureCode.VISION}))
-    service = make_service(gate, images=images)
+    service = make_service(gate, images=image_understanding(resolver=images))
 
     results = await service.describe(PERSON, [IMAGE_REF])
 
@@ -135,11 +154,9 @@ async def test_a_plan_without_vision_costs_nothing() -> None:
 async def test_a_plan_without_voice_costs_nothing() -> None:
     audio = FakeAudio()
     gate = RecordingGate(denied=frozenset({FeatureCode.VOICE_TRANSCRIPTION}))
-    service = make_service(gate, audio=audio)
+    service = make_service(gate, audio=audio_understanding(resolver=audio))
 
-    result = await service.transcribe(
-        PERSON, AUDIO_REF, RECORDING_SECONDS, MIN_SECONDS, MAX_SECONDS
-    )
+    result = await service.transcribe(transcription())
 
     assert result.outcome is MediaOutcome.REFUSED_BY_PLAN
     assert audio.fetched == []
@@ -153,8 +170,8 @@ async def test_the_plan_is_answered_before_the_duration() -> None:
     gate = RecordingGate(denied=frozenset({FeatureCode.VOICE_TRANSCRIPTION}))
     service = make_service(gate)
 
-    too_short = await service.transcribe(PERSON, AUDIO_REF, 0, MIN_SECONDS, MAX_SECONDS)
-    too_long = await service.transcribe(PERSON, AUDIO_REF, 9999, MIN_SECONDS, MAX_SECONDS)
+    too_short = await service.transcribe(transcription(0))
+    too_long = await service.transcribe(transcription(9999))
 
     assert too_short.outcome is MediaOutcome.REFUSED_BY_PLAN
     assert too_long.outcome is MediaOutcome.REFUSED_BY_PLAN
@@ -175,7 +192,7 @@ async def test_the_gate_is_asked_once_per_call_not_once_per_image() -> None:
 async def test_a_described_image_is_ledgered_once_per_success() -> None:
     gate = RecordingGate()
     vision = FakeVision()
-    service = make_service(gate, vision=vision)
+    service = make_service(gate, images=image_understanding(client=vision))
 
     results = await service.describe(PERSON, [IMAGE_REF, "tgfile:img-2"])
 
@@ -190,7 +207,9 @@ async def test_a_described_image_is_ledgered_once_per_success() -> None:
 async def test_only_the_images_that_worked_are_ledgered() -> None:
     """A fetch that failed cost the provider nothing and must not read as spend."""
     gate = RecordingGate()
-    service = make_service(gate, images=FakeImages(broken=frozenset({"tgfile:img-2"})))
+    service = make_service(
+        gate, images=image_understanding(FakeImages(broken=frozenset({"tgfile:img-2"})))
+    )
 
     results = await service.describe(PERSON, [IMAGE_REF, "tgfile:img-2", "tgfile:img-3"])
 
@@ -207,9 +226,7 @@ async def test_a_transcript_is_ledgered_in_seconds() -> None:
     gate = RecordingGate()
     service = make_service(gate)
 
-    result = await service.transcribe(
-        PERSON, AUDIO_REF, RECORDING_SECONDS, MIN_SECONDS, MAX_SECONDS
-    )
+    result = await service.transcribe(transcription())
 
     assert result.outcome is MediaOutcome.OK
     assert result.text == TRANSCRIPT
@@ -220,11 +237,11 @@ async def test_a_transcript_is_ledgered_in_seconds() -> None:
 
 async def test_silence_is_a_successful_transcript_of_nothing() -> None:
     """The surface says "I heard nothing" in its own words; this is not a failure."""
-    service = make_service(RecordingGate(), speech=FakeSpeech(transcript=""))
-
-    result = await service.transcribe(
-        PERSON, AUDIO_REF, RECORDING_SECONDS, MIN_SECONDS, MAX_SECONDS
+    service = make_service(
+        RecordingGate(), audio=audio_understanding(client=FakeSpeech(transcript=""))
     )
+
+    result = await service.transcribe(transcription())
 
     assert result.outcome is MediaOutcome.OK
     assert result.text == ""
@@ -246,7 +263,7 @@ async def test_duration_bounds_are_applied_for_an_allowed_plan(
 ) -> None:
     service = make_service(RecordingGate())
 
-    result = await service.transcribe(PERSON, AUDIO_REF, seconds, MIN_SECONDS, MAX_SECONDS)
+    result = await service.transcribe(transcription(seconds))
 
     assert result.outcome is expected
 
@@ -256,7 +273,7 @@ async def test_an_unknown_duration_skips_the_bounds() -> None:
     gate = RecordingGate()
     service = make_service(gate)
 
-    result = await service.transcribe(PERSON, AUDIO_REF, None, MIN_SECONDS, MAX_SECONDS)
+    result = await service.transcribe(transcription(None))
 
     assert result.outcome is MediaOutcome.OK
     assert gate.events == []  # nothing to meter: seconds unknown, so no seconds billed
@@ -268,11 +285,9 @@ async def test_an_unknown_duration_skips_the_bounds() -> None:
 async def test_a_failed_transcription_is_unavailable_not_an_exception() -> None:
     """A crash here would take down the message that carried the recording."""
     gate = RecordingGate()
-    service = make_service(gate, audio=FakeAudio(broken=True))
+    service = make_service(gate, audio=audio_understanding(FakeAudio(broken=True)))
 
-    result = await service.transcribe(
-        PERSON, AUDIO_REF, RECORDING_SECONDS, MIN_SECONDS, MAX_SECONDS
-    )
+    result = await service.transcribe(transcription())
 
     assert result.outcome is MediaOutcome.UNAVAILABLE
     assert gate.events == []
@@ -283,9 +298,7 @@ async def test_unconfigured_media_is_unavailable_for_everyone() -> None:
     service = MediaService(limits=RecordingGate())
 
     described = await service.describe(PERSON, [IMAGE_REF])
-    transcribed = await service.transcribe(
-        PERSON, AUDIO_REF, RECORDING_SECONDS, MIN_SECONDS, MAX_SECONDS
-    )
+    transcribed = await service.transcribe(transcription())
 
     assert described[0].outcome is MediaOutcome.UNAVAILABLE
     assert transcribed.outcome is MediaOutcome.UNAVAILABLE
@@ -311,10 +324,11 @@ async def test_the_classifiers_separate_a_refusal_from_a_failure() -> None:
     gate = RecordingGate(denied=frozenset({FeatureCode.VISION}))
     refused = await make_service(gate).describe(PERSON, [IMAGE_REF])
     broken = await make_service(
-        RecordingGate(), images=FakeImages(broken=frozenset({IMAGE_REF}))
+        RecordingGate(), images=image_understanding(FakeImages(broken=frozenset({IMAGE_REF})))
     ).describe(PERSON, [IMAGE_REF])
     mixed = await make_service(
-        RecordingGate(), images=FakeImages(broken=frozenset({"tgfile:img-2"}))
+        RecordingGate(),
+        images=image_understanding(FakeImages(broken=frozenset({"tgfile:img-2"}))),
     ).describe(PERSON, [IMAGE_REF, "tgfile:img-2"])
 
     assert refused_by_plan(refused) and none_understood(refused)

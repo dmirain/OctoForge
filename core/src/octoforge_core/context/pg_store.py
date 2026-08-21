@@ -17,7 +17,7 @@ probes for pg_textsearch and builds this only when the index can exist.
 import sqlalchemy as sa
 from sqlalchemy import and_, or_, select
 
-from octoforge_core.context.api import ArchivedMessage, ArchiveFilter
+from octoforge_core.context.api import ArchivedMessage, ArchiveFilter, ArchiveSearch
 from octoforge_core.context.store import SqlAlchemySummaryStore, to_archived
 from octoforge_core.dialogs.models import MessageRow
 
@@ -30,14 +30,7 @@ NO_MATCH_SCORE = 0
 class PostgresSummaryStore(SqlAlchemySummaryStore):
     """SqlAlchemySummaryStore whose `search` ranks by BM25 relevance."""
 
-    async def search(
-        self,
-        dialog_id: str,
-        query: str,
-        *,
-        filters: ArchiveFilter | None = None,
-        limit: int,
-    ) -> list[ArchivedMessage]:
+    async def search(self, request: ArchiveSearch) -> list[ArchivedMessage]:
         """Return the messages most relevant to the query, best first.
 
         Same contract as the portable implementation — dialog scope, the seq
@@ -45,12 +38,12 @@ class PostgresSummaryStore(SqlAlchemySummaryStore):
         better answers: the query is stemmed, so an inflected form matches, and
         results come back by relevance rather than by position in the dialog.
         """
-        needle = query.strip()
-        restriction = filters if filters is not None else ArchiveFilter()
+        needle = request.query.strip()
+        restriction = request.filters if request.filters is not None else ArchiveFilter()
         if not needle or restriction.seq_ranges == ():
             return []
         relevance = MessageRow.content.op("<@>")(sa.func.to_bm25query(needle, MESSAGE_BM25_INDEX))
-        clauses = [MessageRow.dialog_id == dialog_id, relevance < NO_MATCH_SCORE]
+        clauses = [MessageRow.dialog_id == request.dialog_id, relevance < NO_MATCH_SCORE]
         if restriction.seq_ranges is not None:
             clauses.append(
                 or_(
@@ -66,6 +59,6 @@ class PostgresSummaryStore(SqlAlchemySummaryStore):
             clauses.append(MessageRow.created_at < restriction.date_to)
         async with self._session_factory() as session:
             rows = await session.scalars(
-                select(MessageRow).where(*clauses).order_by(relevance).limit(limit)
+                select(MessageRow).where(*clauses).order_by(relevance).limit(request.limit)
             )
             return [to_archived(row) for row in rows.all()]

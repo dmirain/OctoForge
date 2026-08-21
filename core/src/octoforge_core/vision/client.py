@@ -9,7 +9,7 @@ import httpx
 from octoforge_core.config import VisionConfig
 from octoforge_core.errors import LLMResponseError
 from octoforge_core.llm.errors import TransportError, raise_for_error_status
-from octoforge_core.llm.retry import Sleeper, retry_transient
+from octoforge_core.llm.retry import ShortRetryPolicy, Sleeper, retry_transient
 from octoforge_core.vision.api import ImageData
 
 COMPLETIONS_PATH = "/chat/completions"
@@ -41,7 +41,10 @@ class OpenAIVisionClient:
         """Answer `prompt` about the images; retries only transient failures."""
         if not images:
             return ""
-        return await retry_transient(lambda: self._request(images, prompt), sleeper=self._sleeper)
+        return await retry_transient(
+            lambda: self._request(images, prompt),
+            ShortRetryPolicy(sleeper=self._sleeper),
+        )
 
     async def _request(self, images: tuple[ImageData, ...], prompt: str) -> str:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]

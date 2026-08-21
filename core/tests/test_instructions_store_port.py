@@ -13,9 +13,12 @@ import pytest
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
     Instruction,
+    InstructionDefinition,
     InstructionDraft,
     InstructionNotFoundError,
+    InstructionSearchRequest,
     InstructionType,
+    InstructionVectorQuery,
 )
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.time import utc_now
@@ -195,20 +198,21 @@ class VectorSearchStore(InMemoryInstructionStore):
 
     async def search_by_vector(
         self,
-        query_embedding: tuple[float, ...],
-        limit: int,
-        user_id: str | None,
-        kinds: tuple[InstructionType, ...] = (),
+        request: InstructionVectorQuery,
     ) -> list[EmbeddedInstruction]:
-        self.vector_calls.append((query_embedding, limit, user_id))
-        self.kind_filters.append(kinds)
+        self.vector_calls.append((request.embedding, request.limit, request.user_id))
+        self.kind_filters.append(request.kinds)
         candidates = [
             EmbeddedInstruction(instruction=record, embedding=self.embeddings[record.id])
             for record in self.records.values()
-            if (not kinds or record.type in kinds)
-            and (user_id is None or record.owner_id is None or record.owner_id == user_id)
+            if (not request.kinds or record.type in request.kinds)
+            and (
+                request.user_id is None
+                or record.owner_id is None
+                or record.owner_id == request.user_id
+            )
         ]
-        return candidates[:limit]
+        return candidates[: request.limit]
 
 
 def make_embedder() -> StubEmbedder:
@@ -222,21 +226,30 @@ def make_embedder() -> StubEmbedder:
 
 async def save_three(service: LocalInstructionService) -> None:
     for title in (TITLE_ALPHA, TITLE_BETA, TITLE_GAMMA):
-        await service.save(USER_ID, InstructionType.KNOWLEDGE, title, CONTENT)
+        await service.save(
+            USER_ID,
+            InstructionDefinition(InstructionType.KNOWLEDGE, title, CONTENT),
+        )
 
 
 async def test_service_runs_over_an_in_memory_store() -> None:
     store = InMemoryInstructionStore()
     service = LocalInstructionService(store, make_embedder())
 
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT, ("mem",))
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT, ("mem2",))
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT, ("mem",)),
+    )
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT, ("mem2",)),
+    )
     stored = await service.get_by_name(TITLE_ALPHA, InstructionType.KNOWLEDGE, USER_ID)
 
     assert stored.version == SECOND_VERSION
     assert stored.tags == ("mem2",)
 
-    hits = await service.search(USER_ID, QUERY, k=1)
+    hits = await service.search(USER_ID, InstructionSearchRequest(QUERY, 1))
     assert [hit.instruction.title for hit in hits] == [TITLE_ALPHA]
     await wait_for_usage(service, TITLE_ALPHA, USAGE_ONCE)
 
@@ -250,7 +263,7 @@ async def test_vector_capable_store_receives_the_search() -> None:
     service = LocalInstructionService(store, make_embedder())
     await save_three(service)
 
-    hits = await service.search(USER_ID, QUERY, k=TWO_HITS)
+    hits = await service.search(USER_ID, InstructionSearchRequest(QUERY, TWO_HITS))
 
     # a kind-less search oversamples to k*3: the type caps need a tail to
     # backfill from (see LocalInstructionService._search)
@@ -264,7 +277,7 @@ async def test_exact_title_boost_applies_over_store_candidates() -> None:
     service = LocalInstructionService(store, make_embedder())
     await save_three(service)
 
-    hits = await service.search(USER_ID, EXACT_QUERY, k=THREE_RECORDS)
+    hits = await service.search(USER_ID, InstructionSearchRequest(EXACT_QUERY, THREE_RECORDS))
 
     assert hits[0].instruction.title == TITLE_BETA
     assert hits[0].score > hits[1].score

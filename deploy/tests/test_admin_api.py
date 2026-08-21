@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 from collections.abc import Iterator
+from dataclasses import dataclass
 from functools import partial
 from http import HTTPStatus
 from pathlib import Path
@@ -12,8 +13,9 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 from octoforge_core.dialogs.api import DialogRepository, ExchangeRepository, ExchangeStatus
-from octoforge_core.identity.api import IdentityStore
+from octoforge_core.identity.api import IdentityKey, IdentityProfile, IdentityStore
 from octoforge_core.instructions.api import (
+    InstructionDefinition,
     InstructionDraft,
     InstructionService,
     InstructionType,
@@ -22,7 +24,12 @@ from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.time import utc_now
 from octoforge_server.auth import MAX_FAILED_ATTEMPTS, hash_password, verify_password
 from octoforge_server.config import Settings
-from octoforge_telegram.invites.api import Invite, InviteStatus, MemberProfile
+from octoforge_telegram.invites.api import (
+    Invite,
+    InviteStatus,
+    MemberProfile,
+    MemberProfileUpdate,
+)
 
 from octoforge_deploy.main import create_app
 
@@ -299,7 +306,11 @@ def test_public_instruction_is_deletable_without_owner(client: TestClient) -> No
     """The console can drop a public record: owner_id NULL used to be unreachable."""
     service = app_instructions(client)
     assert client.portal is not None
-    saved = client.portal.call(service.save, "alice", InstructionType.SKILL, "temp skill", "steps")
+    saved = client.portal.call(
+        service.save,
+        "alice",
+        InstructionDefinition(InstructionType.SKILL, "temp skill", "steps"),
+    )
     published = client.portal.call(service.publish, saved.id)
 
     deleted = client.delete(f"/api/admin/instructions/{published.id}")
@@ -312,7 +323,11 @@ def test_public_instruction_is_deletable_without_owner(client: TestClient) -> No
 def test_private_instruction_needs_its_owner(client: TestClient) -> None:
     service = app_instructions(client)
     assert client.portal is not None
-    saved = client.portal.call(service.save, "alice", InstructionType.SKILL, "own skill", "steps")
+    saved = client.portal.call(
+        service.save,
+        "alice",
+        InstructionDefinition(InstructionType.SKILL, "own skill", "steps"),
+    )
 
     without_owner = client.delete(f"/api/admin/instructions/{saved.id}")
     with_owner = client.delete(f"/api/admin/instructions/{saved.id}?owner_id=alice")
@@ -364,9 +379,7 @@ class _StaticDirectory:
     def __init__(self, profile: MemberProfile) -> None:
         self._profile = profile
 
-    async def record(
-        self, user_id: str, first_name: str, last_name: str, username: str | None
-    ) -> None:
+    async def record(self, profile: MemberProfileUpdate) -> None:
         raise AssertionError("read-only endpoint must not write")
 
     async def get(self, user_id: str) -> MemberProfile | None:
@@ -417,7 +430,7 @@ def test_listings_name_the_person_not_just_the_id(client: TestClient) -> None:
     the opaque id stays for machines (and for rows whose person is unnamed)."""
     client.post("/api/dialog/messages", json={"content": "hi"}, headers={USER_ID_HEADER: "alice"})
     store = cast(IdentityStore, client.app.state.identity_store)
-    asyncio.run(store.update_profile("web", "alice", "Alice Smith", None))
+    asyncio.run(store.update_profile(IdentityProfile(IdentityKey("web", "alice"), "Alice Smith")))
 
     dialogs = client.get("/api/admin/dialogs").json()
 
@@ -487,29 +500,53 @@ BASIC_TARIFF = {
 STARTER_PLANS = frozenset({"unlimited", "freemium"})
 
 
-def test_tariff_crud_and_assignment_via_the_console(client: TestClient) -> None:
-    created = client.post("/api/admin/tariffs", json=BASIC_TARIFF)
-    listed = client.get("/api/admin/tariffs").json()
-    assigned = client.post(
-        "/api/admin/tariffs/assign", json={"user_id": "person-1", "code": "basic"}
-    )
-    with_user = client.get("/api/admin/tariffs").json()
-    blocked = client.delete("/api/admin/tariffs/basic")
-    unassigned = client.post("/api/admin/tariffs/assign", json={"user_id": "person-1"})
-    deleted = client.delete("/api/admin/tariffs/basic")
+@dataclass(frozen=True)
+class TariffCrudResponses:
+    created: Any
+    listed: dict[str, Any]
+    assigned: Any
+    with_user: dict[str, Any]
+    blocked: Any
+    unassigned: Any
+    deleted: Any
 
-    assert created.status_code == HTTPStatus.OK
-    assert created.json()["daily_tokens"] == BASIC_TARIFF["daily_tokens"]
-    assert created.json()["daily_user_messages"] is None  # unnamed limits stay unlimited
-    (plan,) = [item for item in listed["items"] if item["code"] == "basic"]
-    assert plan["features"] == ["web_search"]
-    assert "skill_create" in listed["features"]  # the vocabulary for the form
-    assert assigned.status_code == HTTPStatus.OK
-    assert _plan(with_user, "basic")["users"] == ["person-1"]
-    assert blocked.status_code == HTTPStatus.CONFLICT  # still assigned
-    assert unassigned.status_code == HTTPStatus.OK
-    assert deleted.status_code == HTTPStatus.OK
-    remaining = {item["code"] for item in client.get("/api/admin/tariffs").json()["items"]}
+
+def _run_tariff_crud(client: TestClient) -> TariffCrudResponses:
+    return TariffCrudResponses(
+        created=client.post("/api/admin/tariffs", json=BASIC_TARIFF),
+        listed=client.get("/api/admin/tariffs").json(),
+        assigned=client.post(
+            "/api/admin/tariffs/assign", json={"user_id": "person-1", "code": "basic"}
+        ),
+        with_user=client.get("/api/admin/tariffs").json(),
+        blocked=client.delete("/api/admin/tariffs/basic"),
+        unassigned=client.post("/api/admin/tariffs/assign", json={"user_id": "person-1"}),
+        deleted=client.delete("/api/admin/tariffs/basic"),
+    )
+
+
+def _assert_tariff_crud(responses: TariffCrudResponses) -> None:
+    assert responses.created.status_code == HTTPStatus.OK
+    assert responses.created.json()["daily_tokens"] == BASIC_TARIFF["daily_tokens"]
+    assert responses.created.json()["daily_user_messages"] is None
+    assert _plan(responses.listed, "basic")["features"] == ["web_search"]
+    assert "skill_create" in responses.listed["features"]
+    assert responses.assigned.status_code == HTTPStatus.OK
+    assert _plan(responses.with_user, "basic")["users"] == ["person-1"]
+    assert responses.blocked.status_code == HTTPStatus.CONFLICT
+    assert responses.unassigned.status_code == HTTPStatus.OK
+    assert responses.deleted.status_code == HTTPStatus.OK
+
+
+def _remaining_plan_codes(client: TestClient) -> set[str]:
+    return {item["code"] for item in client.get("/api/admin/tariffs").json()["items"]}
+
+
+def test_tariff_crud_and_assignment_via_the_console(client: TestClient) -> None:
+    responses = _run_tariff_crud(client)
+
+    _assert_tariff_crud(responses)
+    remaining = _remaining_plan_codes(client)
     assert "basic" not in remaining
     assert remaining == STARTER_PLANS  # the seeded catalog is all that is left
 

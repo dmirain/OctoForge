@@ -2,12 +2,18 @@
 
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.context.api import NO_COMPACTED_SEQ, ArchiveFilter, DialogueSummary
+from octoforge_core.context.api import (
+    NO_COMPACTED_SEQ,
+    ArchiveFilter,
+    ArchiveSearch,
+    DialogueSummary,
+)
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import MessageRow
@@ -43,41 +49,49 @@ async def make_dialog(session_factory: async_sessionmaker[AsyncSession], user_id
     return dialog.id
 
 
+@dataclass(frozen=True, slots=True)
+class MessageFixture:
+    dialog_id: str
+    seq: int
+    content: str
+    created_at: datetime = DAY_ONE
+
+
 async def add_message(
     session_factory: async_sessionmaker[AsyncSession],
-    dialog_id: str,
-    seq: int,
-    content: str,
-    created_at: datetime = DAY_ONE,
+    message: MessageFixture,
 ) -> None:
     async with session_factory() as session:
         session.add(
             MessageRow(
                 id=uuid.uuid4().hex,
-                dialog_id=dialog_id,
-                seq=seq,
+                dialog_id=message.dialog_id,
+                seq=message.seq,
                 role=MessageRole.USER.value,
-                content=content,
-                created_at=created_at,
+                content=message.content,
+                created_at=message.created_at,
             )
         )
         await session.commit()
 
 
-def make_summary(
-    dialog_id: str,
-    seq_from: int,
-    seq_to: int,
-    topics: tuple[str, ...] = ("travel",),
-    content: str = "compressed segment",
-) -> DialogueSummary:
+@dataclass(frozen=True, slots=True)
+class SummaryFixture:
+    dialog_id: str
+    seq_from: int
+    seq_to: int
+    topics: tuple[str, ...] = ("travel",)
+    content: str = "compressed segment"
+
+
+def make_summary(fixture: SummaryFixture) -> DialogueSummary:
     return DialogueSummary(
         id=uuid.uuid4().hex,
-        dialog_id=dialog_id,
-        seq_from=seq_from,
-        seq_to=seq_to,
-        topics=topics,
-        content=content,
+        dialog_id=fixture.dialog_id,
+        seq_from=fixture.seq_from,
+        seq_to=fixture.seq_to,
+        topics=fixture.topics,
+        content=fixture.content,
         created_at=CREATED,
     )
 
@@ -91,8 +105,8 @@ async def test_delete_for_dialog_removes_only_that_dialogs_summaries(
 ) -> None:
     dialog_id = await make_dialog(session_factory, USER_A)
     other_id = await make_dialog(session_factory, USER_B)
-    await store.create(make_summary(dialog_id, 1, 2))
-    await store.create(make_summary(other_id, 1, 2, content="keep"))
+    await store.create(make_summary(SummaryFixture(dialog_id, 1, 2)))
+    await store.create(make_summary(SummaryFixture(other_id, 1, 2, content="keep")))
 
     await store.delete_for_dialog(dialog_id)
     await store.delete_for_dialog("missing")  # a no-op, not an error
@@ -106,8 +120,12 @@ async def test_create_and_list_roundtrip(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     dialog_id = await make_dialog(session_factory, USER_A)
-    await store.create(make_summary(dialog_id, 3, 4, topics=("beta",), content="second"))
-    await store.create(make_summary(dialog_id, 1, 2, topics=("alpha",), content="first"))
+    await store.create(
+        make_summary(SummaryFixture(dialog_id, 3, 4, topics=("beta",), content="second"))
+    )
+    await store.create(
+        make_summary(SummaryFixture(dialog_id, 1, 2, topics=("alpha",), content="first"))
+    )
 
     summaries = await store.list_for_dialog(dialog_id)
 
@@ -127,8 +145,8 @@ async def test_max_seq_to_tracks_the_compaction_boundary(
     dialog_b = await make_dialog(session_factory, USER_B)
 
     assert await store.max_seq_to(dialog_a) == 0
-    await store.create(make_summary(dialog_a, 1, 5))
-    await store.create(make_summary(dialog_a, 6, 8))
+    await store.create(make_summary(SummaryFixture(dialog_a, 1, 5)))
+    await store.create(make_summary(SummaryFixture(dialog_a, 6, 8)))
 
     assert await store.max_seq_to(dialog_a) == MAX_COVERED_SEQ
     assert await store.max_seq_to(dialog_b) == 0  # dialogs are isolated
@@ -140,9 +158,9 @@ async def test_find_by_topic_matches_case_insensitively_within_the_dialog(
 ) -> None:
     dialog_a = await make_dialog(session_factory, USER_A)
     dialog_b = await make_dialog(session_factory, USER_B)
-    await store.create(make_summary(dialog_a, 1, 2, topics=("Travel", "food")))
-    await store.create(make_summary(dialog_a, 3, 4, topics=("work",)))
-    await store.create(make_summary(dialog_b, 1, 2, topics=("travel",)))
+    await store.create(make_summary(SummaryFixture(dialog_a, 1, 2, topics=("Travel", "food"))))
+    await store.create(make_summary(SummaryFixture(dialog_a, 3, 4, topics=("work",))))
+    await store.create(make_summary(SummaryFixture(dialog_b, 1, 2, topics=("travel",))))
 
     hits = await store.find_by_topic(dialog_a, "travel")
 
@@ -160,12 +178,12 @@ async def test_count_and_tail_after_the_boundary(
 ) -> None:
     dialog_id = await make_dialog(session_factory, USER_A)
     for seq in (1, 2, 3):
-        await add_message(session_factory, dialog_id, seq, f"message {seq}")
+        await add_message(session_factory, MessageFixture(dialog_id, seq, f"message {seq}"))
 
     # nothing compacted: the whole dialog is the tail, boundary is the sentinel
     assert await store.count_hot_tail(dialog_id) == (3, NO_COMPACTED_SEQ)
     # the counter derives the boundary from the summaries on its own
-    await store.create(make_summary(dialog_id, 1, 1))
+    await store.create(make_summary(SummaryFixture(dialog_id, 1, 1)))
     assert await store.count_hot_tail(dialog_id) == (TWO_MESSAGES, 1)
     tail = await store.tail_after(dialog_id, 1)
     assert [(m.seq, m.content) for m in tail] == [(2, "message 2"), (3, "message 3")]
@@ -179,14 +197,14 @@ async def test_search_matches_substring_case_insensitively(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     dialog_id = await make_dialog(session_factory, USER_A)
-    await add_message(session_factory, dialog_id, 1, "we flew to Berlin")
-    await add_message(session_factory, dialog_id, 2, "nothing here")
-    await add_message(session_factory, dialog_id, 3, "BERLIN again")
+    await add_message(session_factory, MessageFixture(dialog_id, 1, "we flew to Berlin"))
+    await add_message(session_factory, MessageFixture(dialog_id, 2, "nothing here"))
+    await add_message(session_factory, MessageFixture(dialog_id, 3, "BERLIN again"))
 
-    hits = await store.search(dialog_id, "berlin", limit=10)
+    hits = await store.search(ArchiveSearch(dialog_id, "berlin", None, 10))
 
     assert [m.seq for m in hits] == [1, 3]
-    assert await store.search(dialog_id, "  ", limit=10) == []
+    assert await store.search(ArchiveSearch(dialog_id, "  ", None, 10)) == []
 
 
 async def test_search_restricts_to_seq_ranges(
@@ -195,14 +213,14 @@ async def test_search_restricts_to_seq_ranges(
 ) -> None:
     dialog_id = await make_dialog(session_factory, USER_A)
     for seq in (1, 2, 3, 4):
-        await add_message(session_factory, dialog_id, seq, f"hit {seq}")
+        await add_message(session_factory, MessageFixture(dialog_id, seq, f"hit {seq}"))
 
     hits = await store.search(
-        dialog_id, "hit", filters=ArchiveFilter(seq_ranges=((2, 3),)), limit=10
+        ArchiveSearch(dialog_id, "hit", ArchiveFilter(seq_ranges=((2, 3),)), 10)
     )
 
     assert [m.seq for m in hits] == [2, 3]
-    empty = await store.search(dialog_id, "hit", filters=ArchiveFilter(seq_ranges=()), limit=10)
+    empty = await store.search(ArchiveSearch(dialog_id, "hit", ArchiveFilter(seq_ranges=()), 10))
     assert empty == []
 
 
@@ -211,13 +229,15 @@ async def test_search_filters_by_date_range(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     dialog_id = await make_dialog(session_factory, USER_A)
-    await add_message(session_factory, dialog_id, 1, "hit one", created_at=DAY_ONE)
-    await add_message(session_factory, dialog_id, 2, "hit two", created_at=DAY_TWO)
+    await add_message(session_factory, MessageFixture(dialog_id, 1, "hit one", DAY_ONE))
+    await add_message(session_factory, MessageFixture(dialog_id, 2, "hit two", DAY_TWO))
 
     from_hits = await store.search(
-        dialog_id, "hit", filters=ArchiveFilter(date_from=DAY_TWO), limit=10
+        ArchiveSearch(dialog_id, "hit", ArchiveFilter(date_from=DAY_TWO), 10)
     )
-    to_hits = await store.search(dialog_id, "hit", filters=ArchiveFilter(date_to=DAY_TWO), limit=10)
+    to_hits = await store.search(
+        ArchiveSearch(dialog_id, "hit", ArchiveFilter(date_to=DAY_TWO), 10)
+    )
 
     assert [m.seq for m in from_hits] == [2]
     assert [m.seq for m in to_hits] == [1]  # date_to is exclusive
@@ -230,11 +250,11 @@ async def test_search_limits_and_isolates_dialogs(
     dialog_a = await make_dialog(session_factory, USER_A)
     dialog_b = await make_dialog(session_factory, USER_B)
     for seq in (1, 2, 3):
-        await add_message(session_factory, dialog_a, seq, f"hit {seq}")
-    await add_message(session_factory, dialog_b, 1, "hit foreign")
+        await add_message(session_factory, MessageFixture(dialog_a, seq, f"hit {seq}"))
+    await add_message(session_factory, MessageFixture(dialog_b, 1, "hit foreign"))
 
-    limited = await store.search(dialog_a, "hit", limit=2)
-    foreign = await store.search(dialog_b, "hit", limit=10)
+    limited = await store.search(ArchiveSearch(dialog_a, "hit", None, 2))
+    foreign = await store.search(ArchiveSearch(dialog_b, "hit", None, 10))
 
     assert [m.seq for m in limited] == [1, 2]
     assert [m.seq for m in foreign] == [1]

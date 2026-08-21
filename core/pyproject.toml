@@ -42,12 +42,13 @@ postgres = [
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
-    # Both checkers are capped: their releases change verdicts on unchanged
-    # code (a ruff minor stabilizes preview rules — PLR0917 in 0.16 — and
-    # flips both lint errors and `noqa` usefulness; a mypy major changes
-    # inference), so an unbounded range makes CI and a local .venv disagree.
+    # The checkers are capped: their releases change verdicts on unchanged
+    # code (a ruff minor stabilizes preview rules — PLR0917 in 0.16 — while
+    # pylint and mypy majors change diagnostics and inference), so an
+    # unbounded range makes CI and a local .venv disagree.
     # Bump deliberately, with the fallout in the same change.
     "ruff>=0.16,<0.17",
+    "pylint>=4,<5",
     "mypy>=2.3,<3",
     # dependency CVE scan; uncapped on purpose — its job is to know about
     # advisories published after this line was written
@@ -73,13 +74,31 @@ target-version = "py311"
 extend-exclude = ["src/octoforge_core/db/migrations"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "C90", "PL", "RUF"]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "N", "SIM", "RET", "ANN", "C90", "PL", "RUF"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
 
 [tool.ruff.lint.pylint]
-max-statements = 50
+max-args = 3
+max-statements = 20
+
+[tool.pylint.main]
+ignore = ["migrations"]
+
+[tool.pylint."messages control"]
+disable = ["all"]
+enable = ["R0913", "R0915", "C0302", "R1702", "R0912", "R0916", "W0511"]
+
+[tool.pylint.design]
+max-args = 3
+max-statements = 20
+max-nested-blocks = 4
+max-branches = 12
+max-bool-expr = 3
+
+[tool.pylint.format]
+max-module-lines = 120
 
 [tool.mypy]
 strict = true

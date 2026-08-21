@@ -5,6 +5,7 @@ import inspect
 import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -16,6 +17,7 @@ from octoforge_core.context.api import INTERRUPTED_NOTE, ArchivedMessage, Dialog
 from octoforge_core.context.compactor import (
     SEGMENT_FETCH_LIMIT,
     CompactorConfig,
+    CompactorServices,
     LlmContextCompactor,
     NoopContextCompactor,
     select_compact_segment,
@@ -27,6 +29,7 @@ from octoforge_core.context.prompts import (
 )
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
+from octoforge_core.dialogs.api import MessageAppend
 from octoforge_core.dialogs.store import SqlAlchemyDialogRepository, SqlAlchemyMessageRepository
 from octoforge_core.domain import ChatMessage, Dialog, MessageRole
 from octoforge_core.llm.events import StreamEvent
@@ -82,7 +85,7 @@ async def append_history(
     history: list[ChatMessage] = []
     for text in texts:
         message = ChatMessage(role=MessageRole.USER, content=text)
-        await repository.append(dialog_id, message)
+        await repository.append(MessageAppend(dialog_id, message))
         history.append(message)
     return history
 
@@ -192,22 +195,27 @@ class RecordingMeter:
         self.events.append(event)
 
 
+@dataclass(frozen=True, slots=True)
+class CompactorTestOptions:
+    hot_max_chars: int = 100000
+    compact_target_chars: int = 50000
+    meter: RecordingMeter | None = None
+
+
+DEFAULT_TEST_OPTIONS = CompactorTestOptions()
+
+
 def make_compactor(
     store: SqlAlchemySummaryStore,
     llm: SummarizingLLM,
-    hot_max_chars: int = 100000,
-    compact_target_chars: int = 50000,
-    meter: RecordingMeter | None = None,
+    options: CompactorTestOptions = DEFAULT_TEST_OPTIONS,
 ) -> LlmContextCompactor:
     return LlmContextCompactor(
-        store=store,
-        archive=store,
-        llm=llm,
-        config=CompactorConfig(
-            hot_max_chars=hot_max_chars,
-            compact_target_chars=compact_target_chars,
+        CompactorServices(store, store, llm, options.meter),
+        CompactorConfig(
+            hot_max_chars=options.hot_max_chars,
+            compact_target_chars=options.compact_target_chars,
         ),
-        meter=meter,
     )
 
 
@@ -426,7 +434,7 @@ async def test_overflow_compacts_the_oldest_messages_in_background(
 ) -> None:
     dialog = await make_dialog(session_factory)
     llm = SummarizingLLM([SUMMARY_REPLY])
-    compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
+    compactor = make_compactor(store, llm, CompactorTestOptions(20, 25))
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
 
     await compactor.assemble(dialog, history)  # 40 chars > 20: triggers compaction
@@ -465,13 +473,28 @@ async def _wait_for_summaries(
     return summaries
 
 
+async def wait_for_summary_seq_to(
+    store: SqlAlchemySummaryStore, dialog_id: str, seq_to: int
+) -> DialogueSummary:
+    await wait_for_condition(lambda: _has_single_summary_seq_to(store, dialog_id, seq_to))
+    (summary,) = await store.list_for_dialog(dialog_id)
+    return summary
+
+
+async def _has_single_summary_seq_to(
+    store: SqlAlchemySummaryStore, dialog_id: str, seq_to: int
+) -> bool:
+    summaries = await store.list_for_dialog(dialog_id)
+    return len(summaries) == 1 and summaries[0].seq_to == seq_to
+
+
 async def test_guard_runs_one_compaction_per_dialog_and_retriggers_after(
     store: SqlAlchemySummaryStore,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     dialog = await make_dialog(session_factory)
     llm = GatedSummarizingLLM([SUMMARY_REPLY, SECOND_SUMMARY_REPLY])
-    compactor = make_compactor(store, llm, hot_max_chars=15, compact_target_chars=25)
+    compactor = make_compactor(store, llm, CompactorTestOptions(15, 25))
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
 
     await compactor.assemble(dialog, history)
@@ -489,13 +512,7 @@ async def test_guard_runs_one_compaction_per_dialog_and_retriggers_after(
     # rolling merge: the second run folds the new segment into the one summary
     assert "Previous summary:" in llm.requests[1][1].content
     assert "compressed facts" in llm.requests[1][1].content
-
-    async def _merged() -> bool:
-        summaries = await store.list_for_dialog(dialog.id)
-        return len(summaries) == 1 and summaries[0].seq_to == THREE_MESSAGES
-
-    await wait_for_condition(_merged)
-    (merged,) = await store.list_for_dialog(dialog.id)
+    merged = await wait_for_summary_seq_to(store, dialog.id, THREE_MESSAGES)
     # keep-recent: the last tail message (seq 4) is never compacted
     assert (merged.seq_from, merged.seq_to) == (1, THREE_MESSAGES)
     assert merged.topics == ("gamma",)
@@ -508,7 +525,7 @@ async def test_failed_compaction_logs_a_warning_and_the_dialog_lives(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     dialog = await make_dialog(session_factory)
-    compactor = make_compactor(store, FailingLLM([]), hot_max_chars=20, compact_target_chars=25)
+    compactor = make_compactor(store, FailingLLM([]), CompactorTestOptions(20, 25))
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
 
     with caplog.at_level(logging.WARNING, logger="octoforge_core.context.compactor"):
@@ -527,7 +544,7 @@ async def test_repeated_compactions_merge_into_one_rolling_summary(
 ) -> None:
     dialog = await make_dialog(session_factory)
     llm = SummarizingLLM([SUMMARY_REPLY, SECOND_SUMMARY_REPLY])
-    compactor = make_compactor(store, llm, hot_max_chars=25, compact_target_chars=25)
+    compactor = make_compactor(store, llm, CompactorTestOptions(25, 25))
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * SIX_MESSAGES)
 
     await compactor.assemble(dialog, history)
@@ -564,10 +581,8 @@ def make_token_compactor(
     model_context_tokens: int = MODEL_CONTEXT_TOKENS,
 ) -> LlmContextCompactor:
     return LlmContextCompactor(
-        store=store,
-        archive=store,
-        llm=llm,
-        config=CompactorConfig(
+        CompactorServices(store, store, llm),
+        CompactorConfig(
             hot_max_chars=100000,  # the chars heuristic stays out of the way
             compact_target_chars=50000,
             model_context_tokens=model_context_tokens,
@@ -583,9 +598,11 @@ async def append_assistant_with_usage(
 ) -> ChatMessage:
     message = ChatMessage(role=MessageRole.ASSISTANT, content="answer")
     await SqlAlchemyMessageRepository(session_factory).append(
-        dialog_id,
-        message,
-        usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=USAGE_COMPLETION_TOKENS),
+        MessageAppend(
+            dialog_id,
+            message,
+            Usage(prompt_tokens=prompt_tokens, completion_tokens=USAGE_COMPLETION_TOKENS),
+        )
     )
     return message
 
@@ -730,7 +747,7 @@ async def test_compaction_meters_its_llm_usage_on_the_dialogs_user(
     usage = Usage(prompt_tokens=300, completion_tokens=70)
     llm = SummarizingLLM([SUMMARY_REPLY], usage=usage)
     meter = RecordingMeter()
-    compactor = make_compactor(store, llm, meter=meter)
+    compactor = make_compactor(store, llm, CompactorTestOptions(meter=meter))
     await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
 
     await compactor.compact_now(dialog)
@@ -769,7 +786,11 @@ async def test_compact_now_skips_recompacting_when_the_awaited_run_advanced(
     dialog = await make_dialog(session_factory)
     llm = GatedSummarizingLLM([SUMMARY_REPLY])
     counting = CountingSummaryStore(store)
-    compactor = make_compactor(cast(SqlAlchemySummaryStore, counting), llm, 20, 25)
+    compactor = make_compactor(
+        cast(SqlAlchemySummaryStore, counting),
+        llm,
+        CompactorTestOptions(20, 25),
+    )
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
 
     await compactor.assemble(dialog, history)  # overflow: background compaction starts
@@ -792,7 +813,7 @@ async def test_aclose_cancels_a_pending_compaction(
 ) -> None:
     dialog = await make_dialog(session_factory)
     llm = GatedSummarizingLLM([SUMMARY_REPLY])
-    compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
+    compactor = make_compactor(store, llm, CompactorTestOptions(20, 25))
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * THREE_MESSAGES)
 
     await compactor.assemble(dialog, history)
@@ -812,7 +833,7 @@ async def test_aclose_leaves_other_dialogs_compactions_running(
     dialog = await make_dialog(session_factory)
     other = await SqlAlchemyDialogRepository(session_factory).get_or_create("user-2", CHANNEL)
     llm = GatedSummarizingLLM([SUMMARY_REPLY, SECOND_SUMMARY_REPLY])
-    compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
+    compactor = make_compactor(store, llm, CompactorTestOptions(20, 25))
     history = await append_history(session_factory, dialog.id, [TEN_CHARS] * THREE_MESSAGES)
     other_history = await append_history(session_factory, other.id, [TEN_CHARS] * THREE_MESSAGES)
 
@@ -842,15 +863,16 @@ async def test_start_compact_is_the_single_concurrency_guard(
     """
     dialog = await make_dialog(session_factory)
     llm = GatedSummarizingLLM([SUMMARY_REPLY])
-    compactor = make_compactor(store, llm, hot_max_chars=20, compact_target_chars=25)
+    compactor = make_compactor(store, llm, CompactorTestOptions(20, 25))
     await append_history(session_factory, dialog.id, [TEN_CHARS] * FOUR_MESSAGES)
 
-    first = compactor._start_compact(dialog)
-    second = compactor._start_compact(dialog)
+    first = asyncio.create_task(compactor.compact_now(dialog))
+    await wait_for_condition(lambda: llm.calls == 1)
+    second = asyncio.create_task(compactor.compact_now(dialog))
     llm.release.set()
-    await first
+    outcomes = await asyncio.gather(first, second)
 
-    assert second is first  # the second caller joined the running compaction
+    assert outcomes == [True, True]
     assert llm.calls == 1
 
 
@@ -890,10 +912,12 @@ async def test_compaction_reads_a_bounded_window_of_the_backlog(
             return await super().tail_after(dialog_id, seq, limit)
 
     compactor = LlmContextCompactor(
-        store=store,
-        archive=RecordingArchive(session_factory),
-        llm=SummarizingLLM([SUMMARY_REPLY]),
-        config=CompactorConfig(hot_max_chars=20, compact_target_chars=25),
+        CompactorServices(
+            store,
+            RecordingArchive(session_factory),
+            SummarizingLLM([SUMMARY_REPLY]),
+        ),
+        CompactorConfig(hot_max_chars=20, compact_target_chars=25),
     )
 
     assert await compactor.compact_now(dialog) is True
@@ -923,9 +947,12 @@ async def test_compact_now_reports_failure_instead_of_raising() -> None:
     messages = SqlAlchemyMessageRepository(sessions)
     dialog = await SqlAlchemyDialogRepository(sessions).get_or_create("u", "web")
     for _ in range(6):
-        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="x" * 4000))
+        await messages.append(
+            MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="x" * 4000))
+        )
     compactor = LlmContextCompactor(
-        store=store, archive=store, llm=BrokenLLM(), config=CompactorConfig()
+        CompactorServices(store, store, BrokenLLM()),
+        CompactorConfig(),
     )
 
     assert await compactor.compact_now(dialog) is False

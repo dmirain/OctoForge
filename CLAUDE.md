@@ -19,7 +19,7 @@ deployment from them and is the only package that may import every other one.
 
 | Command | What it does |
 |---|---|
-| `make check` | the gate: ruff → mypy strict → `tools/check_docs.py` → pytest, both projects |
+| `make check` | the gate: Ruff check/format -> Pylint -> mypy strict -> docs -> pytest, both projects |
 | `make lint` / `make format` / `make typecheck` / `make test` / `make docs` | the individual steps |
 | `make install` | create `.venv` with both projects editable |
 | `make upgrade` | refresh `.venv` to what CI resolves — when `make check` disagrees with CI on unchanged code |
@@ -77,6 +77,9 @@ Full list in `AGENTS.md`; these are the ones that change what you do today.
 - **UTC only**, via `utc_now()`; naive datetimes are forbidden.
 - **Full typing**, no bare `Any`; data travels as objects and `StrEnum`s, dicts only at the JSON
   boundary.
+- **Complexity budgets are hard:** production modules <=120 lines; functions <=20 statements,
+  <=3 arguments, McCabe <=10 and <=3 boolean terms. Tests only get 40 Pylint statements and no
+  module-length cap. Split by responsibility; do not add `noqa`, per-file ignores or baselines.
 - **Language:** commits, comments, docstrings, `README.md` and `docs/` in English; conversation in
   whatever language the user writes.
 - **Subagent models by task:** `haiku` for mechanical search, `sonnet` for implementation, tests and

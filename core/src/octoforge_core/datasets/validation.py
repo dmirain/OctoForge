@@ -1,8 +1,4 @@
-"""Schema parsing and record validation for the datasets module.
-
-Schema JSON format: {"fields": [{"name": "item", "type": "string", "required": true}, ...]};
-`required` is optional and defaults to false.
-"""
+"""Dataset schema parsing and record validation."""
 
 from collections.abc import Callable
 from datetime import date, datetime

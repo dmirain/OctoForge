@@ -7,6 +7,7 @@ from octoforge_core.composition import LexicalBackend
 from octoforge_core.db.search_extensions import PG_TEXTSEARCH, VECTOR
 from octoforge_server.capabilities import (
     CRITICAL,
+    CapabilityReport,
     describe_capabilities,
     log_capabilities,
 )
@@ -66,6 +67,16 @@ def test_bare_installation_reports_everything_off() -> None:
     assert not report["secret store"]
     # the database is always there — SQLite by default
     assert report[DATABASE]
+
+
+def test_disabled_capabilities_explain_the_operational_consequences() -> None:
+    settings = Settings(vision_deep_model="")
+
+    assert "re-examination" in detail(settings, "image_look tool")
+    assert "stays hidden" in detail(settings, "web search")
+    assert "auth.secret" in detail(settings, "secret store")
+    assert "mcp_add" in detail(settings, "mcp")
+    assert "mirrored tools" in detail(settings, "mcp")
 
 
 def test_one_llm_key_also_lights_up_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -214,7 +225,7 @@ def test_a_database_without_the_extensions_is_not_a_critical_gap(
     logger = logging.getLogger("test.capabilities.search")
 
     with caplog.at_level(logging.INFO, logger=logger.name):
-        log_capabilities(Settings(), logger, frozenset())
+        log_capabilities(Settings(), logger, CapabilityReport())
 
     assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
     assert "no pgvector" in caplog.text

@@ -1,22 +1,4 @@
-"""Public boundary of the media module: what a surface asks for, and gets back.
-
-A picture or a recording arriving from a user has to become text before it can
-enter a dialog, and turning it into text costs money per image and per second.
-That makes it exactly the kind of call that must not happen anywhere a plan
-cannot be checked: this port is the one way in, and behind it the check, the
-model call and the ledger entry live together.
-
-A surface passes **references**, never bytes — `tgfile:<id>` and its kin, the
-same strings an `Attachment` carries — because the reference is what a
-transport can hand over cheaply and what the core can resolve on its own
-through `ImageResolver` / `AudioResolver`.
-
-What comes back is an outcome, not an exception, because the surface has to
-say something different for each: a plan refusal is spoken out loud ("this is
-not in your plan"), while a technical failure falls back silently to the
-text-only path the deployment had before vision existed. The words themselves
-belong to the surface — it knows the user's language and its own limits.
-"""
+"""The checked and metered boundary through which surfaces turn media into text."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -48,6 +30,20 @@ class MediaResult:
     @property
     def ok(self) -> bool:
         return self.outcome is MediaOutcome.OK
+
+
+@dataclass(frozen=True, slots=True)
+class AudioDuration:
+    seconds: int | None
+    minimum: int
+    maximum: float
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionRequest:
+    user_id: str
+    ref: str
+    duration: AudioDuration
 
 
 def refused_by_plan(results: Sequence[MediaResult]) -> bool:
@@ -88,14 +84,7 @@ class MediaUnderstanding(Protocol):
         """
         ...
 
-    async def transcribe(
-        self,
-        user_id: str,
-        ref: str,
-        seconds: int | None,
-        min_seconds: int,
-        max_seconds: float,
-    ) -> MediaResult:
+    async def transcribe(self, request: TranscriptionRequest) -> MediaResult:
         """Transcribe one recording.
 
         The duration bounds travel with the call instead of being applied by

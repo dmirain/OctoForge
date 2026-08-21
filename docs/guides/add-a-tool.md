@@ -21,7 +21,9 @@ DESCRIPTION = (
 )
 SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"number": {"type": "string", "description": "Invoice number, e.g. INV-2031"}},
+    "properties": {
+        "number": {"type": "string", "description": "Invoice number, e.g. INV-2031"}
+    },
     "required": ["number"],
 }
 

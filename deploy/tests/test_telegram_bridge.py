@@ -2,12 +2,15 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from octoforge_core import (
     AgentLoop,
+    AgentLoopConfig,
     ChatMessage,
     ConversationManager,
     MessageKind,
@@ -32,6 +35,9 @@ from octoforge_core.agent.runner import (
     OwnershipConfig,
     RunnerConfig,
 )
+from octoforge_core.agent.runner import (
+    DialogSubmission as CoreDialogSubmission,
+)
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.unit_of_work import UnitOfWork
@@ -52,6 +58,7 @@ from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 from octoforge_telegram import bridge as bridge_module
+from octoforge_telegram import bridge_events as bridge_events_module
 from octoforge_telegram.bridge import (
     CANCELLED_LINE,
     REPLY_TARGET_MAP_SIZE,
@@ -62,6 +69,7 @@ from octoforge_telegram.bridge import (
     RunnerProvider,
     TelegramBridge,
     TelegramBridgeOptions,
+    TelegramBridgeServices,
 )
 from octoforge_telegram.client import (
     CHAT_ACTION_TYPING,
@@ -69,10 +77,13 @@ from octoforge_telegram.client import (
     MAX_RICH_MESSAGE_LENGTH,
     TELEGRAM_CHANNEL,
     USER_ID_PREFIX,
+    EditMessage,
+    SendMessage,
     TelegramApiError,
 )
 from octoforge_telegram.drafts import SqlAlchemyDraftStore
-from octoforge_telegram.poller import TelegramBridgeRegistry
+from octoforge_telegram.gateway import DialogSubmission
+from octoforge_telegram.poller import BridgeRegistryServices, TelegramBridgeRegistry
 from octoforge_telegram.schema import TelegramSurfaceBase
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -82,7 +93,6 @@ SYSTEM_PROMPT = "test prompt"
 MAX_ITERATIONS = 3
 MAX_PROCESSES = 5
 NO_THROTTLE = 0.0
-MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 EXCHANGE_ID = "ex-1"
 WAIT_TIMEOUT_SECONDS = 5.0
 POLL_SECONDS = 0.01
@@ -117,20 +127,12 @@ class FakeTelegramClient:
     async def get_updates(self, offset: int | None, timeout_seconds: float) -> list[Any]:
         raise NotImplementedError
 
-    async def send_message(
-        self,
-        chat_id: int,
-        text: str,
-        parse_mode: str | None = None,
-        reply_to_message_id: int | None = None,
-    ) -> int:
+    async def send_message(self, request: SendMessage) -> int:
         # plain notices only (the poller's greetings and refusals)
         self._next_message_id += 1
         return self._next_message_id
 
-    async def edit_message_text(
-        self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
-    ) -> None:
+    async def edit_message_text(self, request: EditMessage) -> None:
         raise NotImplementedError
 
     async def send_rich_message(
@@ -275,7 +277,7 @@ class FakeRunner:
     """ConversationRunner stub recording `submit()` calls (reply-routing tests only)."""
 
     def __init__(self) -> None:
-        self.submitted: list[tuple[str, str | None, str | None]] = []
+        self.submitted: list[CoreDialogSubmission] = []
         self.kinds: list[MessageKind] = []
 
     def subscribe(self) -> asyncio.Queue[Any]:
@@ -284,15 +286,9 @@ class FakeRunner:
     def unsubscribe(self, queue: asyncio.Queue[Any]) -> None:
         pass
 
-    async def submit(
-        self,
-        content: str,
-        client_message_id: str | None = None,
-        reply_to_exchange_id: str | None = None,
-        source: MessageSource | None = None,
-    ) -> None:
-        self.submitted.append((content, client_message_id, reply_to_exchange_id))
-        self.kinds.append((source or MessageSource()).kind)
+    async def submit(self, submission: CoreDialogSubmission) -> None:
+        self.submitted.append(submission)
+        self.kinds.append((submission.source or MessageSource()).kind)
 
     async def cancel(self) -> None:
         raise AssertionError("cancel should not be called in these tests")
@@ -317,23 +313,31 @@ def tool_call_reply() -> ChatMessage:
 
 
 @pytest.fixture
-async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_engine(MEMORY_DATABASE_URL)
+async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'bridge.db'}")
     await init_db(engine)
     yield create_session_factory(engine)
     await engine.dispose()
 
 
+@dataclass(frozen=True, slots=True)
+class BridgeManagerOptions:
+    registry: ToolRegistry | None = None
+    tasks: SqlAlchemyTaskStore | None = None
+
+
+DEFAULT_MANAGER_OPTIONS = BridgeManagerOptions()
+
+
 async def make_manager(
     llm_client: LLMClient,
     session_factory: async_sessionmaker[AsyncSession],
-    registry: ToolRegistry | None = None,
-    tasks: SqlAlchemyTaskStore | None = None,
+    options: BridgeManagerOptions = DEFAULT_MANAGER_OPTIONS,
 ) -> ConversationManager:
     loop = AgentLoop(
         llm_client=llm_client,
-        registry=registry or ToolRegistry(),
-        max_iterations=MAX_ITERATIONS,
+        registry=options.registry or ToolRegistry(),
+        config=AgentLoopConfig(MAX_ITERATIONS),
     )
     return ConversationManager(
         config=RunnerConfig(
@@ -346,7 +350,9 @@ async def make_manager(
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),
-            tasks=tasks if tasks is not None else SqlAlchemyTaskStore(session_factory),
+            tasks=(
+                options.tasks if options.tasks is not None else SqlAlchemyTaskStore(session_factory)
+            ),
             exchanges=SqlAlchemyExchangeRepository(session_factory),
             claims=SqlAlchemyClaimRepository(session_factory),
             uow=UnitOfWork(session_factory),
@@ -361,11 +367,13 @@ def make_bridge(
     drafts: SqlAlchemyDraftStore | None = None,
 ) -> TelegramBridge:
     return TelegramBridge(
-        user_id=TELEGRAM_USER_ID,
-        chat_id=CHAT_ID,
-        runner_provider=manager.get_or_create_runner,
-        client=client,
-        options=TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE, drafts=drafts),
+        TelegramBridgeServices(
+            TELEGRAM_USER_ID,
+            CHAT_ID,
+            manager.get_or_create_runner,
+            client,
+        ),
+        TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE, drafts=drafts),
     )
 
 
@@ -375,6 +383,57 @@ async def wait_until(predicate: Callable[[], bool]) -> None:
             await asyncio.sleep(POLL_SECONDS)
 
     await asyncio.wait_for(poll(), WAIT_TIMEOUT_SECONDS)
+
+
+async def wait_until_async(predicate: Callable[[], Awaitable[bool]]) -> None:
+    async def poll() -> None:
+        while not await predicate():
+            await asyncio.sleep(POLL_SECONDS)
+
+    await asyncio.wait_for(poll(), WAIT_TIMEOUT_SECONDS)
+
+
+async def wait_until_settled(runner: ConversationRunner) -> None:
+    async def settled() -> bool:
+        return not await runner._stores.exchanges.list_live(runner.dialog_id)
+
+    await wait_until_async(settled)
+
+
+async def wait_until_terminal(
+    manager: ConversationManager,
+    rendered: Callable[[], bool],
+) -> None:
+    await wait_until(rendered)
+    runner = await manager.get_or_create_runner(TELEGRAM_USER_ID, TELEGRAM_CHANNEL)
+    await wait_until_settled(runner)
+
+
+async def _add_finished_task(
+    tasks: SqlAlchemyTaskStore,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> Task:
+    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(
+        TELEGRAM_USER_ID, TELEGRAM_CHANNEL
+    )
+    task = Task(
+        dialog_id=dialog.id,
+        title=CRON_TITLE,
+        kind=TaskKind.RUN,
+        input={"prompt": CRON_TITLE},
+        status=TaskStatus.DONE,
+        result=CRON_RESULT,
+        started_at=utc_now(),
+    )
+    await tasks.add(task)
+    return task
+
+
+async def _wait_for_task_delivery(tasks: SqlAlchemyTaskStore, task_id: str) -> None:
+    deadline = asyncio.get_running_loop().time() + WAIT_TIMEOUT_SECONDS
+    while (await tasks.get(task_id)).delivered_at is None:
+        assert asyncio.get_running_loop().time() < deadline, "never stamped delivered"
+        await asyncio.sleep(POLL_SECONDS)
 
 
 async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
@@ -390,20 +449,10 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
     """
     client = FakeTelegramClient()
     tasks = SqlAlchemyTaskStore(session_factory)
-    manager = await make_manager(ScriptedLLM([]), session_factory, tasks=tasks)
-    dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(
-        TELEGRAM_USER_ID, TELEGRAM_CHANNEL
+    manager = await make_manager(
+        ScriptedLLM([]), session_factory, BridgeManagerOptions(tasks=tasks)
     )
-    task = Task(
-        dialog_id=dialog.id,
-        title=CRON_TITLE,
-        kind=TaskKind.RUN,
-        input={"prompt": CRON_TITLE},
-        status=TaskStatus.DONE,
-        result=CRON_RESULT,
-        started_at=utc_now(),
-    )
-    await tasks.add(task)
+    task = await _add_finished_task(tasks, session_factory)
 
     await manager.recover_interrupted()  # no bridge is attached yet
     await asyncio.sleep(POLL_SECONDS * 5)
@@ -416,15 +465,7 @@ async def test_warmed_bridge_gets_the_result_that_finished_while_it_was_down(
 
     await wait_until(lambda: client.sent != [])
     assert client.sent == [(CHAT_ID, CRON_RESULT)]
-
-    async def stamped() -> bool:
-        return (await tasks.get(task.id)).delivered_at is not None
-
-    # the SQL store hands out fresh rows, not aliases: poll it, not the object
-    deadline = asyncio.get_running_loop().time() + WAIT_TIMEOUT_SECONDS
-    while not await stamped():
-        assert asyncio.get_running_loop().time() < deadline, "never stamped delivered"
-        await asyncio.sleep(POLL_SECONDS)
+    await _wait_for_task_delivery(tasks, task.id)
     await bridge.aclose()
     await manager.stop_all()
 
@@ -456,10 +497,8 @@ async def test_first_contact_through_the_poller_renders_the_answer_once(
     client = FakeTelegramClient()
     manager = await make_manager(ChunkedLLM(["hel", "lo"]), session_factory)
     registry = TelegramBridgeRegistry(
-        runner_provider=manager.get_or_create_runner,
-        client=client,
-        edit_throttle_seconds=NO_THROTTLE,
-        identities=identities,
+        BridgeRegistryServices(manager.get_or_create_runner, client, identities),
+        TelegramBridgeOptions(NO_THROTTLE),
     )
     manager.use_surface(registry)
 
@@ -469,8 +508,11 @@ async def test_first_contact_through_the_poller_renders_the_answer_once(
     # forwarder
     await registry.get_or_create(person, CHAT_ID).start()
     bridge = await registry.gateway_for(TELEGRAM_USER_ID, CHAT_ID)
-    await bridge.handle_text("hi")
-    await wait_until(lambda: client.current_text() == "hello" if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi"))
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == "hello" if client.sent else False,
+    )
 
     assert client.current_text() == "hello"
     await registry.aclose()
@@ -484,8 +526,11 @@ async def test_single_delta_sends_one_message(
     manager = await make_manager(ScriptedLLM([reply()]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
-    await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi"))
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == REPLY if client.sent else False,
+    )
 
     assert client.sent == [(CHAT_ID, REPLY)]
     assert client.edited == []
@@ -501,8 +546,11 @@ async def test_answer_replies_to_its_question(
     manager = await make_manager(ScriptedLLM([reply()]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi", client_message_id="777")
-    await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi", client_message_id="777"))
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == REPLY if client.sent else False,
+    )
 
     assert client.replies == [777]
     await bridge.aclose()
@@ -517,9 +565,10 @@ async def test_empty_final_renders_nothing(
     manager = await make_manager(ScriptedLLM([reply("")]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
+    await bridge.handle_text(DialogSubmission("hi"))
     runner = await manager.get_or_create_runner(TELEGRAM_USER_ID, TELEGRAM_CHANNEL)
-    await wait_until(lambda: not runner._processes)
+    await wait_until_settled(runner)
+    await wait_until(lambda: not bridge._drafts)
 
     assert client.sent == []
     assert client.edited == []
@@ -556,8 +605,11 @@ async def test_keyless_submit_sends_a_plain_message(
     manager = await make_manager(ScriptedLLM([reply()]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
-    await wait_until(lambda: client.current_text() == REPLY if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi"))
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == REPLY if client.sent else False,
+    )
 
     assert client.replies == [None]
     await bridge.aclose()
@@ -571,8 +623,11 @@ async def test_deltas_stream_into_one_edited_message(
     manager = await make_manager(ChunkedLLM(["hel", "lo"]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
-    await wait_until(lambda: client.current_text() == "hello" if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi"))
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == "hello" if client.sent else False,
+    )
 
     assert client.sent == [(CHAT_ID, "hel")]
     assert client.edited == [(CHAT_ID, 1, "hello")]
@@ -590,8 +645,11 @@ async def test_long_reply_is_split_into_telegram_sized_messages(
     manager = await make_manager(ScriptedLLM([reply(long_reply)]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi", client_message_id="555")
-    await wait_until(lambda: len(client.sent) == EXPECTED_MESSAGE_COUNT)
+    await bridge.handle_text(DialogSubmission("hi", client_message_id="555"))
+    await wait_until_terminal(
+        manager,
+        lambda: len(client.sent) == EXPECTED_MESSAGE_COUNT,
+    )
 
     head, tail = client.sent
     assert head == (CHAT_ID, "x" * MAX_RICH_MESSAGE_LENGTH)
@@ -599,6 +657,7 @@ async def test_long_reply_is_split_into_telegram_sized_messages(
     # only the head of a split answer replies; continuations are plain
     assert client.replies == [555, None]
     await bridge.aclose()
+    await manager.stop_all()
 
 
 async def test_an_answer_under_the_rich_limit_is_never_split(
@@ -613,8 +672,11 @@ async def test_an_answer_under_the_rich_limit_is_never_split(
     manager = await make_manager(ScriptedLLM([reply(table)]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
-    await wait_until(lambda: client.current_text().endswith("|") if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi"))
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text().endswith("|") if client.sent else False,
+    )
 
     assert len(table) > PLAIN_TEXT_LIMIT  # would have been split before
     assert len(client.sent) == 1
@@ -630,14 +692,19 @@ async def test_tool_call_renders_status_line_before_the_answer(
     registry.register(EchoTool())
     client = FakeTelegramClient()
     manager = await make_manager(
-        ScriptedLLM([tool_call_reply(), reply()]), session_factory, registry
+        ScriptedLLM([tool_call_reply(), reply()]),
+        session_factory,
+        BridgeManagerOptions(registry=registry),
     )
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
+    await bridge.handle_text(DialogSubmission("hi"))
     status_block = f"```\n{TOOL_LINE_TEMPLATE.format(name=ECHO_TOOL)} ·\n```"
     expected = f"{status_block}\n{REPLY}"
-    await wait_until(lambda: client.current_text() == expected if client.sent else False)
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == expected if client.sent else False,
+    )
 
     assert client.sent == [(CHAT_ID, status_block)]
     assert client.edited == [(CHAT_ID, 1, expected)]
@@ -659,13 +726,16 @@ async def test_cancel_appends_the_cancelled_line(
     manager = await make_manager(llm, session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
+    await bridge.handle_text(DialogSubmission("hi"))
     await wait_until(lambda: bool(client.sent))
     runner = await manager.get_or_create_runner(TELEGRAM_USER_ID, TELEGRAM_CHANNEL)
     await runner.cancel()
     llm.release.set()
     expected = f"{PARTIAL}\n{CANCELLED_LINE}"
-    await wait_until(lambda: client.current_text() == expected if client.edited else False)
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == expected if client.edited else False,
+    )
 
     assert client.current_text() == expected
     await bridge.aclose()
@@ -679,8 +749,11 @@ async def test_llm_failure_appends_the_error_line(
     manager = await make_manager(FailingLLM(), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
-    await wait_until(lambda: "❌ Ошибка" in client.current_text() if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi"))
+    await wait_until_terminal(
+        manager,
+        lambda: "❌ Ошибка" in client.current_text() if client.sent else False,
+    )
 
     assert client.current_text().startswith(PARTIAL)
     assert "RuntimeError: boom" in client.current_text()
@@ -698,8 +771,11 @@ async def test_markdown_reply_is_delivered_verbatim(
     manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi")
-    await wait_until(lambda: client.current_text() == content if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi"))
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == content if client.sent else False,
+    )
 
     assert client.sent == [(CHAT_ID, content)]
     await bridge.aclose()
@@ -716,8 +792,11 @@ async def test_a_table_reply_is_sent_rich_and_still_threads_its_reply(
     manager = await make_manager(ScriptedLLM([reply(content)]), session_factory)
     bridge = make_bridge(client, manager)
 
-    await bridge.handle_text("hi", client_message_id=str(QUESTION_MESSAGE_ID))
-    await wait_until(lambda: client.current_text() == content if client.sent else False)
+    await bridge.handle_text(DialogSubmission("hi", client_message_id=str(QUESTION_MESSAGE_ID)))
+    await wait_until_terminal(
+        manager,
+        lambda: client.current_text() == content if client.sent else False,
+    )
 
     assert client.sent == [(CHAT_ID, content)]
     assert client.replies[0] == QUESTION_MESSAGE_ID
@@ -732,11 +811,13 @@ def make_fake_bridge(
     client: FakeTelegramClient, runner: FakeRunner, throttle: float = NO_THROTTLE
 ) -> TelegramBridge:
     return TelegramBridge(
-        user_id=TELEGRAM_USER_ID,
-        chat_id=CHAT_ID,
-        runner_provider=make_fake_provider(runner),
-        client=client,
-        options=TelegramBridgeOptions(edit_throttle_seconds=throttle),
+        TelegramBridgeServices(
+            TELEGRAM_USER_ID,
+            CHAT_ID,
+            make_fake_provider(runner),
+            client,
+        ),
+        TelegramBridgeOptions(edit_throttle_seconds=throttle),
     )
 
 
@@ -751,9 +832,11 @@ async def test_reply_target_is_recorded_and_used_for_a_matching_reply() -> None:
     assert client.sent == [(CHAT_ID, REPLY)]
     assert bridge._reply_targets == {1: "x1"}  # the sent message id maps to its exchange
 
-    await bridge.handle_text("thanks", reply_to_message_id=1)
+    await bridge.handle_text(DialogSubmission("thanks", reply_to_message_id=1))
 
-    assert runner.submitted == [("thanks", None, "x1")]
+    assert runner.submitted == [
+        CoreDialogSubmission("thanks", reply_to_exchange_id="x1", source=MessageSource())
+    ]
     await bridge.aclose()
 
 
@@ -766,9 +849,9 @@ async def test_unmatched_reply_target_submits_without_an_exchange() -> None:
     await bridge._render(TextDelta(text=REPLY), "x1")
     await bridge._render(Finished(message=reply()), "x1")
 
-    await bridge.handle_text("thanks", reply_to_message_id=999)
+    await bridge.handle_text(DialogSubmission("thanks", reply_to_message_id=999))
 
-    assert runner.submitted == [("thanks", None, None)]
+    assert runner.submitted == [CoreDialogSubmission("thanks", source=MessageSource())]
     await bridge.aclose()
 
 
@@ -778,9 +861,9 @@ async def test_absent_reply_target_submits_without_an_exchange() -> None:
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
 
-    await bridge.handle_text("hi")
+    await bridge.handle_text(DialogSubmission("hi"))
 
-    assert runner.submitted == [("hi", None, None)]
+    assert runner.submitted == [CoreDialogSubmission("hi", source=MessageSource())]
     await bridge.aclose()
 
 
@@ -958,7 +1041,11 @@ async def test_terminal_flush_retries_once_before_giving_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A first failed terminal flush is retried once; the retry delivers the text."""
-    monkeypatch.setattr(bridge_module, "TERMINAL_FLUSH_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(
+        bridge_events_module,
+        "TERMINAL_FLUSH_RETRY_DELAY_SECONDS",
+        0.0,
+    )
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
@@ -985,7 +1072,11 @@ async def test_terminal_flush_pops_the_draft_even_when_both_attempts_fail(
     of the flush outcome; the lost message is reported as an error, not a
     warning, so it stands out from routine render hiccups.
     """
-    monkeypatch.setattr(bridge_module, "TERMINAL_FLUSH_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(
+        bridge_events_module,
+        "TERMINAL_FLUSH_RETRY_DELAY_SECONDS",
+        0.0,
+    )
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = make_fake_bridge(client, runner)
@@ -1009,18 +1100,22 @@ async def test_material_submits_without_promising_an_answer() -> None:
     client = FakeTelegramClient()
     runner = FakeRunner()
     bridge = TelegramBridge(
-        user_id=TELEGRAM_USER_ID,
-        chat_id=CHAT_ID,
-        runner_provider=make_fake_provider(runner),
-        client=client,
-        options=TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE),
+        TelegramBridgeServices(
+            TELEGRAM_USER_ID,
+            CHAT_ID,
+            make_fake_provider(runner),
+            client,
+        ),
+        TelegramBridgeOptions(edit_throttle_seconds=NO_THROTTLE),
     )
 
     await bridge.handle_text(
-        "[переслано от Иван] чужой текст",
-        client_message_id="7",
-        kind=MessageKind.MATERIAL,
-        origin="Иван",
+        DialogSubmission(
+            "[переслано от Иван] чужой текст",
+            client_message_id="7",
+            kind=MessageKind.MATERIAL,
+            origin="Иван",
+        )
     )
 
     assert runner.kinds == [MessageKind.MATERIAL]
@@ -1052,29 +1147,31 @@ async def test_the_bridge_drops_a_runner_that_handed_the_dialog_over(
         await manager.stop_all()
 
 
-async def draft_store() -> SqlAlchemyDraftStore:
-    """A draft store on its own in-memory copy of the surface schema."""
-    engine = create_engine(MEMORY_DATABASE_URL)
+@pytest.fixture
+async def draft_store(tmp_path: Path) -> AsyncIterator[SqlAlchemyDraftStore]:
+    """A draft store on its own copy of the surface schema."""
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'drafts.db'}")
     async with engine.begin() as connection:
         await connection.run_sync(TelegramSurfaceBase.metadata.create_all)
-    return SqlAlchemyDraftStore(create_session_factory(engine))
+    yield SqlAlchemyDraftStore(create_session_factory(engine))
+    await engine.dispose()
 
 
 async def test_a_dialog_that_moved_keeps_writing_into_the_same_message(
     session_factory: async_sessionmaker[AsyncSession],
+    draft_store: SqlAlchemyDraftStore,
 ) -> None:
     """The failure this prevents: a deploy mid-answer leaves the user with a
     truncated message and a second, complete one underneath it."""
-    drafts = await draft_store()
     first_client = FakeTelegramClient()
-    first = make_bridge(first_client, await make_manager([], session_factory), drafts=drafts)
+    first = make_bridge(first_client, await make_manager([], session_factory), drafts=draft_store)
     await first._render_safely(TextDelta(text="Согласно отчёту"), EXCHANGE_ID)
     assert first_client.sent  # the message exists now
     message_id = first_client._next_message_id
 
     # another process picks the dialog up and re-answers it from scratch
     second_client = FakeTelegramClient()
-    second = make_bridge(second_client, await make_manager([], session_factory), drafts=drafts)
+    second = make_bridge(second_client, await make_manager([], session_factory), drafts=draft_store)
     await second._restore_drafts()
     await second._render_safely(TextDelta(text="Согласно отчёту за третий квартал"), EXCHANGE_ID)
 
@@ -1084,29 +1181,29 @@ async def test_a_dialog_that_moved_keeps_writing_into_the_same_message(
 
 async def test_a_finished_answer_is_no_longer_remembered(
     session_factory: async_sessionmaker[AsyncSession],
+    draft_store: SqlAlchemyDraftStore,
 ) -> None:
     """Otherwise the next answer of the same exchange would edit a message
     that already holds a final reply."""
-    drafts = await draft_store()
     client = FakeTelegramClient()
-    bridge = make_bridge(client, await make_manager([], session_factory), drafts=drafts)
+    bridge = make_bridge(client, await make_manager([], session_factory), drafts=draft_store)
     await bridge._render_safely(TextDelta(text="почти"), EXCHANGE_ID)
-    assert await drafts.load(CHAT_ID) != []
+    assert await draft_store.load(CHAT_ID) != []
 
     await bridge._render_safely(Finished(message=reply("готово")), EXCHANGE_ID)
 
-    assert await drafts.load(CHAT_ID) == []
+    assert await draft_store.load(CHAT_ID) == []
 
 
 async def test_a_notice_without_an_exchange_is_never_remembered(
     session_factory: async_sessionmaker[AsyncSession],
+    draft_store: SqlAlchemyDraftStore,
 ) -> None:
     """Broker notices and background results are one-shot: there is no
     exchange to key them by, and nothing to continue after a move."""
-    drafts = await draft_store()
     client = FakeTelegramClient()
-    bridge = make_bridge(client, await make_manager([], session_factory), drafts=drafts)
+    bridge = make_bridge(client, await make_manager([], session_factory), drafts=draft_store)
 
     await bridge._render_safely(TextDelta(text="фоновая работа готова"), None)
 
-    assert await drafts.load(CHAT_ID) == []
+    assert await draft_store.load(CHAT_ID) == []

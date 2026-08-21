@@ -14,7 +14,10 @@ import pytest
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.identity.api import (
+    IdentityKey,
+    IdentityLink,
     IdentityNotFoundError,
+    IdentityProfile,
     IdentityTakenError,
     UserNotFoundError,
     UserStatus,
@@ -27,6 +30,17 @@ TELEGRAM = "telegram"
 WEB = "web"
 ACCOUNT = "102161717"
 OTHER_ACCOUNT = "500500500"
+TELEGRAM_ACCOUNT = IdentityKey(TELEGRAM, ACCOUNT)
+
+
+def link(
+    user_id: str, key: IdentityKey = TELEGRAM_ACCOUNT, details: dict[str, str] | None = None
+) -> IdentityLink:
+    return IdentityLink(user_id, key, details)
+
+
+def profile(name: str, username: str | None) -> IdentityProfile:
+    return IdentityProfile(TELEGRAM_ACCOUNT, name, username)
 
 
 @pytest.fixture
@@ -49,7 +63,7 @@ async def test_a_persons_id_carries_no_structure(store: SqlAlchemyIdentityStore)
 
 async def test_an_account_leads_to_its_person(store: SqlAlchemyIdentityStore) -> None:
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
+    await store.link(link(user.id))
 
     assert await store.resolve(TELEGRAM, ACCOUNT) == user.id
 
@@ -65,8 +79,8 @@ async def test_the_same_id_on_two_surfaces_is_two_people(
     another, and treating them as one would hand over a stranger's dialogs."""
     telegram_user = await store.create_user()
     web_user = await store.create_user()
-    await store.link(telegram_user.id, TELEGRAM, "42")
-    await store.link(web_user.id, WEB, "42")
+    await store.link(link(telegram_user.id, IdentityKey(TELEGRAM, "42")))
+    await store.link(link(web_user.id, IdentityKey(WEB, "42")))
 
     assert await store.resolve(TELEGRAM, "42") == telegram_user.id
     assert await store.resolve(WEB, "42") == web_user.id
@@ -79,10 +93,10 @@ async def test_one_account_never_belongs_to_two_people(
     deliver one person's messages to another."""
     first = await store.create_user()
     second = await store.create_user()
-    await store.link(first.id, TELEGRAM, ACCOUNT)
+    await store.link(link(first.id))
 
     with pytest.raises(IdentityTakenError):
-        await store.link(second.id, TELEGRAM, ACCOUNT)
+        await store.link(link(second.id))
 
     assert await store.resolve(TELEGRAM, ACCOUNT) == first.id
 
@@ -92,10 +106,10 @@ async def test_linking_an_account_again_to_its_own_person_is_not_a_conflict(
 ) -> None:
     """Coming back is not a collision — and a revoked identity revives."""
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
+    await store.link(link(user.id))
     await store.deactivate(TELEGRAM, ACCOUNT)
 
-    revived = await store.link(user.id, TELEGRAM, ACCOUNT)
+    revived = await store.link(link(user.id))
 
     assert revived.active
     assert await store.resolve(TELEGRAM, ACCOUNT) == user.id
@@ -107,7 +121,7 @@ async def test_a_person_keeps_everything_when_their_account_changes(
     """The whole point: the core id does not move, so dialogs, memories,
     skills and secrets follow without being touched."""
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
+    await store.link(link(user.id))
 
     await store.reseat(TELEGRAM, user.id, OTHER_ACCOUNT)
 
@@ -120,8 +134,8 @@ async def test_reseating_onto_somebody_elses_account_is_refused(
 ) -> None:
     mover = await store.create_user()
     occupant = await store.create_user()
-    await store.link(mover.id, TELEGRAM, ACCOUNT)
-    await store.link(occupant.id, TELEGRAM, OTHER_ACCOUNT)
+    await store.link(link(mover.id))
+    await store.link(link(occupant.id, IdentityKey(TELEGRAM, OTHER_ACCOUNT)))
 
     with pytest.raises(IdentityTakenError):
         await store.reseat(TELEGRAM, mover.id, OTHER_ACCOUNT)
@@ -141,7 +155,7 @@ async def test_reseating_somebody_with_no_identity_there_is_refused(
 
 async def test_a_revoked_account_is_not_a_way_in(store: SqlAlchemyIdentityStore) -> None:
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
+    await store.link(link(user.id))
 
     await store.deactivate(TELEGRAM, ACCOUNT)
 
@@ -151,7 +165,7 @@ async def test_a_revoked_account_is_not_a_way_in(store: SqlAlchemyIdentityStore)
 async def test_a_revoked_account_keeps_its_history(store: SqlAlchemyIdentityStore) -> None:
     """Deleting the row would lose that it was ever used, and by whom."""
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
+    await store.link(link(user.id))
     await store.deactivate(TELEGRAM, ACCOUNT)
 
     identities = await store.identities_of(user.id)
@@ -165,8 +179,8 @@ async def test_a_person_can_be_known_on_several_surfaces(
     store: SqlAlchemyIdentityStore,
 ) -> None:
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
-    await store.link(user.id, WEB, "dmirain")
+    await store.link(link(user.id))
+    await store.link(link(user.id, IdentityKey(WEB, "dmirain")))
 
     assert {item.surface for item in await store.identities_of(user.id)} == {TELEGRAM, WEB}
     assert await store.resolve(WEB, "dmirain") == user.id
@@ -178,7 +192,7 @@ async def test_surface_extras_ride_along_with_the_identity(
     """A JSON column is right here — nothing about it needs enforcing — and
     wrong for the account itself, which needs a unique constraint."""
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT, details={"username": "someone"})
+    await store.link(link(user.id, details={"username": "someone"}))
 
     found = await store.find_by_identity(TELEGRAM, ACCOUNT)
 
@@ -225,9 +239,9 @@ async def test_the_identity_mirrors_what_the_surface_calls_them(
 ) -> None:
     """People rename themselves on a surface; the mirror must not go stale."""
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
+    await store.link(link(user.id))
 
-    await store.update_profile(TELEGRAM, ACCOUNT, "Alice Smith", "alice")
+    await store.update_profile(profile("Alice Smith", "alice"))
 
     found = await store.find_by_identity(TELEGRAM, ACCOUNT)
     assert found is not None
@@ -238,9 +252,9 @@ async def test_the_first_surface_to_report_a_name_christens_the_person(
     store: SqlAlchemyIdentityStore,
 ) -> None:
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
+    await store.link(link(user.id))
 
-    await store.update_profile(TELEGRAM, ACCOUNT, "Alice Smith", None)
+    await store.update_profile(profile("Alice Smith", None))
 
     assert (await store.get_user(user.id)).name == "Alice Smith"
 
@@ -251,10 +265,10 @@ async def test_a_named_person_is_not_renamed_by_a_surface(
     """The canonical name is the person's own once set; only the identity's
     mirror follows a surface rename."""
     user = await store.create_user()
-    await store.link(user.id, TELEGRAM, ACCOUNT)
-    await store.update_profile(TELEGRAM, ACCOUNT, "Alice Smith", "alice")
+    await store.link(link(user.id))
+    await store.update_profile(profile("Alice Smith", "alice"))
 
-    await store.update_profile(TELEGRAM, ACCOUNT, "A. Smith", "alice2")
+    await store.update_profile(profile("A. Smith", "alice2"))
 
     found = await store.find_by_identity(TELEGRAM, ACCOUNT)
     assert found is not None
@@ -268,9 +282,9 @@ async def test_a_surface_lists_everyone_it_knows_revoked_included(
     """The operator's roll call: one row per account, each naming its person."""
     first = await store.create_user()
     second = await store.create_user()
-    await store.link(first.id, TELEGRAM, ACCOUNT)
-    await store.link(second.id, TELEGRAM, OTHER_ACCOUNT)
-    await store.link(second.id, WEB, "dmirain")
+    await store.link(link(first.id))
+    await store.link(link(second.id, IdentityKey(TELEGRAM, OTHER_ACCOUNT)))
+    await store.link(link(second.id, IdentityKey(WEB, "dmirain")))
     await store.deactivate(TELEGRAM, OTHER_ACCOUNT)
 
     listed = await store.list_identities(TELEGRAM)
@@ -285,7 +299,7 @@ async def test_a_profile_for_an_unknown_account_is_dropped(
     store: SqlAlchemyIdentityStore,
 ) -> None:
     """Recording a profile is a courtesy, not a way to create an identity."""
-    await store.update_profile(TELEGRAM, ACCOUNT, "Alice Smith", "alice")
+    await store.update_profile(profile("Alice Smith", "alice"))
 
     assert await store.find_by_identity(TELEGRAM, ACCOUNT) is None
 
@@ -296,7 +310,7 @@ async def test_first_contact_never_attaches_itself_to_somebody(
     """Linking to an existing person is what an invite does. If arriving could
     do it, a mistake would hand a stranger their dialogs."""
     existing = await store.create_user()
-    await store.link(existing.id, WEB, "dmirain")
+    await store.link(link(existing.id, IdentityKey(WEB, "dmirain")))
 
     newcomer = await store.resolve_or_create(TELEGRAM, ACCOUNT)
 

@@ -100,5 +100,7 @@ The framework itself has no settings. Which tools exist depends on configuration
   (`TaskSpawner`, `TaskDeleter`, `UserPrompter`, `ImageInspector`)
 - `core/src/octoforge_core/tools/registry.py` — the registry and visibility
 - `core/src/octoforge_core/tools/errors.py` — the three errors
-- `core/src/octoforge_core/composition.py` — where every tool is wired
+- `core/src/octoforge_core/composition.py` — the stable builder facade
+- `core/src/octoforge_core/composition_tools.py`,
+  `core/src/octoforge_core/composition_knowledge_tools.py` — where tools are wired
 - `core/tests/test_tools_registry.py`, `core/tests/test_boundaries.py`

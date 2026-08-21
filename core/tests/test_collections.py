@@ -8,6 +8,7 @@ jsonb SQL and lives in `test_postgres_stores.py`, behind `make test-pg`.
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import timedelta
 
 import pytest
@@ -16,11 +17,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from octoforge_core.composition import build_collections
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.net.collections.api import (
+    CollectionAppend,
     CollectionConfig,
     CollectionKind,
     CollectionNotFoundError,
     CollectionPassport,
     CollectionQuotaError,
+    NewCollection,
     NewRecords,
     Query,
     QueryResult,
@@ -28,6 +31,8 @@ from octoforge_core.net.collections.api import (
 from octoforge_core.net.collections.ingest import (
     MAX_RECORDS,
     ResponseSpill,
+    ResponseSpillOptions,
+    SpillRequest,
     _take_apart,
     _unwrap,
     parse_structured,
@@ -41,7 +46,7 @@ from octoforge_core.net.collections.schema_infer import (
 )
 from octoforge_core.net.collections.store import SqlAlchemyCollectionStore
 from octoforge_core.net.collections.tools import CollectionQueryTool
-from octoforge_core.net.response_memory import ResponseMemory, ResponseMemoryConfig
+from octoforge_core.net.response_memory import DocumentDraft, ResponseMemory, ResponseMemoryConfig
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 
@@ -72,7 +77,11 @@ def store(session_factory: async_sessionmaker[AsyncSession]) -> SqlAlchemyCollec
 
 @pytest.fixture
 def spill(store: SqlAlchemyCollectionStore) -> ResponseSpill:
-    return ResponseSpill(store, TINY_CONFIG)
+    return ResponseSpill(ResponseSpillOptions(store, TINY_CONFIG))
+
+
+def _spill_request(body: str, content_type: str) -> SpillRequest:
+    return SpillRequest(OWNER, body, content_type, SOURCE, False)
 
 
 def _big_items(count: int = ITEM_COUNT) -> str:
@@ -128,23 +137,23 @@ def test_field_paths_resolve_dotted_and_report_known() -> None:
 async def test_a_small_body_stays_inline(spill: ResponseSpill) -> None:
     """Below the threshold the body itself is the best possible answer."""
     body = json.dumps({"items": [{"id": 1}]})
-    assert await spill.spill(OWNER, body, "application/json", SOURCE, False) is None
+    assert await spill.spill(_spill_request(body, "application/json")) is None
 
 
 async def test_unstructured_text_keeps_the_old_truncation(spill: ResponseSpill) -> None:
-    assert await spill.spill(OWNER, "x" * LONG_ENOUGH, "text/html", SOURCE, False) is None
+    assert await spill.spill(_spill_request("x" * LONG_ENOUGH, "text/html")) is None
 
 
 async def test_declared_json_that_does_not_parse_stays_inline(spill: ResponseSpill) -> None:
     body = "{" + "x" * LONG_ENOUGH
-    assert await spill.spill(OWNER, body, "application/json", SOURCE, False) is None
+    assert await spill.spill(_spill_request(body, "application/json")) is None
 
 
 async def test_a_big_json_body_becomes_a_collection_passport(
     spill: ResponseSpill, store: SqlAlchemyCollectionStore
 ) -> None:
     """The model sees the shape and the counts, never a truncated head."""
-    passport_text = await spill.spill(OWNER, _big_items(), "application/json", SOURCE, False)
+    passport_text = await spill.spill(_spill_request(_big_items(), "application/json"))
 
     assert passport_text is not None
     assert "100 records" in passport_text
@@ -159,7 +168,7 @@ async def test_a_big_json_body_becomes_a_collection_passport(
 
 async def test_a_top_level_array_is_the_records(spill: ResponseSpill) -> None:
     body = json.dumps([{"id": index} for index in range(200)])
-    passport_text = await spill.spill(OWNER, body, "", SOURCE, False)
+    passport_text = await spill.spill(_spill_request(body, ""))
     assert passport_text is not None and "200 records" in passport_text
 
 
@@ -167,7 +176,7 @@ async def test_csv_becomes_records_with_header_keys(
     spill: ResponseSpill, store: SqlAlchemyCollectionStore
 ) -> None:
     lines = ["name;amount"] + [f"contractor-{index};{index}" for index in range(CSV_ROWS)]
-    passport_text = await spill.spill(OWNER, "\n".join(lines), "text/csv", SOURCE, False)
+    passport_text = await spill.spill(_spill_request("\n".join(lines), "text/csv"))
 
     assert passport_text is not None
     assert "kind=csv" in passport_text
@@ -184,32 +193,34 @@ async def test_a_spill_failure_falls_back_instead_of_failing_the_call(
     """The data already arrived; losing it to a storage blip is not an option."""
 
     class ExplodingStore(SqlAlchemyCollectionStore):
-        async def create(self, *args: object, **kwargs: object) -> None:  # type: ignore[override]
+        async def create(self, collection: NewCollection) -> CollectionPassport:
             raise RuntimeError("db down")
 
-    broken = ResponseSpill(ExplodingStore(session_factory, TINY_CONFIG), TINY_CONFIG)
-    assert await broken.spill(OWNER, _big_items(), "application/json", SOURCE, False) is None
+    broken = ResponseSpill(
+        ResponseSpillOptions(ExplodingStore(session_factory, TINY_CONFIG), TINY_CONFIG)
+    )
+    assert await broken.spill(_spill_request(_big_items(), "application/json")) is None
 
 
 # --- the store's lifecycle ----------------------------------------------------
 
 
 async def test_the_owner_is_a_wall(store: SqlAlchemyCollectionStore) -> None:
-    passport = await _create(store, OWNER)
+    passport = await _create(store)
     with pytest.raises(CollectionNotFoundError):
         await store.passport(STRANGER, passport.id)
 
 
 async def test_expiry_reads_as_not_found(store: SqlAlchemyCollectionStore) -> None:
     """To the caller an expired collection never existed; the remedy is the same."""
-    passport = await _create(store, OWNER, expires_in=timedelta(seconds=-1))
+    passport = await _create(store, CollectionFixtureOptions(expires_in=timedelta(seconds=-1)))
     with pytest.raises(CollectionNotFoundError):
         await store.passport(OWNER, passport.id)
 
 
 async def test_the_sweeper_drops_expired_collections(store: SqlAlchemyCollectionStore) -> None:
-    await _create(store, OWNER, expires_in=timedelta(seconds=-1))
-    kept = await _create(store, OWNER)
+    await _create(store, CollectionFixtureOptions(expires_in=timedelta(seconds=-1)))
+    kept = await _create(store)
 
     dropped = await store.delete_expired()
 
@@ -218,14 +229,16 @@ async def test_the_sweeper_drops_expired_collections(store: SqlAlchemyCollection
 
 
 async def test_append_grows_and_reschemas(store: SqlAlchemyCollectionStore) -> None:
-    passport = await _create(store, OWNER)
+    passport = await _create(store)
     grown = await store.append(
-        OWNER,
-        passport.id,
-        NewRecords(payloads=[{"id": 3, "fresh": True}], source="endpoint:other"),
-        schema=infer_records([{"id": 3, "fresh": True}]),
-        byte_size=50,
-        expires_at=utc_now() + timedelta(hours=1),
+        CollectionAppend(
+            OWNER,
+            passport.id,
+            NewRecords(payloads=[{"id": 3, "fresh": True}], source="endpoint:other"),
+            infer_records([{"id": 3, "fresh": True}]),
+            50,
+            utc_now() + timedelta(hours=1),
+        )
     )
     assert grown.record_count == passport.record_count + 1
     assert grown.pages_loaded == EXPECTED_PAGES
@@ -236,9 +249,9 @@ async def test_the_count_quota_evicts_the_least_recently_touched(
     store: SqlAlchemyCollectionStore,
 ) -> None:
     """max_per_user=2: the third collection pushes out the oldest, silently."""
-    first = await _create(store, OWNER)
-    second = await _create(store, OWNER)
-    third = await _create(store, OWNER)
+    first = await _create(store)
+    second = await _create(store)
+    third = await _create(store)
 
     with pytest.raises(CollectionNotFoundError):
         await store.passport(OWNER, first.id)
@@ -250,8 +263,8 @@ async def test_the_byte_quota_evicts_until_the_newcomer_fits(
     store: SqlAlchemyCollectionStore,
 ) -> None:
     """max_bytes=10k: one 6k tenant leaves when another 6k one arrives."""
-    fat = await _create(store, OWNER, byte_size=FAT_BYTES)
-    newcomer = await _create(store, OWNER, byte_size=FAT_BYTES)
+    fat = await _create(store, CollectionFixtureOptions(byte_size=FAT_BYTES))
+    newcomer = await _create(store, CollectionFixtureOptions(byte_size=FAT_BYTES))
 
     with pytest.raises(CollectionNotFoundError):
         await store.passport(OWNER, fat.id)
@@ -261,32 +274,39 @@ async def test_the_byte_quota_evicts_until_the_newcomer_fits(
 async def test_the_passport_renders_expiry_and_truncation(
     store: SqlAlchemyCollectionStore,
 ) -> None:
-    passport = await _create(store, OWNER, truncated=True)
+    passport = await _create(store, CollectionFixtureOptions(truncated=True))
     rendered = render_passport(passport)
     assert "SOURCE CUT" in rendered
     assert "expires in" in rendered
     assert "collection_query" in rendered
 
 
+@dataclass(frozen=True, slots=True)
+class CollectionFixtureOptions:
+    owner: str = OWNER
+    expires_in: timedelta = timedelta(hours=1)
+    byte_size: int = 100
+    truncated: bool = False
+
+
 async def _create(
-    store: SqlAlchemyCollectionStore,
-    owner: str,
-    expires_in: timedelta = timedelta(hours=1),
-    byte_size: int = 100,
-    truncated: bool = False,
+    store: SqlAlchemyCollectionStore, options: CollectionFixtureOptions | None = None
 ) -> CollectionPassport:
+    resolved = options or CollectionFixtureOptions()
     payloads = [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
     return await store.create(
-        owner_id=owner,
-        label="",
-        kind=CollectionKind.JSON,
-        source=SOURCE,
-        schema=infer_records(payloads),
-        envelope={},
-        records=NewRecords(payloads=payloads, source=SOURCE),
-        byte_size=byte_size,
-        truncated=truncated,
-        expires_at=utc_now() + expires_in,
+        NewCollection(
+            resolved.owner,
+            "",
+            CollectionKind.JSON,
+            SOURCE,
+            infer_records(payloads),
+            {},
+            NewRecords(payloads=payloads, source=SOURCE),
+            resolved.byte_size,
+            resolved.truncated,
+            utc_now() + resolved.expires_in,
+        )
     )
 
 
@@ -305,16 +325,18 @@ async def test_the_feature_is_absent_off_postgres() -> None:
 async def test_append_refuses_past_the_byte_quota(store: SqlAlchemyCollectionStore) -> None:
     """The quota holds on BOTH write paths: create evicts, append refuses —
     a growing collection must not evict others to feed its own growth."""
-    passport = await _create(store, OWNER, byte_size=9_000)
+    passport = await _create(store, CollectionFixtureOptions(byte_size=9_000))
 
     with pytest.raises(CollectionQuotaError):
         await store.append(
-            OWNER,
-            passport.id,
-            NewRecords(payloads=[{"id": 99}]),
-            schema=infer_records([{"id": 99}]),
-            byte_size=2_000,
-            expires_at=utc_now() + timedelta(hours=1),
+            CollectionAppend(
+                OWNER,
+                passport.id,
+                NewRecords(payloads=[{"id": 99}]),
+                infer_records([{"id": 99}]),
+                2_000,
+                utc_now() + timedelta(hours=1),
+            )
         )
     # what was there before the refusal is untouched
     untouched = 2
@@ -362,10 +384,10 @@ async def test_over_max_records_marks_the_collection_truncated(
 async def test_ram_budget_is_per_owner_not_global() -> None:
     """One user's fetches must not evict another user's in-flight document."""
     memory = ResponseMemory(ResponseMemoryConfig(budget_chars=3000))
-    theirs = memory.store("user-b", "task-b", "text", "src", "b" * 2000).ref
+    theirs = memory.store(DocumentDraft("user-b", "task-b", "src", "b" * 2000)).ref
     # user-a fills their OWN budget; user-b's document must survive
-    memory.store("user-a", "task-a", "text", "src", "a" * 2000)
-    memory.store("user-a", "task-a", "text", "src", "a" * 2000)
+    memory.store(DocumentDraft("user-a", "task-a", "src", "a" * 2000))
+    memory.store(DocumentDraft("user-a", "task-a", "src", "a" * 2000))
 
     assert memory.get("user-b", theirs).body[0] == "b"
 
@@ -389,7 +411,7 @@ async def test_records_are_found_inside_a_nested_wrapper(spill: ResponseSpill) -
             },
         }
     )
-    passport = await spill.spill(OWNER, body, "application/json", SOURCE, False)
+    passport = await spill.spill(_spill_request(body, "application/json"))
 
     assert passport is not None
     assert "col:" in passport  # a collection, not a resp: document

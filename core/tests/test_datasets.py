@@ -7,6 +7,7 @@ implementation of the protocol by swapping that one fixture.
 """
 
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from datetime import UTC, timedelta
 
 import pytest
@@ -14,9 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.datasets.api import (
     Dataset,
+    DatasetDefinition,
     DatasetExistsError,
     DatasetNotFoundError,
     DatasetQuotaError,
+    DatasetRecordQuery,
     DatasetSchema,
     DatasetService,
     FieldType,
@@ -56,6 +59,9 @@ FOOD_SCHEMA_RAW = {
     ]
 }
 FOOD_SCHEMA = parse_schema(FOOD_SCHEMA_RAW)
+FOOD_DEFINITION = DatasetDefinition(OWNER_A, FOOD_DATASET, FOOD_DESCRIPTION, FOOD_SCHEMA)
+SPORT_DEFINITION = DatasetDefinition(OWNER_A, SPORT_DATASET, SPORT_DESCRIPTION, DatasetSchema(()))
+BASE_RECORD_QUERY = DatasetRecordQuery(OWNER_A, FOOD_DATASET, None, None, None, 10)
 
 
 class StubEmbedder:
@@ -111,22 +117,22 @@ def service(
 
 def register_vector(
     embedder: StubEmbedder,
-    name: str,
-    description: str,
+    definition: DatasetDefinition,
     vector: tuple[float, ...],
-    usage_notes: str = "",
 ) -> None:
     """Map the exact text the service embeds for a descriptor to a vector."""
-    key = EMBEDDED_TEXT_SEPARATOR.join((name, description, usage_notes))
+    key = EMBEDDED_TEXT_SEPARATOR.join(
+        (definition.name, definition.description, definition.usage_notes)
+    )
     embedder.vectors[key] = vector
 
 
 async def create_food_dataset(service: DatasetService, owner: str = OWNER_A) -> Dataset:
-    return await service.create_dataset(owner, FOOD_DATASET, FOOD_DESCRIPTION, FOOD_SCHEMA)
+    return await service.create_dataset(replace(FOOD_DEFINITION, owner_user_id=owner))
 
 
 async def test_create_and_get_dataset(service: DatasetService, embedder: StubEmbedder) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
 
     created = await create_food_dataset(service)
 
@@ -152,7 +158,7 @@ async def test_create_duplicate_name_same_owner_raises(
     service: DatasetService,
     embedder: StubEmbedder,
 ) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
     await create_food_dataset(service)
 
     with pytest.raises(DatasetExistsError):
@@ -163,10 +169,10 @@ async def test_same_name_different_owners_coexist(
     service: DatasetService,
     embedder: StubEmbedder,
 ) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
 
-    first = await service.create_dataset(OWNER_A, FOOD_DATASET, FOOD_DESCRIPTION, FOOD_SCHEMA)
-    second = await service.create_dataset(OWNER_B, FOOD_DATASET, FOOD_DESCRIPTION, FOOD_SCHEMA)
+    first = await service.create_dataset(FOOD_DEFINITION)
+    second = await service.create_dataset(replace(FOOD_DEFINITION, owner_user_id=OWNER_B))
 
     assert first.id != second.id
     assert (await service.get_dataset(OWNER_B, FOOD_DATASET)).id == second.id
@@ -178,7 +184,7 @@ async def test_get_missing_dataset_raises(service: DatasetService) -> None:
 
 
 async def test_add_record_round_trip(service: DatasetService, embedder: StubEmbedder) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
     dataset = await create_food_dataset(service)
     payload = {"item": "apple", "kcal": 95}
 
@@ -197,7 +203,7 @@ async def test_add_record_unknown_dataset_raises(service: DatasetService) -> Non
 
 
 async def test_owner_isolation(service: DatasetService, embedder: StubEmbedder) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
     await create_food_dataset(service)
     embedder.vectors[QUERY] = V_RIGHT
 
@@ -206,7 +212,7 @@ async def test_owner_isolation(service: DatasetService, embedder: StubEmbedder) 
     with pytest.raises(DatasetNotFoundError):
         await service.add_record(OWNER_B, FOOD_DATASET, {"item": "apple"})
     with pytest.raises(DatasetNotFoundError):
-        await service.query_records(OWNER_B, FOOD_DATASET, None, None, None, 1)
+        await service.query_records(replace(BASE_RECORD_QUERY, owner_user_id=OWNER_B, limit=1))
     with pytest.raises(DatasetNotFoundError):
         await service.delete_dataset(OWNER_B, FOOD_DATASET)
     assert await service.search(OWNER_B, QUERY, k=TWO_HITS) == []
@@ -217,12 +223,12 @@ async def test_query_records_newest_first(
     service: DatasetService,
     embedder: StubEmbedder,
 ) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
     await create_food_dataset(service)
     for seq in range(THREE_RECORDS):
         await service.add_record(OWNER_A, FOOD_DATASET, {"item": f"item-{seq}", "seq": seq})
 
-    records = await service.query_records(OWNER_A, FOOD_DATASET, None, None, None, 10)
+    records = await service.query_records(BASE_RECORD_QUERY)
 
     assert [record.payload["seq"] for record in records] == [2, 1, 0]
 
@@ -231,16 +237,16 @@ async def test_query_records_equals_is_type_sensitive(
     service: DatasetService,
     embedder: StubEmbedder,
 ) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
     await create_food_dataset(service)
     await service.add_record(OWNER_A, FOOD_DATASET, {"item": "apple", "kcal": 95})
     await service.add_record(OWNER_A, FOOD_DATASET, {"item": "apple", "kcal": "95"})
     await service.add_record(OWNER_A, FOOD_DATASET, {"item": "banana", "kcal": 105})
 
-    by_item = await service.query_records(OWNER_A, FOOD_DATASET, {"item": "apple"}, None, None, 10)
-    by_int = await service.query_records(OWNER_A, FOOD_DATASET, {"kcal": 95}, None, None, 10)
-    by_str = await service.query_records(OWNER_A, FOOD_DATASET, {"kcal": "95"}, None, None, 10)
-    by_missing = await service.query_records(OWNER_A, FOOD_DATASET, {"fat": 1}, None, None, 10)
+    by_item = await service.query_records(replace(BASE_RECORD_QUERY, equals={"item": "apple"}))
+    by_int = await service.query_records(replace(BASE_RECORD_QUERY, equals={"kcal": 95}))
+    by_str = await service.query_records(replace(BASE_RECORD_QUERY, equals={"kcal": "95"}))
+    by_missing = await service.query_records(replace(BASE_RECORD_QUERY, equals={"fat": 1}))
 
     assert len(by_item) == TWO_RECORDS
     assert [record.payload["item"] for record in by_int] == ["apple"]
@@ -252,7 +258,7 @@ async def test_query_records_date_range(
     service: DatasetService,
     embedder: StubEmbedder,
 ) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
     await create_food_dataset(service)
     started = utc_now()
     await service.add_record(OWNER_A, FOOD_DATASET, {"item": "apple"})
@@ -260,17 +266,19 @@ async def test_query_records_date_range(
     day = timedelta(days=1)
 
     wide = await service.query_records(
-        OWNER_A, FOOD_DATASET, None, started - day, finished + day, 10
+        replace(BASE_RECORD_QUERY, date_from=started - day, date_to=finished + day)
     )
-    exact = await service.query_records(OWNER_A, FOOD_DATASET, None, started, finished, 10)
+    exact = await service.query_records(
+        replace(BASE_RECORD_QUERY, date_from=started, date_to=finished)
+    )
     future = await service.query_records(
-        OWNER_A, FOOD_DATASET, None, finished + day, finished + day, 10
+        replace(BASE_RECORD_QUERY, date_from=finished + day, date_to=finished + day)
     )
     past = await service.query_records(
-        OWNER_A, FOOD_DATASET, None, started - day, started - day, 10
+        replace(BASE_RECORD_QUERY, date_from=started - day, date_to=started - day)
     )
-    from_only = await service.query_records(OWNER_A, FOOD_DATASET, None, started - day, None, 10)
-    to_only = await service.query_records(OWNER_A, FOOD_DATASET, None, None, finished + day, 10)
+    from_only = await service.query_records(replace(BASE_RECORD_QUERY, date_from=started - day))
+    to_only = await service.query_records(replace(BASE_RECORD_QUERY, date_to=finished + day))
 
     assert len(wide) == 1
     assert len(exact) == 1
@@ -281,29 +289,29 @@ async def test_query_records_date_range(
 
 
 async def test_query_records_limit(service: DatasetService, embedder: StubEmbedder) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
     await create_food_dataset(service)
     for seq in range(THREE_RECORDS):
         await service.add_record(OWNER_A, FOOD_DATASET, {"item": f"item-{seq}", "seq": seq})
 
-    records = await service.query_records(OWNER_A, FOOD_DATASET, None, None, None, TWO_RECORDS)
+    records = await service.query_records(replace(BASE_RECORD_QUERY, limit=TWO_RECORDS))
 
     assert [record.payload["seq"] for record in records] == [2, 1]
 
 
 async def test_query_records_unknown_dataset_raises(service: DatasetService) -> None:
     with pytest.raises(DatasetNotFoundError):
-        await service.query_records(OWNER_A, "missing", None, None, None, 1)
+        await service.query_records(replace(BASE_RECORD_QUERY, dataset_name="missing", limit=1))
 
 
 async def test_delete_dataset_cascades_and_counts(
     service: DatasetService,
     embedder: StubEmbedder,
 ) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
-    register_vector(embedder, SPORT_DATASET, SPORT_DESCRIPTION, V_UP)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
+    register_vector(embedder, SPORT_DEFINITION, V_UP)
     await create_food_dataset(service)
-    await service.create_dataset(OWNER_A, SPORT_DATASET, SPORT_DESCRIPTION, DatasetSchema(()))
+    await service.create_dataset(SPORT_DEFINITION)
     for _ in range(TWO_RECORDS):
         await service.add_record(OWNER_A, FOOD_DATASET, {"item": "apple"})
     await service.add_record(OWNER_A, SPORT_DATASET, {"kind": "run"})
@@ -313,7 +321,7 @@ async def test_delete_dataset_cascades_and_counts(
     assert deleted == TWO_RECORDS
     with pytest.raises(DatasetNotFoundError):
         await service.get_dataset(OWNER_A, FOOD_DATASET)
-    remaining = await service.query_records(OWNER_A, SPORT_DATASET, None, None, None, 10)
+    remaining = await service.query_records(replace(BASE_RECORD_QUERY, dataset_name=SPORT_DATASET))
     assert len(remaining) == 1
 
 
@@ -326,10 +334,10 @@ async def test_search_closer_vector_wins(
     service: DatasetService,
     embedder: StubEmbedder,
 ) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
-    register_vector(embedder, SPORT_DATASET, SPORT_DESCRIPTION, V_UP)
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
+    register_vector(embedder, SPORT_DEFINITION, V_UP)
     await create_food_dataset(service)
-    await service.create_dataset(OWNER_A, SPORT_DATASET, SPORT_DESCRIPTION, DatasetSchema(()))
+    await service.create_dataset(SPORT_DEFINITION)
     embedder.vectors[QUERY] = V_DIAGONAL
 
     hits = await service.search(OWNER_A, QUERY, k=TWO_HITS)
@@ -343,10 +351,10 @@ async def test_search_exact_name_boost_beats_closer_vector(
     service: DatasetService,
     embedder: StubEmbedder,
 ) -> None:
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_UP)
-    register_vector(embedder, SPORT_DATASET, SPORT_DESCRIPTION, V_RIGHT)
+    register_vector(embedder, FOOD_DEFINITION, V_UP)
+    register_vector(embedder, SPORT_DEFINITION, V_RIGHT)
     await create_food_dataset(service)
-    await service.create_dataset(OWNER_A, SPORT_DATASET, SPORT_DESCRIPTION, DatasetSchema(()))
+    await service.create_dataset(SPORT_DEFINITION)
     # the query vector is closest to sport_log, but the query equals food_log's name
     embedder.vectors[EXACT_QUERY] = V_RIGHT
 
@@ -359,8 +367,9 @@ async def test_search_exact_name_boost_beats_closer_vector(
 async def test_search_respects_k(service: DatasetService, embedder: StubEmbedder) -> None:
     for index in range(THREE_RECORDS):
         name = f"dataset-{index}"
-        register_vector(embedder, name, FOOD_DESCRIPTION, V_RIGHT)
-        await service.create_dataset(OWNER_A, name, FOOD_DESCRIPTION, DatasetSchema(()))
+        definition = DatasetDefinition(OWNER_A, name, FOOD_DESCRIPTION, DatasetSchema(()))
+        register_vector(embedder, definition, V_RIGHT)
+        await service.create_dataset(definition)
     embedder.vectors[QUERY] = V_RIGHT
 
     hits = await service.search(OWNER_A, QUERY, k=TWO_HITS)
@@ -411,15 +420,16 @@ async def test_dataset_creation_refuses_over_the_plans_cap(
     service = LocalDatasetService(
         SqlAlchemyDatasetStore(session_factory), embedder, limits=DatasetCapGate(max_datasets=1)
     )
-    register_vector(embedder, FOOD_DATASET, FOOD_DESCRIPTION, V_RIGHT)
-    register_vector(embedder, "second", FOOD_DESCRIPTION, V_RIGHT)
+    second = DatasetDefinition(OWNER_A, "second", FOOD_DESCRIPTION, DatasetSchema(()))
+    register_vector(embedder, FOOD_DEFINITION, V_RIGHT)
+    register_vector(embedder, second, V_RIGHT)
 
     await create_food_dataset(service)
     with pytest.raises(DatasetQuotaError, match="at most 1 datasets"):
-        await service.create_dataset(OWNER_A, "second", FOOD_DESCRIPTION, DatasetSchema(()))
+        await service.create_dataset(second)
 
     # another owner is unaffected, and an unlimited plan (no cap) stays open
     open_service = LocalDatasetService(
         SqlAlchemyDatasetStore(session_factory), embedder, limits=DatasetCapGate(max_datasets=None)
     )
-    await open_service.create_dataset(OWNER_A, "second", FOOD_DESCRIPTION, DatasetSchema(()))
+    await open_service.create_dataset(second)

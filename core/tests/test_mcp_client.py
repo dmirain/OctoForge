@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
-from octoforge_core.mcp.api import McpError
+from octoforge_core.mcp.api import McpError, McpToolCall
 from octoforge_core.mcp.client import (
     MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION,
@@ -137,7 +137,7 @@ async def test_call_tool_renders_text_and_placeholders() -> None:
     )
     client, http = make_client(server)
 
-    result = await client.call_tool(URL, {}, "get_weather", {"city": "Lisbon"})
+    result = await client.call_tool(McpToolCall(URL, {}, "get_weather", {"city": "Lisbon"}))
 
     await http.aclose()
     assert result.text == "sunny\n[image content omitted]"
@@ -149,7 +149,7 @@ async def test_sse_answers_are_parsed_past_interleaved_notifications() -> None:
     server = ScriptedServer(answers, sse=True)
     client, http = make_client(server)
 
-    result = await client.call_tool(URL, {}, "anything", {})
+    result = await client.call_tool(McpToolCall(URL, {}, "anything", {}))
 
     await http.aclose()
     assert result.is_error is True
@@ -162,7 +162,7 @@ async def test_jsonrpc_error_becomes_mcp_error() -> None:
     client, http = make_client(server)
 
     with pytest.raises(McpError, match="Unknown tool"):
-        await client.call_tool(URL, {}, "nope", {})
+        await client.call_tool(McpToolCall(URL, {}, "nope", {}))
     await http.aclose()
 
 

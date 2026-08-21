@@ -29,7 +29,7 @@ from octoforge_core.agent.events import (
     TextDelta,
     ToolCallRequested,
 )
-from octoforge_core.agent.loop import AgentLoop
+from octoforge_core.agent.loop import AgentLoop, AgentLoopConfig
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import (
     ExchangeInfo,
@@ -52,6 +52,7 @@ from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
     ConversationRunner,
+    DialogSubmission,
     ManagerStores,
     OwnershipConfig,
     RunnerConfig,
@@ -68,11 +69,11 @@ from octoforge_core.context.api import (
 )
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.context.store import SqlAlchemySummaryStore
-from octoforge_core.cron.api import CronWaker, WakeOutcome
+from octoforge_core.cron.api import CronWake, CronWaker, WakeOutcome
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.unit_of_work import UnitOfWork
-from octoforge_core.dialogs.api import ExchangeStatus
+from octoforge_core.dialogs.api import Exchange, ExchangeStatus, MessageAppend
 from octoforge_core.dialogs.models import ExchangeRow, MessageRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyClaimRepository,
@@ -607,6 +608,14 @@ def reply(content: str = REPLY) -> ChatMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class ManagerEnvironment:
+    """Stateful dependencies shared by one test manager."""
+
+    registry: ToolRegistry
+    sessions: async_sessionmaker[AsyncSession]
+
+
+@dataclass(frozen=True, slots=True)
 class ManagerOptions:
     """Optional knobs for building a test ConversationManager."""
 
@@ -625,12 +634,12 @@ class ManagerOptions:
 
 def make_manager(
     llm: LLMClient,
-    registry: ToolRegistry,
-    session_factory: async_sessionmaker[AsyncSession],
+    environment: ManagerEnvironment,
     options: ManagerOptions | None = None,
 ) -> ConversationManager:
     resolved = options if options is not None else ManagerOptions()
-    loop = AgentLoop(llm_client=llm, registry=registry, max_iterations=MAX_ITERATIONS)
+    loop = AgentLoop(llm, environment.registry, AgentLoopConfig(MAX_ITERATIONS))
+    session_factory = environment.sessions
     config = RunnerConfig(
         loop=loop,
         prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: PROMPT}),
@@ -774,6 +783,431 @@ async def wait_for_condition(predicate: Callable[[], bool]) -> None:
     await asyncio.wait_for(_wait(), timeout=TIMEOUT_SECONDS)
 
 
+def history_contents(runner: ConversationRunner) -> list[str]:
+    return [message.content for message in runner.history()]
+
+
+def finished_payloads(events: list[ConversationEvent]) -> list[Finished]:
+    return [event.payload for event in events if isinstance(event.payload, Finished)]
+
+
+def failed_payloads(events: list[ConversationEvent]) -> list[Failed]:
+    return [event.payload for event in events if isinstance(event.payload, Failed)]
+
+
+def completion_statuses(events: list[ConversationEvent]) -> list[tuple[str, str]]:
+    return [(item.title, item.status) for item in completions(events)]
+
+
+async def drain_queue(
+    events: list[ConversationEvent], queue: asyncio.Queue[ConversationEvent]
+) -> list[ConversationEvent]:
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    return events
+
+
+def first_finished_event(events: list[ConversationEvent]) -> ConversationEvent:
+    return next(event for event in events if isinstance(event.payload, Finished))
+
+
+@dataclass(frozen=True, slots=True)
+class AskingScenario:
+    runner: ConversationRunner
+    queue: asyncio.Queue[ConversationEvent]
+    tool: "AskingTool"
+    exchanges: SqlAlchemyExchangeRepository
+    session_factory: async_sessionmaker[AsyncSession]
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialPromotionSetup:
+    target_id: str
+    collection: Exchange
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialPromotionScenario:
+    runner: ConversationRunner
+    queue: asyncio.Queue[ConversationEvent]
+    router: FakeRouter
+    exchanges: SqlAlchemyExchangeRepository
+    target_id: str
+    collection: Exchange
+
+
+@dataclass(frozen=True, slots=True)
+class StalledAssembleScenario:
+    runner: ConversationRunner
+    queue: asyncio.Queue[ConversationEvent]
+    tool: BlockingTool
+    compactor: "GatedAssembleCompactor"
+    router: FakeRouter
+    exchanges: SqlAlchemyExchangeRepository
+
+
+@dataclass(frozen=True, slots=True)
+class BlockingScenario:
+    runner: ConversationRunner
+    queue: asyncio.Queue[ConversationEvent]
+    tool: BlockingTool
+
+
+async def start_blocked_submission(
+    scenario: BlockingScenario, submission: DialogSubmission
+) -> list[ConversationEvent]:
+    await scenario.runner.submit(submission)
+    events = await collect_until(
+        scenario.queue, lambda event: isinstance(event.payload, ToolCallRequested)
+    )
+    await asyncio.wait_for(scenario.tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    return events
+
+
+async def park_asked_exchange(
+    scenario: AskingScenario, prompt: str = "what is the weather?"
+) -> Exchange:
+    live_exchange, _ = await park_asked_exchange_with_events(scenario, prompt)
+    return live_exchange
+
+
+async def park_asked_exchange_with_events(
+    scenario: AskingScenario, prompt: str = "what is the weather?"
+) -> tuple[Exchange, list[ConversationEvent]]:
+    await scenario.runner.submit(DialogSubmission(prompt))
+    await asyncio.wait_for(scenario.tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    events = await collect_until(scenario.queue, is_delivered(scenario.tool.question))
+    await wait_for_condition(lambda: not scenario.runner._processes)
+    (live_exchange,) = await scenario.exchanges.list_live(scenario.runner.dialog_id)
+    return live_exchange, events
+
+
+async def submit_material_message(
+    runner: ConversationRunner, content: str, origin: str | None
+) -> None:
+    source = MessageSource(kind=MessageKind.MATERIAL, origin=origin)
+    await runner.submit(DialogSubmission(content, source=source))
+
+
+async def create_collecting_exchange(
+    runner: ConversationRunner,
+    exchanges: SqlAlchemyExchangeRepository,
+    origin: str | None,
+) -> Exchange:
+    for content in (MATERIAL_ONE, MATERIAL_TWO, MATERIAL_THREE):
+        await submit_material_message(runner, content, origin)
+    await wait_for_condition(
+        lambda: (
+            sum(1 for message in runner.history() if message.kind is MessageKind.MATERIAL)
+            == THREE_MATERIAL_MESSAGES
+        )
+    )
+    exchange = await exchanges.find_collecting(runner.dialog_id)
+    assert exchange is not None
+    return exchange
+
+
+async def create_parked_target_collection(
+    scenario: AskingScenario, origin: str | None
+) -> MaterialPromotionSetup:
+    target = await park_asked_exchange(scenario, TARGET_QUESTION)
+    collection = await create_collecting_exchange(
+        scenario.runner, scenario.exchanges, origin=origin
+    )
+    await _backdate_exchange(
+        scenario.session_factory,
+        collection.id,
+        seconds=MATERIAL_QUIET_SECONDS + 1,
+    )
+    return MaterialPromotionSetup(target_id=target.id, collection=collection)
+
+
+async def create_material_promotion_scenario(
+    scenario: AskingScenario, router: FakeRouter, origin: str | None
+) -> MaterialPromotionScenario:
+    setup = await create_parked_target_collection(scenario, origin)
+    return MaterialPromotionScenario(
+        runner=scenario.runner,
+        queue=scenario.queue,
+        router=router,
+        exchanges=scenario.exchanges,
+        target_id=setup.target_id,
+        collection=setup.collection,
+    )
+
+
+def assert_partial_history(history: list[ChatMessage]) -> None:
+    assert [message.role for message in history] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.SYSTEM,
+    ]
+    assert history[1].content == PARTIAL
+    assert history[2].content == INTERRUPTED_NOTE
+
+
+async def wait_for_message_count(
+    runner: ConversationRunner, kind: MessageKind, expected_count: int
+) -> None:
+    await wait_for_condition(
+        lambda: sum(1 for message in runner.history() if message.kind is kind) == expected_count
+    )
+
+
+async def submit_single_material(runner: ConversationRunner) -> None:
+    await submit_material_message(runner, MATERIAL_ONE, origin=None)
+    await wait_for_message_count(runner, MessageKind.MATERIAL, 1)
+
+
+def assert_started_client_keys(events: list[ConversationEvent], expected: list[str]) -> None:
+    assert (
+        sorted(
+            event.payload.source_client_message_id
+            for event in events
+            if isinstance(event.payload, ProcessStarted)
+        )
+        == expected
+    )
+
+
+def assert_final_exchange_count(events: list[ConversationEvent], expected_count: int) -> None:
+    assert (
+        len(
+            {
+                event.exchange_id
+                for event in events
+                if isinstance(event.payload, Finished)
+                and event.payload.message.content.endswith("final")
+            }
+        )
+        == expected_count
+    )
+
+
+async def wait_for_all_task_states(
+    store: TaskStore, dialog_id: str, predicate: Callable[[Task], bool]
+) -> list[Task]:
+    tasks = await store.list(dialog_id)
+    for item in tasks:
+        await wait_for_task_state(store, item.id, predicate)
+    return tasks
+
+
+def assert_notice_text(notice: ChatMessage, fragment: str) -> None:
+    assert notice.role is MessageRole.ASSISTANT
+    assert "process limit (1)" in notice.content
+    assert fragment in notice.content
+
+
+def assert_task_create_delivery(
+    runner: ConversationRunner, tasks: dict[TaskKind, Task], events: list[ConversationEvent]
+) -> None:
+    assert history_contents(runner) == [
+        "do it in the background",
+        "spawn confirmed",
+        TASK_RESULT,
+    ]
+    assert tasks[TaskKind.RUN].status is TaskStatus.DONE
+    assert tasks[TaskKind.RUN].delivered_at is not None
+    assert runner.history()[-1].task_id == tasks[TaskKind.RUN].id
+    assert [item.message.content for item in finished_payloads(events)] == [
+        "spawn confirmed",
+        TASK_RESULT,
+    ]
+
+
+def assert_cron_delivery_message(
+    runner: ConversationRunner, task: Task, finished: Finished
+) -> None:
+    assert finished.message == ChatMessage(
+        role=MessageRole.ASSISTANT, content=TASK_RESULT, task_id=task.id
+    )
+    assert task.status is TaskStatus.DONE
+    assert task.delivered_at is not None
+    assert task.input["cron_job_id"] == CRON_JOB_ID
+    assert isinstance(task.input["fired_at"], str)
+    assert runner.history() == [finished.message]
+    assert not runner._pending_deliveries
+
+
+def assert_background_prompt(request: list[ChatMessage], prompt: str) -> None:
+    assert request[0].content == BACKGROUND_TASK_PROMPT
+    assert request[1].role is MessageRole.USER
+    assert request[1].content.endswith(prompt)
+
+
+async def create_waiting_material_collection(
+    runner: ConversationRunner,
+    exchanges: SqlAlchemyExchangeRepository,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> Exchange:
+    collection = await create_collecting_exchange(runner, exchanges, origin=MATERIAL_ORIGIN)
+    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+    return collection
+
+
+def first_history_exchange_id(runner: ConversationRunner) -> str:
+    exchange_id = runner.history()[0].exchange_id
+    assert exchange_id is not None
+    return exchange_id
+
+
+async def overtake_queued_answer(
+    scenario: BlockingScenario, router: GatedRouter, prompt: str
+) -> list[ConversationEvent]:
+    await scenario.runner.submit(DialogSubmission("why so many seagulls?"))
+    await asyncio.wait_for(scenario.tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    router.gate_armed = True
+    await scenario.runner.submit(DialogSubmission(prompt))
+    await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
+    scenario.tool.release.set()
+    await collect_until(scenario.queue, is_completed)
+    router.release.set()
+    return await collect_until(scenario.queue, is_delivered("weather answer"))
+
+
+async def cancel_absorbed_clarification(
+    runner: ConversationRunner,
+    queue: asyncio.Queue[ConversationEvent],
+    tool: "TwoPhaseBlockingTool",
+) -> list[ConversationEvent]:
+    await runner.submit(DialogSubmission("first"))
+    await asyncio.wait_for(tool.started[0].wait(), timeout=TIMEOUT_SECONDS)
+    await runner.submit(DialogSubmission("уточнение"))
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+    tool.release[0].set()
+    await asyncio.wait_for(tool.started[1].wait(), timeout=TIMEOUT_SECONDS)
+    await runner.cancel()
+    events = await collect_until(queue, is_completed)
+    tool.release[1].set()
+    return events
+
+
+async def stage_stalled_assemble_message(scenario: StalledAssembleScenario) -> str:
+    await start_blocked_submission(
+        BlockingScenario(scenario.runner, scenario.queue, scenario.tool),
+        DialogSubmission("first"),
+    )
+    exchange_id = first_history_exchange_id(scenario.runner)
+    scenario.router.decide_continue()
+    await scenario.runner.submit(DialogSubmission("setup"))
+    await wait_for_condition(lambda: len(scenario.runner.history()) == MESSAGES_AFTER_INJECT)
+    scenario.tool.release.set()
+    await asyncio.wait_for(scenario.compactor.entered.wait(), timeout=TIMEOUT_SECONDS)
+    await scenario.runner.submit(DialogSubmission("clarification"))
+    await wait_for_message(scenario.runner, "clarification")
+    return exchange_id
+
+
+async def seed_stranded_exchange(
+    runner: ConversationRunner,
+    exchanges: SqlAlchemyExchangeRepository,
+    messages: SqlAlchemyMessageRepository,
+) -> Exchange:
+    stranded = await exchanges.create(runner.dialog_id, "stranded question")
+    message_id = await messages.append(
+        MessageAppend(
+            runner.dialog_id,
+            ChatMessage(role=MessageRole.USER, content="stranded question"),
+        )
+    )
+    await messages.set_exchange(message_id, stranded.id)
+    runner._narrative.append(
+        ChatMessage(
+            id=message_id,
+            role=MessageRole.USER,
+            content="stranded question",
+            exchange_id=stranded.id,
+        )
+    )
+    return stranded
+
+
+async def wait_named_task_statuses(
+    store: TaskStore, tasks: dict[str, Task], expected: dict[str, TaskStatus]
+) -> None:
+    for title, status in expected.items():
+        await wait_for_task_state(
+            store,
+            tasks[title].id,
+            lambda t, status=status: t.status is status,
+        )
+
+
+async def stage_stalled_asker_reply_window(scenario: AskingScenario, llm: "AskThenStallLLM") -> str:
+    await scenario.runner.submit(DialogSubmission("what is the weather?"))
+    await asyncio.wait_for(scenario.tool.called.wait(), timeout=TIMEOUT_SECONDS)
+    await collect_until(scenario.queue, is_delivered(scenario.tool.question))
+    live = await scenario.exchanges.list_live(scenario.runner.dialog_id)
+    assert [item.status for item in live] == [ExchangeStatus.AWAITING_USER]
+    await asyncio.wait_for(llm.stalled.wait(), timeout=TIMEOUT_SECONDS)
+    return live[0].id
+
+
+async def stage_cancel_with_unseen_reply(
+    runner: ConversationRunner,
+    queue: asyncio.Queue[ConversationEvent],
+    router: FakeRouter,
+) -> str:
+    await runner.submit(DialogSubmission("work"))
+    await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
+    exchange_id = first_history_exchange_id(runner)
+    router.decide_continue()
+    await runner.submit(DialogSubmission("more context"))
+    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+    return exchange_id
+
+
+def configure_router_cancel(router: FakeRouter, exchange_id: str) -> None:
+    router.action = RouteAction.COMMAND
+    router.decide_cancel(exchange_id)
+
+
+def running_process_exchange_id(runner: ConversationRunner, title: str) -> str:
+    exchange_id = next(p for p in runner._processes.values() if p.title == title).exchange_id
+    assert exchange_id is not None
+    return exchange_id
+
+
+async def stage_live_material_batch(
+    runner: ConversationRunner,
+    queue: asyncio.Queue[ConversationEvent],
+    exchanges: SqlAlchemyExchangeRepository,
+) -> str:
+    await runner.submit(DialogSubmission("start"))
+    await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
+    target_id = (await exchanges.list_live(runner.dialog_id))[0].id
+    for content in (MATERIAL_ONE, MATERIAL_TWO, MATERIAL_THREE):
+        await submit_material_message(runner, content, origin=None)
+    await wait_for_message_count(runner, MessageKind.MATERIAL, THREE_MATERIAL_MESSAGES)
+    assert await exchanges.find_collecting(runner.dialog_id) is None
+    return target_id
+
+
+async def collect_material_promotion_result(
+    scenario: MaterialPromotionScenario,
+    reaction: str,
+) -> list[ConversationEvent]:
+    await scenario.runner.promote_collected(scenario.collection.id)
+    events = await collect_until(scenario.queue, is_delivered(reaction))
+    await wait_for_async_condition(lambda: _is_answered(scenario.exchanges, scenario.collection.id))
+    assert len(scenario.router.calls) == 1
+    return events
+
+
+def assert_material_reparenting(
+    scenario: MaterialPromotionScenario, target_id: str, expected_count: int
+) -> None:
+    routed_exchanges, digest = scenario.router.calls[0]
+    assert [item.id for item in routed_exchanges] == [target_id]
+    assert f"forwarded {expected_count} message" in digest
+    for content in (MATERIAL_ONE, MATERIAL_TWO, MATERIAL_THREE):
+        assert content in digest
+    reparented = [m for m in scenario.runner.history() if m.kind is MessageKind.MATERIAL]
+    assert len(reparented) == expected_count
+    assert all(m.exchange_id == target_id for m in reparented)
+
+
 def test_loop_control_has_no_inject_channel() -> None:
     control = LoopControl()
     assert not hasattr(control, "inject")
@@ -786,41 +1220,51 @@ async def test_submit_streams_events_and_updates_narrative(
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        ScriptedLLM([reply()]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+        ScriptedLLM([reply()]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     events = await collect_until(queue, is_completed)
 
-    payloads = [event.payload for event in events]
-    assert any(isinstance(payload, TextDelta) for payload in payloads)
-    finished = [payload for payload in payloads if isinstance(payload, Finished)]
-    assert len(finished) == 1
-    assert finished[0].message.content == REPLY
-    done = completions(events)
-    assert [(item.title, item.status) for item in done] == [("hi", TaskStatus.DONE.value)]
-    seqs = [event.seq for event in events]
-    assert seqs == sorted(seqs)
+    assert any(isinstance(event.payload, TextDelta) for event in events)
+    assert [item.message.content for item in finished_payloads(events)] == [REPLY]
+    assert completion_statuses(events) == [("hi", TaskStatus.DONE.value)]
+    assert [event.seq for event in events] == sorted(event.seq for event in events)
     # every process is task-backed: the answer task links the final message
     task = await single_task(store, runner.dialog_id)
-    assert task.kind is TaskKind.ANSWER
     source_message = runner.history()[0]
     assert source_message.id is not None  # captured from the persist
-    assert task.input["prompt"] == "hi"
-    assert task.input["source_message_id"] == source_message.id
-    assert task.input["exchange_id"] == source_message.exchange_id
-    assert task.status is TaskStatus.DONE
+    assert (
+        task.kind,
+        task.input["prompt"],
+        task.input["source_message_id"],
+        task.input["exchange_id"],
+        task.status,
+    ) == (
+        TaskKind.ANSWER,
+        "hi",
+        source_message.id,
+        source_message.exchange_id,
+        TaskStatus.DONE,
+    )
     # the foreground stream was the delivery: the actor stamps it asynchronously
     await wait_for_task_state(store, task.id, lambda t: t.delivered_at is not None)
     assert not runner._pending_deliveries  # nothing left in the outbox
-    assert runner.history() == [
+    expected_history = [
         ChatMessage(role=MessageRole.USER, content="hi"),
         replace(reply(), task_id=task.id),
     ]
-    dialog = await get_dialog(session_factory)
-    assert await SqlAlchemyMessageRepository(session_factory).list(dialog.id) == runner.history()
+    assert runner.history() == expected_history
+    assert (
+        await SqlAlchemyMessageRepository(session_factory).list(
+            (await get_dialog(session_factory)).id
+        )
+        == expected_history
+    )
 
 
 async def test_finished_usage_is_persisted_on_the_assistant_message(
@@ -829,12 +1273,14 @@ async def test_finished_usage_is_persisted_on_the_assistant_message(
     usage = Usage(prompt_tokens=PROMPT_TOKENS, completion_tokens=COMPLETION_TOKENS)
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        UsageLLM([reply()], usage), ToolRegistry(), session_factory, ManagerOptions(store=store)
+        UsageLLM([reply()], usage),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     events = await collect_until(queue, is_completed)
 
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
@@ -862,14 +1308,13 @@ async def test_submit_and_answer_are_ledgered(
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         UsageLLM([reply()], usage),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store, limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     await collect_until(queue, is_completed)
 
     (user_event,) = gate.by_kind(UsageKind.USER_MESSAGE)
@@ -895,14 +1340,13 @@ async def test_multi_iteration_run_ledgers_the_accumulated_tokens(
     gate = RecordingLimitGate()
     manager = make_manager(
         UsageLLM([blocking_call(), reply()], usage),
-        quick_registry(),
-        session_factory,
+        ManagerEnvironment(quick_registry(), session_factory),
         ManagerOptions(limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     await collect_until(queue, is_completed)
 
     (answer,) = gate.by_kind(UsageKind.LLM_ANSWER)
@@ -922,17 +1366,16 @@ async def test_routing_llm_usage_is_ledgered(
     llm = ScriptedLLM([blocking_call(), reply("second final"), reply("first final")])
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=router, limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")  # a live exchange exists: the router is asked
+    await runner.submit(DialogSubmission("second"))  # a live exchange exists: the router is asked
     await collect_until(queue, is_delivered("second final"))
     tool.release.set()
     await collect_until(queue, is_delivered("first final"))
@@ -947,11 +1390,11 @@ async def test_branch_keeps_system_prompt_stable_and_envelopes_last_message(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([reply()])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     await collect_until(queue, is_completed)
 
     branch = llm.requests[0]
@@ -979,7 +1422,7 @@ async def test_stop_honors_a_cancellation_the_store_swallowed(
     it. The swallow is simulated here rather than provoked through the store,
     so the test pins the actor loop's contract on every version.
     """
-    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     entered = asyncio.Event()
 
@@ -1006,10 +1449,10 @@ async def test_evict_stops_the_runner_and_the_next_contact_rebuilds(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([reply(), reply(SECOND_REPLY)])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     await collect_until(queue, is_completed)
 
     await manager.evict(USER_ID, CHANNEL)
@@ -1026,14 +1469,18 @@ async def test_duplicate_client_message_id_is_skipped(
 ) -> None:
     router = FakeRouter()
     llm = ScriptedLLM([reply(), reply(SECOND_REPLY)])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(router=router)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi", client_message_id=FIRST_CLIENT_KEY)
+    await runner.submit(DialogSubmission("hi", client_message_id=FIRST_CLIENT_KEY))
     await collect_until(queue, is_completed)
-    await runner.submit("hi", client_message_id=FIRST_CLIENT_KEY)  # delivery retry
-    await runner.submit("again", client_message_id=SECOND_CLIENT_KEY)
+    await runner.submit(
+        DialogSubmission("hi", client_message_id=FIRST_CLIENT_KEY)
+    )  # delivery retry
+    await runner.submit(DialogSubmission("again", client_message_id=SECOND_CLIENT_KEY))
     await collect_until(queue, is_completed)
 
     # neither message needs the router (the first has nothing to belong to, the
@@ -1049,12 +1496,14 @@ async def test_context_overflow_compacts_and_retries_once(
     llm = OverflowLLM(overflows=1)
     compactor = FakeCompactor()
     manager = make_manager(
-        llm, ToolRegistry(), session_factory, ManagerOptions(compactor=compactor)
+        llm,
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(compactor=compactor),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     events = await collect_until(queue, is_completed)
 
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
@@ -1076,12 +1525,14 @@ async def test_second_context_overflow_fails_the_run(
     llm = OverflowLLM(overflows=RETRIED_CALLS)
     compactor = FakeCompactor()
     manager = make_manager(
-        llm, ToolRegistry(), session_factory, ManagerOptions(compactor=compactor)
+        llm,
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(compactor=compactor),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     events = await collect_until(queue, is_completed)
 
     failed = [e.payload for e in events if isinstance(e.payload, Failed)]
@@ -1097,11 +1548,11 @@ async def test_context_overflow_without_compaction_fails_immediately(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = OverflowLLM(overflows=1)  # NoopContextCompactor: compact_now -> False
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     events = await collect_until(queue, is_completed)
 
     failed = [e.payload for e in events if isinstance(e.payload, Failed)]
@@ -1115,12 +1566,14 @@ async def test_compaction_crash_fails_the_run_and_releases_the_slot(
     llm = OverflowLLM(overflows=1)
     compactor = FakeCompactor(compact_error=RuntimeError("store down"))
     manager = make_manager(
-        llm, ToolRegistry(), session_factory, ManagerOptions(compactor=compactor)
+        llm,
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(compactor=compactor),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     events = await collect_until(queue, is_completed)
 
     failed = [e.payload for e in events if isinstance(e.payload, Failed)]
@@ -1131,7 +1584,7 @@ async def test_compaction_crash_fails_the_run_and_releases_the_slot(
     assert [(item.title, item.status) for item in done] == [("hi", TaskStatus.FAILED.value)]
 
     # the crashed pump must not leak the slot: a follow-up runs a new foreground process
-    await runner.submit("again")
+    await runner.submit(DialogSubmission("again"))
     events = await collect_until(queue, is_completed)
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
     assert len(finished) == 1
@@ -1147,46 +1600,43 @@ async def test_answers_stream_concurrently_each_into_its_own_exchange(
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([blocking_call(), reply("second final"), reply("first final")])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first", client_message_id="101")
-    events = await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second", client_message_id="102")
+    events = await start_blocked_submission(
+        BlockingScenario(runner, queue, tool),
+        DialogSubmission("first", client_message_id="101"),
+    )
+    await runner.submit(DialogSubmission("second", client_message_id="102"))
     # the second answer streams to completion while the first is still blocked
     events += await collect_until(queue, is_delivered("second final"))
-    second_finished = next(e for e in events if isinstance(e.payload, Finished))
-    assert second_finished.payload.message.content == "second final"
-    assert second_finished.exchange_id is not None  # tagged for its own draft
+    second_finished = first_finished_event(events)
+    assert (
+        second_finished.payload.message.content,
+        second_finished.exchange_id is not None,
+    ) == ("second final", True)
 
     tool.release.set()
     events += await collect_until(queue, is_delivered("first final"))
 
-    # the two streams are tagged with different exchanges
-    tagged = {
-        e.exchange_id
-        for e in events
-        if isinstance(e.payload, Finished) and e.payload.message.content.endswith("final")
-    }
-    assert len(tagged) == TWO_PROCESSES
-    started_keys = [
-        e.payload.source_client_message_id for e in events if isinstance(e.payload, ProcessStarted)
-    ]
-    assert sorted(started_keys) == ["101", "102"]
+    assert_final_exchange_count(events, TWO_PROCESSES)
+    assert_started_client_keys(events, ["101", "102"])
     # the second run never saw the first question (someone else owes it)
-    queued_branch = llm.requests[1]
-    assert not any(m.role is MessageRole.USER and m.content == "first" for m in queued_branch)
-    tasks = await store.list(runner.dialog_id)
+    assert not any(
+        message.role is MessageRole.USER and message.content == "first"
+        for message in llm.requests[1]
+    )
+    tasks = await wait_for_all_task_states(
+        store,
+        runner.dialog_id,
+        lambda t: t.status is TaskStatus.DONE and t.delivered_at is not None,
+    )
     assert {task.title for task in tasks} == {"first", "second"}
-    for item in tasks:
-        await wait_for_task_state(
-            store, item.id, lambda t: t.status is TaskStatus.DONE and t.delivered_at is not None
-        )
-    history = runner.history()
-    assert [m.content for m in history] == ["first", "second", "second final", "first final"]
+    assert history_contents(runner) == ["first", "second", "second final", "first final"]
 
 
 async def test_inject_routed_message_is_pulled_into_the_next_iteration(
@@ -1196,36 +1646,42 @@ async def test_inject_routed_message_is_pulled_into_the_next_iteration(
     llm = ScriptedLLM([blocking_call(), reply("after")])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await start_blocked_submission(BlockingScenario(runner, queue, tool), DialogSubmission("start"))
     router.decide_continue()
-    await runner.submit("extra context")
+    await runner.submit(DialogSubmission("extra context"))
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     assert len(llm.requests) == 1  # INJECT is a no-op: no new run, no push channel
     tool.release.set()
     await collect_until(queue, is_completed)
 
     # the running process re-synced its branch: the message arrived at iteration 2
-    second_request = llm.requests[1]
-    contents = [m.content for m in second_request]
-    assert any(m.role is MessageRole.USER and "extra context" in m.content for m in second_request)
-    assert next(i for i, c in enumerate(contents) if "start" in c) < next(
-        i for i, content in enumerate(contents) if "extra context" in content
+    assert any(
+        message.role is MessageRole.USER and "extra context" in message.content
+        for message in llm.requests[1]
+    )
+    request_contents = [message.content for message in llm.requests[1]]
+    assert next(i for i, content in enumerate(request_contents) if "start" in content) < next(
+        i for i, content in enumerate(request_contents) if "extra context" in content
     )
     # the mid-run arrival carries the note (the model is told to fold it into
     # the answer); the run's own question carries its own marker
-    wrapped = CLARIFICATION_NOTE_TEMPLATE.format(content="extra context")
-    assert any(wrapped in m.content for m in second_request)
-    assert any(TASK_NOTE_TEMPLATE.format(content="start") in m.content for m in second_request)
+    assert any(
+        CLARIFICATION_NOTE_TEMPLATE.format(content="extra context") in message.content
+        for message in llm.requests[1]
+    )
+    assert any(
+        TASK_NOTE_TEMPLATE.format(content="start") in message.content for message in llm.requests[1]
+    )
     # a message the process did sync is not re-routed at finalize: one process only
     assert len(llm.requests) == RETRIED_CALLS
-    assert [m.content for m in runner.history()] == ["start", "extra context", "after"]
+    assert history_contents(runner) == ["start", "extra context", "after"]
 
 
 async def test_answer_events_carry_the_source_client_key(
@@ -1235,11 +1691,13 @@ async def test_answer_events_carry_the_source_client_key(
     Finished terminal carry the submit's client_message_id."""
     llm = ScriptedLLM([reply()])
     store = SqlAlchemyTaskStore(session_factory)
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi", client_message_id="777")
+    await runner.submit(DialogSubmission("hi", client_message_id="777"))
     events = await collect_until(queue, is_completed)
 
     started = [e.payload for e in events if isinstance(e.payload, ProcessStarted)]
@@ -1262,11 +1720,13 @@ async def test_empty_final_is_silence_not_an_empty_bubble(
     the narrative and nothing is queued for delivery."""
     llm = ScriptedLLM([reply("")])
     store = SqlAlchemyTaskStore(session_factory)
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     await collect_until(queue, is_completed)
 
     (task,) = await store.list(runner.dialog_id)
@@ -1361,31 +1821,25 @@ async def test_asking_the_user_keeps_the_exchange_open_and_resumes_it(
     llm = ScriptedLLM([blocking_call(), reply(""), reply("+21 in Moscow")])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit("what is the weather?")
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    await collect_until(queue, is_delivered(tool.question))
-
-    # the question reached the user and the obligation is NOT closed
-    live = await exchanges.list_live(runner.dialog_id)
-    assert [item.status for item in live] == [ExchangeStatus.AWAITING_USER]
-    assert live[0].pending_question == tool.question
-    await wait_for_condition(lambda: not runner._processes)  # the slot was freed
+    live = await park_asked_exchange(
+        AskingScenario(runner, queue, tool, exchanges, session_factory),
+        "what is the weather?",
+    )
+    assert (live.status, live.pending_question) == (ExchangeStatus.AWAITING_USER, tool.question)
 
     # the reply continues that exchange and a fresh run answers it
     router.decide_continue()
-    await runner.submit("Moscow")
+    await runner.submit(DialogSubmission("Moscow"))
     await collect_until(queue, is_delivered("+21 in Moscow"))
-
-    await wait_for_async_condition(
-        lambda: _is_answered(exchanges, live[0].id)
-    )  # the same obligation, now closed by a real answer
-    assert [m.content for m in runner.history()] == [
+    await wait_for_async_condition(lambda: _is_answered(exchanges, live.id))
+    assert history_contents(runner) == [
         "what is the weather?",
         tool.question,
         "Moscow",
@@ -1411,33 +1865,30 @@ async def test_a_run_that_asked_says_nothing_more(
     llm = ScriptedLLM([blocking_call(), reply(filler), reply("+21 in Moscow")])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit("what is the weather?")
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    events = await collect_until(queue, is_delivered(tool.question))
-    await wait_for_condition(lambda: not runner._processes)
-
-    # the filler reached neither the user nor the narrative
-    while not queue.empty():
-        events.append(queue.get_nowait())
-    assert not any(filler in _rendered(event) for event in events)
-    assert [m.content for m in runner.history()] == ["what is the weather?", tool.question]
+    live, question_events = await park_asked_exchange_with_events(
+        AskingScenario(runner, queue, tool, exchanges, session_factory),
+        "what is the weather?",
+    )
+    assert not any(
+        filler in _rendered(event) for event in await drain_queue(question_events, queue)
+    )
+    assert history_contents(runner) == ["what is the weather?", tool.question]
 
     # and the obligation still waits for the user, question intact
-    live = await exchanges.list_live(runner.dialog_id)
-    assert [item.status for item in live] == [ExchangeStatus.AWAITING_USER]
-    assert live[0].pending_question == tool.question
+    assert (live.status, live.pending_question) == (ExchangeStatus.AWAITING_USER, tool.question)
 
     # so the reply continues that same exchange rather than opening a new one
     router.decide_continue()
-    await runner.submit("Moscow")
+    await runner.submit(DialogSubmission("Moscow"))
     await collect_until(queue, is_delivered("+21 in Moscow"))
-    await wait_for_async_condition(lambda: _is_answered(exchanges, live[0].id))
+    await wait_for_async_condition(lambda: _is_answered(exchanges, live.id))
     assert len(await exchanges.list_live(runner.dialog_id)) == 0
 
 
@@ -1457,17 +1908,19 @@ async def test_late_message_reopens_the_exchange(
     router = FakeRouter()
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        llm, quick_registry(), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(quick_registry(), session_factory),
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
+    await runner.submit(DialogSubmission("start"))
     await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
 
     # the message lands after the process's last sync: the run finishes without it
     router.decide_continue()
-    await runner.submit("extra context")
+    await runner.submit(DialogSubmission("extra context"))
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     llm.release.set()
     await collect_completions(queue, 2)
@@ -1476,13 +1929,12 @@ async def test_late_message_reopens_the_exchange(
     # message) and a fresh run picks it up — durable state instead of the
     # requeue heuristic it replaced
     assert len(llm.requests) == EXPECTED_LLM_CALLS
-    third_request = llm.requests[2]
     assert any(
-        m.role is MessageRole.USER
-        and CLARIFICATION_NOTE_TEMPLATE.format(content="extra context") in m.content
-        for m in third_request
+        message.role is MessageRole.USER
+        and CLARIFICATION_NOTE_TEMPLATE.format(content="extra context") in message.content
+        for message in llm.requests[2]
     )
-    assert [m.content for m in runner.history()] == [
+    assert history_contents(runner) == [
         "start",
         "extra context",
         "first final",
@@ -1499,28 +1951,29 @@ async def test_bring_back_starts_a_new_answer_process(
         [blocking_call(), reply("second final"), reply("bring-back answer"), reply("first final")]
     )
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")
+    await start_blocked_submission(BlockingScenario(runner, queue, tool), DialogSubmission("first"))
+    await runner.submit(DialogSubmission("second"))
     events = await collect_until(queue, is_delivered("second final"))
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     # wait for "second" to settle: its question then renders as plain history
     await wait_for_async_condition(lambda: _only_first_is_live(exchanges, runner.dialog_id))
-    await runner.submit("bring back the first one")
+    await runner.submit(DialogSubmission("bring back the first one"))
     events += await collect_until(queue, is_delivered("bring-back answer"))
 
     # there is no promote route: a "bring back" request is a plain new
     # exchange; its branch sees the whole narrative — "second" is answered
     # history, while "first" is still owed by a live run (dropped)
-    bring_back_request = llm.requests[2]
-    assert [m.content for m in bring_back_request[1:-1]] == ["second", "second final"]
-    assert "bring back the first one" in bring_back_request[-1].content
+    assert (
+        [message.content for message in llm.requests[2][1:-1]],
+        "bring back the first one" in llm.requests[2][-1].content,
+    ) == (["second", "second final"], True)
 
     tool.release.set()
     events += await collect_until(queue, is_delivered("first final"))
@@ -1528,11 +1981,13 @@ async def test_bring_back_starts_a_new_answer_process(
         queue, lambda e: isinstance(e.payload, ProcessCompleted) and e.payload.title == "first"
     )
 
-    done = completions(events)
-    assert {item.title for item in done} == {"first", "second", "bring back the first one"}
-    tasks = await store.list(runner.dialog_id)
-    await wait_for_condition(lambda: all(t.status is TaskStatus.DONE for t in tasks))
-    assert [m.content for m in runner.history()] == [
+    assert {item.title for item in completions(events)} == {
+        "first",
+        "second",
+        "bring back the first one",
+    }
+    await wait_for_all_task_states(store, runner.dialog_id, lambda t: t.status is TaskStatus.DONE)
+    assert history_contents(runner) == [
         "first",
         "second",
         "second final",
@@ -1551,34 +2006,29 @@ async def test_router_cancel_stops_the_process(
     router = FakeRouter()
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await start_blocked_submission(BlockingScenario(runner, queue, tool), DialogSubmission("start"))
 
     router.action = RouteAction.COMMAND  # a pure stop, nothing to answer
     router.decide_cancel_all()
-    await runner.submit("stop it")
+    await runner.submit(DialogSubmission("stop it"))
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     tool.release.set()
     events = await collect_until(queue, is_completed)
 
     assert any(isinstance(e.payload, Cancelled) for e in events)
-    done = completions(events)
-    assert [(item.title, item.status) for item in done] == [("start", TaskStatus.CANCELLED.value)]
+    assert completion_statuses(events) == [("start", TaskStatus.CANCELLED.value)]
     # a cancel-routed message is a command, not a question: no re-queue, no answer
     assert runner.history() == [
         ChatMessage(role=MessageRole.USER, content="start"),
         ChatMessage(role=MessageRole.USER, content="stop it"),
     ]
-    task = await single_task(store, runner.dialog_id)
-    assert task.status is TaskStatus.CANCELLED
+    assert (await single_task(store, runner.dialog_id)).status is TaskStatus.CANCELLED
 
 
 async def test_cancel_api_cancels_answer_runs_but_not_run_tasks(
@@ -1589,12 +2039,14 @@ async def test_cancel_api_cancels_answer_runs_but_not_run_tasks(
     store = SqlAlchemyTaskStore(session_factory)
     llm = BranchLLM(main=[blocking_call()], background=[reply(TASK_RESULT)])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
@@ -1615,21 +2067,20 @@ async def test_process_limit_delivers_a_canned_notice_without_an_llm_run(
     tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), reply("after")])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(max_processes=ONE_PROCESS)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("new question")
+    await start_blocked_submission(BlockingScenario(runner, queue, tool), DialogSubmission("start"))
+    await runner.submit(DialogSubmission("new question"))
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_REFUSAL)
     assert len(llm.requests) == 1  # the notice needs no LLM run
     notice = runner.history()[2]
     assert notice.role is MessageRole.ASSISTANT
-    assert "process limit (1)" in notice.content
-    assert "start" in notice.content
+    assert "process limit (1)" in notice.content and "start" in notice.content
     # phase 4: the notice is delivered immediately, its own message
     events = await collect_until(queue, is_delivered(notice.content))
     assert any(isinstance(e.payload, Finished) for e in events)
@@ -1646,8 +2097,7 @@ async def test_process_limit_notice_flushes_immediately_when_foreground_is_free(
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         llm,
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -1656,25 +2106,22 @@ async def test_process_limit_notice_flushes_immediately_when_foreground_is_free(
     spawned = await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
     assert TASK_TITLE in spawned or "task" in spawned
 
-    await runner.submit("new question")
+    await runner.submit(DialogSubmission("new question"))
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
-    events = await collect_until(queue, is_delivered(runner.history()[1].content))
+    notice = runner.history()[1]
+    events = await collect_until(queue, is_delivered(notice.content))
 
     # the slot is taken by the background task: a canned notice, no report run
-    notice = runner.history()[1]
-    assert notice.role is MessageRole.ASSISTANT
-    assert "process limit (1)" in notice.content
-    assert TASK_TITLE in notice.content
+    assert_notice_text(notice, TASK_TITLE)
     assert llm.main_requests == []
-    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert [item.message.content for item in finished] == [notice.content]
+    assert [item.message.content for item in finished_payloads(events)] == [notice.content]
 
     llm.background_release.set()
-    events = await collect_until(queue, is_delivered(TASK_RESULT))
-
+    await collect_until(queue, is_delivered(TASK_RESULT))
     task = await single_task(store, runner.dialog_id)
-    assert task.status is TaskStatus.DONE
-    assert task.delivered_at is not None
+    assert (
+        await wait_for_task_state(store, task.id, lambda item: item.delivered_at is not None)
+    ).status is TaskStatus.DONE
     assert not runner._pending_deliveries
 
 
@@ -1684,14 +2131,14 @@ async def test_spawn_task_refuses_over_the_process_limit(
     tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), reply("after")])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(max_processes=ONE_PROCESS)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await start_blocked_submission(BlockingScenario(runner, queue, tool), DialogSubmission("start"))
 
     refusal = await runner.spawn_task("another job", "do it")
 
@@ -1736,7 +2183,9 @@ async def test_delete_task_stops_a_live_background_process(
     llm = BranchLLM(main=[reply("pong")], background=[reply(TASK_RESULT)])
     llm.gate_background = True
     store = SqlAlchemyTaskStore(session_factory)
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -1750,16 +2199,13 @@ async def test_delete_task_stops_a_live_background_process(
     events = await collect_until(queue, is_completed)
 
     assert outcome is TaskDeleteOutcome.DELETED
-    assert [(item.title, item.status) for item in completions(events)] == [
-        (TASK_TITLE, TaskStatus.CANCELLED.value)
-    ]
+    assert completion_statuses(events) == [(TASK_TITLE, TaskStatus.CANCELLED.value)]
     # the stopped task's row is kept as CANCELLED and nothing is delivered
-    row = await single_task(store, runner.dialog_id)
-    assert row.status is TaskStatus.CANCELLED
+    assert (await single_task(store, runner.dialog_id)).status is TaskStatus.CANCELLED
     assert not runner._pending_deliveries
 
     # the actor survived the cancelled task's termination notice
-    await runner.submit("ping")
+    await runner.submit(DialogSubmission("ping"))
     await collect_completions(queue, 1)
     assert runner.history()[-1].content == "pong"
 
@@ -1767,7 +2213,7 @@ async def test_delete_task_stops_a_live_background_process(
 async def test_delete_task_reports_not_running_for_an_unknown_task(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
     assert await runner.delete_task("missing") is TaskDeleteOutcome.NOT_RUNNING
@@ -1784,7 +2230,9 @@ async def test_delete_task_from_inside_its_own_process_is_refused(
         main=[],
         background=[self_delete_call(), reply(TASK_RESULT)],
     )
-    manager = make_manager(llm, registry, session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(registry, session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -1812,32 +2260,23 @@ async def test_task_create_tool_runs_background_process_and_delivers(
     )
     llm.gate_background = True
     store = SqlAlchemyTaskStore(session_factory)
-    manager = make_manager(llm, registry, session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(registry, session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("do it in the background")
+    await runner.submit(DialogSubmission("do it in the background"))
     events = await collect_completions(queue, 1)
     llm.background_release.set()
     events += await collect_until(queue, is_delivered(TASK_RESULT))
 
-    # the result is delivered verbatim; no report run rephrases it
-    assert [m.content for m in runner.history()] == [
-        "do it in the background",
-        "spawn confirmed",
-        TASK_RESULT,
-    ]
     tasks = {task.kind: task for task in await store.list(runner.dialog_id)}
-    assert tasks[TaskKind.RUN].status is TaskStatus.DONE
-    assert tasks[TaskKind.RUN].delivered_at is not None
-    assert runner.history()[-1].task_id == tasks[TaskKind.RUN].id
-    finished = [e.payload for e in events if isinstance(e.payload, Finished)]
-    assert [item.message.content for item in finished] == ["spawn confirmed", TASK_RESULT]
+    assert_task_create_delivery(runner, tasks, events)
     assert len(llm.main_requests) == RETRIED_CALLS  # the tool iteration and the final answer
-    background_request = llm.background_requests[0]
-    assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
-    assert background_request[1].role is MessageRole.USER
-    assert background_request[1].content.endswith(TASK_PROMPT)  # date envelope + prompt
+    assert llm.background_requests[0][0].content == BACKGROUND_TASK_PROMPT
+    assert llm.background_requests[0][1].role is MessageRole.USER
+    assert llm.background_requests[0][1].content.endswith(TASK_PROMPT)
 
 
 async def test_run_task_result_delivers_immediately_even_mid_stream(
@@ -1850,29 +2289,28 @@ async def test_run_task_result_delivers_immediately_even_mid_stream(
     llm = BranchLLM(main=[blocking_call(), reply("after")], background=[reply(TASK_RESULT)])
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await start_blocked_submission(BlockingScenario(runner, queue, tool), DialogSubmission("start"))
 
     await runner.spawn_task(TASK_TITLE, TASK_PROMPT)
     # delivered while the answer stream is still blocked in its tool
     events = await collect_until(queue, is_delivered(TASK_RESULT))
-    delivered = next(e for e in events if isinstance(e.payload, Finished))
+    delivered = next(event for event in events if isinstance(event.payload, Finished))
     assert delivered.exchange_id is None  # a RUN result owns no exchange
-    (task,) = [t for t in await store.list(runner.dialog_id) if t.kind is TaskKind.RUN]
+    (task,) = [item for item in await store.list(runner.dialog_id) if item.kind is TaskKind.RUN]
     await wait_for_task_state(store, task.id, lambda t: t.delivered_at is not None)
     assert not runner._pending_deliveries
 
     tool.release.set()
     events += await collect_until(queue, is_delivered("after"))
     # the answer run pulled the background final into its next iteration
-    second_request = llm.main_requests[1]
-    assert any(TASK_RESULT in m.content for m in second_request)
+    assert any(TASK_RESULT in message.content for message in llm.main_requests[1])
 
 
 class FailingMarkDeliveredStore(InMemoryTaskStore):
@@ -1894,7 +2332,9 @@ async def test_delivery_is_retried_when_marking_delivered_fails(
 ) -> None:
     store = FailingMarkDeliveredStore()
     llm = BranchLLM(main=[reply("pong")], background=[reply(TASK_RESULT)])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
@@ -1907,7 +2347,7 @@ async def test_delivery_is_retried_when_marking_delivered_fails(
     assert len(runner._pending_deliveries) == 1
 
     # the next flush (any termination with a free foreground) retries it
-    await runner.submit("ping")
+    await runner.submit(DialogSubmission("ping"))
     events += await collect_until(
         queue, lambda e: isinstance(e.payload, TextDelta) and e.payload.text == TASK_RESULT
     )
@@ -1926,11 +2366,13 @@ async def test_interrupted_turn_is_salvaged_into_the_narrative(
 ) -> None:
     llm = StallingLLM()
     store = SqlAlchemyTaskStore(session_factory)
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("work")
+    await runner.submit(DialogSubmission("work"))
     await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
     await runner.cancel()
     llm.release.set()
@@ -1940,13 +2382,7 @@ async def test_interrupted_turn_is_salvaged_into_the_narrative(
     done = completions(events)
     assert [item.status for item in done] == [TaskStatus.CANCELLED.value]
     history = runner.history()
-    assert [message.role for message in history] == [
-        MessageRole.USER,
-        MessageRole.ASSISTANT,
-        MessageRole.SYSTEM,
-    ]
-    assert history[1].content == PARTIAL
-    assert history[2].content == INTERRUPTED_NOTE
+    assert_partial_history(history)
     task = await single_task(store, runner.dialog_id)
     assert task.status is TaskStatus.CANCELLED  # the row is kept, nothing delivered
     assert history[1].task_id == task.id
@@ -1959,11 +2395,11 @@ async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
 ) -> None:
     tool = BlockingTool()
     llm = ToolStallingLLM()
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(blocking_registry(tool), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("work")
+    await runner.submit(DialogSubmission("work"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await runner.cancel()
     llm.release.set()
@@ -1974,13 +2410,7 @@ async def test_interrupted_tool_turn_is_salvaged_into_the_narrative(
     done = completions(events)
     assert [item.status for item in done] == [TaskStatus.CANCELLED.value]
     history = runner.history()
-    assert [message.role for message in history] == [
-        MessageRole.USER,
-        MessageRole.ASSISTANT,
-        MessageRole.SYSTEM,
-    ]
-    assert history[1].content == PARTIAL  # salvaged despite the trailing tool reply
-    assert history[2].content == INTERRUPTED_NOTE
+    assert_partial_history(history)
     dialog = await get_dialog(session_factory)
     assert await SqlAlchemyMessageRepository(session_factory).list(dialog.id) == history
 
@@ -1989,14 +2419,14 @@ async def test_narrative_is_rebuilt_after_manager_restart(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([blocking_call(), reply("after")])
-    manager = make_manager(llm, quick_registry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(quick_registry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
+    await runner.submit(DialogSubmission("start"))
     await collect_until(queue, is_completed)
 
-    restarted = make_manager(ScriptedLLM([]), quick_registry(), session_factory)
+    restarted = make_manager(ScriptedLLM([]), ManagerEnvironment(quick_registry(), session_factory))
     restored = await restarted.get_or_create_runner(USER_ID, CHANNEL)
 
     assert [m.content for m in restored.history()] == ["start", "after"]
@@ -2023,12 +2453,14 @@ async def test_a_cron_firing_leaves_a_dialog_another_instance_is_running(
     polling every second a user's conversation would hop between them for no
     reason at all.
     """
-    manager = make_manager(BranchLLM(main=[], background=[]), ToolRegistry(), session_factory)
+    manager = make_manager(
+        BranchLLM(main=[], background=[]), ManagerEnvironment(ToolRegistry(), session_factory)
+    )
     dialog = await get_dialog(session_factory)
     claims = SqlAlchemyClaimRepository(session_factory)
     held = await claims.claim(dialog.id, PEER_NODE)
 
-    outcome = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    outcome = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
 
     assert outcome is WakeOutcome.NOT_OURS
     # the peer still owns it at the same generation: nothing was taken
@@ -2044,8 +2476,7 @@ async def test_a_settled_collection_is_left_to_the_instance_that_owns_the_dialog
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         BranchLLM(main=[], background=[]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store),
     )
     dialog = await get_dialog(session_factory)
@@ -2065,10 +2496,10 @@ async def test_background_work_adopts_a_dialog_nobody_is_running(
     idle user's cron still has to fire somewhere, and an unclaimed dialog is
     exactly what a fresh instance sees for all of them."""
     llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     dialog = await get_dialog(session_factory)
 
-    outcome = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    outcome = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
 
     assert outcome is WakeOutcome.DELIVERED
     assert await SqlAlchemyClaimRepository(session_factory).current_generation(dialog.id)
@@ -2082,14 +2513,13 @@ async def test_a_stale_claim_does_not_hold_background_work_hostage(
     llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
     manager = make_manager(
         llm,
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(stale_after_seconds=0.0),  # every claim reads as dead
     )
     dialog = await get_dialog(session_factory)
     await SqlAlchemyClaimRepository(session_factory).claim(dialog.id, PEER_NODE)
 
-    outcome = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    outcome = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
 
     assert outcome is WakeOutcome.DELIVERED
 
@@ -2099,32 +2529,22 @@ async def test_wake_runs_cron_tagged_background_process(
 ) -> None:
     llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
     store = SqlAlchemyTaskStore(session_factory)
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    delivered = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
     assert delivered is WakeOutcome.DELIVERED
     events = await collect_until(queue, is_delivered(TASK_RESULT))
 
-    # exactly one delivered message, with the verbatim result and the task link
     finished = [e.payload for e in events if isinstance(e.payload, Finished)]
     assert len(finished) == 1
     task = await single_task(store, runner.dialog_id)
-    assert finished[0].message == ChatMessage(
-        role=MessageRole.ASSISTANT, content=TASK_RESULT, task_id=task.id
-    )
-    assert task.status is TaskStatus.DONE
-    assert task.delivered_at is not None
-    assert task.input["cron_job_id"] == CRON_JOB_ID
-    assert isinstance(task.input["fired_at"], str)  # the parent linkage timestamp
-    assert runner.history() == [finished[0].message]
-    assert not runner._pending_deliveries
-    assert llm.main_requests == []  # no report run
-    background_request = llm.background_requests[0]
-    assert background_request[0].content == BACKGROUND_TASK_PROMPT  # no volatile date
-    assert background_request[1].role is MessageRole.USER
-    assert background_request[1].content.endswith(CRON_PROMPT)  # date envelope + prompt
+    assert_cron_delivery_message(runner, task, finished[0])
+    assert llm.main_requests == []
+    assert_background_prompt(llm.background_requests[0], CRON_PROMPT)
 
 
 EXHAUSTED = LimitVerdict(allowed=False, reason="daily_tokens", used=1000, limit=1000)
@@ -2140,12 +2560,14 @@ async def test_exhausted_budget_withholds_the_run_but_keeps_the_message(
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([])  # any LLM call would pop an empty script and fail
     manager = make_manager(
-        llm, ToolRegistry(), session_factory, ManagerOptions(store=store, limits=gate)
+        llm,
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store, limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     events = await collect_until(
         queue,
         lambda e: isinstance(e.payload, Finished),  # the notice delivery
@@ -2168,14 +2590,16 @@ async def test_exhausted_budget_notices_once_per_dialog_and_day(
     gate = RecordingLimitGate()
     gate.run_verdict = EXHAUSTED
     manager = make_manager(
-        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(limits=gate)
+        ScriptedLLM([]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first try")
+    await runner.submit(DialogSubmission("first try"))
     await collect_until(queue, lambda e: isinstance(e.payload, Finished))
-    await runner.submit("second try")
+    await runner.submit(DialogSubmission("second try"))
     await wait_for_message(runner, "second try")
     await asyncio.sleep(POLL_SECONDS * 5)  # give a second notice a chance to appear
 
@@ -2190,14 +2614,16 @@ async def test_exhausted_budget_skips_a_cron_wake_with_one_note_per_day(
     gate.run_verdict = EXHAUSTED
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store, limits=gate)
+        ScriptedLLM([]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store, limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    first = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    first = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
     events = await collect_until(queue, lambda e: isinstance(e.payload, Finished))
-    second = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    second = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
 
     assert first is WakeOutcome.LIMITED
     assert second is WakeOutcome.LIMITED
@@ -2218,7 +2644,9 @@ async def test_exhausted_budget_refuses_spawn_task_with_text(
     gate.run_verdict = EXHAUSTED
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store, limits=gate)
+        ScriptedLLM([]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store, limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
@@ -2251,12 +2679,14 @@ async def test_enabled_features_reach_the_tool_context(
     registry = ToolRegistry()
     registry.register(SpyTool())
     manager = make_manager(
-        ScriptedLLM([reply()]), registry, session_factory, ManagerOptions(limits=gate)
+        ScriptedLLM([reply()]),
+        ManagerEnvironment(registry, session_factory),
+        ManagerOptions(limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     await collect_until(queue, is_completed)
 
     assert seen_specs == ["frozenset()"]
@@ -2270,14 +2700,13 @@ async def test_a_cron_run_is_ledgered_with_cron_origin(
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         UsageLLM([reply(TASK_RESULT)], usage),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store, limits=gate),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    delivered = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
     assert delivered is WakeOutcome.DELIVERED
     await collect_until(queue, is_delivered(TASK_RESULT))
 
@@ -2294,11 +2723,13 @@ async def test_wake_delivers_a_failed_event_for_a_failed_cron_task(
 ) -> None:
     llm = FailingTaskLLM()
     store = SqlAlchemyTaskStore(session_factory)
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    delivered = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    delivered = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
     assert delivered is WakeOutcome.DELIVERED
     events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
 
@@ -2317,12 +2748,14 @@ async def test_two_cron_results_are_delivered_separately(
 ) -> None:
     llm = BranchLLM(main=[], background=[reply("report one"), reply("report two")])
     store = SqlAlchemyTaskStore(session_factory)
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await manager.wake(USER_ID, CHANNEL, "first job", CRON_PROMPT, CRON_JOB_ID)
-    await manager.wake(USER_ID, CHANNEL, "second job", CRON_PROMPT, "cron-job-2")
+    await manager.wake(CronWake(USER_ID, CHANNEL, "first job", CRON_PROMPT, CRON_JOB_ID))
+    await manager.wake(CronWake(USER_ID, CHANNEL, "second job", CRON_PROMPT, "cron-job-2"))
     events = await collect_completions(queue, 2)
     events += await collect_until(queue, is_delivered("report two"))
 
@@ -2347,25 +2780,20 @@ async def test_wake_over_the_process_limit_publishes_a_canned_notice(
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await start_blocked_submission(BlockingScenario(runner, queue, tool), DialogSubmission("start"))
 
     delivered = await runner.wake(CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
     assert delivered is False
 
     note = runner.history()[-1]
-    assert note.role is MessageRole.ASSISTANT
+    assert_notice_text(note, "start")
     assert f"Cron job '{CRON_TITLE}' could not start" in note.content
-    assert "process limit (1)" in note.content
-    assert "start" in note.content
     # no RUN task was created for the refused cron firing (the answer task of
     # the foreground question is the only row)
     assert [task for task in await store.list(runner.dialog_id) if task.kind is TaskKind.RUN] == []
@@ -2399,14 +2827,13 @@ async def test_cron_task_outcome_is_reported_to_the_listener(
     listener = RecordingOutcomeListener()
     manager = make_manager(
         llm,
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(listener=listener),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
     await collect_completions(queue, 1)
 
     (reported,) = listener.calls
@@ -2422,8 +2849,7 @@ async def test_plain_task_outcome_is_not_reported(
     listener = RecordingOutcomeListener()
     manager = make_manager(
         llm,
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(listener=listener),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -2442,14 +2868,13 @@ async def test_listener_failure_does_not_break_finalize(
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         llm,
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store, listener=RecordingOutcomeListener(fail=True)),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
     await collect_until(queue, is_delivered(TASK_RESULT))
 
     # finalize and delivery completed despite the listener failure
@@ -2481,8 +2906,7 @@ async def test_actor_survives_a_failing_command(
     tool = BlockingTool()
     manager = make_manager(
         ScriptedLLM([blocking_call(), reply(), reply()]),
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=BoomingRouter()),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -2490,10 +2914,10 @@ async def test_actor_survives_a_failing_command(
 
     # the first message needs no router; the next two reach it while the first
     # exchange is still live — one raises, and the actor must survive it
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")  # router raises: the actor logs and stays alive
-    await runner.submit("third")  # processed normally, proving the actor survived
+    await runner.submit(DialogSubmission("second"))  # router raises: the actor logs and stays alive
+    await runner.submit(DialogSubmission("third"))  # processed normally, proving the actor survived
     tool.release.set()
 
     events = await collect_completions(queue, 2)
@@ -2534,15 +2958,14 @@ async def test_actor_dies_when_a_failing_command_races_its_cancellation(
     tool = BlockingTool()
     manager = make_manager(
         ScriptedLLM([blocking_call(), reply()]),
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
-    await runner.submit("hi")  # no live exchange yet: the router is skipped
+    await runner.submit(DialogSubmission("hi"))  # no live exchange yet: the router is skipped
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("again")  # now the router is reached — and blocks
+    await runner.submit(DialogSubmission("again"))  # now the router is reached — and blocks
     await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
     tool.release.set()
     await runner.stop()  # cancels the actor mid-dispatch
@@ -2573,8 +2996,7 @@ async def test_process_slot_released_when_finalize_fails(
     store = FailingFinalizeStore()
     manager = make_manager(
         ScriptedLLM([reply("bg1"), reply("bg2")]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -2611,8 +3033,7 @@ async def test_concurrent_spawns_do_not_exceed_the_process_limit(
     llm = BranchLLM(main=[], background=[reply(TASK_RESULT)])
     manager = make_manager(
         llm,
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -2669,14 +3090,15 @@ async def test_spawn_during_a_pending_start_new_does_not_exceed_the_limit(
     llm = BranchLLM(main=[reply("answer")], background=[])
     manager = make_manager(
         llm,
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(compactor=compactor, max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hello")  # the default empty route decision maps to START_NEW
+    await runner.submit(
+        DialogSubmission("hello")
+    )  # the default empty route decision maps to START_NEW
     await asyncio.wait_for(compactor.entered.wait(), timeout=TIMEOUT_SECONDS)
     spawn = asyncio.create_task(runner.spawn_task(TASK_TITLE, TASK_PROMPT))
     await asyncio.sleep(0)  # let the spawn reach the spawn lock
@@ -2697,11 +3119,11 @@ async def test_stop_cancels_and_awaits_actor_and_pumps(
 ) -> None:
     tool = BlockingTool()
     llm = ToolStallingLLM()
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(blocking_registry(tool), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("work")
+    await runner.submit(DialogSubmission("work"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
 
     # the pump is stalled mid-stream: stop must cancel it directly, not hang
@@ -2721,8 +3143,7 @@ async def test_stop_closes_only_the_own_dialogs_compaction(
     compactor = FakeCompactor()
     manager = make_manager(
         ScriptedLLM([reply()]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(compactor=compactor),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -2735,7 +3156,9 @@ async def test_stop_closes_only_the_own_dialogs_compaction(
 async def test_stop_all_stops_and_deregisters_every_runner(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([reply()]), ToolRegistry(), session_factory)
+    manager = make_manager(
+        ScriptedLLM([reply()]), ManagerEnvironment(ToolRegistry(), session_factory)
+    )
     first = await manager.get_or_create_runner(USER_ID, CHANNEL)
     second = await manager.get_or_create_runner("user-2", CHANNEL)
 
@@ -2752,11 +3175,18 @@ async def test_stop_all_stops_and_deregisters_every_runner(
 # --- startup recovery ----------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class RecoveryTask:
+    """Identity and chronology of a task inserted for recovery tests."""
+
+    id: str
+    created_at: datetime | None = None
+
+
 async def add_exchange_task(
     session_factory: async_sessionmaker[AsyncSession],
     exchange_id: str,
-    task_id: str,
-    created_at: datetime | None = None,
+    draft: RecoveryTask,
 ) -> Task:
     """Store a RUNNING answer task of the exchange — ownership, as derived.
 
@@ -2766,14 +3196,14 @@ async def add_exchange_task(
     """
     dialog = await get_dialog(session_factory)
     task = Task(
-        id=task_id,
+        id=draft.id,
         dialog_id=dialog.id,
-        title=task_id,
+        title=draft.id,
         kind=TaskKind.ANSWER,
         exchange_id=exchange_id,
-        input={"prompt": task_id, "exchange_id": exchange_id},
+        input={"prompt": draft.id, "exchange_id": exchange_id},
         status=TaskStatus.RUNNING,
-        created_at=created_at if created_at is not None else utc_now(),
+        created_at=draft.created_at if draft.created_at is not None else utc_now(),
         started_at=utc_now(),
     )
     await SqlAlchemyTaskStore(session_factory).add(task)
@@ -2801,7 +3231,9 @@ async def test_recover_interrupted_restarts_orphaned_run_tasks(
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([reply(TASK_RESULT)])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog)
     await store.add(task)
@@ -2829,11 +3261,16 @@ async def test_recover_interrupted_restarts_orphaned_answer_tasks(
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([reply("re-answer")])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     dialog = await get_dialog(session_factory)
     # the question lives in the narrative, persisted before the crash
     await SqlAlchemyMessageRepository(session_factory).append(
-        dialog.id, ChatMessage(role=MessageRole.USER, content="unanswered question")
+        MessageAppend(
+            dialog.id,
+            ChatMessage(role=MessageRole.USER, content="unanswered question"),
+        )
     )
     task = orphaned_task(
         dialog,
@@ -2864,8 +3301,7 @@ async def test_recover_interrupted_reports_cron_outcome_after_the_restart(
     llm = ScriptedLLM([reply("one"), reply("two")])
     manager = make_manager(
         llm,
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store, listener=listener),
     )
     dialog = await get_dialog(session_factory)
@@ -2903,22 +3339,15 @@ async def test_queued_answer_knows_its_question_after_being_overtaken(
     llm = ScriptedLLM([blocking_call(), reply("seagull answer"), reply("weather answer")])
     router = GatedRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
-
-    await runner.submit("why so many seagulls?")
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    router.gate_armed = True
-    await runner.submit("what is the weather?")
-    await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
-
-    # the foreground finishes while the router still holds the second message
-    tool.release.set()
-    await collect_until(queue, is_completed)
-    router.release.set()
-    events = await collect_until(queue, is_delivered("weather answer"))
+    events = await overtake_queued_answer(
+        BlockingScenario(runner, queue, tool), router, "what is the weather?"
+    )
 
     # the message became visible only after routing, so it sits AFTER the
     # foreground's final — and it is marked as this run's task either way
@@ -2931,8 +3360,9 @@ async def test_queued_answer_knows_its_question_after_being_overtaken(
     # and the user actually gets the second answer
     assert any(isinstance(e.payload, Finished) for e in events)
     tasks = {task.title: task for task in await store.list(runner.dialog_id)}
-    weather = tasks["what is the weather?"]
-    await wait_for_task_state(store, weather.id, lambda t: t.result == "weather answer")
+    await wait_for_task_state(
+        store, tasks["what is the weather?"].id, lambda t: t.result == "weather answer"
+    )
     await wait_for_condition(lambda: [m.content for m in runner.history()][-1] == "weather answer")
 
 
@@ -2948,32 +3378,22 @@ async def test_cancel_takes_absorbed_clarifications_with_it(
     llm = ScriptedLLM([blocking_call(), blocking_call(), reply("never")])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
-
-    await runner.submit("first")
-    await asyncio.wait_for(tool.started[0].wait(), timeout=TIMEOUT_SECONDS)
     router.decide_continue()
-    await runner.submit("уточнение")
-    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
-    tool.release[0].set()  # iteration 2: the sync absorbs the clarification
-    await asyncio.wait_for(tool.started[1].wait(), timeout=TIMEOUT_SECONDS)
+    events = await cancel_absorbed_clarification(runner, queue, tool)
     assert any(
         CLARIFICATION_NOTE_TEMPLATE.format(content="уточнение") in m.content
         for m in llm.requests[1]
     )
 
-    await runner.cancel()
-    events = await collect_until(queue, is_completed)
-    tool.release[1].set()
-
     (task,) = await store.list(runner.dialog_id)
     assert task.status is TaskStatus.CANCELLED
-    # the absorbed clarification is NOT re-routed: no second answer process
-    completed = completions(events)
-    assert [item.status for item in completed] == [TaskStatus.CANCELLED.value]
+    assert [item.status for item in completions(events)] == [TaskStatus.CANCELLED.value]
     assert len(router.calls) == 1  # only the clarification needed routing
     assert not any(isinstance(e.payload, Finished) for e in events)
 
@@ -2986,15 +3406,17 @@ async def test_a_failed_answer_does_not_affect_the_sibling_stream(
     store = SqlAlchemyTaskStore(session_factory)
     llm = ExhaustedFailsLLM([blocking_call(), reply("second final")])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")
+    await runner.submit(DialogSubmission("second"))
     events = await collect_until(queue, is_delivered("second final"))
     tool.release.set()  # the first run's iteration 2 hits the dry script -> Failed
     events += await collect_until(queue, lambda e: isinstance(e.payload, Failed))
@@ -3013,28 +3435,28 @@ async def test_router_cancel_targets_one_exchange_while_the_other_streams(
     llm = ScriptedLLM([blocking_call(), blocking_call(), reply("first final")])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await runner.submit("second")
+    await start_blocked_submission(BlockingScenario(runner, queue, tool), DialogSubmission("first"))
+    await runner.submit(DialogSubmission("second"))
     await wait_for_condition(lambda: len(runner._processes) == TWO_PROCESSES)
-    second = next(p for p in runner._processes.values() if p.title == "second")
-    assert second.exchange_id is not None
-
-    router.action = RouteAction.COMMAND
-    router.decide_cancel(second.exchange_id)
-    await runner.submit("cancel the second one")
+    configure_router_cancel(router, running_process_exchange_id(runner, "second"))
+    await runner.submit(DialogSubmission("cancel the second one"))
     await wait_for_condition(lambda: len(runner._processes) == 1)
     tool.release.set()
     events = await collect_until(queue, is_delivered("first final"))
 
     tasks = {task.title: task for task in await store.list(runner.dialog_id)}
-    await wait_for_task_state(store, tasks["second"].id, lambda t: t.status is TaskStatus.CANCELLED)
-    await wait_for_task_state(store, tasks["first"].id, lambda t: t.status is TaskStatus.DONE)
+    await wait_named_task_statuses(
+        store,
+        tasks,
+        {"second": TaskStatus.CANCELLED, "first": TaskStatus.DONE},
+    )
     assert any(
         isinstance(e.payload, Finished) and e.payload.message.content == "first final"
         for e in events
@@ -3047,7 +3469,9 @@ async def test_redelivery_threads_the_reply_and_skips_silent_results(
     """Recovery redeliveries keep reply threading and never redeliver emptiness."""
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     dialog = await get_dialog(session_factory)
     threaded = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
     threaded.input["source_client_message_id"] = "777"
@@ -3074,7 +3498,9 @@ async def test_failed_delivery_carries_the_reply_target(
     """A FAILED redelivery opens with ProcessStarted too: errors thread like answers."""
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+        ScriptedLLM([]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store),
     )
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog, status=TaskStatus.FAILED, error=PROVIDER_ERROR_MESSAGE)
@@ -3097,7 +3523,9 @@ async def test_recover_interrupted_redelivers_undelivered_results(
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
     await store.add(task)
@@ -3120,7 +3548,9 @@ async def test_recover_interrupted_redelivers_undelivered_failures(
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+        ScriptedLLM([]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store),
     )
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog, status=TaskStatus.FAILED, error=PROVIDER_ERROR_MESSAGE)
@@ -3142,7 +3572,9 @@ async def test_recover_interrupted_skips_already_delivered_results(
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
     task.delivered_at = utc_now()
@@ -3169,7 +3601,9 @@ async def test_redelivery_without_a_subscriber_waits_instead_of_being_stamped(
     """
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
     await store.add(task)
@@ -3200,12 +3634,11 @@ async def test_cron_result_of_an_unwatched_dialog_waits_for_a_subscriber(
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         BranchLLM(main=[], background=[reply(TASK_RESULT)]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store),
     )
 
-    fired = await manager.wake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID)
+    fired = await manager.wake(CronWake(USER_ID, CHANNEL, CRON_TITLE, CRON_PROMPT, CRON_JOB_ID))
     assert fired is WakeOutcome.DELIVERED
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     task = await single_task(store, runner.dialog_id)
@@ -3226,7 +3659,7 @@ async def test_recover_interrupted_noop_without_candidates(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
 
     await manager.recover_interrupted()
 
@@ -3247,8 +3680,7 @@ async def test_recover_interrupted_survives_store_failures(
 ) -> None:
     manager = make_manager(
         ScriptedLLM([]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=SweepFailingStore()),
     )
 
@@ -3263,14 +3695,13 @@ async def test_restart_task_over_the_limit_fails_the_task_and_delivers(
     llm = ScriptedLLM([blocking_call(), reply("after")])
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
+    await runner.submit(DialogSubmission("start"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
@@ -3279,9 +3710,8 @@ async def test_restart_task_over_the_limit_fails_the_task_and_delivers(
     await store.add(task)
     await runner.restart_task(task)  # the single slot is taken
 
-    stored = await store.get(task.id)
-    assert stored.status is TaskStatus.FAILED
-    assert stored.error == RESTART_LIMIT_ERROR
+    assert (await store.get(task.id)).status is TaskStatus.FAILED
+    assert (await store.get(task.id)).error == RESTART_LIMIT_ERROR
 
     tool.release.set()
     events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
@@ -3296,7 +3726,9 @@ async def test_request_result_delivery_is_idempotent(
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+        ScriptedLLM([]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store),
     )
     dialog = await get_dialog(session_factory)
     task = orphaned_task(dialog, status=TaskStatus.DONE, result=TASK_RESULT)
@@ -3327,7 +3759,7 @@ async def test_full_subscriber_queue_never_drops_terminal_events(
     says delivered while no transport ever saw the result. The oldest queued
     event is evicted instead.
     """
-    manager = make_manager(ScriptedLLM([]), quick_registry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(quick_registry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     for _ in range(SUBSCRIBER_QUEUE_SIZE + 5):  # flood the queue past its capacity
@@ -3348,7 +3780,7 @@ async def test_full_subscriber_queue_never_drops_terminal_events(
 async def test_full_subscriber_queue_drops_stream_chatter(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([]), quick_registry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(quick_registry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     for _ in range(SUBSCRIBER_QUEUE_SIZE):
@@ -3393,14 +3825,16 @@ async def test_cancel_bypasses_an_actor_stuck_in_routing(
     router = StuckRouter()
     llm = ScriptedLLM([blocking_call()])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    await runner.submit("second")  # the actor enters the stuck router call
+    await runner.submit(DialogSubmission("second"))  # the actor enters the stuck router call
     await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
 
     await runner.cancel()
@@ -3439,7 +3873,9 @@ async def test_one_dialogs_slow_init_does_not_block_another(
     process.
     """
     slow = SlowHistoryRepository(session_factory)
-    manager = make_manager(ScriptedLLM([reply()]), quick_registry(), session_factory)
+    manager = make_manager(
+        ScriptedLLM([reply()]), ManagerEnvironment(quick_registry(), session_factory)
+    )
     manager._messages = slow
 
     first = asyncio.create_task(manager.get_or_create_runner(USER_ID, CHANNEL))
@@ -3462,7 +3898,9 @@ async def test_concurrent_first_contacts_share_one_build(
 ) -> None:
     slow = SlowHistoryRepository(session_factory)
     slow.release.set()
-    manager = make_manager(ScriptedLLM([reply()]), quick_registry(), session_factory)
+    manager = make_manager(
+        ScriptedLLM([reply()]), ManagerEnvironment(quick_registry(), session_factory)
+    )
     manager._messages = slow
 
     runners = await asyncio.gather(
@@ -3505,16 +3943,15 @@ async def test_narrative_trims_to_the_hot_tail(
     llm = ScriptedLLM([reply(), reply(SECOND_REPLY)])
     manager = make_manager(
         llm,
-        quick_registry(),
-        session_factory,
+        ManagerEnvironment(quick_registry(), session_factory),
         ManagerOptions(compactor=TailCompactor(tail=1)),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await collect_completions(queue, 1)
-    await runner.submit("second")
+    await runner.submit(DialogSubmission("second"))
     await collect_completions(queue, 1)
 
     # at the second start the assembled tail was just ["second"]: everything
@@ -3538,7 +3975,9 @@ async def test_initial_narrative_load_starts_after_the_compaction_boundary(
     messages = SqlAlchemyMessageRepository(session_factory)
     dialog = await dialogs.get_or_create(USER_ID, CHANNEL)
     for content in ("old-1", "old-2", "hot-3"):
-        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content=content))
+        await messages.append(
+            MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content=content))
+        )
     await SqlAlchemySummaryStore(session_factory).create(
         DialogueSummary(
             id="summary-1",
@@ -3552,8 +3991,7 @@ async def test_initial_narrative_load_starts_after_the_compaction_boundary(
     )
     manager = make_manager(
         ScriptedLLM([]),
-        quick_registry(),
-        session_factory,
+        ManagerEnvironment(quick_registry(), session_factory),
         ManagerOptions(compactor=TailCompactor(tail=10)),
     )
 
@@ -3569,10 +4007,10 @@ async def test_trim_narrative_remaps_watermarks(
     """White-box: trimming shifts process watermarks (ownership lives in the DB)."""
     tool = BlockingTool()
     llm = ScriptedLLM([blocking_call()])
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(blocking_registry(tool), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     runner.subscribe()
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
     process = next(iter(runner._processes.values()))
@@ -3592,13 +4030,7 @@ async def test_trim_narrative_remaps_watermarks(
 class FailingAppendRepository(SqlAlchemyMessageRepository):
     """MessageRepository whose append always fails (a broken store)."""
 
-    async def append(
-        self,
-        dialog_id: str,
-        message: ChatMessage,
-        usage: Usage | None = None,
-        client_message_id: str | None = None,
-    ) -> str:
+    async def append(self, request: MessageAppend) -> str:
         raise RuntimeError("store down")
 
 
@@ -3611,12 +4043,14 @@ async def test_failed_submit_persist_reports_to_the_transport(
     that would never come. Now the transport receives a Failed event telling
     them to resend.
     """
-    manager = make_manager(ScriptedLLM([reply()]), quick_registry(), session_factory)
+    manager = make_manager(
+        ScriptedLLM([reply()]), ManagerEnvironment(quick_registry(), session_factory)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     runner._messages = FailingAppendRepository(session_factory)
     queue = runner.subscribe()
 
-    await runner.submit("hello?")
+    await runner.submit(DialogSubmission("hello?"))
     events = await collect_until(queue, lambda e: isinstance(e.payload, Failed))
 
     failed = next(e.payload for e in events if isinstance(e.payload, Failed))
@@ -3633,16 +4067,18 @@ async def test_settle_skips_when_the_exchange_changed_hands(
 ) -> None:
     """A termination from a task that no longer owns the exchange must not
     clobber the new owner's IN_PROGRESS state (`_settle_exchange`'s owner guard)."""
-    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     exchange = await exchanges.create(runner.dialog_id, "title", status=ExchangeStatus.IN_PROGRESS)
     # the dead task is older; the follow-up's task is the exchange's newest,
     # which is what owning it now means
     await add_exchange_task(
-        session_factory, exchange.id, DEAD_TASK_ID, created_at=utc_now() - timedelta(minutes=1)
+        session_factory,
+        exchange.id,
+        RecoveryTask(DEAD_TASK_ID, utc_now() - timedelta(minutes=1)),
     )
-    await add_exchange_task(session_factory, exchange.id, OTHER_TASK_ID)
+    await add_exchange_task(session_factory, exchange.id, RecoveryTask(OTHER_TASK_ID))
 
     await runner._settle_exchange(
         _ProcessTerminated(
@@ -3670,11 +4106,11 @@ async def test_settle_does_not_resurrect_a_cancelled_exchange(
     keeps that distinction. What must stop it is the exchange no longer
     being live, not the identity check.
     """
-    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     exchange = await exchanges.create(runner.dialog_id, "title")
-    await add_exchange_task(session_factory, exchange.id, DEAD_TASK_ID)
+    await add_exchange_task(session_factory, exchange.id, RecoveryTask(DEAD_TASK_ID))
     await exchanges.set_status(exchange.id, ExchangeStatus.CANCELLED)
 
     await runner._settle_exchange(
@@ -3700,24 +4136,23 @@ async def test_router_cancel_settles_the_exchange_as_cancelled(
     llm = ScriptedLLM([blocking_call()])
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit("start")
+    await runner.submit(DialogSubmission("start"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
     router.action = RouteAction.COMMAND
     router.decide_cancel_all()
-    await runner.submit("stop it")
+    await runner.submit(DialogSubmission("stop it"))
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
-
-    maybe_exchange_id = runner.history()[0].exchange_id
-    assert maybe_exchange_id is not None
-    exchange_id: str = maybe_exchange_id
+    exchange_id = first_history_exchange_id(runner)
     await wait_for_async_condition(lambda: _is_cancelled(exchanges, exchange_id))
 
     tool.release.set()
@@ -3729,12 +4164,14 @@ async def test_failed_run_settles_its_exchange_as_failed(
 ) -> None:
     store = SqlAlchemyTaskStore(session_factory)
     llm = ExhaustedFailsLLM([])  # the very first stream call fails
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit("boom")
+    await runner.submit(DialogSubmission("boom"))
     await collect_until(queue, lambda e: isinstance(e.payload, Failed))
 
     maybe_exchange_id = runner.history()[0].exchange_id
@@ -3746,7 +4183,7 @@ async def test_failed_run_settles_its_exchange_as_failed(
 async def test_recover_interrupted_reopens_a_stranded_in_progress_exchange(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(ToolRegistry(), session_factory))
     dialog = await get_dialog(session_factory)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     exchange = await exchanges.create(dialog.id, "stranded", status=ExchangeStatus.IN_PROGRESS)
@@ -3766,7 +4203,9 @@ async def test_recover_interrupted_leaves_an_awaiting_user_answer_task_silently_
     closes the row silently instead; the user's reply resumes the exchange."""
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+        ScriptedLLM([]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store),
     )
     dialog = await get_dialog(session_factory)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
@@ -3799,7 +4238,7 @@ async def test_stale_awaiting_exchange_triggers_a_nudge_on_a_new_message(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([reply("answer to new")])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
@@ -3810,7 +4249,7 @@ async def test_stale_awaiting_exchange_triggers_a_nudge_on_a_new_message(
     )
     await _backdate_exchange(session_factory, stale.id, NUDGE_STALE_SECONDS)
 
-    await runner.submit("new question")
+    await runner.submit(DialogSubmission("new question"))
     nudge_content = NUDGE_TEMPLATE.format(title="old question", question="Which city?")
     events = await collect_until(queue, is_delivered(nudge_content))
 
@@ -3826,25 +4265,27 @@ async def test_explicit_reply_joins_the_named_exchange_without_routing(
     router = FakeRouter()
     llm = ScriptedLLM([blocking_call(), reply("second reply"), reply("third reply")])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     live_exchange_id = runner.history()[0].exchange_id
     assert live_exchange_id is not None
 
     # a known, live exchange named explicitly: the deterministic shortcut, no LLM
-    await runner.submit("clarification", reply_to_exchange_id=live_exchange_id)
+    await runner.submit(DialogSubmission("clarification", reply_to_exchange_id=live_exchange_id))
     await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
     assert runner.history()[1].exchange_id == live_exchange_id
     assert router.calls == []
 
     # a reply_to naming an exchange that is not live falls back to the router
-    await runner.submit("stray reply", reply_to_exchange_id="not-a-live-exchange")
+    await runner.submit(DialogSubmission("stray reply", reply_to_exchange_id="not-a-live-exchange"))
     await wait_for_message(runner, "stray reply")
     assert len(router.calls) == 1
 
@@ -3932,33 +4373,15 @@ async def test_message_appended_during_a_stalled_assemble_is_never_lost(
     router = FakeRouter()
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(compactor=compactor, router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit("first")
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
-    exchange_id = runner.history()[0].exchange_id
-    assert exchange_id is not None
-
-    # picked up normally at the next sync: this is what makes iteration 2's
-    # sync actually call assemble (nothing changed otherwise)
-    router.decide_continue()
-    await runner.submit("setup")
-    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
-
-    tool.release.set()  # iteration 2 begins: its sync stalls inside assemble
-    await asyncio.wait_for(compactor.entered.wait(), timeout=TIMEOUT_SECONDS)
-
-    # the actor is free (the stall sits in the PUMP task): a second reply is
-    # persisted and routed while the frozen snapshot is stuck mid-return
-    await runner.submit("clarification")
-    await wait_for_message(runner, "clarification")
+    exchange_id = await stage_stalled_assemble_message(
+        StalledAssembleScenario(runner, queue, tool, compactor, router, exchanges)
+    )
 
     compactor.gate.set()  # release the stale (pre-clarification) snapshot
     await collect_completions(queue, TWO_PROCESSES)  # this run, then the reopened fresh run
@@ -4005,7 +4428,9 @@ async def test_appendleft_during_a_stalled_flush_survives_identity_removal(
     """
     store = GatedMarkDeliveredStore()
     manager = make_manager(
-        ScriptedLLM([]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+        ScriptedLLM([]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
@@ -4026,8 +4451,7 @@ async def test_appendleft_during_a_stalled_flush_survives_identity_removal(
     await notice_call
     events += await collect_until(queue, is_delivered("the question"))
 
-    assert task.delivered_at is not None  # the original delivery was still stamped
-    assert not runner._pending_deliveries  # nothing left stuck behind the question
+    assert (task.delivered_at is not None, not runner._pending_deliveries) == (True, True)
     finished_contents = [
         e.payload.message.content for e in events if isinstance(e.payload, Finished)
     ]
@@ -4045,10 +4469,12 @@ async def test_answer_finished_with_zero_subscribers_waits_for_the_first_one(
     """
     store = SqlAlchemyTaskStore(session_factory)
     llm = ScriptedLLM([reply()])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(store=store))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(store=store)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
-    await runner.submit("hi")  # no subscriber attached at all
+    await runner.submit(DialogSubmission("hi"))  # no subscriber attached at all
 
     async def has_a_task() -> bool:
         return len(await store.list(runner.dialog_id)) == 1
@@ -4124,33 +4550,30 @@ async def test_reply_while_the_asker_still_owns_the_exchange_spawns_no_second_ru
     reply) does the exchange reopen for a fresh run.
     """
     tool = AskingTool()
-    store = SqlAlchemyTaskStore(session_factory)
     llm = AskThenStallLLM(final_content="", next_content="answered after all")
     router = FakeRouter()
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router, store=SqlAlchemyTaskStore(session_factory)),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit("what is the weather?")
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    await collect_until(queue, is_delivered(tool.question))
-    live = await exchanges.list_live(runner.dialog_id)
-    assert [item.status for item in live] == [ExchangeStatus.AWAITING_USER]
-    exchange_id = live[0].id
-    assert len(runner._processes) == ONE_PROCESS  # the asker, still alive
-
-    # the asker is mid-generation of its own next turn (still streaming)
-    await asyncio.wait_for(llm.stalled.wait(), timeout=TIMEOUT_SECONDS)
+    exchange_id = await stage_stalled_asker_reply_window(
+        AskingScenario(runner, queue, tool, exchanges, session_factory),
+        llm,
+    )
+    assert len(runner._processes) == ONE_PROCESS
 
     router.decide_continue()
-    await runner.submit("Moscow")
+    await runner.submit(DialogSubmission("Moscow"))
     await wait_for_message(runner, "Moscow")
     # the reply landed while the asker still owns the exchange: no new run
-    assert len(runner._processes) == ONE_PROCESS
-    assert next(iter(runner._processes.values())).exchange_id == exchange_id
+    assert (
+        len(runner._processes),
+        next(iter(runner._processes.values())).exchange_id,
+    ) == (ONE_PROCESS, exchange_id)
 
     llm.release.set()  # the asker finishes silently, never having synced "Moscow" in
     await wait_for_condition(lambda: not runner._processes)
@@ -4179,20 +4602,14 @@ async def test_cancel_with_an_unseen_reply_settles_cancelled_not_reopened(
     router = FakeRouter()
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
-        llm, ToolRegistry(), session_factory, ManagerOptions(router=router, store=store)
+        llm,
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit("work")
-    await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
-    exchange_id = runner.history()[0].exchange_id
-    assert exchange_id is not None
-
-    router.decide_continue()
-    await runner.submit("more context")  # arrives after the run's last sync
-    await wait_for_condition(lambda: len(runner.history()) == MESSAGES_AFTER_INJECT)
+    exchange_id = await stage_cancel_with_unseen_reply(runner, queue, router)
 
     await runner.cancel()
     llm.release.set()
@@ -4203,8 +4620,7 @@ async def test_cancel_with_an_unseen_reply_settles_cancelled_not_reopened(
     assert runner._processes == {}
     await asyncio.sleep(POLL_SECONDS * 5)  # give a would-be resurrection a chance to appear
     assert runner._processes == {}
-    still = await exchanges.get(exchange_id)
-    assert still.status is ExchangeStatus.CANCELLED
+    assert (await exchanges.get(exchange_id)).status is ExchangeStatus.CANCELLED
 
 
 async def test_cancel_closes_a_parked_awaiting_exchange_with_no_live_run(
@@ -4217,12 +4633,12 @@ async def test_cancel_closes_a_parked_awaiting_exchange_with_no_live_run(
     """
     tool = AskingTool()
     llm = ScriptedLLM([blocking_call(), reply("")])
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(blocking_registry(tool), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit("what is the weather?")
+    await runner.submit(DialogSubmission("what is the weather?"))
     await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
     await collect_until(queue, is_delivered(tool.question))
     await wait_for_condition(lambda: not runner._processes)  # the run ended, the ask is parked
@@ -4249,38 +4665,21 @@ async def test_unowned_open_exchange_is_revived_when_a_process_slot_frees(
     llm = ScriptedLLM([blocking_call(), reply("first done"), reply("stranded answered")])
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(store=store, max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
-
-    # seed an OPEN, ownerless exchange with its message already in the
-    # narrative (a crash between exchange creation and owner assignment)
-    stranded = await exchanges.create(runner.dialog_id, "stranded question")
-    stranded_message_id = await messages.append(
-        runner.dialog_id, ChatMessage(role=MessageRole.USER, content="stranded question")
-    )
-    await messages.set_exchange(stranded_message_id, stranded.id)
-    runner._narrative.append(
-        ChatMessage(
-            id=stranded_message_id,
-            role=MessageRole.USER,
-            content="stranded question",
-            exchange_id=stranded.id,
-        )
-    )
+    stranded = await seed_stranded_exchange(runner, exchanges, messages)
 
     # the single slot is taken: nothing may spawn for the stranded exchange
-    await runner.submit("first")
+    await runner.submit(DialogSubmission("first"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     assert len(runner._processes) == ONE_PROCESS
-    still_open = await exchanges.get(stranded.id)
-    assert still_open.status is ExchangeStatus.OPEN
+    assert (await exchanges.get(stranded.id)).status is ExchangeStatus.OPEN
     assert runner._live_process_for(stranded.id) is None  # nothing spawned for it yet
 
     tool.release.set()
@@ -4299,13 +4698,13 @@ async def test_recover_interrupted_revives_an_unowned_open_exchange(
     orphaned task gets restarted.
     """
     llm = ScriptedLLM([reply("stranded answered")])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     dialog = await get_dialog(session_factory)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
     messages = SqlAlchemyMessageRepository(session_factory)
     exchange = await exchanges.create(dialog.id, "stranded question")  # OPEN, no owner
     message_id = await messages.append(
-        dialog.id, ChatMessage(role=MessageRole.USER, content="stranded question")
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="stranded question"))
     )
     await messages.set_exchange(message_id, exchange.id)
 
@@ -4328,17 +4727,16 @@ async def test_stop_pressed_while_the_message_is_still_routing_cancels_its_run(
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         ScriptedLLM([blocking_call(), reply("late answer")]),
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=router, store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     runner.subscribe()
 
-    await runner.submit("first")  # no live exchange: routed without the router
+    await runner.submit(DialogSubmission("first"))  # no live exchange: routed without the router
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
     router.gate_armed = True
-    await runner.submit("second")  # the actor blocks inside the router
+    await runner.submit(DialogSubmission("second"))  # the actor blocks inside the router
     await asyncio.wait_for(router.entered.wait(), timeout=TIMEOUT_SECONDS)
     await runner.cancel()  # stop pressed while "second" is mid-routing
     tool.release.set()
@@ -4395,17 +4793,25 @@ async def test_forwarding_material_collects_without_routing_or_starting_a_run(
 ) -> None:
     router = FakeRouter()
     llm = ScriptedLLM([])  # a router call or a run would starve this and blow up
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(router=router)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
     await runner.submit(
-        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        DialogSubmission(
+            MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        )
     )
     await runner.submit(
-        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        DialogSubmission(
+            MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        )
     )
     await runner.submit(
-        MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        DialogSubmission(
+            MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        )
     )
     await wait_for_condition(lambda: len(runner.history()) == THREE_MATERIAL_MESSAGES)
 
@@ -4426,11 +4832,11 @@ async def test_forwarding_material_collects_without_routing_or_starting_a_run(
 async def test_forwarding_material_without_origin_titles_the_exchange_anonymous(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
 
     await runner.submit(
-        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL)
+        DialogSubmission(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
     )  # no origin: anonymous forward
     await wait_for_condition(lambda: len(runner.history()) == 1)
 
@@ -4445,24 +4851,11 @@ async def test_promote_collected_starts_one_run_covering_all_collected_material(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([reply(MATERIAL_REACTION)])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit(
-        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    )
-    await runner.submit(
-        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    )
-    await runner.submit(
-        MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    )
-    await wait_for_condition(lambda: len(runner.history()) == THREE_MATERIAL_MESSAGES)
-    exchange = await exchanges.find_collecting(runner.dialog_id)
-    assert exchange is not None
-    await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
+    exchange = await create_waiting_material_collection(runner, exchanges, session_factory)
 
     await runner.promote_collected(exchange.id)
     events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
@@ -4484,22 +4877,26 @@ async def test_promote_collected_is_a_noop_once_the_exchange_left_collecting(
     and the actor picking up the promotion: the re-check inside the actor
     must see that and do nothing (the anti-race guard `_handle_promote` exists for)."""
     llm = ScriptedLLM([])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    await runner.submit(
+        DialogSubmission(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    )
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
     await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
     await exchanges.set_status(exchange.id, ExchangeStatus.IN_PROGRESS)
-    await add_exchange_task(session_factory, exchange.id, ADOPTING_TASK_ID)
+    await add_exchange_task(session_factory, exchange.id, RecoveryTask(ADOPTING_TASK_ID))
 
     await runner.promote_collected(exchange.id)
     # FIFO proof: this submit's effect can only land after the promote above
     # was fully dispatched, since both go through the same single-consumer inbox
-    await runner.submit(MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL))
+    await runner.submit(
+        DialogSubmission(MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL))
+    )
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     settled = await exchanges.get(exchange.id)
@@ -4514,11 +4911,13 @@ async def test_promote_collected_is_a_noop_when_material_just_touched_it(
     that arrival must find the window unmet and back off (the sweep's stale
     snapshot can lag the actor's live state by a full sweep interval)."""
     llm = ScriptedLLM([])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    await runner.submit(
+        DialogSubmission(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    )
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
@@ -4526,7 +4925,7 @@ async def test_promote_collected_is_a_noop_when_material_just_touched_it(
 
     await runner.promote_collected(exchange.id)
     await runner.submit(
-        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL)
+        DialogSubmission(MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL))
     )  # FIFO ordering proof
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
@@ -4545,19 +4944,23 @@ async def test_own_message_adopts_the_sole_fresh_collection_without_asking_the_r
     nothing about its subject."""
     router = FakeRouter()  # deliberately unprogrammed: it must not be consulted
     llm = ScriptedLLM([reply(MATERIAL_REACTION)])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(router=router)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
     await runner.submit(
-        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        DialogSubmission(
+            MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        )
     )
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
 
-    await runner.submit("please summarize this")
+    await runner.submit(DialogSubmission("please summarize this"))
     events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
 
     assert router.calls == []  # no LLM stood between the forward and its question
@@ -4575,19 +4978,23 @@ async def test_a_stale_collection_is_left_to_the_sweep_and_goes_to_the_router(
     shortcut steps aside and the router decides — with the content in hand."""
     router = FakeRouter()
     llm = ScriptedLLM([reply(MATERIAL_REACTION)])
-    manager = make_manager(llm, ToolRegistry(), session_factory, ManagerOptions(router=router))
+    manager = make_manager(
+        llm, ManagerEnvironment(ToolRegistry(), session_factory), ManagerOptions(router=router)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
     await runner.submit(
-        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        DialogSubmission(
+            MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        )
     )
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
     await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
 
-    await runner.submit("unrelated question")
+    await runner.submit(DialogSubmission("unrelated question"))
     await wait_for_condition(lambda: router.calls != [])
 
 
@@ -4603,28 +5010,20 @@ async def test_another_live_exchange_sends_the_message_to_the_router_with_the_pr
     llm = ScriptedLLM([blocking_call(), reply("")])
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=router, store=SqlAlchemyTaskStore(session_factory)),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    # one obligation parked on the user, so the collection is not alone
-    await runner.submit("what is the weather?")
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    await collect_until(queue, is_delivered(tool.question))
-    # after the run has ended, or the material joins it directly and no
-    # collection ever stands beside the parked question (see the tail test)
-    await wait_for_condition(lambda: runner._processes == {})
-    await runner.submit(
-        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    await create_material_promotion_scenario(
+        AskingScenario(runner, queue, tool, exchanges, session_factory),
+        router,
+        MATERIAL_ORIGIN,
     )
-    await wait_for_async_condition(lambda: _collection_exists(exchanges, runner.dialog_id))
     router.calls.clear()
 
-    await runner.submit("what about the thing above?")
+    await runner.submit(DialogSubmission("what about the thing above?"))
     await wait_for_condition(lambda: router.calls != [])
 
     candidates, _ = router.calls[0]
@@ -4650,40 +5049,37 @@ async def test_a_long_forward_keeps_its_tail_in_the_preview(
     llm = ScriptedLLM([blocking_call(), reply("")])
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=router, store=SqlAlchemyTaskStore(session_factory)),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit("what is the weather?")
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    await collect_until(queue, is_delivered(tool.question))
-    # the ask is delivered while its run is still terminating; material sent
-    # in that window joins the live exchange directly instead of opening the
-    # collection this test is about. The SQL task store's extra awaits made
-    # the race land there reliably — the in-memory store just hid it.
-    await wait_for_condition(lambda: runner._processes == {})
+    await park_asked_exchange(
+        AskingScenario(runner, queue, tool, exchanges, session_factory), TARGET_QUESTION
+    )
     head = "[image] a poster with a minimalist design "
     tail = "the first travel MCP hackathon"
     await runner.submit(
-        head + "x" * (MATERIAL_DIGEST_CHARS * 2) + tail,
-        source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN),
+        DialogSubmission(
+            head + "x" * (MATERIAL_DIGEST_CHARS * 2) + tail,
+            source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN),
+        )
     )
     await wait_for_async_condition(lambda: _collection_exists(exchanges, runner.dialog_id))
     router.calls.clear()
 
-    await runner.submit("what about the thing above?")
+    await runner.submit(DialogSubmission("what about the thing above?"))
     await wait_for_condition(lambda: router.calls != [])
 
     candidates, _ = router.calls[0]
     preview = next(item.preview for item in candidates if item.status is ExchangeStatus.COLLECTING)
     assert preview is not None
-    assert len(preview) <= MATERIAL_DIGEST_CHARS
-    assert preview.startswith(head)
-    assert preview.endswith(tail)
+    assert (
+        len(preview) <= MATERIAL_DIGEST_CHARS
+        and preview.startswith(head)
+        and preview.endswith(tail)
+    )
 
 
 async def test_continue_renames_the_exchange_to_what_it_is_now_about(
@@ -4697,22 +5093,21 @@ async def test_continue_renames_the_exchange_to_what_it_is_now_about(
     llm = ScriptedLLM([blocking_call(), reply(""), reply("+21 in Moscow")])
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=router, store=SqlAlchemyTaskStore(session_factory)),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit("what is the weather?")
+    await runner.submit(DialogSubmission("what is the weather?"))
     await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
     await collect_until(queue, is_delivered(tool.question))
     live = await exchanges.list_live(runner.dialog_id)
     assert live[0].title == "what is the weather?"
 
     router.decide_continue(title="Погода в Москве")
-    await runner.submit("Moscow")
+    await runner.submit(DialogSubmission("Moscow"))
     await collect_until(queue, is_delivered("+21 in Moscow"))
 
     await wait_for_async_condition(lambda: _has_title(exchanges, live[0].id, "Погода в Москве"))
@@ -4727,21 +5122,20 @@ async def test_continue_without_a_new_title_keeps_the_name_it_had(
     llm = ScriptedLLM([blocking_call(), reply(""), reply("+21 in Moscow")])
     manager = make_manager(
         llm,
-        blocking_registry(tool),
-        session_factory,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
         ManagerOptions(router=router, store=SqlAlchemyTaskStore(session_factory)),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit("what is the weather?")
+    await runner.submit(DialogSubmission("what is the weather?"))
     await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
     await collect_until(queue, is_delivered(tool.question))
     live = await exchanges.list_live(runner.dialog_id)
 
     router.decide_continue()  # no title offered
-    await runner.submit("Moscow")
+    await runner.submit(DialogSubmission("Moscow"))
     await collect_until(queue, is_delivered("+21 in Moscow"))
 
     unchanged = await exchanges.get(live[0].id)
@@ -4752,11 +5146,13 @@ async def test_cancel_cancels_a_collecting_exchange_and_blocks_later_promotion(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM([])
-    manager = make_manager(llm, ToolRegistry(), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    await runner.submit(
+        DialogSubmission(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    )
     await wait_for_condition(lambda: len(runner.history()) == 1)
     exchange = await exchanges.find_collecting(runner.dialog_id)
     assert exchange is not None
@@ -4769,7 +5165,7 @@ async def test_cancel_cancels_a_collecting_exchange_and_blocks_later_promotion(
     await _backdate_exchange(session_factory, exchange.id, seconds=MATERIAL_QUIET_SECONDS + 1)
     await runner.promote_collected(exchange.id)
     await runner.submit(
-        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL)
+        DialogSubmission(MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL))
     )  # FIFO ordering proof
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
@@ -4787,16 +5183,20 @@ async def test_material_never_triggers_the_process_limit_notice(
     tool = BlockingTool()
     llm = ScriptedLLM([blocking_call()])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(max_processes=ONE_PROCESS)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(max_processes=ONE_PROCESS),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("start")
+    await runner.submit(DialogSubmission("start"))
     await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
     await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
 
-    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    await runner.submit(
+        DialogSubmission(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
+    )
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     # no canned notice was inserted: exactly the question and the forward
@@ -4832,60 +5232,29 @@ async def test_promotion_reparents_material_into_a_live_exchange_with_one_router
     router = FakeRouter()
     llm = ScriptedLLM([blocking_call(), reply(""), reply("target final")])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit(TARGET_QUESTION)
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    await collect_until(queue, is_delivered(tool.question))
-    await wait_for_condition(lambda: not runner._processes)  # asked, parked, run ended
-    target_id = (await exchanges.list_live(runner.dialog_id))[0].id
-
-    await runner.submit(
-        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+    scenario = await create_material_promotion_scenario(
+        AskingScenario(runner, queue, tool, exchanges, session_factory),
+        router,
+        MATERIAL_ORIGIN,
     )
-    await runner.submit(
-        MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    )
-    await runner.submit(
-        MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
-    )
-    await wait_for_condition(
-        lambda: (
-            sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL)
-            == THREE_MATERIAL_MESSAGES
-        )
-    )
-    # no run was live: the material formed its own collection instead of
-    # joining the parked exchange directly
-    collection = await exchanges.find_collecting(runner.dialog_id)
-    assert collection is not None
-    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
 
     router.decide_continue()  # CONTINUE into exchanges[0]: the only other live exchange
-    await runner.promote_collected(collection.id)
-    await wait_for_async_condition(lambda: _is_cancelled(exchanges, collection.id))
-
-    assert len(router.calls) == 1  # one call for the whole batch, not one per forward
-    routed_exchanges, digest = router.calls[0]
-    assert [item.id for item in routed_exchanges] == [target_id]  # the collection is excluded
-    assert f"forwarded {THREE_MATERIAL_MESSAGES} message" in digest
-    assert MATERIAL_ONE in digest
-    assert MATERIAL_TWO in digest
-    assert MATERIAL_THREE in digest
-
-    reparented = [m for m in runner.history() if m.kind is MessageKind.MATERIAL]
-    assert len(reparented) == THREE_MATERIAL_MESSAGES
-    assert all(m.exchange_id == target_id for m in reparented)
+    await scenario.runner.promote_collected(scenario.collection.id)
+    await wait_for_async_condition(lambda: _is_cancelled(exchanges, scenario.collection.id))
+    assert_material_reparenting(scenario, scenario.target_id, THREE_MATERIAL_MESSAGES)
 
     # the target had nobody running it: reparenting gives it a fresh run,
     # which answers and closes the obligation (IN_PROGRESS is too transient
     # to poll for reliably with a scripted, tool-free reply)
     await collect_until(queue, is_delivered("target final"))
-    await wait_for_async_condition(lambda: _is_answered(exchanges, target_id))
+    await wait_for_async_condition(lambda: _is_answered(exchanges, scenario.target_id))
 
 
 async def test_router_new_decision_promotes_the_collection_as_its_own_exchange(
@@ -4903,32 +5272,23 @@ async def test_router_new_decision_promotes_the_collection_as_its_own_exchange(
     router = FakeRouter()  # default action is NEW
     llm = ScriptedLLM([blocking_call(), reply(""), reply(MATERIAL_REACTION)])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit(TARGET_QUESTION)
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    await collect_until(queue, is_delivered(tool.question))
-    await wait_for_condition(lambda: not runner._processes)  # asked, parked, run ended
-
-    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
-    await wait_for_condition(
-        lambda: sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL) == 1
+    scenario = await create_material_promotion_scenario(
+        AskingScenario(runner, queue, tool, exchanges, session_factory),
+        router,
+        None,
     )
-    collection = await exchanges.find_collecting(runner.dialog_id)
-    assert collection is not None
-    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
-
-    await runner.promote_collected(collection.id)
-    events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
+    events = await collect_material_promotion_result(scenario, MATERIAL_REACTION)
 
     assert len(router.calls) == 1  # consulted, but declined to claim the batch
     material_message = next(m for m in runner.history() if m.content == MATERIAL_ONE)
-    assert material_message.exchange_id == collection.id  # never reparented
-    await wait_for_async_condition(lambda: _is_answered(exchanges, collection.id))
+    assert material_message.exchange_id == scenario.collection.id  # never reparented
     assert any(isinstance(e.payload, Finished) for e in events)
 
 
@@ -4946,36 +5306,29 @@ async def test_material_routing_ignores_cancel_ids_from_the_decision(
     router = FakeRouter()
     llm = ScriptedLLM([blocking_call(), reply(""), reply("target final")])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit(TARGET_QUESTION)
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    await collect_until(queue, is_delivered(tool.question))
-    await wait_for_condition(lambda: not runner._processes)  # asked, parked, run ended
-    target_id = (await exchanges.list_live(runner.dialog_id))[0].id
-
-    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
-    await wait_for_condition(
-        lambda: sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL) == 1
+    scenario = await create_material_promotion_scenario(
+        AskingScenario(runner, queue, tool, exchanges, session_factory),
+        router,
+        None,
     )
-    collection = await exchanges.find_collecting(runner.dialog_id)
-    assert collection is not None
-    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
 
     router.decide_continue()
-    router.decide_cancel(target_id)  # a confused/hostile decision naming the live exchange
-    await runner.promote_collected(collection.id)
-    await wait_for_async_condition(lambda: _is_cancelled(exchanges, collection.id))
+    router.decide_cancel(scenario.target_id)
+    await scenario.runner.promote_collected(scenario.collection.id)
+    await wait_for_async_condition(lambda: _is_cancelled(exchanges, scenario.collection.id))
 
     # not cancelled by the material decision: it gets a fresh run instead,
     # which answers and closes the obligation normally
     await collect_until(queue, is_delivered("target final"))
-    await wait_for_async_condition(lambda: _is_answered(exchanges, target_id))
-    settled = await exchanges.get(target_id)
+    await wait_for_async_condition(lambda: _is_answered(exchanges, scenario.target_id))
+    settled = await exchanges.get(scenario.target_id)
     assert settled.status is not ExchangeStatus.CANCELLED
 
 
@@ -4993,30 +5346,21 @@ async def test_command_decision_at_promotion_promotes_the_collection_on_its_own(
     router.action = RouteAction.COMMAND
     llm = ScriptedLLM([blocking_call(), reply(""), reply(MATERIAL_REACTION)])
     manager = make_manager(
-        llm, blocking_registry(tool), session_factory, ManagerOptions(router=router)
+        llm,
+        ManagerEnvironment(blocking_registry(tool), session_factory),
+        ManagerOptions(router=router),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit(TARGET_QUESTION)
-    await asyncio.wait_for(tool.called.wait(), timeout=TIMEOUT_SECONDS)
-    await collect_until(queue, is_delivered(tool.question))
-    await wait_for_condition(lambda: not runner._processes)  # asked, parked, run ended
-
-    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
-    await wait_for_condition(
-        lambda: sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL) == 1
+    scenario = await create_material_promotion_scenario(
+        AskingScenario(runner, queue, tool, exchanges, session_factory),
+        router,
+        None,
     )
-    collection = await exchanges.find_collecting(runner.dialog_id)
-    assert collection is not None
-    await _backdate_exchange(session_factory, collection.id, seconds=MATERIAL_QUIET_SECONDS + 1)
-
-    await runner.promote_collected(collection.id)
-    events = await collect_until(queue, is_delivered(MATERIAL_REACTION))
+    events = await collect_material_promotion_result(scenario, MATERIAL_REACTION)
 
     assert len(router.calls) == 1
-    await wait_for_async_condition(lambda: _is_answered(exchanges, collection.id))
     assert any(isinstance(e.payload, Finished) for e in events)
 
 
@@ -5034,31 +5378,16 @@ async def test_material_landing_in_a_live_exchange_parks_it_instead_of_reopening
     """
     router = FakeRouter()
     llm = GatedLLM()
-    manager = make_manager(llm, quick_registry(), session_factory, ManagerOptions(router=router))
+    manager = make_manager(
+        llm, ManagerEnvironment(quick_registry(), session_factory), ManagerOptions(router=router)
+    )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
-
-    await runner.submit("start")
-    # the run has synced once (the quick tool call) and is now stalled mid-
-    # second-iteration, past its last sync — exactly like test_late_message_
-    # reopens_the_exchange, but with material instead of a real reply
-    await collect_until(queue, lambda e: isinstance(e.payload, TextDelta))
-    target_id = (await exchanges.list_live(runner.dialog_id))[0].id
-
-    await runner.submit(MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL))
-    await runner.submit(MATERIAL_TWO, source=MessageSource(kind=MessageKind.MATERIAL))
-    await runner.submit(MATERIAL_THREE, source=MessageSource(kind=MessageKind.MATERIAL))
-    await wait_for_condition(
-        lambda: (
-            sum(1 for m in runner.history() if m.kind is MessageKind.MATERIAL)
-            == THREE_MATERIAL_MESSAGES
-        )
+    target_id = await stage_live_material_batch(runner, queue, exchanges)
+    assert all(
+        m.exchange_id == target_id for m in runner.history() if m.kind is MessageKind.MATERIAL
     )
-    # the run was still live: the material joined it directly, no collection
-    assert await exchanges.find_collecting(runner.dialog_id) is None
-    materials = [m for m in runner.history() if m.kind is MessageKind.MATERIAL]
-    assert all(m.exchange_id == target_id for m in materials)
 
     llm.release.set()  # the run finishes, unaware of material it never synced
     events = await collect_until(queue, is_completed)
@@ -5093,18 +5422,20 @@ async def test_material_arriving_while_a_run_is_live_joins_its_exchange_directly
     (measured live)."""
     tool = BlockingTool()
     llm = ScriptedLLM([blocking_call(), reply("after")])
-    manager = make_manager(llm, blocking_registry(tool), session_factory)
+    manager = make_manager(llm, ManagerEnvironment(blocking_registry(tool), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
     exchanges = SqlAlchemyExchangeRepository(session_factory)
 
-    await runner.submit(TARGET_QUESTION)
-    await collect_until(queue, lambda e: isinstance(e.payload, ToolCallRequested))
-    await asyncio.wait_for(tool.started.wait(), timeout=TIMEOUT_SECONDS)
+    await start_blocked_submission(
+        BlockingScenario(runner, queue, tool), DialogSubmission(TARGET_QUESTION)
+    )
     target_id = (await exchanges.list_live(runner.dialog_id))[0].id
 
     await runner.submit(
-        MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        DialogSubmission(
+            MATERIAL_ONE, source=MessageSource(kind=MessageKind.MATERIAL, origin=MATERIAL_ORIGIN)
+        )
     )
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
@@ -5112,8 +5443,10 @@ async def test_material_arriving_while_a_run_is_live_joins_its_exchange_directly
     # own exchange straight away
     assert await exchanges.find_collecting(runner.dialog_id) is None
     material_message = runner.history()[-1]
-    assert material_message.kind is MessageKind.MATERIAL
-    assert material_message.exchange_id == target_id
+    assert (material_message.kind, material_message.exchange_id) == (
+        MessageKind.MATERIAL,
+        target_id,
+    )
 
     tool.release.set()
     await collect_until(queue, is_completed)
@@ -5163,13 +5496,16 @@ async def test_look_at_image_asks_about_the_newest_picture_of_the_dialog(
     vision, resolver = RecordingVision(), RecordingResolver()
     manager = make_manager(
         ScriptedLLM([]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(vision=vision, image_resolver=resolver),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    await runner.submit("старое фото", source=MessageSource(attachments=(OLD_IMAGE,)))
-    await runner.submit("новое фото", source=MessageSource(attachments=(NEW_IMAGE,)))
+    await runner.submit(
+        DialogSubmission("старое фото", source=MessageSource(attachments=(OLD_IMAGE,)))
+    )
+    await runner.submit(
+        DialogSubmission("новое фото", source=MessageSource(attachments=(NEW_IMAGE,)))
+    )
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     answer = await runner.look_at_image(IMAGE_QUESTION)
@@ -5191,14 +5527,17 @@ async def test_look_at_image_sees_every_picture_of_the_newest_message(
     vision, resolver = RecordingVision(), RecordingResolver()
     manager = make_manager(
         ScriptedLLM([]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(vision=vision, image_resolver=resolver),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    await runner.submit("старое фото", source=MessageSource(attachments=(OLD_IMAGE,)))
+    await runner.submit(
+        DialogSubmission("старое фото", source=MessageSource(attachments=(OLD_IMAGE,)))
+    )
     pages = (NEW_IMAGE, Attachment(kind=AttachmentKind.IMAGE, ref="tg:page-2"))
-    await runner.submit("меню в картинках", source=MessageSource(attachments=pages))
+    await runner.submit(
+        DialogSubmission("меню в картинках", source=MessageSource(attachments=pages))
+    )
     await wait_for_condition(lambda: len(runner.history()) == TWO_MESSAGES)
 
     await runner.look_at_image(IMAGE_QUESTION)
@@ -5214,8 +5553,7 @@ async def test_look_at_image_without_any_picture_is_refused(
 ) -> None:
     manager = make_manager(
         ScriptedLLM([]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(vision=RecordingVision(), image_resolver=RecordingResolver()),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
@@ -5229,9 +5567,9 @@ async def test_look_at_image_without_vision_configured_is_refused(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """The whole capability is optional: no model, no resolver, no tool."""
-    manager = make_manager(ScriptedLLM([]), ToolRegistry(), session_factory)
+    manager = make_manager(ScriptedLLM([]), ManagerEnvironment(ToolRegistry(), session_factory))
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
-    await runner.submit("фото", source=MessageSource(attachments=(NEW_IMAGE,)))
+    await runner.submit(DialogSubmission("фото", source=MessageSource(attachments=(NEW_IMAGE,))))
     await wait_for_condition(lambda: len(runner.history()) == 1)
 
     with pytest.raises(VisionUnavailableError):
@@ -5264,12 +5602,14 @@ async def test_a_failed_finalize_takes_the_persisted_answer_with_it(
     """
     store = _MarkDoneUnavailable(session_factory)
     manager = make_manager(
-        ScriptedLLM([reply()]), ToolRegistry(), session_factory, ManagerOptions(store=store)
+        ScriptedLLM([reply()]),
+        ManagerEnvironment(ToolRegistry(), session_factory),
+        ManagerOptions(store=store),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     await collect_until(queue, is_completed)
 
     assert store.failures == 1

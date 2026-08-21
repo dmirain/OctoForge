@@ -87,12 +87,11 @@ def ctx_with(
     spawner: FakeSpawner | None = None,
     deleter: FakeDeleter | None = None,
     owner_task_id: str | None = None,
-    base: ToolContext = CTX,
 ) -> ToolContext:
     return ToolContext(
-        user_id=base.user_id,
-        channel=base.channel,
-        dialog_id=base.dialog_id,
+        user_id=CTX.user_id,
+        channel=CTX.channel,
+        dialog_id=CTX.dialog_id,
         task_spawner=spawner,
         task_deleter=deleter,
         owner_task_id=owner_task_id,

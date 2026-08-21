@@ -26,6 +26,7 @@ from octoforge_core.agent.loop import (
     MAX_ITERATIONS_MESSAGE,
     STREAM_IDLE_TIMEOUT_MESSAGE,
     AgentLoop,
+    AgentLoopConfig,
 )
 from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.llm.events import ReasoningDelta as LlmReasoningDelta
@@ -311,7 +312,7 @@ async def test_final_answer_event_sequence() -> None:
     loop = AgentLoop(
         llm_client=ScriptedLLM([final_reply()]),
         registry=ToolRegistry(),
-        max_iterations=3,
+        config=AgentLoopConfig(max_iterations=3),
     )
 
     events = await collect(loop.stream(history, LoopControl(), CTX))
@@ -326,7 +327,7 @@ async def test_final_answer_event_sequence() -> None:
 async def test_tool_call_flow_events_and_history() -> None:
     llm = ScriptedLLM([assistant_with_call(), final_reply()])
     tool = RecordingTool()
-    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
+    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), config=AgentLoopConfig(3))
     history = [user_message()]
 
     events = await collect(loop.stream(history, LoopControl(), CTX))
@@ -346,7 +347,7 @@ async def test_tool_call_flow_events_and_history() -> None:
 async def test_cancel_mid_stream_keeps_partial_message() -> None:
     parts = ["part-1", "part-2", "part-3"]
     control = LoopControl()
-    loop = AgentLoop(llm_client=ChunkedLLM(parts), registry=ToolRegistry(), max_iterations=3)
+    loop = AgentLoop(ChunkedLLM(parts), ToolRegistry(), AgentLoopConfig(3))
     history = [user_message()]
     events: list[LoopEvent] = []
 
@@ -364,7 +365,7 @@ async def test_cancel_mid_stream_keeps_partial_message() -> None:
 
 async def test_skill_failure_emits_event_and_continues() -> None:
     llm = ScriptedLLM([assistant_with_call(), final_reply()])
-    loop = AgentLoop(llm_client=llm, registry=make_registry(FailingTool()), max_iterations=3)
+    loop = AgentLoop(llm, make_registry(FailingTool()), AgentLoopConfig(3))
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -375,7 +376,7 @@ async def test_skill_failure_emits_event_and_continues() -> None:
 
 async def test_skill_failure_with_empty_message_uses_class_name() -> None:
     llm = ScriptedLLM([assistant_with_call(), final_reply()])
-    loop = AgentLoop(llm_client=llm, registry=make_registry(EmptyFailingTool()), max_iterations=3)
+    loop = AgentLoop(llm, make_registry(EmptyFailingTool()), AgentLoopConfig(3))
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -389,7 +390,7 @@ async def test_skill_failure_with_empty_message_uses_class_name() -> None:
 async def test_max_iterations_emits_failed() -> None:
     replies = [assistant_with_call() for _ in range(5)]
     llm = ScriptedLLM(replies)
-    loop = AgentLoop(llm_client=llm, registry=make_registry(RecordingTool()), max_iterations=2)
+    loop = AgentLoop(llm, make_registry(RecordingTool()), AgentLoopConfig(2))
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -418,7 +419,7 @@ async def test_reasoning_deltas_flow_through_as_loop_events() -> None:
         ],
         final_reply(),
     )
-    loop = AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=3)
+    loop = AgentLoop(llm, ToolRegistry(), AgentLoopConfig(3))
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -438,7 +439,7 @@ async def test_tool_call_requested_before_stream_finished() -> None:
         final_reply(),
     )
     tool = RecordingTool()
-    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
+    loop = AgentLoop(llm, make_registry(tool), AgentLoopConfig(3))
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -463,7 +464,7 @@ async def test_eager_calls_run_concurrently_history_keeps_call_order() -> None:
     registry = ToolRegistry()
     registry.register(NamedTool(SLOW_NAME, delay=PAUSE_SECONDS))
     registry.register(NamedTool(FAST_NAME, delay=0.0))
-    loop = AgentLoop(llm_client=llm, registry=registry, max_iterations=3)
+    loop = AgentLoop(llm, registry, AgentLoopConfig(3))
     history = [user_message()]
 
     events = await collect(loop.stream(history, LoopControl(), CTX))
@@ -487,7 +488,7 @@ async def test_broken_tool_call_reports_error_without_execution() -> None:
         final_reply(),
     )
     tool = RecordingTool()
-    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
+    loop = AgentLoop(llm, make_registry(tool), AgentLoopConfig(3))
     history = [user_message()]
 
     events = await collect(loop.stream(history, LoopControl(), CTX))
@@ -509,7 +510,7 @@ async def test_cancel_mid_stream_cancels_running_tool() -> None:
         [ToolCallReady(call=call), LlmTextDelta(text="more"), LlmTextDelta(text="even more")],
         final_reply(),
     )
-    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
+    loop = AgentLoop(llm, make_registry(tool), AgentLoopConfig(3))
     history = [user_message()]
     events: list[LoopEvent] = []
 
@@ -535,7 +536,7 @@ async def test_cancel_after_tool_completed_keeps_result() -> None:
         [ToolCallReady(call=call), LlmTextDelta(text="more"), LlmTextDelta(text="even more")],
         final_reply(),
     )
-    loop = AgentLoop(llm_client=llm, registry=make_registry(RecordingTool()), max_iterations=3)
+    loop = AgentLoop(llm, make_registry(RecordingTool()), AgentLoopConfig(3))
     history = [user_message()]
     events: list[LoopEvent] = []
 
@@ -558,8 +559,7 @@ async def test_idle_timeout_fails_run_and_cancels_tools() -> None:
     loop = AgentLoop(
         llm_client=llm,
         registry=make_registry(tool),
-        max_iterations=3,
-        stream_idle_timeout=IDLE_TIMEOUT_SECONDS,
+        config=AgentLoopConfig(3, stream_idle_timeout=IDLE_TIMEOUT_SECONDS),
     )
     history = [user_message()]
 
@@ -574,7 +574,7 @@ async def test_idle_timeout_fails_run_and_cancels_tools() -> None:
 async def test_stream_exception_aborts_running_tools() -> None:
     tool = GatedTool()
     llm = CrashingLLM([ToolCallReady(call=eager_call()), LlmTextDelta(text="tail")])
-    loop = AgentLoop(llm_client=llm, registry=make_registry(tool), max_iterations=3)
+    loop = AgentLoop(llm, make_registry(tool), AgentLoopConfig(3))
     history = [user_message()]
 
     with pytest.raises(ConnectionError, match="transport lost"):
@@ -589,8 +589,7 @@ async def test_idle_timeout_before_first_event() -> None:
     loop = AgentLoop(
         llm_client=llm,
         registry=ToolRegistry(),
-        max_iterations=3,
-        stream_idle_timeout=IDLE_TIMEOUT_SECONDS,
+        config=AgentLoopConfig(3, stream_idle_timeout=IDLE_TIMEOUT_SECONDS),
     )
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
@@ -601,7 +600,7 @@ async def test_idle_timeout_before_first_event() -> None:
 
 async def test_disabled_idle_timeout_keeps_waiting() -> None:
     llm = SlowLLM(pause=PAUSE_SECONDS, reply=final_reply())
-    loop = AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=3)
+    loop = AgentLoop(llm, ToolRegistry(), AgentLoopConfig(3))
 
     events = await collect(loop.stream([user_message()], LoopControl(), CTX))
 
@@ -619,7 +618,7 @@ async def test_cancel_interrupts_a_stalled_stream_immediately() -> None:
     partial = "stalled-part"
     llm = StallingLLM([LlmTextDelta(text=partial)])
     control = LoopControl()
-    loop = AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=3)
+    loop = AgentLoop(llm, ToolRegistry(), AgentLoopConfig(3))
     history = [user_message()]
     events: list[LoopEvent] = []
 

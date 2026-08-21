@@ -1,6 +1,5 @@
 """Tests for the agent-facing secrets tools: listing metadata, minting links."""
 
-from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import pytest
@@ -12,6 +11,7 @@ from octoforge_core.secrets.api import (
     SecretInfo,
     SecretPlacement,
     SecretTransform,
+    SecretWrite,
 )
 from octoforge_core.secrets.tools import SecretLinkTool, SecretListTool
 from octoforge_core.tools.base import ToolContext
@@ -27,16 +27,7 @@ class ScriptedSecretStore:
     def __init__(self, infos: list[SecretInfo]) -> None:
         self._infos = infos
 
-    async def put(  # noqa: PLR0913, PLR0917 — mirrors the port
-        self,
-        user_id: str,
-        code: str,
-        value: str,
-        allowed_host: str,
-        description: str,
-        placements: Iterable[str] = (),
-        transform: str | None = None,
-    ) -> SecretInfo:
+    async def put(self, request: SecretWrite) -> SecretInfo:
         raise NotImplementedError
 
     async def list(self, user_id: str) -> list[SecretInfo]:

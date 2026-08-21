@@ -22,12 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.events import Finished
 from octoforge_core.agent.events import TextDelta as LoopTextDelta
+from octoforge_core.agent.loop import AgentLoopConfig
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import (
     STREAM_CLOSED,
     ConversationManager,
     ConversationRunner,
+    DialogSubmission,
     ManagerStores,
     OwnershipConfig,
     RunnerConfig,
@@ -111,7 +113,9 @@ def make_manager(
 ) -> ConversationManager:
     return ConversationManager(
         config=RunnerConfig(
-            loop=build_agent_loop(ScriptedLLM(), ToolRegistry(), max_iterations=MAX_ITERATIONS),
+            loop=build_agent_loop(
+                ScriptedLLM(), ToolRegistry(), AgentLoopConfig(max_iterations=MAX_ITERATIONS)
+            ),
             prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: SYSTEM_PROMPT}),
             router=PassThroughRouter(),
             max_processes=MAX_PROCESSES,
@@ -357,7 +361,7 @@ async def test_a_run_refuses_to_start_once_the_dialog_has_moved(
         # taken away without the heartbeat having noticed yet
         await SqlAlchemyClaimRepository(session_factory).claim(runner.dialog_id, PEER_NODE)
 
-        await runner.submit("what is the budget?")
+        await runner.submit(DialogSubmission("what is the budget?"))
         # the obligation is recorded, then the run is refused: what is left
         # behind must be work the new owner can pick up
         await _wait_for(lambda: _only_open(exchanges, runner.dialog_id))
@@ -377,7 +381,7 @@ async def test_one_process_answers_exactly_as_it_always_did(
     try:
         runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
         queue = runner.subscribe()
-        await runner.submit("what is the budget?")
+        await runner.submit(DialogSubmission("what is the budget?"))
 
         seen = []
         while True:

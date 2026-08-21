@@ -2,28 +2,34 @@
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.events import ProcessCompleted
-from octoforge_core.agent.loop import AgentLoop
+from octoforge_core.agent.loop import AgentLoop, AgentLoopConfig
 from octoforge_core.agent.prompts import SYSTEM_PROMPT_NAME, StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
 from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
+    DialogSubmission,
     ManagerStores,
     OwnershipConfig,
     RunnerConfig,
 )
 from octoforge_core.context.api import DialogueSummary
-from octoforge_core.context.compactor import CompactorConfig, LlmContextCompactor
+from octoforge_core.context.compactor import (
+    CompactorConfig,
+    CompactorServices,
+    LlmContextCompactor,
+)
 from octoforge_core.context.store import SqlAlchemySummaryStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.unit_of_work import UnitOfWork
+from octoforge_core.dialogs.api import MessageAppend
 from octoforge_core.dialogs.store import (
     SqlAlchemyClaimRepository,
     SqlAlchemyDialogRepository,
@@ -113,7 +119,7 @@ def make_manager(
     session_factory: async_sessionmaker[AsyncSession],
     compactor: LlmContextCompactor,
 ) -> ConversationManager:
-    loop = AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=MAX_ITERATIONS)
+    loop = AgentLoop(llm, ToolRegistry(), AgentLoopConfig(MAX_ITERATIONS))
     config = RunnerConfig(
         loop=loop,
         prompts=StaticPromptProvider({SYSTEM_PROMPT_NAME: PROMPT}),
@@ -140,13 +146,18 @@ async def prefill(session_factory: async_sessionmaker[AsyncSession], texts: list
     dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_ID, CHANNEL)
     repository = SqlAlchemyMessageRepository(session_factory)
     for text in texts:
-        await repository.append(dialog.id, ChatMessage(role=MessageRole.USER, content=text))
+        await repository.append(
+            MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content=text))
+        )
     return dialog
 
 
 async def add_summary(
-    store: SqlAlchemySummaryStore, dialog_id: str, seq_from: int, seq_to: int
+    store: SqlAlchemySummaryStore,
+    dialog_id: str,
+    seq_range: tuple[int, int],
 ) -> None:
+    seq_from, seq_to = seq_range
     await store.create(
         DialogueSummary(
             id=uuid.uuid4().hex,
@@ -194,19 +205,38 @@ def branch_contents(branch: list[ChatMessage]) -> list[str]:
     return [message.content for message in branch]
 
 
+async def submit_and_wait(
+    submit: Callable[[DialogSubmission], Awaitable[None]],
+    queue: asyncio.Queue[ConversationEvent],
+    prompt: str,
+) -> None:
+    await submit(DialogSubmission(prompt))
+    await wait_completed(queue)
+
+
+def assert_compacted_branch(contents: list[str]) -> None:
+    assert any("compressed one" in content for content in contents)  # the topics block
+    assert "old message three" in contents  # the hot tail stays verbatim
+    assert "fresh question one" in contents
+    assert "answer one" in contents
+    assert any("fresh question two" in content for content in contents)  # date-enveloped tail
+    assert "old message one" not in contents
+    assert "old message two" not in contents
+
+
 async def test_branch_after_restart_has_topics_block_and_fresh_tail(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     dialog = await prefill(session_factory, [*OLD_MESSAGES, "recent one", "recent two"])
     store = SqlAlchemySummaryStore(session_factory)
-    await add_summary(store, dialog.id, seq_from=1, seq_to=2)
+    await add_summary(store, dialog.id, (1, 2))
     llm = DialogLLM(stream_replies=["answer"], complete_replies=[])
-    compactor = LlmContextCompactor(store, store, llm, CompactorConfig())
+    compactor = LlmContextCompactor(CompactorServices(store, store, llm), CompactorConfig())
     manager = make_manager(llm, session_factory, compactor)
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("fresh question")
+    await runner.submit(DialogSubmission("fresh question"))
     await wait_completed(queue)
 
     contents = branch_contents(llm.stream_requests[0])
@@ -229,9 +259,7 @@ async def test_long_dialog_compacts_and_the_next_branch_uses_the_block(
         complete_replies=[FIRST_SUMMARY_REPLY, SECOND_SUMMARY_REPLY],
     )
     compactor = LlmContextCompactor(
-        store,
-        store,
-        llm,
+        CompactorServices(store, store, llm),
         CompactorConfig(
             hot_max_chars=HOT_MAX_CHARS,
             compact_target_chars=COMPACT_TARGET_CHARS,
@@ -241,22 +269,14 @@ async def test_long_dialog_compacts_and_the_next_branch_uses_the_block(
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("fresh question one")
-    await wait_completed(queue)
+    await submit_and_wait(runner.submit, queue, "fresh question one")
     await wait_for_condition(lambda: llm.complete_requests != [])
     summaries = await wait_for_summaries(store, dialog.id)
     assert [(s.seq_from, s.seq_to) for s in summaries] == [(1, COMPACTED_SEQ_TO)]
     assert summaries[0].topics == ("alpha",)
     assert summaries[0].content == "compressed one"
 
-    await runner.submit("fresh question two")
-    await wait_completed(queue)
+    await submit_and_wait(runner.submit, queue, "fresh question two")
 
     contents = branch_contents(llm.stream_requests[-1])
-    assert any("compressed one" in content for content in contents)  # the topics block
-    assert "old message three" in contents  # the hot tail stays verbatim
-    assert "fresh question one" in contents
-    assert "answer one" in contents
-    assert any("fresh question two" in content for content in contents)  # date-enveloped tail
-    assert "old message one" not in contents
-    assert "old message two" not in contents
+    assert_compacted_branch(contents)

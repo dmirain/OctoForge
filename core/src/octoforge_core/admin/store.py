@@ -1,228 +1,55 @@
-"""SQL implementation of the admin read model.
+"""Public SQL adapter for cross-user, read-only admin views."""
 
-Every listing is `SELECT … LIMIT/OFFSET` plus a `count()` for the pager, and
-nothing here writes. The row→DTO mappings mirror the ones each owning module
-keeps private (`cron/store.py:_to_cron_job` and friends): the alternative would
-be exporting them, which would turn an internal detail of every module into
-public API for one console.
-"""
-
-from collections.abc import Sequence
-from datetime import timedelta
-from typing import Any
-
-from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.admin.api import (
-    DialogOverview,
-    ExchangeOverview,
-    MessageRecord,
-    Page,
+from octoforge_core.admin import _account_queries as accounts
+from octoforge_core.admin import _dialog_queries as dialogs
+from octoforge_core.admin import _knowledge_queries as knowledge
+from octoforge_core.admin import _totals
+from octoforge_core.admin import _usage_queries as usage
+from octoforge_core.admin import _work_queries as work
+from octoforge_core.admin.account_types import (
     SecretOverview,
-    TaskOverview,
     Totals,
     UsageEventOverview,
     UsageReportRow,
     UserParamOverview,
 )
+from octoforge_core.admin.requests import ExchangeListing, PageRequest, TaskListing
+from octoforge_core.admin.types import (
+    DialogOverview,
+    ExchangeOverview,
+    MessageRecord,
+    Page,
+    TaskOverview,
+)
 from octoforge_core.context.api import DialogueSummary
-from octoforge_core.context.models import SummaryRow
 from octoforge_core.cron.api import CronJob
-from octoforge_core.cron.models import CronJobRow
 from octoforge_core.datasets.api import Dataset, DatasetRecord
-from octoforge_core.datasets.models import DatasetRecordRow, DatasetRow
-from octoforge_core.datasets.validation import parse_schema
-from octoforge_core.db.unit_of_work import read_session
-from octoforge_core.dialogs.api import ACTIVITY_WINDOW, ExchangeStatus
-from octoforge_core.dialogs.models import DialogRow, ExchangeRow, MessageRow
-from octoforge_core.instructions.api import Instruction, InstructionType
-from octoforge_core.instructions.models import InstructionRow
+from octoforge_core.instructions.api import Instruction
 from octoforge_core.memory.api import Memory
-from octoforge_core.params.models import UserParamRow
-from octoforge_core.secrets.api import DEFAULT_PLACEMENTS
-from octoforge_core.secrets.models import SecretRow
-from octoforge_core.tariffs.models import UsageEventRow
-from octoforge_core.tasks.api import TaskKind, TaskStatus
-from octoforge_core.tasks.models import TaskRow
-from octoforge_core.time import utc_now
 
 
 class SqlAlchemyAdminStore:
-    """Read-only cross-user views over every table of the schema."""
+    """Read every admin projection through cohesive query modules."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        self._session_factory = session_factory
+        self._sessions = session_factory
 
     async def totals(self) -> Totals:
-        async with read_session(self._session_factory) as session:
-            counts = {
-                name: await _count(session, select(func.count()).select_from(model))
-                for name, model in (
-                    ("dialogs", DialogRow),
-                    ("messages", MessageRow),
-                    ("tasks", TaskRow),
-                    ("cron_jobs", CronJobRow),
-                    ("datasets", DatasetRow),
-                    ("dataset_records", DatasetRecordRow),
-                    ("dialog_summaries", SummaryRow),
-                    ("exchanges", ExchangeRow),
-                )
-            }
-            # memories share the instructions table (type=memory): the two
-            # console tabs split one table by type
-            counts["instructions"] = await _count(
-                session,
-                select(func.count())
-                .select_from(InstructionRow)
-                .where(InstructionRow.type != InstructionType.MEMORY.value),
-            )
-            counts["memories"] = await _count(
-                session,
-                select(func.count())
-                .select_from(InstructionRow)
-                .where(InstructionRow.type == InstructionType.MEMORY.value),
-            )
-        return Totals(**counts)
+        return await _totals.totals(self._sessions)
 
     async def list_dialogs(self, limit: int, offset: int) -> Page[DialogOverview]:
-        """Dialogs with their counters, most recently active first.
-
-        The counters are correlated scalar subqueries rather than joins: a join
-        would multiply rows across messages and tasks and need grouping to undo.
-        """
-        user_message_count = (
-            select(func.count())
-            .select_from(MessageRow)
-            .where(MessageRow.dialog_id == DialogRow.id, MessageRow.role == "user")
-            .scalar_subquery()
-        )
-        agent_message_count = (
-            select(func.count())
-            .select_from(MessageRow)
-            .where(MessageRow.dialog_id == DialogRow.id, MessageRow.role == "assistant")
-            .scalar_subquery()
-        )
-        task_count = (
-            select(func.count())
-            .select_from(TaskRow)
-            .where(TaskRow.dialog_id == DialogRow.id)
-            .scalar_subquery()
-        )
-        last_message_at = (
-            select(func.max(MessageRow.created_at))
-            .where(MessageRow.dialog_id == DialogRow.id)
-            .scalar_subquery()
-        )
-        last_user_message_at = (
-            select(func.max(MessageRow.created_at))
-            .where(MessageRow.dialog_id == DialogRow.id, MessageRow.role == "user")
-            .scalar_subquery()
-        )
-        user_messages_24h = (
-            select(func.count())
-            .select_from(MessageRow)
-            .where(
-                MessageRow.dialog_id == DialogRow.id,
-                MessageRow.role == "user",
-                MessageRow.created_at >= utc_now() - ACTIVITY_WINDOW,
-            )
-            .scalar_subquery()
-        )
-        statement = (
-            select(
-                DialogRow,
-                user_message_count,
-                agent_message_count,
-                task_count,
-                last_message_at,
-                last_user_message_at,
-                user_messages_24h,
-            )
-            # by what actually happened, not by when the row was last written:
-            # the dialog row is no longer touched per message (that was two
-            # writes a turn for this ordering alone)
-            .order_by(last_message_at.desc().nullslast(), DialogRow.id)
-            .limit(limit)
-            .offset(offset)
-        )
-        async with read_session(self._session_factory) as session:
-            rows = (await session.execute(statement)).all()
-            total = await _count(session, select(func.count()).select_from(DialogRow))
-        items = tuple(
-            DialogOverview(
-                id=row[0].id,
-                user_id=row[0].user_id,
-                channel=row[0].channel,
-                created_at=row[0].created_at,
-                user_message_count=row[1],
-                agent_message_count=row[2],
-                task_count=row[3],
-                last_message_at=row[4],
-                last_user_message_at=row[5],
-                user_messages_24h=row[6],
-            )
-            for row in rows
-        )
-        return Page(items=items, total=total, limit=limit, offset=offset)
+        return await dialogs.list_dialogs(self._sessions, PageRequest(limit, offset))
 
     async def list_messages(self, dialog_id: str, limit: int, offset: int) -> Page[MessageRecord]:
-        statement = (
-            select(MessageRow)
-            .where(MessageRow.dialog_id == dialog_id)
-            .order_by(MessageRow.seq)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = (
-            select(func.count()).select_from(MessageRow).where(MessageRow.dialog_id == dialog_id)
-        )
-        rows, total = await self._page(statement, counter)
-        return Page(
-            items=tuple(_to_message_record(row) for row in rows),
-            total=total,
-            limit=limit,
-            offset=offset,
-        )
+        return await dialogs.list_messages(self._sessions, dialog_id, PageRequest(limit, offset))
 
-    async def list_tasks(
-        self,
-        limit: int,
-        offset: int,
-        status: str | None = None,
-        kind: str | None = None,
-    ) -> Page[TaskOverview]:
-        filters = []
-        if status is not None:
-            filters.append(TaskRow.status == status)
-        if kind is not None:
-            filters.append(TaskRow.kind == kind)
-        statement = (
-            select(TaskRow, DialogRow.user_id, DialogRow.channel)
-            .join(DialogRow, TaskRow.dialog_id == DialogRow.id)
-            .where(*filters)
-            .order_by(TaskRow.created_at.desc(), TaskRow.id)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = select(func.count()).select_from(TaskRow).where(*filters)
-        async with read_session(self._session_factory) as session:
-            rows = (await session.execute(statement)).all()
-            total = await _count(session, counter)
-        return Page(
-            items=tuple(_to_task_overview(row[0], row[1], row[2]) for row in rows),
-            total=total,
-            limit=limit,
-            offset=offset,
-        )
+    async def list_tasks(self, request: TaskListing) -> Page[TaskOverview]:
+        return await work.list_tasks(self._sessions, request)
 
     async def list_cron_jobs(self, limit: int, offset: int) -> Page[CronJob]:
-        statement = select(CronJobRow).order_by(CronJobRow.next_fire_at).limit(limit).offset(offset)
-        counter = select(func.count()).select_from(CronJobRow)
-        rows, total = await self._page(statement, counter)
-        return Page(
-            items=tuple(_to_cron_job(row) for row in rows), total=total, limit=limit, offset=offset
-        )
+        return await work.list_cron_jobs(self._sessions, PageRequest(limit, offset))
 
     async def list_instructions(
         self,
@@ -230,38 +57,10 @@ class SqlAlchemyAdminStore:
         offset: int,
         query: str | None = None,
     ) -> Page[Instruction]:
-        # the memories tab owns type=memory rows; this tab lists the rest
-        filters = [InstructionRow.type != InstructionType.MEMORY.value]
-        if query:
-            filters.append(InstructionRow.title.ilike(f"%{query}%"))
-        statement = (
-            select(InstructionRow)
-            .where(*filters)
-            .order_by(InstructionRow.type, InstructionRow.title)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = select(func.count()).select_from(InstructionRow).where(*filters)
-        rows, total = await self._page(statement, counter)
-        return Page(
-            items=tuple(_to_instruction(row) for row in rows),
-            total=total,
-            limit=limit,
-            offset=offset,
-        )
+        return await knowledge.list_instructions(self._sessions, PageRequest(limit, offset), query)
 
     async def list_datasets(self, limit: int, offset: int) -> Page[Dataset]:
-        statement = (
-            select(DatasetRow)
-            .order_by(DatasetRow.owner_user_id, DatasetRow.name)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = select(func.count()).select_from(DatasetRow)
-        rows, total = await self._page(statement, counter)
-        return Page(
-            items=tuple(_to_dataset(row) for row in rows), total=total, limit=limit, offset=offset
-        )
+        return await knowledge.list_datasets(self._sessions, PageRequest(limit, offset))
 
     async def list_dataset_records(
         self,
@@ -269,353 +68,29 @@ class SqlAlchemyAdminStore:
         limit: int,
         offset: int,
     ) -> Page[DatasetRecord]:
-        statement = (
-            select(DatasetRecordRow)
-            .where(DatasetRecordRow.dataset_id == dataset_id)
-            .order_by(DatasetRecordRow.created_at.desc(), DatasetRecordRow.id)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = (
-            select(func.count())
-            .select_from(DatasetRecordRow)
-            .where(DatasetRecordRow.dataset_id == dataset_id)
-        )
-        rows, total = await self._page(statement, counter)
-        return Page(
-            items=tuple(_to_record(row) for row in rows), total=total, limit=limit, offset=offset
+        return await knowledge.list_records(
+            self._sessions,
+            dataset_id,
+            PageRequest(limit, offset),
         )
 
     async def list_memories(self, limit: int, offset: int) -> Page[Memory]:
-        memory_only = InstructionRow.type == InstructionType.MEMORY.value
-        statement = (
-            select(InstructionRow)
-            .where(memory_only)
-            .order_by(InstructionRow.updated_at.desc(), InstructionRow.title)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = select(func.count()).select_from(InstructionRow).where(memory_only)
-        rows, total = await self._page(statement, counter)
-        return Page(
-            items=tuple(_to_memory(row) for row in rows), total=total, limit=limit, offset=offset
-        )
+        return await knowledge.list_memories(self._sessions, PageRequest(limit, offset))
 
     async def list_summaries(self, limit: int, offset: int) -> Page[DialogueSummary]:
-        statement = (
-            select(SummaryRow)
-            .order_by(SummaryRow.created_at.desc(), SummaryRow.id)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = select(func.count()).select_from(SummaryRow)
-        rows, total = await self._page(statement, counter)
-        return Page(
-            items=tuple(_to_summary(row) for row in rows), total=total, limit=limit, offset=offset
-        )
+        return await work.list_summaries(self._sessions, PageRequest(limit, offset))
 
-    async def list_exchanges(
-        self,
-        limit: int,
-        offset: int,
-        user_id: str | None = None,
-        status: str | None = None,
-    ) -> Page[ExchangeOverview]:
-        """Exchanges of every dialog, most recently updated first.
-
-        `ExchangeRow` doesn't carry user_id/channel — no table does, identity
-        is the dialog's — so this joins `DialogRow` the same way
-        `list_dialogs` correlates its counters, as a plain join since every
-        exchange has exactly one owning dialog.
-        """
-        filters = []
-        if user_id is not None:
-            filters.append(DialogRow.user_id == user_id)
-        if status is not None:
-            filters.append(ExchangeRow.status == status)
-        statement = (
-            select(ExchangeRow, DialogRow.user_id, DialogRow.channel)
-            .join(DialogRow, DialogRow.id == ExchangeRow.dialog_id)
-            .where(*filters)
-            .order_by(ExchangeRow.updated_at.desc(), ExchangeRow.id)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = (
-            select(func.count())
-            .select_from(ExchangeRow)
-            .join(DialogRow, DialogRow.id == ExchangeRow.dialog_id)
-            .where(*filters)
-        )
-        async with read_session(self._session_factory) as session:
-            rows = (await session.execute(statement)).all()
-            total = await _count(session, counter)
-        items = tuple(_to_exchange_overview(row[0], row[1], row[2]) for row in rows)
-        return Page(items=items, total=total, limit=limit, offset=offset)
+    async def list_exchanges(self, request: ExchangeListing) -> Page[ExchangeOverview]:
+        return await work.list_exchanges(self._sessions, request)
 
     async def list_user_params(self, limit: int, offset: int) -> Page[UserParamOverview]:
-        """Per-user params of every user, ordered by user then code."""
-        statement = (
-            select(UserParamRow)
-            .order_by(UserParamRow.user_id, UserParamRow.code)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = select(func.count()).select_from(UserParamRow)
-        rows, total = await self._page(statement, counter)
-        items = tuple(
-            UserParamOverview(
-                user_id=row.user_id,
-                code=row.code,
-                value=row.value,
-                updated_at=row.updated_at,
-            )
-            for row in rows
-        )
-        return Page(items=items, total=total, limit=limit, offset=offset)
-
-    async def list_usage_events(self, limit: int, offset: int) -> Page[UsageEventOverview]:
-        """Usage-ledger events of every user, newest first."""
-        statement = (
-            select(UsageEventRow)
-            .order_by(UsageEventRow.created_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = select(func.count()).select_from(UsageEventRow)
-        rows, total = await self._page(statement, counter)
-        items = tuple(
-            UsageEventOverview(
-                user_id=row.user_id,
-                kind=row.kind,
-                origin=row.origin,
-                prompt_tokens=row.prompt_tokens,
-                completion_tokens=row.completion_tokens,
-                quantity=row.quantity,
-                dialog_id=row.dialog_id,
-                exchange_id=row.exchange_id,
-                task_id=row.task_id,
-                created_at=row.created_at,
-            )
-            for row in rows
-        )
-        return Page(items=items, total=total, limit=limit, offset=offset)
-
-    async def usage_report(self, days: int) -> list[UsageReportRow]:
-        """Consumption of the last `days` days, grouped per (user, kind, origin).
-
-        Grouping avoids any per-dialect date arithmetic: the cutoff is
-        computed in Python and the sums run in SQL.
-        """
-        cutoff = utc_now() - timedelta(days=max(1, days))
-        statement = (
-            select(
-                UsageEventRow.user_id,
-                UsageEventRow.kind,
-                UsageEventRow.origin,
-                func.sum(UsageEventRow.prompt_tokens),
-                func.sum(UsageEventRow.completion_tokens),
-                func.sum(UsageEventRow.quantity),
-                func.count(),
-            )
-            .where(UsageEventRow.created_at >= cutoff)
-            .group_by(UsageEventRow.user_id, UsageEventRow.kind, UsageEventRow.origin)
-            .order_by(UsageEventRow.user_id, UsageEventRow.kind, UsageEventRow.origin)
-        )
-        async with read_session(self._session_factory) as session:
-            rows = (await session.execute(statement)).all()
-        return [
-            UsageReportRow(
-                user_id=user_id,
-                kind=kind,
-                origin=origin,
-                prompt_tokens=prompt or 0,
-                completion_tokens=completion or 0,
-                quantity=quantity or 0,
-                events=events,
-            )
-            for user_id, kind, origin, prompt, completion, quantity, events in rows
-        ]
+        return await accounts.list_user_params(self._sessions, PageRequest(limit, offset))
 
     async def list_secrets(self, limit: int, offset: int) -> Page[SecretOverview]:
-        """Secret metadata of every user; the ciphertext column is never selected."""
-        statement = (
-            select(SecretRow)
-            .order_by(SecretRow.user_id, SecretRow.code)
-            .limit(limit)
-            .offset(offset)
-        )
-        counter = select(func.count()).select_from(SecretRow)
-        rows, total = await self._page(statement, counter)
-        items = tuple(_to_secret_overview(row) for row in rows)
-        return Page(items=items, total=total, limit=limit, offset=offset)
+        return await accounts.list_secrets(self._sessions, PageRequest(limit, offset))
 
-    async def _page(
-        self,
-        statement: Select[Any],
-        counter: Select[Any],
-    ) -> tuple[Sequence[Any], int]:
-        """Run a listing and its counter on one session."""
-        async with read_session(self._session_factory) as session:
-            rows = (await session.scalars(statement)).all()
-            total = await _count(session, counter)
-        return rows, total
+    async def list_usage_events(self, limit: int, offset: int) -> Page[UsageEventOverview]:
+        return await usage.list_usage_events(self._sessions, PageRequest(limit, offset))
 
-
-async def _count(session: AsyncSession, statement: Select[Any]) -> int:
-    return int((await session.execute(statement)).scalar_one())
-
-
-def _to_secret_overview(row: SecretRow) -> SecretOverview:
-    # mirrors the secrets store's column reading (see module docstring on
-    # why these mappings are duplicated rather than exported)
-    placements = (
-        tuple(sorted(member.value for member in DEFAULT_PLACEMENTS))
-        if row.placements is None
-        else tuple(row.placements.split(","))
-    )
-    return SecretOverview(
-        user_id=row.user_id,
-        code=row.code,
-        allowed_host=row.allowed_host,
-        description=row.description,
-        placements=placements,
-        transform=row.transform,
-        created_at=row.created_at,
-        last_used_at=row.last_used_at,
-    )
-
-
-def _to_message_record(row: MessageRow) -> MessageRecord:
-    return MessageRecord(
-        id=row.id,
-        dialog_id=row.dialog_id,
-        seq=row.seq,
-        role=row.role,
-        content=row.content,
-        task_id=row.task_id,
-        prompt_tokens=row.prompt_tokens,
-        completion_tokens=row.completion_tokens,
-        created_at=row.created_at,
-    )
-
-
-def _to_task_overview(row: TaskRow, user_id: str, channel: str) -> TaskOverview:
-    return TaskOverview(
-        id=row.id,
-        dialog_id=row.dialog_id,
-        user_id=user_id,
-        channel=channel,
-        kind=TaskKind(row.kind),
-        title=row.title,
-        status=TaskStatus(row.status),
-        input=row.input,
-        result=row.result,
-        error=row.error,
-        created_at=row.created_at,
-        finished_at=row.finished_at,
-        delivered_at=row.delivered_at,
-    )
-
-
-def _to_cron_job(row: CronJobRow) -> CronJob:
-    return CronJob(
-        id=row.id,
-        user_id=row.user_id,
-        channel=row.channel,
-        title=row.title,
-        schedule=row.schedule,
-        timezone=row.timezone,
-        prompt=row.prompt,
-        enabled=row.enabled,
-        next_fire_at=row.next_fire_at,
-        last_fire_at=row.last_fire_at,
-        claimed_by=row.claimed_by,
-        claimed_at=row.claimed_at,
-        created_at=row.created_at,
-        one_shot=row.one_shot,
-        last_status=None if row.last_status is None else TaskStatus(row.last_status),
-        last_error=row.last_error,
-        retry_count=row.retry_count,
-    )
-
-
-def _to_instruction(row: InstructionRow) -> Instruction:
-    return Instruction(
-        id=row.id,
-        type=InstructionType(row.type),
-        title=row.title,
-        content=row.content,
-        tags=tuple(row.tags),
-        version=row.version,
-        usage_count=row.usage_count,
-        success_count=row.success_count,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-        system=row.system,
-        owner_id=row.owner_id,
-    )
-
-
-def _to_dataset(row: DatasetRow) -> Dataset:
-    return Dataset(
-        id=row.id,
-        owner_user_id=row.owner_user_id,
-        name=row.name,
-        description=row.description,
-        schema=parse_schema(row.schema),
-        usage_notes=row.usage_notes,
-        retention=row.retention,
-        version=row.version,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-    )
-
-
-def _to_record(row: DatasetRecordRow) -> DatasetRecord:
-    return DatasetRecord(
-        id=row.id,
-        dataset_id=row.dataset_id,
-        owner_user_id=row.owner_user_id,
-        payload=row.payload,
-        created_at=row.created_at,
-    )
-
-
-def _to_memory(row: InstructionRow) -> Memory:
-    """Map a memory-type instruction row to the console's memory shape."""
-    return Memory(
-        id=row.id,
-        user_id=row.owner_id,
-        key=row.title,
-        content=row.content,
-        tags=tuple(row.tags),
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-    )
-
-
-def _to_exchange_overview(row: ExchangeRow, user_id: str, channel: str) -> ExchangeOverview:
-    return ExchangeOverview(
-        id=row.id,
-        dialog_id=row.dialog_id,
-        user_id=user_id,
-        channel=channel,
-        status=ExchangeStatus(row.status),
-        title=row.title,
-        pending_question=row.pending_question,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-    )
-
-
-def _to_summary(row: SummaryRow) -> DialogueSummary:
-    return DialogueSummary(
-        id=row.id,
-        dialog_id=row.dialog_id,
-        seq_from=row.seq_from,
-        seq_to=row.seq_to,
-        topics=tuple(row.topics),
-        content=row.content,
-        created_at=row.created_at,
-    )
+    async def usage_report(self, days: int) -> list[UsageReportRow]:
+        return await usage.usage_report(self._sessions, days)

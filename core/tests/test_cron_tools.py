@@ -5,9 +5,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from octoforge_core.cron.api import CronJob, CronJobNotFoundError
+from octoforge_core.cron.api import (
+    CronClaim,
+    CronEnablement,
+    CronFireResult,
+    CronJob,
+    CronJobNotFoundError,
+)
 from octoforge_core.cron.tools import CronPauseTool, CronResumeTool
-from octoforge_core.tasks.api import TaskStatus
 from octoforge_core.time import utc_now
 from octoforge_core.tools.base import ToolContext
 
@@ -47,20 +52,16 @@ class FakeCronStore:
             raise CronJobNotFoundError(job_id)
         del self.jobs[job_id]
 
-    async def set_enabled(
-        self,
-        user_id: str,
-        job_id: str,
-        enabled: bool,
-        next_fire_at: datetime | None = None,
-    ) -> CronJob:
-        job = await self._get_owned(user_id, job_id)
+    async def set_enabled(self, request: CronEnablement) -> CronJob:
+        job = await self._get_owned(request.user_id, request.job_id)
         updated = replace(
             job,
-            enabled=enabled,
-            next_fire_at=next_fire_at if next_fire_at is not None else job.next_fire_at,
+            enabled=request.enabled,
+            next_fire_at=(
+                request.next_fire_at if request.next_fire_at is not None else job.next_fire_at
+            ),
         )
-        self.jobs[job_id] = updated
+        self.jobs[request.job_id] = updated
         return updated
 
     async def _get_owned(self, user_id: str, job_id: str) -> CronJob:
@@ -72,14 +73,7 @@ class FakeCronStore:
     async def list_due(self, now: datetime, stale_before: datetime, limit: int) -> list[CronJob]:
         raise NotImplementedError
 
-    async def claim(
-        self,
-        job_id: str,
-        expected_next_fire_at: datetime,
-        owner: str,
-        now: datetime,
-        stale_before: datetime,
-    ) -> bool:
+    async def claim(self, request: CronClaim) -> bool:
         raise NotImplementedError
 
     async def release_claim(self, job_id: str) -> None:
@@ -88,13 +82,7 @@ class FakeCronStore:
     async def complete_fire(self, job_id: str, fired_at: datetime, next_fire_at: datetime) -> None:
         raise NotImplementedError
 
-    async def record_fire_result(
-        self,
-        job_id: str,
-        status: TaskStatus,
-        error: str | None,
-        retry_at: datetime | None,
-    ) -> None:
+    async def record_fire_result(self, result: CronFireResult) -> None:
         raise NotImplementedError
 
 

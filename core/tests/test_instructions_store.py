@@ -47,23 +47,21 @@ async def test_upsert_recovers_from_a_concurrent_insert_race(
     winner = SqlAlchemyInstructionStore(session_factory)
     await winner.upsert(make_draft(content="winner content", system=True))
     store = SqlAlchemyInstructionStore(session_factory)
-    real_find = store._find_row
+    real_find = store._writer._find_draft
     missed = False
 
     async def find_with_race(
         session: AsyncSession,
-        kind: InstructionType,
-        title: str,
-        owner_id: str | None,
+        draft: InstructionDraft,
     ) -> InstructionRow | None:
         nonlocal missed
-        row = await real_find(session, kind, title, owner_id)
+        row = await real_find(session, draft)
         if row is not None and not missed:
             missed = True
             return None
         return row
 
-    monkeypatch.setattr(store, "_find_row", find_with_race)
+    monkeypatch.setattr(store._writer, "_find_draft", find_with_race)
 
     stored = await store.upsert(make_draft(content="loser content", system=True))
 

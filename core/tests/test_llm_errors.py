@@ -23,13 +23,13 @@ from octoforge_core import (
 )
 from octoforge_core.agent.control import LoopControl
 from octoforge_core.agent.events import Finished, RetryScheduled
-from octoforge_core.agent.loop import AgentLoop
+from octoforge_core.agent.loop import AgentLoop, AgentLoopConfig
 from octoforge_core.llm.errors import classify_http_error, parse_retry_after
 from octoforge_core.llm.events import RetryScheduled as LlmRetryScheduled
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.openai import OpenAICompatibleClient
-from octoforge_core.llm.retry import RETRY_AFTER_DELAY_CAP_SECONDS
+from octoforge_core.llm.retry import RETRY_AFTER_DELAY_CAP_SECONDS, RetryPolicy
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.registry import ToolRegistry
 
@@ -207,10 +207,7 @@ class RecordingSleeper:
 def make_retrying(inner: ScriptedFailureLLM, sleeper: RecordingSleeper) -> RetryingLLMClient:
     return RetryingLLMClient(
         inner,
-        max_retries=2,
-        base_seconds=0.01,
-        max_seconds=MAX_DELAY_SECONDS,
-        sleeper=sleeper,
+        RetryPolicy(2, 0.01, MAX_DELAY_SECONDS, sleeper),
     )
 
 
@@ -240,7 +237,10 @@ async def test_complete_retry_delay_floored_at_retry_after() -> None:
 
 
 async def test_retry_after_delay_includes_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("octoforge_core.llm.retry.random.uniform", lambda low, high: JITTER_SECONDS)
+    monkeypatch.setattr(
+        "octoforge_core.llm.retry_policy.random.uniform",
+        lambda low, high: JITTER_SECONDS,
+    )
     inner = ScriptedFailureLLM([RateLimitError("slow down", retry_after=FLOOR_RETRY_AFTER)])
     sleeper = RecordingSleeper()
     client = make_retrying(inner, sleeper)
@@ -326,7 +326,7 @@ async def test_stream_does_not_retry_payload_errors() -> None:
 async def test_loop_maps_retry_scheduled_into_loop_events() -> None:
     inner = ScriptedFailureLLM([RateLimitError("slow down")])
     client = make_retrying(inner, RecordingSleeper())
-    loop = AgentLoop(llm_client=client, registry=ToolRegistry(), max_iterations=3)
+    loop = AgentLoop(client, ToolRegistry(), AgentLoopConfig(3))
 
     events = [
         event
@@ -347,7 +347,7 @@ async def test_loop_fails_when_retries_exhausted() -> None:
     failures = [TransportError("x") for _ in range(EXHAUSTED_CALLS)]
     inner = ScriptedFailureLLM(failures)
     client = make_retrying(inner, RecordingSleeper())
-    loop = AgentLoop(llm_client=client, registry=ToolRegistry(), max_iterations=3)
+    loop = AgentLoop(client, ToolRegistry(), AgentLoopConfig(3))
 
     with pytest.raises(TransportError):
         async for _ in loop.stream(

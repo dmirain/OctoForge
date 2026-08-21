@@ -16,7 +16,7 @@ is grandfathered onto `unlimited` in the same step.)
 
 Seeding lives here, and not only in that migration, because a fresh
 non-SQLite database skips the migration chain entirely (`create_all` +
-`stamp head`, see `db/engine.py`); this way a new Postgres installation is
+`stamp head`, see `composition_schema.py`); this way a new Postgres installation is
 not left with an empty plan catalog its SQLite twin would have.
 """
 

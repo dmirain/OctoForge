@@ -52,6 +52,8 @@ upgrade:
 lint:
 	$(BIN)/ruff check core/src core/tests server/src surfaces/*/src deploy/src deploy/tests tools
 	$(BIN)/ruff format --check core/src core/tests server/src surfaces/*/src deploy/src deploy/tests tools
+	$(BIN)/pylint --rcfile=core/pyproject.toml core/src server/src surfaces/*/src deploy/src tools
+	$(BIN)/pylint --rcfile=core/pyproject.toml --max-statements=40 --max-module-lines=999999 core/tests deploy/tests
 
 format:
 	$(BIN)/ruff check --fix core/src core/tests server/src surfaces/*/src deploy/src deploy/tests tools

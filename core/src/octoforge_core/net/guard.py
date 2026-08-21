@@ -1,26 +1,4 @@
-"""SSRF guard: reject outbound URLs that resolve to non-public addresses.
-
-The hostname is resolved and EVERY resolved address is checked with the
-`ipaddress` predicates: private, loopback, link-local (covers the cloud
-metadata address 169.254.169.254), multicast, reserved and unspecified are
-blocked, as is any non-globally-routable address (e.g. the CGNAT range
-100.64.0.0/10, which passes all six named predicates).
-
-`allowed_prefixes` bypass the resolve-and-check pipeline by ORIGIN: a URL
-whose (scheme, host, port) — the port defaulted by the scheme — matches an
-allowlisted prefix's origin skips the check. The comparison is parsed, never
-a raw string prefix match, so userinfo like `http://allowed@169.254.169.254/`
-does NOT match (the real host is compared) and the prefix's path is ignored
-(an allowlisted origin trusts every path on it). Reserve the allowlist for
-the composition root's own base URL (the application calling its own HTTP
-API, which may sit on a loopback address) — never for user-controlled targets.
-
-Known limitation (TOCTOU / DNS rebinding): the address is resolved at check
-time, but the HTTP client resolves the hostname again when connecting, and an
-attacker-controlled DNS record can answer differently between the two lookups.
-Closing that gap requires connecting by resolved IP with the Host header set —
-out of scope for this stage.
-"""
+"""Reject non-public outbound URLs; the later HTTP resolve still permits DNS rebinding."""
 
 import asyncio
 import ipaddress

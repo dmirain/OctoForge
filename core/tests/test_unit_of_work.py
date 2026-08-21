@@ -9,6 +9,7 @@ a session of its own while a unit is active.
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -16,7 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.unit_of_work import UnitOfWork, outside_uow, read_session
-from octoforge_core.dialogs.api import Exchange, ExchangeNotFoundError, ExchangeStatus
+from octoforge_core.dialogs.api import (
+    Exchange,
+    ExchangeNotFoundError,
+    ExchangeStatus,
+    MessageAppend,
+)
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
     SqlAlchemyExchangeRepository,
@@ -52,6 +58,22 @@ def tasks(session_factory: async_sessionmaker[AsyncSession]) -> SqlAlchemyTaskSt
     return SqlAlchemyTaskStore(session_factory)
 
 
+@dataclass(frozen=True, slots=True)
+class DatabaseFixtures:
+    sessions: async_sessionmaker[AsyncSession]
+    exchanges: SqlAlchemyExchangeRepository
+    tasks: SqlAlchemyTaskStore
+
+
+@pytest.fixture
+def database(
+    session_factory: async_sessionmaker[AsyncSession],
+    exchanges: SqlAlchemyExchangeRepository,
+    tasks: SqlAlchemyTaskStore,
+) -> DatabaseFixtures:
+    return DatabaseFixtures(session_factory, exchanges, tasks)
+
+
 @pytest.fixture
 async def dialog_id(session_factory: async_sessionmaker[AsyncSession]) -> str:
     dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create("user-a", "web")
@@ -60,25 +82,23 @@ async def dialog_id(session_factory: async_sessionmaker[AsyncSession]) -> str:
 
 async def test_writes_of_one_unit_commit_together(
     uow: UnitOfWork,
-    exchanges: SqlAlchemyExchangeRepository,
-    tasks: SqlAlchemyTaskStore,
+    database: DatabaseFixtures,
     dialog_id: str,
 ) -> None:
     """Calls on different stores inside one unit all land at exit."""
     async with uow():
-        exchange = await exchanges.create(dialog_id, "question")
+        exchange = await database.exchanges.create(dialog_id, "question")
         task = Task(dialog_id=dialog_id, title="answer", kind=TaskKind.ANSWER, input={})
-        await tasks.add(task)
-        await exchanges.set_status(exchange.id, ExchangeStatus.IN_PROGRESS)
-    settled = await exchanges.get(exchange.id)
+        await database.tasks.add(task)
+        await database.exchanges.set_status(exchange.id, ExchangeStatus.IN_PROGRESS)
+    settled = await database.exchanges.get(exchange.id)
     assert settled.status is ExchangeStatus.IN_PROGRESS
-    assert (await tasks.get(task.id)).id == task.id
+    assert (await database.tasks.get(task.id)).id == task.id
 
 
 async def test_an_error_rolls_the_whole_unit_back(
     uow: UnitOfWork,
-    exchanges: SqlAlchemyExchangeRepository,
-    tasks: SqlAlchemyTaskStore,
+    database: DatabaseFixtures,
     dialog_id: str,
 ) -> None:
     """No partial state survives: every write of the failed unit is gone."""
@@ -86,14 +106,14 @@ async def test_an_error_rolls_the_whole_unit_back(
     exchange_id = ""
     with pytest.raises(RuntimeError, match="boom"):
         async with uow():
-            exchange = await exchanges.create(dialog_id, "question")
+            exchange = await database.exchanges.create(dialog_id, "question")
             exchange_id = exchange.id
-            await tasks.add(task)
+            await database.tasks.add(task)
             raise RuntimeError("boom")
     with pytest.raises(ExchangeNotFoundError):
-        await exchanges.get(exchange_id)
+        await database.exchanges.get(exchange_id)
     with pytest.raises(TaskNotFoundError):
-        await tasks.get(task.id)
+        await database.tasks.get(task.id)
 
 
 async def test_a_unit_refuses_to_nest(uow: UnitOfWork) -> None:
@@ -196,26 +216,27 @@ async def test_appends_join_the_unit(
     messages = SqlAlchemyMessageRepository(session_factory)
     with pytest.raises(RuntimeError, match="boom"):
         async with uow():
-            await messages.append(dialog_id, ChatMessage(role=MessageRole.USER, content="hi"))
+            await messages.append(
+                MessageAppend(dialog_id, ChatMessage(role=MessageRole.USER, content="hi"))
+            )
             raise RuntimeError("boom")
     assert await messages.list(dialog_id) == []
 
 
 async def test_a_failed_append_attempt_spares_the_units_earlier_writes(
     uow: UnitOfWork,
-    exchanges: SqlAlchemyExchangeRepository,
-    session_factory: async_sessionmaker[AsyncSession],
+    database: DatabaseFixtures,
     dialog_id: str,
 ) -> None:
     """The retry SAVEPOINT rolls back the attempt alone: after the violation
     the unit is intact and usable, and commits what came before."""
-    messages = SqlAlchemyMessageRepository(session_factory)
+    messages = SqlAlchemyMessageRepository(database.sessions)
     original = ChatMessage(role=MessageRole.USER, content="hi")
-    await messages.append(dialog_id, original, client_message_id="dup")
+    await messages.append(MessageAppend(dialog_id, original, client_message_id="dup"))
     async with uow():
-        exchange = await exchanges.create(dialog_id, "question")
+        exchange = await database.exchanges.create(dialog_id, "question")
         with pytest.raises(IntegrityError):  # the idempotency key is taken
-            await messages.append(dialog_id, original, client_message_id="dup")
-        await exchanges.set_title(exchange.id, "still alive")
-    assert (await exchanges.get(exchange.id)).title == "still alive"
+            await messages.append(MessageAppend(dialog_id, original, client_message_id="dup"))
+        await database.exchanges.set_title(exchange.id, "still alive")
+    assert (await database.exchanges.get(exchange.id)).title == "still alive"
     assert len(await messages.list(dialog_id)) == 1  # the duplicate never landed

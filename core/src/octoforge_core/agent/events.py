@@ -2,8 +2,13 @@
 
 from dataclasses import dataclass
 
+from octoforge_core.agent.process_events import ProcessCompleted as _ProcessCompleted
+from octoforge_core.agent.process_events import ProcessStarted as _ProcessStarted
 from octoforge_core.domain import ChatMessage, ToolCall
 from octoforge_core.llm.usage import Usage
+
+ProcessCompleted = _ProcessCompleted
+ProcessStarted = _ProcessStarted
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,30 +100,6 @@ class RetryScheduled:
     attempt: int
     delay_seconds: float
     reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessStarted:
-    """Actor marker: the text of this answer is about to begin.
-
-    Broadcast before the first token of every answer stream and at the head
-    of a whole-message outbox delivery, so a transport that threads replies
-    knows the target BEFORE it has to create the message (a reply can only be
-    set at creation time). `source_client_message_id` mirrors `Finished`'s.
-    """
-
-    process_id: str
-    title: str
-    source_client_message_id: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessCompleted:
-    """Actor marker: a process reached a terminal status (TaskStatus values)."""
-
-    process_id: str
-    title: str
-    status: str
 
 
 LoopEvent = (

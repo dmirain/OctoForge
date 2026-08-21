@@ -13,9 +13,10 @@ nowhere near the query in vector space.
 import sqlalchemy as sa
 from sqlalchemy import select
 
-from octoforge_core.datasets.api import EmbeddedDataset
+from octoforge_core.datasets._rows import to_embedded_dataset
 from octoforge_core.datasets.models import DatasetRow
-from octoforge_core.datasets.store import SqlAlchemyDatasetStore, to_embedded_dataset
+from octoforge_core.datasets.store import SqlAlchemyDatasetStore
+from octoforge_core.datasets.types import EmbeddedDataset
 from octoforge_core.db.unit_of_work import read_session
 
 DESCRIPTION_BM25_INDEX = "ix_datasets_bm25_description"

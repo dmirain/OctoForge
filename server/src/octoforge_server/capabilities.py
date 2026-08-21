@@ -1,56 +1,30 @@
-"""What this installation can actually do, reported once at startup.
-
-Every optional capability of OctoForge is a port with an empty-configuration
-switch: no key, no feature. That is the right default for an embeddable core —
-and a bad first experience, because a missing `OF_EMBEDDING_*` used to mean the
-agent quietly lost `recall` (its skills, knowledge and dataset search) with
-nothing in the log to say so.
-
-So the composition root states the object graph it just built: one block listing
-every capability as on or off, with the endpoint or model that backs it. Values
-are never logged — only URLs, model names and counts.
-"""
+"""Describe and log the object graph assembled for this installation."""
 
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from urllib.parse import urlsplit
 
 from octoforge_core.composition import LexicalBackend
-from octoforge_core.config import EmbeddingBackend
-from octoforge_core.db.search_extensions import VECTOR
 
+from octoforge_server.capability_llm import llm_capabilities, multimodal_capabilities
+from octoforge_server.capability_model import CRITICAL, REPORT_HEADER, Capability
+from octoforge_server.capability_search import search_capabilities
+from octoforge_server.capability_tools import (
+    retention_capabilities,
+    surface_capabilities,
+    tool_capabilities,
+)
 from octoforge_server.config import Settings
-
-# Which engine answers a keyword query, and what that costs the user. Naming the
-# engine matters: the two are not equivalent — Postgres stems Russian, SQLite
-# matches substrings, so "задача" finds "задачи" on one and not the other.
-LEXICAL_DETAIL = {
-    LexicalBackend.POSTGRES: "pg_textsearch, BM25 over the russian_unaccent config",
-    LexicalBackend.SQLITE: "SQLite FTS5, BM25 over trigrams (no russian stemming)",
-    LexicalBackend.NONE: "unavailable here — recall is embeddings only",
-}
-
-REPORT_HEADER = "capabilities of this installation:"
-ON = "on"
-OFF = "off"
-# Off is normal for most capabilities, but these two make the installation
-# either useless (no recall) or unreachable (503 on every HTTP request), so
-# they are worth a warning rather than a line in a list.
-CRITICAL = frozenset({"embeddings", "operator credential"})
 
 
 @dataclass(frozen=True, slots=True)
-class Capability:
-    """One reported capability: its state and what backs it."""
+class CapabilityReport:
+    search_extensions: frozenset[str] = frozenset()
+    lexical_backend: LexicalBackend = LexicalBackend.NONE
+    extra: Sequence[Capability] = ()
 
-    name: str
-    enabled: bool
-    detail: str
 
-    def line(self) -> str:
-        """Render as a single log line."""
-        return f"  {self.name:<20} {ON if self.enabled else OFF:<3}  {self.detail}"
+DEFAULT_CAPABILITY_REPORT = CapabilityReport()
 
 
 def describe_capabilities(
@@ -58,218 +32,39 @@ def describe_capabilities(
     search_extensions: frozenset[str] = frozenset(),
     lexical_backend: LexicalBackend = LexicalBackend.NONE,
 ) -> tuple[Capability, ...]:
-    """Describe every optional capability, in report order.
-
-    `search_extensions` is what the database was probed for, so it is passed in
-    rather than derived from settings: whether pgvector and pg_textsearch exist
-    is a fact about the server, not about configuration, and no OF_ variable
-    can be trusted to describe it.
-    """
     return (
-        *_llm_capabilities(settings),
-        *_multimodal_capabilities(settings),
-        *_tool_capabilities(settings),
-        *_surface_capabilities(settings),
-        *_retention_capabilities(settings),
-        *_search_capabilities(search_extensions, lexical_backend),
+        *llm_capabilities(settings),
+        *multimodal_capabilities(settings),
+        *tool_capabilities(settings),
+        *surface_capabilities(settings),
+        *retention_capabilities(settings),
+        *search_capabilities(search_extensions, lexical_backend),
     )
 
 
 def log_capabilities(
     settings: Settings,
     logger: logging.Logger,
-    search_extensions: frozenset[str] = frozenset(),
-    lexical_backend: LexicalBackend = LexicalBackend.NONE,
-    extra: Sequence[Capability] = (),
+    report: CapabilityReport = DEFAULT_CAPABILITY_REPORT,
 ) -> None:
-    """Log the capability report; critical gaps also get their own warning.
-
-    `extra` is what the installed interfaces have to say about themselves.
-    The service cannot report on a bot it does not know exists, and an
-    operator reading the startup log still wants one list.
-    """
-    capabilities = (*describe_capabilities(settings, search_extensions, lexical_backend), *extra)
+    capabilities = (
+        *describe_capabilities(
+            settings,
+            report.search_extensions,
+            report.lexical_backend,
+        ),
+        *report.extra,
+    )
     logger.info("%s\n%s", REPORT_HEADER, "\n".join(cap.line() for cap in capabilities))
-    for cap in capabilities:
-        if not cap.enabled and cap.name in CRITICAL:
-            logger.warning("%s is off: %s", cap.name, cap.detail)
+    for capability in capabilities:
+        if not capability.enabled and capability.name in CRITICAL:
+            logger.warning("%s is off: %s", capability.name, capability.detail)
 
 
-def _llm_capabilities(settings: Settings) -> tuple[Capability, ...]:
-    return (
-        Capability(
-            name="llm",
-            enabled=bool(settings.llm_api_key),
-            detail=(
-                f"{settings.llm_model} at {_host(settings.llm_base_url)}"
-                if settings.llm_api_key
-                else "set OF_LLM_API_KEY — no answer can be generated without it"
-            ),
-        ),
-        Capability(
-            name="embeddings",
-            enabled=settings.embeddings_configured(),
-            detail=_embeddings_detail(settings),
-        ),
-        Capability(
-            name="reranker",
-            enabled=bool(settings.reranker_model) or bool(settings.reranker_api_key),
-            detail=_reranker_detail(settings),
-        ),
-    )
-
-
-def _multimodal_capabilities(settings: Settings) -> tuple[Capability, ...]:
-    return (
-        Capability(
-            name="vision",
-            enabled=settings.vision_configured(),
-            detail=(
-                f"{settings.vision_model} at {_host(settings.resolved_vision_base_url())}"
-                if settings.vision_configured()
-                else "OF_VISION_MODEL is empty — images arrive as text placeholders"
-            ),
-        ),
-        Capability(
-            name="image_look tool",
-            enabled=settings.deep_vision_configured(),
-            detail=(
-                settings.vision_deep_model
-                if settings.deep_vision_configured()
-                else "OF_VISION_DEEP_MODEL is empty — no re-examination of a picture"
-            ),
-        ),
-        Capability(
-            name="voice messages",
-            enabled=settings.speech_configured(),
-            detail=(
-                f"{settings.stt_model} at {_host(settings.stt_base_url)}"
-                if settings.speech_configured()
-                else "set OF_STT_BASE_URL and OF_STT_MODEL to transcribe recordings"
-            ),
-        ),
-    )
-
-
-def _tool_capabilities(settings: Settings) -> tuple[Capability, ...]:
-    return (
-        Capability(
-            name="web search",
-            enabled=bool(settings.serper_token),
-            detail=(
-                "serper.dev"
-                if settings.serper_token
-                else "OF_SERPER_TOKEN is empty — the web_search tool stays hidden"
-            ),
-        ),
-        Capability(
-            name="secret store",
-            enabled=bool(settings.secrets_key),
-            detail=(
-                f"Fernet, one-time links at {settings.resolved_public_base_url()}"
-                if settings.secrets_key
-                else "OF_SECRETS_KEY is empty — endpoints declaring auth.secret fail"
-            ),
-        ),
-        Capability(
-            name="mcp",
-            enabled=True,
-            detail=(
-                "servers are user-added records (mcp_add); mirrored tools refresh "
-                f"every {settings.mcp_sync_interval_seconds:.0f}s"
-            ),
-        ),
-    )
-
-
-def _surface_capabilities(settings: Settings) -> tuple[Capability, ...]:
-    return (
-        Capability(
-            name="database",
-            enabled=True,
-            detail=_database_detail(settings.database_url),
-        ),
-        Capability(
-            name="operator credential",
-            enabled=bool(settings.admin_password_hash),
-            detail=(
-                f"HTTP Basic as {settings.admin_username!r}"
-                if settings.admin_password_hash
-                else "OF_ADMIN_PASSWORD_HASH is empty — the HTTP surface answers 503"
-            ),
-        ),
-    )
-
-
-def _embeddings_detail(settings: Settings) -> str:
-    if settings.embedding_backend == EmbeddingBackend.LOCAL:
-        return f"local sentence-transformers, {settings.embedding_model}"
-    if settings.embeddings_inherit_llm():
-        return (
-            f"{settings.embedding_model} at {_host(settings.resolved_embedding_base_url())}"
-            " (inherited from OF_LLM_*)"
-        )
-    if settings.embeddings_configured():
-        return f"{settings.embedding_model} at {_host(settings.embedding_base_url)}"
-    return "no endpoint — recall, skills, knowledge and dataset search are unavailable"
-
-
-def _reranker_detail(settings: Settings) -> str:
-    if settings.reranker_api_key:
-        return f"HTTP rerank at {_host(settings.reranker_api_url)}"
-    if settings.reranker_model:
-        return f"local cross-encoder, {settings.reranker_model}"
-    return "OF_RERANKER_MODEL is empty — recall ranks by cosine only"
-
-
-def _database_detail(url: str) -> str:
-    scheme = urlsplit(url).scheme
-    dialect = scheme.split("+", 1)[0] if scheme else "unknown"
-    single_writer = " (single writer: one process only)" if dialect == "sqlite" else ""
-    return f"{dialect}{single_writer}"
-
-
-def _host(url: str) -> str:
-    """Host of a URL, or the raw value when it does not parse as one."""
-    return urlsplit(url).netloc or url
-
-
-def _search_capabilities(
-    search_extensions: frozenset[str],
-    lexical_backend: LexicalBackend,
-) -> tuple[Capability, ...]:
-    """Report what the database itself can contribute to retrieval.
-
-    Neither is required. Without pgvector the whole visible table is pulled
-    into the process and ranked there, which is correct but grows with the
-    corpus; without pg_textsearch there is no lexical half at all. Both are
-    unavailable on managed Postgres and on SQLite, so "off" here is a normal
-    state worth stating plainly rather than a misconfiguration.
-    """
-    vector = VECTOR in search_extensions
-    return (
-        Capability(
-            name="vector search",
-            enabled=vector,
-            detail=(
-                "pgvector ranks in the database"
-                if vector
-                else "no pgvector — the visible table is ranked in process"
-            ),
-        ),
-        Capability(
-            name="lexical search",
-            enabled=lexical_backend is not LexicalBackend.NONE,
-            detail=LEXICAL_DETAIL[lexical_backend],
-        ),
-    )
-
-
-def _retention_capabilities(settings: Settings) -> tuple[Capability, ...]:
-    """Report the retention policy, because silent deletion is the worst kind.
-
-    "off" is the normal state and says so plainly: an operator reading this
-    should be able to tell at a glance whether anything is being deleted.
-    """
-    policy = settings.retention_policy()
-    return (Capability(name="retention", enabled=policy.enabled(), detail=policy.describe()),)
+__all__ = [
+    "CRITICAL",
+    "Capability",
+    "CapabilityReport",
+    "describe_capabilities",
+    "log_capabilities",
+]

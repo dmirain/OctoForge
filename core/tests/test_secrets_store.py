@@ -1,6 +1,7 @@
 """Tests for the encrypted per-user secret store."""
 
 from collections.abc import AsyncIterator
+from dataclasses import replace
 
 import pytest
 from cryptography.fernet import Fernet
@@ -15,6 +16,7 @@ from octoforge_core.secrets.api import (
     SecretNotFoundError,
     SecretPlacement,
     SecretTransform,
+    SecretWrite,
     apply_transform,
     host_matches,
     normalize_host,
@@ -29,6 +31,7 @@ CODE = "gmail_token"
 VALUE = "ya29.a0-very-secret-token"
 HOST = "gmail.googleapis.com"
 DESCRIPTION = "read-only token for the work mailbox"
+SECRET = SecretWrite(USER_A, CODE, VALUE, HOST, DESCRIPTION)
 
 
 @pytest.fixture
@@ -50,7 +53,7 @@ def store(session_factory: async_sessionmaker[AsyncSession], key: str) -> SqlAlc
 
 
 async def test_roundtrip_and_last_used_stamp(store: SqlAlchemySecretStore) -> None:
-    await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION)
+    await store.put(SECRET)
 
     resolved = await store.resolve(USER_A, CODE, HOST)
     (info,) = await store.list(USER_A)
@@ -65,7 +68,7 @@ async def test_value_is_encrypted_at_rest(
     store: SqlAlchemySecretStore, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:
     """Neither the database nor its dumps may contain the plaintext."""
-    await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION)
+    await store.put(SECRET)
 
     async with session_factory() as session:
         (row,) = (await session.scalars(select(SecretRow))).all()
@@ -74,7 +77,7 @@ async def test_value_is_encrypted_at_rest(
 
 
 async def test_listing_never_carries_values(store: SqlAlchemySecretStore) -> None:
-    await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION)
+    await store.put(SECRET)
 
     (info,) = await store.list(USER_A)
 
@@ -84,7 +87,7 @@ async def test_listing_never_carries_values(store: SqlAlchemySecretStore) -> Non
 
 async def test_host_binding_blocks_other_hosts(store: SqlAlchemySecretStore) -> None:
     """The exfiltration guard: the value never travels to a foreign host."""
-    await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION)
+    await store.put(SECRET)
 
     with pytest.raises(SecretHostMismatchError) as denied:
         await store.resolve(USER_A, CODE, "evil.example.com")
@@ -93,10 +96,17 @@ async def test_host_binding_blocks_other_hosts(store: SqlAlchemySecretStore) -> 
 
 
 async def test_put_replaces_and_resets_usage(store: SqlAlchemySecretStore) -> None:
-    await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION)
+    await store.put(SECRET)
     await store.resolve(USER_A, CODE, HOST)
 
-    await store.put(USER_A, CODE, "rotated-value", "api.example.com", "rotated")
+    await store.put(
+        replace(
+            SECRET,
+            value="rotated-value",
+            allowed_host="api.example.com",
+            description="rotated",
+        )
+    )
     (info,) = await store.list(USER_A)
 
     assert info.allowed_host == "api.example.com"
@@ -106,13 +116,11 @@ async def test_put_replaces_and_resets_usage(store: SqlAlchemySecretStore) -> No
 
 async def test_placements_and_transform_roundtrip(store: SqlAlchemySecretStore) -> None:
     await store.put(
-        USER_A,
-        CODE,
-        VALUE,
-        HOST,
-        DESCRIPTION,
-        placements=("url", "header"),
-        transform="base64",
+        replace(
+            SECRET,
+            placements=("url", "header"),
+            transform="base64",
+        )
     )
 
     (info,) = await store.list(USER_A)
@@ -125,7 +133,7 @@ async def test_placements_and_transform_roundtrip(store: SqlAlchemySecretStore) 
 
 
 async def test_owner_isolation(store: SqlAlchemySecretStore) -> None:
-    await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION)
+    await store.put(SECRET)
 
     assert await store.list(USER_B) == []
     with pytest.raises(SecretNotFoundError):
@@ -133,7 +141,7 @@ async def test_owner_isolation(store: SqlAlchemySecretStore) -> None:
 
 
 async def test_delete(store: SqlAlchemySecretStore) -> None:
-    await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION)
+    await store.put(SECRET)
     await store.delete(USER_A, CODE)
 
     assert await store.list(USER_A) == []
@@ -145,7 +153,7 @@ async def test_wrong_key_reads_as_missing(
     session_factory: async_sessionmaker[AsyncSession], key: str
 ) -> None:
     """A rotated master key must degrade to \"re-enter the secret\", not crash."""
-    await SqlAlchemySecretStore(session_factory, key).put(USER_A, CODE, VALUE, HOST, DESCRIPTION)
+    await SqlAlchemySecretStore(session_factory, key).put(SECRET)
     other = SqlAlchemySecretStore(session_factory, Fernet.generate_key().decode())
 
     with pytest.raises(SecretNotFoundError):
@@ -154,23 +162,30 @@ async def test_wrong_key_reads_as_missing(
 
 async def test_validation(store: SqlAlchemySecretStore) -> None:
     with pytest.raises(InvalidSecretError):
-        await store.put(USER_A, "Bad Code!", VALUE, HOST, DESCRIPTION)
+        await store.put(replace(SECRET, code="Bad Code!"))
     with pytest.raises(InvalidSecretError):
-        await store.put(USER_A, CODE, "", HOST, DESCRIPTION)
+        await store.put(replace(SECRET, value=""))
     with pytest.raises(InvalidSecretError):
-        await store.put(USER_A, CODE, VALUE, "https://host/with/path", DESCRIPTION)
+        await store.put(replace(SECRET, allowed_host="https://host/with/path"))
     with pytest.raises(InvalidSecretError):  # header injection guard
-        await store.put(USER_A, CODE, "tok\r\nX-Evil: 1", HOST, DESCRIPTION)
+        await store.put(replace(SECRET, value="tok\r\nX-Evil: 1"))
     with pytest.raises(InvalidSecretError):  # non-ASCII cannot travel in a header
-        await store.put(USER_A, CODE, "секрет", HOST, DESCRIPTION)
+        await store.put(replace(SECRET, value="секрет"))
     with pytest.raises(InvalidSecretError):  # the description became required
-        await store.put(USER_A, CODE, VALUE, HOST, "   ")
+        await store.put(replace(SECRET, description="   "))
     with pytest.raises(InvalidSecretError):
-        await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION, placements=("cookie",))
+        await store.put(replace(SECRET, placements=("cookie",)))
     with pytest.raises(InvalidSecretError):
-        await store.put(USER_A, CODE, VALUE, HOST, DESCRIPTION, transform="rot13")
+        await store.put(replace(SECRET, transform="rot13"))
     # normalization: case and trailing dot fold away
-    await store.put(USER_A, "  GMAIL_TOKEN ".strip().lower(), VALUE, "Gmail.googleapis.com.", "x")
+    await store.put(
+        replace(
+            SECRET,
+            code="  GMAIL_TOKEN ".strip().lower(),
+            allowed_host="Gmail.googleapis.com.",
+            description="x",
+        )
+    )
     assert (await store.list(USER_A))[0].allowed_host == HOST
 
 
@@ -208,7 +223,7 @@ def test_host_patterns_that_are_too_broad_or_malformed_are_refused(raw: str) -> 
 
 async def test_a_pattern_binding_serves_sibling_hosts(store: SqlAlchemySecretStore) -> None:
     """One credential for a sharded service, still refused everywhere else."""
-    await store.put(USER_A, CODE, VALUE, "*.icloud.com", DESCRIPTION)
+    await store.put(replace(SECRET, allowed_host="*.icloud.com"))
 
     assert (await store.resolve(USER_A, CODE, "p54-caldav.icloud.com")).value == VALUE
     assert (await store.resolve(USER_A, CODE, "caldav.icloud.com")).value == VALUE

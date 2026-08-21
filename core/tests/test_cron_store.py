@@ -6,7 +6,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from octoforge_core.cron.api import CronJob, CronJobNotFoundError
+from octoforge_core.cron.api import (
+    CronClaim,
+    CronEnablement,
+    CronFireResult,
+    CronJob,
+    CronJobNotFoundError,
+)
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.tasks.api import TaskStatus
@@ -106,18 +112,18 @@ async def test_delete_for_user_removes_only_the_owned_job(store: SqlAlchemyCronS
 async def test_set_enabled_toggles_and_moves_next_fire(store: SqlAlchemyCronStore) -> None:
     await store.create(BASE_JOB)
 
-    paused = await store.set_enabled(USER_A, BASE_JOB.id, False)
+    paused = await store.set_enabled(CronEnablement(USER_A, BASE_JOB.id, False))
 
     assert paused.enabled is False
     assert paused.next_fire_at == DUE_AT  # untouched when not passed
 
-    resumed = await store.set_enabled(USER_A, BASE_JOB.id, True, FUTURE_AT)
+    resumed = await store.set_enabled(CronEnablement(USER_A, BASE_JOB.id, True, FUTURE_AT))
 
     assert resumed.enabled is True
     assert resumed.next_fire_at == FUTURE_AT
 
     with pytest.raises(CronJobNotFoundError):
-        await store.set_enabled(USER_B, BASE_JOB.id, False)
+        await store.set_enabled(CronEnablement(USER_B, BASE_JOB.id, False))
 
 
 async def test_list_due_filters_window_enabled_and_claims(store: SqlAlchemyCronStore) -> None:
@@ -154,8 +160,8 @@ async def test_list_due_respects_the_limit(store: SqlAlchemyCronStore) -> None:
 async def test_claim_is_a_cas_lease(store: SqlAlchemyCronStore) -> None:
     await store.create(BASE_JOB)
 
-    first = await store.claim(BASE_JOB.id, DUE_AT, OWNER_A, NOW, STALE_BEFORE)
-    second = await store.claim(BASE_JOB.id, DUE_AT, OWNER_B, NOW, STALE_BEFORE)
+    first = await store.claim(CronClaim(BASE_JOB.id, DUE_AT, OWNER_A, NOW, STALE_BEFORE))
+    second = await store.claim(CronClaim(BASE_JOB.id, DUE_AT, OWNER_B, NOW, STALE_BEFORE))
 
     assert first is True
     assert second is False  # the fresh claim blocks the race loser
@@ -166,9 +172,9 @@ async def test_claim_is_a_cas_lease(store: SqlAlchemyCronStore) -> None:
 
 async def test_claim_loses_to_a_concurrent_pause(store: SqlAlchemyCronStore) -> None:
     await store.create(BASE_JOB)
-    await store.set_enabled(USER_A, BASE_JOB.id, False)
+    await store.set_enabled(CronEnablement(USER_A, BASE_JOB.id, False))
 
-    claimed = await store.claim(BASE_JOB.id, DUE_AT, OWNER_A, NOW, STALE_BEFORE)
+    claimed = await store.claim(CronClaim(BASE_JOB.id, DUE_AT, OWNER_A, NOW, STALE_BEFORE))
 
     assert claimed is False  # a pause racing the claim after list_due must win
     assert (await store.get(BASE_JOB.id)).claimed_by is None
@@ -177,7 +183,7 @@ async def test_claim_loses_to_a_concurrent_pause(store: SqlAlchemyCronStore) -> 
 async def test_claim_fails_on_a_moved_next_fire(store: SqlAlchemyCronStore) -> None:
     await store.create(BASE_JOB)
 
-    claimed = await store.claim(BASE_JOB.id, FUTURE_AT, OWNER_A, NOW, STALE_BEFORE)
+    claimed = await store.claim(CronClaim(BASE_JOB.id, FUTURE_AT, OWNER_A, NOW, STALE_BEFORE))
 
     assert claimed is False
 
@@ -185,7 +191,7 @@ async def test_claim_fails_on_a_moved_next_fire(store: SqlAlchemyCronStore) -> N
 async def test_claim_reclaims_a_stale_lease(store: SqlAlchemyCronStore) -> None:
     await store.create(make_job(claimed_by=OWNER_A, claimed_at=STALE_CLAIM_AT))
 
-    claimed = await store.claim(BASE_JOB.id, DUE_AT, OWNER_B, NOW, STALE_BEFORE)
+    claimed = await store.claim(CronClaim(BASE_JOB.id, DUE_AT, OWNER_B, NOW, STALE_BEFORE))
 
     assert claimed is True
     assert (await store.get(BASE_JOB.id)).claimed_by == OWNER_B
@@ -193,14 +199,14 @@ async def test_claim_reclaims_a_stale_lease(store: SqlAlchemyCronStore) -> None:
 
 async def test_release_claim_makes_the_job_claimable_again(store: SqlAlchemyCronStore) -> None:
     await store.create(BASE_JOB)
-    await store.claim(BASE_JOB.id, DUE_AT, OWNER_A, NOW, STALE_BEFORE)
+    await store.claim(CronClaim(BASE_JOB.id, DUE_AT, OWNER_A, NOW, STALE_BEFORE))
 
     await store.release_claim(BASE_JOB.id)
 
     released = await store.get(BASE_JOB.id)
     assert released.claimed_by is None
     assert released.claimed_at is None
-    reclaimed = await store.claim(BASE_JOB.id, DUE_AT, OWNER_B, NOW, STALE_BEFORE)
+    reclaimed = await store.claim(CronClaim(BASE_JOB.id, DUE_AT, OWNER_B, NOW, STALE_BEFORE))
     assert reclaimed is True
 
 
@@ -224,8 +230,10 @@ async def test_record_fire_result_with_retry_reschedules_and_grows_the_streak(
     await store.create(BASE_JOB)
     retry_at = NOW + timedelta(minutes=1)
 
-    await store.record_fire_result(BASE_JOB.id, TaskStatus.FAILED, "boom", retry_at)
-    await store.record_fire_result(BASE_JOB.id, TaskStatus.FAILED, "boom2", retry_at)
+    await store.record_fire_result(CronFireResult(BASE_JOB.id, TaskStatus.FAILED, "boom", retry_at))
+    await store.record_fire_result(
+        CronFireResult(BASE_JOB.id, TaskStatus.FAILED, "boom2", retry_at)
+    )
 
     updated = await store.get(BASE_JOB.id)
     assert updated.last_status is TaskStatus.FAILED
@@ -239,7 +247,7 @@ async def test_record_fire_result_without_retry_keeps_the_slot_and_resets_the_st
 ) -> None:
     await store.create(make_job(retry_count=RETRY_TWO))
 
-    await store.record_fire_result(BASE_JOB.id, TaskStatus.DONE, None, None)
+    await store.record_fire_result(CronFireResult(BASE_JOB.id, TaskStatus.DONE, None, None))
 
     updated = await store.get(BASE_JOB.id)
     assert updated.last_status is TaskStatus.DONE

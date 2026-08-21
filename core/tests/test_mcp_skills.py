@@ -3,7 +3,6 @@
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
 
 import pytest
 
@@ -14,10 +13,10 @@ from octoforge_core.instructions.api import InstructionNotFoundError, Instructio
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.llm.errors import LLMError
-from octoforge_core.mcp.api import McpServer, McpToolDescriptor
+from octoforge_core.mcp.api import McpServer, McpToolCall, McpToolDescriptor
 from octoforge_core.mcp.skills import McpSkillGenerator, SkillPattern
 from octoforge_core.mcp.store import SqlAlchemyMcpServerStore
-from octoforge_core.mcp.sync import McpToolSync
+from octoforge_core.mcp.sync import McpSyncOptions, McpSyncServices, McpToolSync
 
 MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 URL = "https://mcp.example.com/mcp"
@@ -68,9 +67,7 @@ class ScriptedMcpClient:
     async def list_tools(self, url: str, headers: dict[str, str]) -> list[McpToolDescriptor]:
         return list(self.tools)
 
-    async def call_tool(
-        self, url: str, headers: dict[str, str], tool: str, arguments: dict[str, Any]
-    ) -> None:
+    async def call_tool(self, request: McpToolCall) -> None:
         raise AssertionError("the sync must never call tools")
 
 
@@ -87,10 +84,8 @@ class Harness:
 
     def sync(self, tools: list[McpToolDescriptor]) -> McpToolSync:
         return McpToolSync(
-            self.store,
-            ScriptedMcpClient(tools),
-            self.instructions,
-            skills=McpSkillGenerator(self.llm, self.instructions),
+            McpSyncServices(self.store, ScriptedMcpClient(tools), self.instructions),
+            McpSyncOptions(skills=McpSkillGenerator(self.llm, self.instructions)),
         )
 
     async def server(self) -> McpServer:

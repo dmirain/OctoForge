@@ -13,11 +13,12 @@ name burns no model call, so there is nothing here for a banned account to
 abuse either.
 """
 
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from octoforge_core.identity.api import IdentityStore
+from octoforge_core.identity.api import IdentityKey, IdentityProfile, IdentityStore
 from pydantic import BaseModel
 
 from octoforge_server.deps import get_channel, get_external_id, get_identity_store
@@ -27,6 +28,16 @@ router = APIRouter(prefix="/api/identity")
 ExternalIdDep = Annotated[str, Depends(get_external_id)]
 ChannelDep = Annotated[str, Depends(get_channel)]
 IdentityStoreDep = Annotated[IdentityStore, Depends(get_identity_store)]
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityContext:
+    external_id: ExternalIdDep
+    channel: ChannelDep
+    store: IdentityStoreDep
+
+
+IdentityContextDep = Annotated[IdentityContext, Depends()]
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -39,9 +50,7 @@ class ProfileUpdateRequest(BaseModel):
 @router.put("/profile", status_code=HTTPStatus.NO_CONTENT)
 async def put_profile(
     request: ProfileUpdateRequest,
-    external_id: ExternalIdDep,
-    channel: ChannelDep,
-    identities: IdentityStoreDep,
+    context: IdentityContextDep,
 ) -> None:
     """Mirror the surface profile of one account, minting the person if needed.
 
@@ -51,5 +60,9 @@ async def put_profile(
     before the first message has — a mirror that only updated would leave
     every newcomer nameless until their second message.
     """
-    await identities.resolve_or_create(channel, external_id)
-    await identities.update_profile(channel, external_id, request.name, request.username)
+    await context.store.resolve_or_create(context.channel, context.external_id)
+    await context.store.update_profile(
+        IdentityProfile(
+            IdentityKey(context.channel, context.external_id), request.name, request.username
+        )
+    )

@@ -19,10 +19,8 @@ class SqlAlchemyMcpServerStore:
     async def add(self, server: McpServer, user_id: str) -> McpServer:
         """Register the server for this user, deduplicating by URL.
 
-        Deliberately NOT unit-of-work aware (raw `_session_factory`): the
-        insert branch uses the commit itself as the uniqueness-race detector —
-        two first adds arriving together must converge on one row, so the
-        loser rolls back and links the winner's row instead.
+        The raw session commit is the uniqueness-race detector: concurrent
+        first adds converge on one row and the loser links the winner.
         """
         async with self._session_factory() as session:
             existing = await self._find_by_url(session, server.url)

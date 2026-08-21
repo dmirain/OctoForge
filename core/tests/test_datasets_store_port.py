@@ -6,16 +6,18 @@ modularity roadmap, P1): brute-force ranking flows through
 `list_with_embeddings`, vector-capable stores get `search_by_vector` instead.
 """
 
-from datetime import datetime
 from typing import Any
 
 import pytest
 
 from octoforge_core.datasets.api import (
     Dataset,
+    DatasetDefinition,
     DatasetExistsError,
     DatasetNotFoundError,
     DatasetRecord,
+    DatasetRecordQuery,
+    DatasetRecordScan,
     DatasetSchema,
     EmbeddedDataset,
 )
@@ -40,6 +42,9 @@ APPLE = {"item": "apple", "kcal": 95}
 BANANA = {"item": "banana", "kcal": 105}
 
 EMPTY_SCHEMA = DatasetSchema(())
+FOOD_DEFINITION = DatasetDefinition(OWNER_A, FOOD_DATASET, DESCRIPTION, EMPTY_SCHEMA)
+SPORT_DEFINITION = DatasetDefinition(OWNER_A, SPORT_DATASET, DESCRIPTION, EMPTY_SCHEMA)
+BASE_QUERY = DatasetRecordQuery(OWNER_A, FOOD_DATASET, None, None, None, TWO_RECORDS)
 
 
 class StubEmbedder:
@@ -61,28 +66,23 @@ class InMemoryDatasetStore:
         self.records: list[DatasetRecord] = []
         self.list_calls = 0
 
-    async def create(  # noqa: PLR0913, PLR0917 — mirrors the DatasetStore port signature
+    async def create(
         self,
-        owner_user_id: str,
-        name: str,
-        description: str,
-        schema: DatasetSchema,
-        usage_notes: str,
-        retention: str,
+        definition: DatasetDefinition,
         embedding: tuple[float, ...],
     ) -> Dataset:
-        key = (owner_user_id, name)
+        key = (definition.owner_user_id, definition.name)
         if key in self.datasets:
-            raise DatasetExistsError(f"dataset '{name}' already exists")
+            raise DatasetExistsError(f"dataset '{definition.name}' already exists")
         now = utc_now()
         dataset = Dataset(
             id=f"mem-{len(self.datasets)}",
-            owner_user_id=owner_user_id,
-            name=name,
-            description=description,
-            schema=schema,
-            usage_notes=usage_notes,
-            retention=retention,
+            owner_user_id=definition.owner_user_id,
+            name=definition.name,
+            description=definition.description,
+            schema=definition.schema,
+            usage_notes=definition.usage_notes,
+            retention=definition.retention,
             version=FIRST_VERSION,
             created_at=now,
             updated_at=now,
@@ -123,22 +123,16 @@ class InMemoryDatasetStore:
         self.list_calls += 1
         return self._owned(owner_user_id)
 
-    async def query_candidates(
-        self,
-        dataset_id: str,
-        date_from: datetime | None,
-        date_to: datetime | None,
-        scan_limit: int,
-    ) -> list[DatasetRecord]:
+    async def query_candidates(self, request: DatasetRecordScan) -> list[DatasetRecord]:
         candidates = [
             record
             for record in self.records
-            if record.dataset_id == dataset_id
-            and (date_from is None or record.created_at >= date_from)
-            and (date_to is None or record.created_at <= date_to)
+            if record.dataset_id == request.dataset_id
+            and (request.date_from is None or record.created_at >= request.date_from)
+            and (request.date_to is None or record.created_at <= request.date_to)
         ]
         candidates.sort(key=lambda record: (record.created_at, record.id), reverse=True)
-        return candidates[:scan_limit]
+        return candidates[: request.limit]
 
     def _owned(self, owner_user_id: str) -> list[EmbeddedDataset]:
         return [
@@ -173,15 +167,15 @@ async def test_service_runs_over_an_in_memory_store() -> None:
     store = InMemoryDatasetStore()
     service = make_service(store)
 
-    await service.create_dataset(OWNER_A, FOOD_DATASET, DESCRIPTION, EMPTY_SCHEMA)
+    await service.create_dataset(FOOD_DEFINITION)
     await service.add_record(OWNER_A, FOOD_DATASET, APPLE)
     await service.add_record(OWNER_A, FOOD_DATASET, BANANA)
 
-    records = await service.query_records(OWNER_A, FOOD_DATASET, None, None, None, TWO_RECORDS)
+    records = await service.query_records(BASE_QUERY)
     assert [record.payload for record in records] == [BANANA, APPLE]
 
     filtered = await service.query_records(
-        OWNER_A, FOOD_DATASET, {"item": "apple"}, None, None, TWO_RECORDS
+        DatasetRecordQuery(OWNER_A, FOOD_DATASET, {"item": "apple"}, None, None, TWO_RECORDS)
     )
     assert [record.payload for record in filtered] == [APPLE]
 
@@ -194,9 +188,11 @@ async def test_service_runs_over_an_in_memory_store() -> None:
 async def test_vector_capable_store_receives_the_search_with_the_owner() -> None:
     store = VectorSearchStore()
     service = make_service(store)
-    await service.create_dataset(OWNER_A, FOOD_DATASET, DESCRIPTION, EMPTY_SCHEMA)
-    await service.create_dataset(OWNER_A, SPORT_DATASET, DESCRIPTION, EMPTY_SCHEMA)
-    await service.create_dataset(OWNER_B, FOOD_DATASET, DESCRIPTION, EMPTY_SCHEMA)
+    await service.create_dataset(FOOD_DEFINITION)
+    await service.create_dataset(SPORT_DEFINITION)
+    await service.create_dataset(
+        DatasetDefinition(OWNER_B, FOOD_DATASET, DESCRIPTION, EMPTY_SCHEMA)
+    )
 
     hits = await service.search(OWNER_A, QUERY, k=1)
 

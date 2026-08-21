@@ -250,11 +250,12 @@ including how routing decides whose a message is, is in
 ## Fitting it into your stack
 
 Dependencies point inward: the core defines `Protocol` ports and never constructs its own
-dependencies, and one composition root assembles the graph. Every builder
-(`build_llm_client`, `build_tool_registry`, `build_conversation_manager`, …) lives in
-`core/composition.py` and takes ports and configs only — no FastAPI — so an alternative composition
-root reuses them instead of copying code. `deploy/src/octoforge_deploy/main.py:runtime()` is just the
-default assembly, shared by the HTTP app and the standalone Telegram surface.
+dependencies, and one composition root assembles the graph. Every builder (`build_llm_client`,
+`build_tool_registry`, `build_conversation_manager`, ...) is exposed by
+`core/src/octoforge_core/composition.py` and takes ports and configs only, with no FastAPI, so an
+alternative composition root reuses them instead of copying code.
+`deploy/src/octoforge_deploy/main.py:runtime()` is the stable entry point for the default staged
+assembly, shared by the HTTP app and the standalone Telegram surface.
 
 | You want to change | Swap this |
 |---|---|
@@ -348,7 +349,9 @@ import asyncio
 import httpx
 from octoforge_core import (
     AgentLoop,
+    AgentLoopConfig,
     ConversationManager,
+    DialogSubmission,
     Failed,
     Finished,
     LLMConfig,
@@ -383,10 +386,14 @@ async def main() -> None:
                 http_client=http,
                 config=LLMConfig(api_key="sk-...", model="gpt-4o-mini"),
             )
-            prompts = StaticPromptProvider()  # built-in prompts; bring your own via the port
+            prompts = (
+                StaticPromptProvider()
+            )  # built-in prompts; bring your own via the port
             manager = ConversationManager(
                 config=RunnerConfig(
-                    loop=AgentLoop(llm_client=llm, registry=ToolRegistry(), max_iterations=10),
+                    loop=AgentLoop(
+                        llm, ToolRegistry(), AgentLoopConfig(max_iterations=10)
+                    ),
                     prompts=prompts,
                     router=LLMRouter(llm, timeout_seconds=10.0, prompts=prompts),
                     max_processes=5,
@@ -400,9 +407,11 @@ async def main() -> None:
 
             runner = await manager.get_or_create_runner("user-1", "cli")
             events = runner.subscribe()  # subscribe BEFORE submit, or events get lost
-            await runner.submit("Hi! What can you do?")
+            await runner.submit(DialogSubmission("Hi! What can you do?"))
             while True:
-                event = (await events.get()).payload  # ConversationEvent(dialog_id, seq, payload)
+                event = (
+                    await events.get()
+                ).payload  # ConversationEvent(dialog_id, seq, payload)
                 if isinstance(event, TextDelta):
                     print(event.text, end="", flush=True)
                 elif isinstance(event, Finished):
@@ -449,15 +458,16 @@ page; the entry points:
 ## Development
 
 ```bash
-make check   # ruff (lint + format) → mypy --strict → pytest, both projects
+make check   # Ruff check/format -> Pylint -> mypy strict -> docs -> pytest
 make test-pg # the Postgres-specific store tests (needs `make db-up`)
 make bench   # the latency harness behind the table above
 ```
 
-Individually: `make lint`, `make typecheck`, `make test`, `make format`. Conventions for writing code
-here — including the rules that keep one event loop responsive — are [AGENTS.md](AGENTS.md), and the
-rules for writing documentation are [docs/CONVENTIONS.md](docs/CONVENTIONS.md). Contributions are
-welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+Individually: `make lint`, `make typecheck`, `make docs`, `make test`, `make format`. Production
+Python modules are capped at 120 lines and functions at 20 statements and 3 arguments; the complete
+quality and event-loop rules are in [AGENTS.md](AGENTS.md). Documentation rules are in
+[docs/CONVENTIONS.md](docs/CONVENTIONS.md). Contributions are welcome: see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

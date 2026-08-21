@@ -7,7 +7,8 @@ self-contained and must not import from the instructions module.
 import math
 from collections.abc import Sequence
 
-from octoforge_core.datasets.api import DatasetHit, EmbeddedDataset
+from octoforge_core.datasets.requests import DatasetRankingRequest
+from octoforge_core.datasets.types import DatasetHit, EmbeddedDataset
 
 # Cosine scores lie in [-1, 1], so adding 2.0 puts an exact-name hit strictly
 # above any non-exact hit regardless of vector similarity.
@@ -28,29 +29,24 @@ def cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> floa
     return dot / (left_norm * right_norm)
 
 
-def rank(
-    candidates: list[EmbeddedDataset],
-    query: str,
-    query_embedding: tuple[float, ...],
-    k: int,
-) -> list[DatasetHit]:
+def rank(request: DatasetRankingRequest) -> list[DatasetHit]:
     """Score candidates against the query and return the top-k hits, best first.
 
     Score = cosine similarity; a candidate whose name equals the query
     (case-insensitively) receives EXACT_NAME_BOOST so it always sorts first.
     Ties break by name for determinism.
     """
-    if k <= 0:
+    if request.limit <= 0:
         return []
     scored = [
         DatasetHit(
             dataset=candidate.dataset,
-            score=_score(candidate, query, query_embedding),
+            score=_score(candidate, request.query, request.query_embedding),
         )
-        for candidate in candidates
+        for candidate in request.candidates
     ]
     scored.sort(key=lambda hit: (-hit.score, hit.dataset.name))
-    return scored[:k]
+    return scored[: request.limit]
 
 
 def _score(

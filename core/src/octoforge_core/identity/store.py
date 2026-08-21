@@ -1,291 +1,87 @@
-"""SQL store of the identity module."""
+"""SQL adapter for the public identity store port."""
 
-import uuid
-from typing import Any, cast
-
-from sqlalchemy import CursorResult, func, select, text, update
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from octoforge_core.db.unit_of_work import read_session, write_session
+from octoforge_core.identity._account_commands import IdentityAccountCommands
+from octoforge_core.identity._account_queries import IdentityAccountQueries
+from octoforge_core.identity._profile_store import IdentityProfileStore
+from octoforge_core.identity._user_store import UserStore
 from octoforge_core.identity.api import (
-    IdentityNotFoundError,
+    IdentityKey,
+    IdentityLink,
+    IdentityProfile,
     IdentityTakenError,
     User,
     UserIdentity,
     UserIdentityList,
     UserList,
-    UserNotFoundError,
     UserStatus,
 )
-from octoforge_core.identity.models import UserIdentityRow, UserRow
-from octoforge_core.time import utc_now
 
 
 class SqlAlchemyIdentityStore:
     """Users and the surface identities pointing at them."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        self._session_factory = session_factory
+        self._users = UserStore(session_factory)
+        self._queries = IdentityAccountQueries(session_factory)
+        self._commands = IdentityAccountCommands(session_factory)
+        self._profiles = IdentityProfileStore(session_factory)
 
     async def resolve(self, surface: str, external_id: str) -> str | None:
-        """The user this account belongs to, or None when nobody active claims it."""
-        async with read_session(self._session_factory) as session:
-            user_id: str | None = await session.scalar(
-                select(UserIdentityRow.user_id).where(
-                    UserIdentityRow.surface == surface,
-                    UserIdentityRow.external_id == external_id,
-                    UserIdentityRow.active.is_(True),
-                )
-            )
-            return user_id
+        return await self._queries.resolve(IdentityKey(surface, external_id))
 
     async def resolve_or_create(self, surface: str, external_id: str) -> str:
-        """The user this account belongs to, minting one on first contact.
-
-        Two first messages arriving together must not mint two people: the
-        loser of the unique constraint re-reads instead of raising, so both
-        end up on the same person.
-        """
-        found = await self.resolve(surface, external_id)
+        """Resolve an account, minting one person safely on first contact."""
+        key = IdentityKey(surface, external_id)
+        found = await self._queries.resolve(key)
         if found is not None:
             return found
-        user = await self.create_user()
+        user = await self._users.create()
         try:
-            await self.link(user.id, surface, external_id)
+            await self._commands.link(IdentityLink(user.id, key))
         except IdentityTakenError:
-            owner = await self.resolve(surface, external_id)
-            if owner is None:  # taken by a revoked identity: nobody may enter
+            owner = await self._queries.resolve(key)
+            if owner is None:
                 raise
             return owner
         return user.id
 
     async def create_user(self, email: str = "") -> User:
-        """Mint a person with an id of their own."""
-        row = UserRow(id=uuid.uuid4().hex, email=email or None)
-        async with write_session(self._session_factory) as session:
-            session.add(row)
-            await session.flush()
-            return _to_user(row)
+        return await self._users.create(email)
 
     async def get_user(self, user_id: str) -> User:
-        async with read_session(self._session_factory) as session:
-            row = await session.get(UserRow, user_id)
-            if row is None:
-                raise UserNotFoundError(user_id)
-            return _to_user(row)
+        return await self._users.get(user_id)
 
-    async def link(
-        self, user_id: str, surface: str, external_id: str, details: dict[str, Any] | None = None
-    ) -> UserIdentity:
-        """Attach an account to a person; raise if it is already somebody's.
-
-        A previously revoked identity of the SAME person is revived rather
-        than refused: coming back is not a conflict.
-
-        Deliberately NOT unit-of-work aware (raw `_session_factory`): the
-        insert branch uses the commit itself as the uniqueness-race detector
-        and rolls the session back on the clash, which inside a shared
-        transaction would discard the unit's earlier writes.
-        """
-        async with self._session_factory() as session:
-            existing = await self._find(session, surface, external_id)
-            if existing is not None:
-                if existing.user_id != user_id:
-                    raise IdentityTakenError(f"{surface}:{external_id}")
-                existing.active = True
-                if details is not None:
-                    existing.details = details
-                await session.commit()
-                return _to_identity(existing)
-            row = UserIdentityRow(
-                id=uuid.uuid4().hex,
-                user_id=user_id,
-                surface=surface,
-                external_id=external_id,
-                details=details or {},
-            )
-            session.add(row)
-            try:
-                await session.commit()
-            except IntegrityError as clash:
-                # somebody claimed it between the check and the insert
-                await session.rollback()
-                raise IdentityTakenError(f"{surface}:{external_id}") from clash
-            return _to_identity(row)
+    async def link(self, request: IdentityLink) -> UserIdentity:
+        return await self._commands.link(request)
 
     async def reseat(self, surface: str, user_id: str, external_id: str) -> UserIdentity:
-        """Point this person's identity on a surface at a different account."""
-        async with write_session(self._session_factory) as session:
-            taken = await self._find(session, surface, external_id)
-            if taken is not None and taken.user_id != user_id:
-                raise IdentityTakenError(f"{surface}:{external_id}")
-            rows = await session.scalars(
-                select(UserIdentityRow).where(
-                    UserIdentityRow.surface == surface, UserIdentityRow.user_id == user_id
-                )
-            )
-            row = rows.first()
-            if row is None:
-                raise IdentityNotFoundError(f"{surface}:{user_id}")
-            row.external_id = external_id
-            row.active = True
-            row.updated_at = utc_now()
-            return _to_identity(row)
+        return await self._commands.reseat(surface, user_id, external_id)
 
     async def deactivate(self, surface: str, external_id: str) -> None:
-        """Revoke an account without erasing that it was once used."""
-        async with write_session(self._session_factory) as session:
-            await session.execute(
-                update(UserIdentityRow)
-                .where(
-                    UserIdentityRow.surface == surface,
-                    UserIdentityRow.external_id == external_id,
-                )
-                .values(active=False, updated_at=utc_now())
-            )
+        await self._commands.deactivate(IdentityKey(surface, external_id))
 
-    async def update_profile(
-        self, surface: str, external_id: str, name: str, username: str | None
-    ) -> None:
-        """Mirror the surface profile; seed the person's name while empty."""
-        async with write_session(self._session_factory) as session:
-            identity = await self._find(session, surface, external_id)
-            if identity is None:
-                return
-            if identity.name != name or identity.username != username:
-                identity.name = name
-                identity.username = username
-                identity.updated_at = utc_now()
-            if not name:
-                return
-            user = await session.get(UserRow, identity.user_id)
-            if user is not None and not user.name:
-                user.name = name
+    async def update_profile(self, profile: IdentityProfile) -> None:
+        await self._profiles.update(profile)
 
     async def set_status(self, user_id: str, status: UserStatus) -> None:
-        """Set the person's status outright; the operator outranks the cap."""
-        async with write_session(self._session_factory) as session:
-            row = await session.get(UserRow, user_id)
-            if row is None:
-                raise UserNotFoundError(user_id)
-            row.status = status.value
+        await self._users.set_status(user_id, status)
 
     async def try_activate(self, user_id: str, max_active: int | None) -> bool:
-        """Promote a WAITING person to ACTIVE if a slot is free.
-
-        The head-count lives in the UPDATE's own WHERE (a scalar subquery),
-        so the check and the flip are one statement. One statement is not
-        yet one winner: under READ COMMITTED two concurrent UPDATEs each
-        count the world *before* the other's flip and both pass at the
-        boundary — so on Postgres the whole activation takes a transaction
-        advisory lock first. Unlike every other guardrail here, this cap is
-        a promise ("никогда не больше N активных"), not an estimate, and
-        activations are rare enough that a global lock costs nothing.
-        SQLite needs none: its writers are serialized by the database.
-        """
-        conditions = [UserRow.id == user_id, UserRow.status == UserStatus.WAITING.value]
-        if max_active is not None:
-            active_count = (
-                select(func.count())
-                .select_from(UserRow)
-                .where(UserRow.status == UserStatus.ACTIVE.value)
-                .scalar_subquery()
-            )
-            conditions.append(active_count < max_active)
-        async with write_session(self._session_factory) as session:
-            capped_on_postgres = (
-                max_active is not None
-                and session.bind is not None
-                and session.bind.dialect.name == "postgresql"
-            )
-            if capped_on_postgres:
-                await session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext('users_activation'))")
-                )
-            # DML executes into a CursorResult at runtime; the stubs type
-            # AsyncSession.execute loosely, so narrow it for rowcount.
-            result = cast(
-                CursorResult[Any],
-                await session.execute(
-                    update(UserRow).where(*conditions).values(status=UserStatus.ACTIVE.value)
-                ),
-            )
-            return result.rowcount == 1
+        return await self._users.try_activate(user_id, max_active)
 
     async def count_by_status(self) -> dict[UserStatus, int]:
-        """How many people hold each status; absent statuses count zero."""
-        async with read_session(self._session_factory) as session:
-            pairs = (
-                await session.execute(select(UserRow.status, func.count()).group_by(UserRow.status))
-            ).all()
-        counts = dict.fromkeys(UserStatus, 0)
-        for status, count in pairs:
-            counts[UserStatus(status)] = count
-        return counts
+        return await self._users.count_by_status()
 
     async def list_users(self) -> UserList:
-        """Everyone the installation knows, newest first."""
-        async with read_session(self._session_factory) as session:
-            rows = await session.scalars(select(UserRow).order_by(UserRow.created_at.desc()))
-            return [_to_user(row) for row in rows.all()]
+        return await self._users.list()
 
     async def identities_of(self, user_id: str) -> UserIdentityList:
-        """Every surface this person is known on, revoked ones included."""
-        async with read_session(self._session_factory) as session:
-            rows = await session.scalars(
-                select(UserIdentityRow)
-                .where(UserIdentityRow.user_id == user_id)
-                .order_by(UserIdentityRow.surface, UserIdentityRow.created_at)
-            )
-            return [_to_identity(row) for row in rows.all()]
+        return await self._queries.of_user(user_id)
 
     async def list_identities(self, surface: str) -> UserIdentityList:
-        """Everyone one surface knows, revoked included, oldest first."""
-        async with read_session(self._session_factory) as session:
-            rows = await session.scalars(
-                select(UserIdentityRow)
-                .where(UserIdentityRow.surface == surface)
-                .order_by(UserIdentityRow.created_at, UserIdentityRow.id)
-            )
-            return [_to_identity(row) for row in rows.all()]
+        return await self._queries.list(surface)
 
     async def find_by_identity(self, surface: str, external_id: str) -> UserIdentity | None:
-        async with read_session(self._session_factory) as session:
-            row = await self._find(session, surface, external_id)
-            return _to_identity(row) if row is not None else None
-
-    @staticmethod
-    async def _find(
-        session: AsyncSession, surface: str, external_id: str
-    ) -> UserIdentityRow | None:
-        rows = await session.scalars(
-            select(UserIdentityRow).where(
-                UserIdentityRow.surface == surface, UserIdentityRow.external_id == external_id
-            )
-        )
-        return rows.first()
-
-
-def _to_user(row: UserRow) -> User:
-    return User(
-        id=row.id,
-        name=row.name,
-        email=row.email or "",
-        status=UserStatus(row.status),
-        created_at=row.created_at,
-    )
-
-
-def _to_identity(row: UserIdentityRow) -> UserIdentity:
-    return UserIdentity(
-        user_id=row.user_id,
-        surface=row.surface,
-        external_id=row.external_id,
-        name=row.name,
-        username=row.username,
-        details=dict(row.details or {}),
-        active=row.active,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-    )
+        return await self._queries.find(IdentityKey(surface, external_id))
