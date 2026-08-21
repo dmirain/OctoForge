@@ -84,6 +84,7 @@ SAVED_CONTENT = "do the composed thing"
 FIRST_VERSION = 1
 MAX_ITERATIONS = 3
 MAX_PROCESSES = 5
+CUSTOM_MATERIAL_QUIET_SECONDS = 7.5
 WAIT_TIMEOUT_SECONDS = 2.0
 
 ALL_BASIC_TOOLS = {
@@ -402,18 +403,23 @@ async def test_build_conversation_manager_runs_a_dialog(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM()
-    manager = build_conversation_manager(
-        config=build_runner_config(
-            RunnerServices(
-                loop=build_agent_loop(
-                    llm, ToolRegistry(), AgentLoopConfig(max_iterations=MAX_ITERATIONS)
-                ),
-                prompts=StaticPromptProvider(),
-                router=PassThroughRouter(),
-                compactor=NoopContextCompactor(),
+    config = build_runner_config(
+        RunnerServices(
+            loop=build_agent_loop(
+                llm, ToolRegistry(), AgentLoopConfig(max_iterations=MAX_ITERATIONS)
             ),
-            RunnerOptions(max_processes=MAX_PROCESSES),
+            prompts=StaticPromptProvider(),
+            router=PassThroughRouter(),
+            compactor=NoopContextCompactor(),
         ),
+        RunnerOptions(
+            max_processes=MAX_PROCESSES,
+            material_quiet_seconds=CUSTOM_MATERIAL_QUIET_SECONDS,
+        ),
+    )
+    assert config.material_quiet_seconds == CUSTOM_MATERIAL_QUIET_SECONDS
+    manager = build_conversation_manager(
+        config=config,
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),

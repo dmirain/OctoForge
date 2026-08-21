@@ -81,6 +81,7 @@ def build_manager(request: AgentBuildRequest) -> ConversationManager:
             services,
             RunnerOptions(
                 max_processes=request.settings.max_processes,
+                material_quiet_seconds=request.settings.material_quiet_seconds,
                 task_outcome_listener=build_cron_outcome_reporter(
                     request.database.stores.cron,
                 ),

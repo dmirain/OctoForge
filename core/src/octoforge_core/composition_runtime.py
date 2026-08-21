@@ -24,6 +24,7 @@ def build_runner_config(services: RunnerServices, options: RunnerOptions) -> Run
         prompts=services.prompts,
         router=services.router,
         max_processes=options.max_processes,
+        material_quiet_seconds=options.material_quiet_seconds,
         compactor=services.compactor,
         task_outcome_listener=options.task_outcome_listener,
         vision=options.vision,

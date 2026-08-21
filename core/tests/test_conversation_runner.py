@@ -5647,14 +5647,13 @@ async def test_a_terminated_process_sweeps_its_response_memory(
     store = SqlAlchemyTaskStore(session_factory)
     manager = make_manager(
         ScriptedLLM([reply()]),
-        ToolRegistry(),
-        session_factory,
+        ManagerEnvironment(ToolRegistry(), session_factory),
         ManagerOptions(store=store, response_memory=memory),
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
 
-    await runner.submit("hi")
+    await runner.submit(DialogSubmission("hi"))
     await collect_until(queue, is_completed)
 
     task = await single_task(store, runner.dialog_id)

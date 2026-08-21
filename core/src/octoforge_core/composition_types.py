@@ -8,7 +8,7 @@ import httpx
 from octoforge_core.agent.loop import AgentLoop
 from octoforge_core.agent.prompts import PromptProvider
 from octoforge_core.agent.router import MessageRouter
-from octoforge_core.agent.runner import TaskOutcomeListener
+from octoforge_core.agent.runner import MATERIAL_QUIET_SECONDS, TaskOutcomeListener
 from octoforge_core.context.api import ContextCompactor, MessageArchive, SummaryStore
 from octoforge_core.cron.api import CronStore
 from octoforge_core.datasets.api import DatasetService
@@ -109,6 +109,7 @@ class RunnerOptions:
     """Optional runner capabilities and process limits."""
 
     max_processes: int
+    material_quiet_seconds: float = MATERIAL_QUIET_SECONDS
     task_outcome_listener: TaskOutcomeListener | None = None
     vision: VisionClient | None = None
     image_resolver: ImageResolver | None = None
