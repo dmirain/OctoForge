@@ -6,7 +6,11 @@ repository reports over to the promoter, one dialog at a time, and must not
 let one broken dialog stop the rest.
 """
 
-from octoforge_core.agent.collecting import CollectingSweeper
+from octoforge_core.agent.collecting import (
+    CollectingSources,
+    CollectingSweepConfig,
+    CollectingSweeper,
+)
 from octoforge_core.dialogs.api import Exchange, ExchangeList, ExchangeStatus
 from octoforge_core.domain import Dialog
 from octoforge_core.time import utc_now
@@ -77,6 +81,18 @@ class RecordingPromoter:
         self.calls.append((user_id, channel, exchange_id))
 
 
+def make_sweeper(
+    exchanges: FakeExchangeRepository,
+    dialogs: FakeDialogRepository,
+    promoter: RecordingPromoter,
+) -> CollectingSweeper:
+    return CollectingSweeper(
+        CollectingSources(exchanges=exchanges, dialogs=dialogs),
+        promoter,
+        CollectingSweepConfig(quiet_seconds=QUIET_SECONDS),
+    )
+
+
 async def test_tick_promotes_every_stale_collection_through_the_promoter() -> None:
     stale = [
         make_exchange(EXCHANGE_ID, DIALOG_ID),
@@ -89,9 +105,7 @@ async def test_tick_promotes_every_stale_collection_through_the_promoter() -> No
         }
     )
     promoter = RecordingPromoter()
-    sweeper = CollectingSweeper(
-        FakeExchangeRepository(stale), dialogs, promoter, quiet_seconds=QUIET_SECONDS
-    )
+    sweeper = make_sweeper(FakeExchangeRepository(stale), dialogs, promoter)
 
     promoted = await sweeper.tick()
 
@@ -110,7 +124,7 @@ async def test_tick_passes_its_quiet_window_through_and_promotes_only_whats_repo
     exchanges = FakeExchangeRepository([make_exchange(EXCHANGE_ID, DIALOG_ID)])
     dialogs = FakeDialogRepository({DIALOG_ID: make_dialog(DIALOG_ID, USER_ID)})
     promoter = RecordingPromoter()
-    sweeper = CollectingSweeper(exchanges, dialogs, promoter, quiet_seconds=QUIET_SECONDS)
+    sweeper = make_sweeper(exchanges, dialogs, promoter)
 
     promoted = await sweeper.tick()
 
@@ -120,7 +134,7 @@ async def test_tick_passes_its_quiet_window_through_and_promotes_only_whats_repo
 
 
 async def test_tick_without_stale_collections_promotes_nothing() -> None:
-    sweeper = CollectingSweeper(
+    sweeper = make_sweeper(
         FakeExchangeRepository([]), FakeDialogRepository({}), RecordingPromoter()
     )
 
@@ -139,7 +153,7 @@ async def test_tick_keeps_going_when_one_dialogs_promoter_raises() -> None:
         }
     )
     promoter = RecordingPromoter(fail_user_id=BROKEN_USER_ID)
-    sweeper = CollectingSweeper(FakeExchangeRepository(stale), dialogs, promoter)
+    sweeper = make_sweeper(FakeExchangeRepository(stale), dialogs, promoter)
 
     promoted = await sweeper.tick()
 

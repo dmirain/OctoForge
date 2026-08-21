@@ -1,22 +1,10 @@
-"""`MediaUnderstanding` over HTTP: how the ingestion node reaches the core.
-
-The twin of `ApiGatewayRegistry` in `gateway.py`, and there for the same
-reason: when ingestion is its own process it holds no core database, so
-anything keyed by a person — the plan check, the usage ledger — has to happen
-on the service. It sends the reference and the service does the rest.
-
-A failure to reach the service is not an exception here but an `UNAVAILABLE`
-outcome, because that is what the caller already knows how to handle: the
-picture keeps its slot with a placeholder, or the message falls back to the
-text-only path it had before vision existed. A raise would cost the user the
-message itself.
-"""
+"""HTTP media understanding for a database-free Telegram ingestion node."""
 
 import logging
 from collections.abc import Sequence
 
 import httpx
-from octoforge_core.media.api import MediaOutcome, MediaResult
+from octoforge_core.media.api import MediaOutcome, MediaResult, TranscriptionRequest
 
 from octoforge_telegram.client import TELEGRAM_CHANNEL, USER_ID_PREFIX
 from octoforge_telegram.gateway import CHANNEL_HEADER, USER_ID_HEADER
@@ -29,6 +17,7 @@ CAPABILITIES_PATH = "/api/media/capabilities"
 # describing a dozen pictures takes as long as a dozen model calls; the
 # default client timeout is nowhere near that
 MEDIA_TIMEOUT_SECONDS = 300.0
+CAPABILITIES_TIMEOUT_SECONDS = 1.0
 
 
 class ApiMediaUnderstanding:
@@ -50,22 +39,15 @@ class ApiMediaUnderstanding:
             return tuple(MediaResult(MediaOutcome.UNAVAILABLE) for _ in refs)
         return tuple(results)
 
-    async def transcribe(
-        self,
-        user_id: str,
-        ref: str,
-        seconds: int | None,
-        min_seconds: int,
-        max_seconds: float,
-    ) -> MediaResult:
+    async def transcribe(self, request: TranscriptionRequest) -> MediaResult:
         body = await self._post(
             TRANSCRIBE_PATH,
-            user_id,
+            request.user_id,
             {
-                "ref": ref,
-                "seconds": seconds,
-                "min_seconds": min_seconds,
-                "max_seconds": max_seconds,
+                "ref": request.ref,
+                "seconds": request.duration.seconds,
+                "min_seconds": request.duration.minimum,
+                "max_seconds": request.duration.maximum,
             },
         )
         if body is None:
@@ -81,7 +63,10 @@ class ApiMediaUnderstanding:
         is how images and voice once degraded silently for a whole day.
         """
         try:
-            response = await self._client.get(CAPABILITIES_PATH, timeout=MEDIA_TIMEOUT_SECONDS)
+            response = await self._client.get(
+                CAPABILITIES_PATH,
+                timeout=CAPABILITIES_TIMEOUT_SECONDS,
+            )
             response.raise_for_status()
             body = response.json()
         except Exception as exc:

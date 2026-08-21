@@ -1,6 +1,7 @@
 """Alembic schema bootstrap: fresh migrate, legacy stamp, and drift guard."""
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -8,13 +9,14 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import Connection, inspect, text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 # Importing the models registers every table on Base.metadata for the drift check.
+from octoforge_core.composition_schema import bootstrap_schema
 from octoforge_core.db.base import Base
 from octoforge_core.db.engine import (
     _BASELINE_REVISION,
     _alembic_config,
-    bootstrap_schema,
     create_engine,
     init_db,
 )
@@ -33,6 +35,20 @@ EXPECTED_TABLES = frozenset(
         "dialog_summaries",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskLinkDowngradeState:
+    message_columns: set[str]
+    message_indexes: set[str]
+    task_columns: set[str]
+
+
+@dataclass(frozen=True, slots=True)
+class GrandfatheredPlanState:
+    plans: dict[str, tuple[int | None, bool]]
+    old: str | None
+    two: str | None
 
 
 def _database_url(tmp_path: Path) -> str:
@@ -246,27 +262,30 @@ def _upgrade_to_head(connection: Connection) -> None:
     command.upgrade(_alembic_config(connection), "head")
 
 
+async def _task_link_downgrade_state(engine: AsyncEngine) -> TaskLinkDowngradeState:
+    async with engine.connect() as connection:
+        message_columns = await connection.run_sync(_table_columns, "messages")
+        message_indexes = await connection.run_sync(_index_names, "messages")
+        task_columns = await connection.run_sync(_table_columns, "tasks")
+    return TaskLinkDowngradeState(message_columns, message_indexes, task_columns)
+
+
 async def test_task_link_and_delivery_migration_downgrades(tmp_path: Path) -> None:
     engine = create_engine(_database_url(tmp_path))
     try:
         await bootstrap_schema(engine)
         async with engine.begin() as connection:
             await connection.run_sync(_downgrade_below_task_link)
-        async with engine.connect() as connection:
-            message_columns = await connection.run_sync(_table_columns, "messages")
-            message_indexes = await connection.run_sync(_index_names, "messages")
-            task_columns = await connection.run_sync(_table_columns, "tasks")
-        assert "task_id" not in message_columns
-        assert "ix_messages_task_id" not in message_indexes
-        assert "delivered_at" not in task_columns
+        downgraded = await _task_link_downgrade_state(engine)
+        assert "task_id" not in downgraded.message_columns
+        assert "ix_messages_task_id" not in downgraded.message_indexes
+        assert "delivered_at" not in downgraded.task_columns
         # the downgrade is reversible: upgrading again restores the columns
         async with engine.begin() as connection:
             await connection.run_sync(_upgrade_to_head)
-        async with engine.connect() as connection:
-            message_columns = await connection.run_sync(_table_columns, "messages")
-            task_columns = await connection.run_sync(_table_columns, "tasks")
-        assert "task_id" in message_columns
-        assert "delivered_at" in task_columns
+        restored = await _task_link_downgrade_state(engine)
+        assert "task_id" in restored.message_columns
+        assert "delivered_at" in restored.task_columns
     finally:
         await engine.dispose()
 
@@ -344,6 +363,14 @@ def _plan_of_user(connection: Connection, user_id: str) -> str | None:
     return None if row is None else str(row[0])
 
 
+async def _grandfathered_plan_state(engine: AsyncEngine) -> GrandfatheredPlanState:
+    async with engine.connect() as connection:
+        plans = await connection.run_sync(_plans)
+        old = await connection.run_sync(_plan_of_user, "u-old")
+        two = await connection.run_sync(_plan_of_user, "u-two")
+    return GrandfatheredPlanState(plans=plans, old=old, two=two)
+
+
 async def test_starter_plans_grandfather_todays_users_onto_unlimited(tmp_path: Path) -> None:
     """Opening to the public must not demote the people already here.
 
@@ -366,17 +393,14 @@ async def test_starter_plans_grandfather_todays_users_onto_unlimited(tmp_path: P
             )
         async with engine.begin() as connection:
             await connection.run_sync(_upgrade_to_head)
-        async with engine.connect() as connection:
-            plans = await connection.run_sync(_plans)
-            old = await connection.run_sync(_plan_of_user, "u-old")
-            two = await connection.run_sync(_plan_of_user, "u-two")
+        state = await _grandfathered_plan_state(engine)
     finally:
         await engine.dispose()
-    assert plans["unlimited"] == (None, False)
-    assert plans["freemium"][0] is not None  # a real cap, whatever the operator sets later
-    assert plans["freemium"][1] is True  # newcomers land here
-    assert old == "unlimited"
-    assert two == "unlimited"
+    assert state.plans["unlimited"] == (None, False)
+    assert state.plans["freemium"][0] is not None  # a real cap, whatever the operator sets later
+    assert state.plans["freemium"][1] is True  # newcomers land here
+    assert state.old == "unlimited"
+    assert state.two == "unlimited"
 
 
 async def test_a_brand_new_installation_gets_the_plans_but_no_default(tmp_path: Path) -> None:

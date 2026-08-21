@@ -276,6 +276,7 @@ That variable is read by `docker-compose.local.yml`, not by the application.
 
 - `server/src/octoforge_server/config.py` — the settings, defaults and derived predicates
 - `server/src/octoforge_server/capabilities.py` — the startup report
-- `deploy/src/octoforge_deploy/main.py` — where each setting turns into a port or a `None`
+- `deploy/src/octoforge_deploy/runtime_assembly.py`,
+  `deploy/src/octoforge_deploy/runtime_surface_assembly.py` — where settings become ports or `None`
 - `.env.example` — the annotated variable list
 - `deploy/tests/test_config.py`, `deploy/tests/test_capabilities.py` — behavior of the above

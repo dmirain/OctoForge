@@ -10,65 +10,37 @@ went downstream, a retry would duplicate partial output.
 (embeddings, reranker): a single extra attempt with a minimal fixed delay.
 """
 
-import asyncio
 import logging
-import random
-from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import TypeVar
+from collections.abc import AsyncIterator
 
 from octoforge_core.domain import ChatMessage
-from octoforge_core.llm.errors import LLMError
+from octoforge_core.llm.error_types import LLMError
 from octoforge_core.llm.events import RetryScheduled, StreamEvent
+from octoforge_core.llm.retry_policy import RetryPolicy
+from octoforge_core.llm.short_retry import (
+    RETRY_AFTER_DELAY_CAP_SECONDS,
+    SHORT_RETRY_DELAY_SECONDS,
+    SHORT_RETRY_MAX_RETRIES,
+    ShortRetryPolicy,
+    Sleeper,
+    retry_transient,
+)
 from octoforge_core.llm.usage import Completion
 from octoforge_core.ports import LLMClient
 from octoforge_core.tools.base import ToolSpec
 
 logger = logging.getLogger(__name__)
 
-Sleeper = Callable[[float], Awaitable[None]]
-
-T = TypeVar("T")
-
-# Hard ceiling for a single retry sleep: a provider hint like
-# `Retry-After: 3600` must not park the process for an hour.
-RETRY_AFTER_DELAY_CAP_SECONDS = 300.0
-
-# Short retry for the secondary HTTP backends (embeddings, reranker): one
-# extra attempt with a minimal fixed delay — a transient 429 during
-# instruction_search should not fail the search, but it must not stall it either.
-SHORT_RETRY_MAX_RETRIES = 1
-SHORT_RETRY_DELAY_SECONDS = 0.5
-
-
-async def retry_transient(
-    call: Callable[[], Awaitable[T]],
-    *,
-    max_retries: int = SHORT_RETRY_MAX_RETRIES,
-    delay_seconds: float = SHORT_RETRY_DELAY_SECONDS,
-    sleeper: Sleeper = asyncio.sleep,
-) -> T:
-    """Run a request, retrying transient LLMError kinds with a short fixed delay.
-
-    A provider-supplied `Retry-After` overrides the fixed delay (capped by
-    RETRY_AFTER_DELAY_CAP_SECONDS); non-transient errors raise immediately.
-    """
-    attempt = 0
-    while True:
-        try:
-            return await call()
-        except LLMError as exc:
-            if not exc.transient or attempt >= max_retries:
-                raise
-            attempt += 1
-            delay = min(exc.retry_after or delay_seconds, RETRY_AFTER_DELAY_CAP_SECONDS)
-            logger.warning(
-                "request failed (%s), retry %d/%d in %.1fs",
-                exc.kind.value,
-                attempt,
-                max_retries,
-                delay,
-            )
-            await sleeper(delay)
+__all__ = [
+    "RETRY_AFTER_DELAY_CAP_SECONDS",
+    "SHORT_RETRY_DELAY_SECONDS",
+    "SHORT_RETRY_MAX_RETRIES",
+    "RetryPolicy",
+    "RetryingLLMClient",
+    "ShortRetryPolicy",
+    "Sleeper",
+    "retry_transient",
+]
 
 
 class RetryingLLMClient:
@@ -77,17 +49,10 @@ class RetryingLLMClient:
     def __init__(
         self,
         inner: LLMClient,
-        *,
-        max_retries: int,
-        base_seconds: float,
-        max_seconds: float,
-        sleeper: Sleeper = asyncio.sleep,
+        policy: RetryPolicy,
     ) -> None:
         self._inner = inner
-        self._max_retries = max_retries
-        self._base_seconds = base_seconds
-        self._max_seconds = max_seconds
-        self._sleeper = sleeper
+        self._policy = policy
 
     async def complete(
         self,
@@ -100,18 +65,18 @@ class RetryingLLMClient:
             try:
                 return await self._inner.complete(messages, tools)
             except LLMError as exc:
-                if not exc.transient or attempt >= self._max_retries:
+                if not exc.transient or attempt >= self._policy.max_retries:
                     raise
                 attempt += 1
-                delay = self._delay(attempt, exc)
+                delay = self._policy.delay(attempt, exc)
                 logger.warning(
                     "LLM complete() failed (%s), retry %d/%d in %.1fs",
                     exc.kind.value,
                     attempt,
-                    self._max_retries,
+                    self._policy.max_retries,
                     delay,
                 )
-                await self._sleeper(delay)
+                await self._policy.sleeper(delay)
 
     async def stream(
         self,
@@ -128,30 +93,16 @@ class RetryingLLMClient:
                     yield event
                 return
             except LLMError as exc:
-                if emitted or not exc.transient or attempt >= self._max_retries:
+                if emitted or not exc.transient or attempt >= self._policy.max_retries:
                     raise
                 attempt += 1
-                delay = self._delay(attempt, exc)
+                delay = self._policy.delay(attempt, exc)
                 logger.warning(
                     "LLM stream() failed (%s), retry %d/%d in %.1fs",
                     exc.kind.value,
                     attempt,
-                    self._max_retries,
+                    self._policy.max_retries,
                     delay,
                 )
                 yield RetryScheduled(attempt=attempt, delay_seconds=delay, reason=exc.kind.value)
-                await self._sleeper(delay)
-
-    def _delay(self, attempt: int, exc: LLMError) -> float:
-        """Exponential backoff with full jitter, floored at Retry-After.
-
-        A provider hint is the floor, not the exact delay: positive jitter is
-        added on top so clients that received the same Retry-After do not
-        retry in lockstep, and the total is capped so an extreme hint cannot
-        park the process (see RETRY_AFTER_DELAY_CAP_SECONDS).
-        """
-        ceiling = min(self._max_seconds, self._base_seconds * (2 ** (attempt - 1)))
-        if exc.retry_after is not None:
-            delay = exc.retry_after + random.uniform(0, ceiling)
-            return min(delay, RETRY_AFTER_DELAY_CAP_SECONDS)
-        return random.uniform(0, ceiling)
+                await self._policy.sleeper(delay)

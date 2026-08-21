@@ -14,6 +14,7 @@ from octoforge_core.net.tools import (
     REQUEST_NAME,
     TRUNCATED_SUFFIX,
     HttpRequestTool,
+    HttpRequestToolConfig,
 )
 from octoforge_core.tariffs.api import FeatureCode
 from octoforge_core.tools.base import ToolContext
@@ -43,7 +44,7 @@ def make_tool(
 ) -> HttpRequestTool:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     guard = SsrfGuard(resolver=StubResolver(ips))
-    return HttpRequestTool(http_client=client, guard=guard, allowed_origins=allowed_origins)
+    return HttpRequestTool(client, guard, HttpRequestToolConfig(allowed_origins=allowed_origins))
 
 
 def test_spec_advertised_to_llm() -> None:

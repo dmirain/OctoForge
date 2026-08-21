@@ -15,12 +15,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
+    InstructionDefinition,
     InstructionNotFoundError,
+    InstructionSearchRequest,
     InstructionService,
     InstructionType,
     SystemInstructionError,
 )
 from octoforge_core.instructions.local import (
+    InstructionSearchOptions,
     InstructionSearchPolicy,
     LocalInstructionService,
 )
@@ -86,6 +89,10 @@ class StubEmbedder:
         self.calls.append(texts)
         return tuple(self.vectors[text] for text in texts)
 
+    def register(self, title: str, content: str, vector: tuple[float, ...]) -> None:
+        """Map the exact text the service embeds for a record to a vector."""
+        self.vectors[f"{title}{EMBEDDED_TEXT_SEPARATOR}{content}"] = vector
+
 
 ServiceFactory = Callable[[async_sessionmaker[AsyncSession], EmbeddingClient], InstructionService]
 
@@ -99,7 +106,7 @@ def build_local_service(
     return LocalInstructionService(
         SqlAlchemyInstructionStore(session_factory),
         embedder,
-        policy=InstructionSearchPolicy(embedding_model=embedding_model),
+        InstructionSearchOptions(policy=InstructionSearchPolicy(embedding_model=embedding_model)),
     )
 
 
@@ -131,21 +138,20 @@ def service(
     return service_factory(session_factory, embedder)
 
 
-def register_vector(
-    embedder: StubEmbedder,
-    title: str,
-    content: str,
-    vector: tuple[float, ...],
-) -> None:
-    """Map the exact text the service embeds for a record to a vector."""
-    embedder.vectors[f"{title}{EMBEDDED_TEXT_SEPARATOR}{content}"] = vector
+register_vector = StubEmbedder.register
 
 
 async def test_save_creates_record(service: InstructionService, embedder: StubEmbedder) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
 
     saved = await service.save(
-        USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A, ("api", "facts")
+        USER_ID,
+        InstructionDefinition(
+            InstructionType.KNOWLEDGE,
+            TITLE_ALPHA,
+            CONTENT_A,
+            ("api", "facts"),
+        ),
     )
 
     assert saved.id
@@ -168,11 +174,13 @@ async def test_save_upsert_replaces_and_bumps_version(
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
     created = await service.save(
-        USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A, ("old",)
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A, ("old",)),
     )
 
     replaced = await service.save(
-        USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B, ("new",)
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B, ("new",)),
     )
 
     assert replaced.id == created.id
@@ -191,11 +199,17 @@ async def test_save_upsert_recomputes_embedding(
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
     embedder.vectors[QUERY] = V_RIGHT
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
 
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B),
+    )
 
-    hits = await service.search(USER_ID, QUERY, k=1)
+    hits = await service.search(USER_ID, InstructionSearchRequest(QUERY, 1))
     assert len(hits) == 1
     # the query vector no longer matches: the stored embedding moved with the content
     assert hits[0].score == pytest.approx(0.0)
@@ -212,8 +226,14 @@ async def test_get_by_name_narrows_by_type(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
-    knowledge = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
-    saved = await service.save(USER_ID, InstructionType.SKILL, TITLE_ALPHA, CONTENT_B)
+    knowledge = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B),
+    )
 
     assert await service.get_by_name(TITLE_ALPHA, InstructionType.SKILL, USER_ID) == saved
     assert await service.get_by_name(TITLE_ALPHA, InstructionType.KNOWLEDGE, USER_ID) == knowledge
@@ -226,7 +246,10 @@ async def test_get_by_name_narrowed_type_missing_raises(
     embedder: StubEmbedder,
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
 
     with pytest.raises(InstructionNotFoundError):
         await service.get_by_name(TITLE_ALPHA, InstructionType.ENDPOINT, USER_ID)
@@ -238,14 +261,14 @@ async def test_search_empty_store_returns_nothing(
 ) -> None:
     embedder.vectors[QUERY] = V_RIGHT
 
-    assert await service.search(USER_ID, QUERY, k=THREE_HITS) == []
+    assert await service.search(USER_ID, InstructionSearchRequest(QUERY, THREE_HITS)) == []
 
 
 async def test_search_blank_query_short_circuits(
     service: InstructionService,
     embedder: StubEmbedder,
 ) -> None:
-    assert await service.search(USER_ID, "   ", k=1) == []
+    assert await service.search(USER_ID, InstructionSearchRequest("   ", 1)) == []
     assert embedder.calls == []
 
 
@@ -253,7 +276,7 @@ async def test_search_non_positive_k_short_circuits_before_embedding(
     service: InstructionService,
     embedder: StubEmbedder,
 ) -> None:
-    assert await service.search(USER_ID, QUERY, k=0) == []
+    assert await service.search(USER_ID, InstructionSearchRequest(QUERY, 0)) == []
     assert embedder.calls == []  # no paid embed call for an empty request
 
 
@@ -263,11 +286,17 @@ async def test_search_closer_vector_wins(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_BETA, CONTENT_B, V_UP)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B),
+    )
     embedder.vectors[QUERY] = V_DIAGONAL
 
-    hits = await service.search(USER_ID, QUERY, k=TWO_HITS)
+    hits = await service.search(USER_ID, InstructionSearchRequest(QUERY, TWO_HITS))
 
     assert [hit.instruction.title for hit in hits] == [TITLE_BETA, TITLE_ALPHA]
     assert hits[0].score == pytest.approx(0.8)
@@ -280,12 +309,18 @@ async def test_search_exact_title_boost_beats_closer_vector(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_UP)
     register_vector(embedder, TITLE_BETA, CONTENT_B, V_RIGHT)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B),
+    )
     # the query vector is closest to beta, but the query equals alpha's title
     embedder.vectors[EXACT_QUERY] = V_RIGHT
 
-    hits = await service.search(USER_ID, EXACT_QUERY, k=TWO_HITS)
+    hits = await service.search(USER_ID, InstructionSearchRequest(EXACT_QUERY, TWO_HITS))
 
     assert [hit.instruction.title for hit in hits] == [TITLE_ALPHA, TITLE_BETA]
     assert hits[0].score > hits[1].score
@@ -297,10 +332,17 @@ async def test_search_respects_k(
 ) -> None:
     for index in range(THREE_HITS):
         register_vector(embedder, f"title-{index}", f"content-{index}", V_RIGHT)
-        await service.save(USER_ID, InstructionType.SKILL, f"title-{index}", f"content-{index}")
+        await service.save(
+            USER_ID,
+            InstructionDefinition(
+                InstructionType.SKILL,
+                f"title-{index}",
+                f"content-{index}",
+            ),
+        )
     embedder.vectors[QUERY] = V_RIGHT
 
-    hits = await service.search(USER_ID, QUERY, k=TWO_HITS)
+    hits = await service.search(USER_ID, InstructionSearchRequest(QUERY, TWO_HITS))
 
     assert len(hits) == TWO_HITS
 
@@ -311,12 +353,18 @@ async def test_search_bumps_usage_of_returned_hits_only(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_BETA, CONTENT_B, V_UP)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B),
+    )
     embedder.vectors[QUERY] = V_RIGHT
 
-    await service.search(USER_ID, QUERY, k=1)
-    await service.search(USER_ID, QUERY, k=1)
+    await service.search(USER_ID, InstructionSearchRequest(QUERY, 1))
+    await service.search(USER_ID, InstructionSearchRequest(QUERY, 1))
 
     await wait_for_usage(service, TITLE_ALPHA, USAGE_TWICE)
     assert (await service.get_by_name(TITLE_BETA, user_id=USER_ID)).usage_count == USAGE_NEVER
@@ -339,7 +387,10 @@ async def test_delete_removes_the_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
 
     await service.delete(USER_ID, saved.id)
 
@@ -360,7 +411,10 @@ async def test_delete_public_removes_a_public_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     published = await service.publish(saved.id)
 
     await service.delete_public(published.id)
@@ -373,7 +427,10 @@ async def test_delete_public_ignores_private_and_missing_records(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
 
     with pytest.raises(InstructionNotFoundError):
         await service.delete_public(saved.id)  # private: not this surface's business
@@ -386,7 +443,9 @@ async def test_delete_public_refuses_a_system_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    saved = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+    )
 
     with pytest.raises(SystemInstructionError):
         await service.delete_public(saved.id)
@@ -397,7 +456,10 @@ async def test_delete_ignores_another_users_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    saved = await service.save(OTHER_USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        OTHER_USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
 
     with pytest.raises(InstructionNotFoundError):
         await service.delete(USER_ID, saved.id)
@@ -413,11 +475,16 @@ async def test_search_hides_another_users_private_records(
     embedder: StubEmbedder,
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
-    await service.save(OTHER_USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    await service.save(
+        OTHER_USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     embedder.vectors[QUERY] = V_RIGHT
 
-    assert await service.search(USER_ID, QUERY, k=THREE_HITS) == []
-    assert len(await service.search(OTHER_USER_ID, QUERY, k=THREE_HITS)) == 1
+    assert await service.search(USER_ID, InstructionSearchRequest(QUERY, THREE_HITS)) == []
+    assert (
+        len(await service.search(OTHER_USER_ID, InstructionSearchRequest(QUERY, THREE_HITS))) == 1
+    )
 
 
 async def test_publish_makes_a_private_record_visible_to_everyone(
@@ -425,14 +492,19 @@ async def test_publish_makes_a_private_record_visible_to_everyone(
     embedder: StubEmbedder,
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
-    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     embedder.vectors[QUERY] = V_RIGHT
-    assert await service.search(OTHER_USER_ID, QUERY, k=THREE_HITS) == []
+    assert await service.search(OTHER_USER_ID, InstructionSearchRequest(QUERY, THREE_HITS)) == []
 
     published = await service.publish(saved.id)
 
     assert published.owner_id is None
-    assert len(await service.search(OTHER_USER_ID, QUERY, k=THREE_HITS)) == 1
+    assert (
+        len(await service.search(OTHER_USER_ID, InstructionSearchRequest(QUERY, THREE_HITS))) == 1
+    )
     # a public record resolves without a user id too
     assert (await service.get_by_name(TITLE_ALPHA)).id == saved.id
 
@@ -448,10 +520,16 @@ async def test_save_creates_a_private_copy_over_a_public_record(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
-    public = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    public = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     await service.publish(public.id)
 
-    private = await service.save(OTHER_USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
+    private = await service.save(
+        OTHER_USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B),
+    )
 
     assert private.id != public.id
     assert private.owner_id == OTHER_USER_ID
@@ -466,11 +544,20 @@ async def test_search_kind_filter_narrows_candidates(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_BETA, CONTENT_B, V_UP)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
-    await service.save(USER_ID, InstructionType.SKILL, TITLE_BETA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, TITLE_BETA, CONTENT_B),
+    )
     embedder.vectors[QUERY] = V_DIAGONAL
 
-    hits = await service.search(USER_ID, QUERY, k=TWO_HITS, kind=InstructionType.SKILL)
+    hits = await service.search(
+        USER_ID,
+        InstructionSearchRequest(QUERY, TWO_HITS, InstructionType.SKILL),
+    )
 
     assert [hit.instruction.title for hit in hits] == [TITLE_BETA]
 
@@ -481,11 +568,17 @@ async def test_search_all_sees_private_records_of_everyone(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_BETA, CONTENT_B, V_RIGHT)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
-    await service.save(OTHER_USER_ID, InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
+    await service.save(
+        OTHER_USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B),
+    )
     embedder.vectors[QUERY] = V_RIGHT
 
-    hits = await service.search_all(QUERY, k=THREE_HITS)
+    hits = await service.search_all(InstructionSearchRequest(QUERY, THREE_HITS))
 
     assert {hit.instruction.title for hit in hits} == {TITLE_ALPHA, TITLE_BETA}
 
@@ -498,7 +591,10 @@ async def test_save_creates_user_record_by_default(
 ) -> None:
     service = make_lenient_service(session_factory)
 
-    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
 
     assert saved.system is False
     assert saved.owner_id == USER_ID
@@ -510,7 +606,9 @@ async def test_save_system_marks_the_record(
 ) -> None:
     service = make_lenient_service(session_factory)
 
-    saved = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+    saved = await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+    )
 
     assert saved.system is True
     assert saved.owner_id is None  # system records are public
@@ -524,19 +622,27 @@ async def test_save_refuses_to_overwrite_a_system_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+    await service.save_system(InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A))
 
     with pytest.raises(SystemInstructionError, match="managed by the registry"):
-        await service.save(USER_ID, InstructionType.SKILL, TITLE_ALPHA, CONTENT_B)
+        await service.save(
+            USER_ID,
+            InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B),
+        )
     # a same-titled record of another type is untouched by the protection
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B),
+    )
 
 
 async def test_delete_ignores_a_system_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    saved = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+    )
 
     # system records are public: an owner-scoped delete sees them as missing
     with pytest.raises(InstructionNotFoundError):
@@ -549,9 +655,13 @@ async def test_save_system_skips_reembedding_an_unchanged_record(
     embedder: StubEmbedder,
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
-    created = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+    created = await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+    )
 
-    again = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+    again = await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+    )
 
     assert again.id == created.id
     assert again.version == VERSION_CREATED  # no bump: nothing changed
@@ -563,9 +673,13 @@ async def test_save_system_reembeds_when_tags_change(
     embedder: StubEmbedder,
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
-    await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+    await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("core",))
+    )
 
-    updated = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("new",))
+    updated = await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("new",))
+    )
 
     assert updated.tags == ("new",)
     assert updated.version == VERSION_REPLACED
@@ -576,7 +690,7 @@ async def test_delete_system_removes_the_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+    await service.save_system(InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A))
 
     await service.delete_system(TITLE_ALPHA, InstructionType.SKILL)
 
@@ -597,10 +711,15 @@ async def test_save_system_adopts_a_public_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    legacy = await service.save(USER_ID, InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("legacy",))
+    legacy = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A, ("legacy",)),
+    )
     await service.publish(legacy.id)  # legacy (pre-ownership) rows migrate to public
 
-    adopted = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B, ("core",))
+    adopted = await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B, ("core",))
+    )
 
     assert adopted.id == legacy.id
     assert adopted.system is True
@@ -614,9 +733,14 @@ async def test_save_system_does_not_adopt_a_private_record(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = make_lenient_service(session_factory)
-    private = await service.save(USER_ID, InstructionType.SKILL, TITLE_ALPHA, CONTENT_A)
+    private = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_A),
+    )
 
-    adopted = await service.save_system(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B)
+    adopted = await service.save_system(
+        InstructionDefinition(InstructionType.SKILL, TITLE_ALPHA, CONTENT_B)
+    )
 
     assert adopted.id != private.id  # a private copy is never adopted by the registry
     assert (await service.get_by_name(TITLE_ALPHA, user_id=USER_ID)).system is False
@@ -627,7 +751,10 @@ async def test_store_reads_endpoint_records(
 ) -> None:
     service = make_lenient_service(session_factory)
 
-    await service.save(USER_ID, InstructionType.ENDPOINT, TITLE_ALPHA, CONTENT_A)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.ENDPOINT, TITLE_ALPHA, CONTENT_A),
+    )
 
     stored = await service.get_by_name(TITLE_ALPHA, InstructionType.ENDPOINT, USER_ID)
     assert stored.type is InstructionType.ENDPOINT
@@ -641,7 +768,10 @@ async def test_publish_refuses_memory_records(
 ) -> None:
     """A user's memory is never publishable, whoever asks."""
     service = make_lenient_service(session_factory)
-    memory = await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)
+    memory = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A),
+    )
 
     with pytest.raises(InstructionNotFoundError):
         await service.publish(memory.id)
@@ -656,12 +786,20 @@ async def test_search_all_hides_memories_unless_asked_explicitly(
     """Admin cross-user search must not casually surface personal memories."""
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_BETA, CONTENT_B, V_RIGHT)
-    await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A),
+    )
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_BETA, CONTENT_B),
+    )
     embedder.vectors[QUERY] = V_RIGHT
 
-    default = await service.search_all(QUERY, k=THREE_HITS)
-    explicit = await service.search_all(QUERY, k=THREE_HITS, kind=InstructionType.MEMORY)
+    default = await service.search_all(InstructionSearchRequest(QUERY, THREE_HITS))
+    explicit = await service.search_all(
+        InstructionSearchRequest(QUERY, THREE_HITS, InstructionType.MEMORY)
+    )
 
     assert [hit.instruction.title for hit in default] == [TITLE_BETA]
     assert [hit.instruction.title for hit in explicit] == [TITLE_ALPHA]
@@ -677,7 +815,10 @@ async def test_save_survives_an_embedding_failure(
     to an empty embedding instead of failing, and the record stays findable
     by name until the sweep re-embeds it.
     """
-    saved = await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A),
+    )
 
     stored = await service.get_by_name(TITLE_ALPHA, InstructionType.MEMORY, USER_ID)
     assert saved.id == stored.id
@@ -689,12 +830,18 @@ async def test_resync_finishes_deferred_embeddings(
     embedder: StubEmbedder,
 ) -> None:
     """The startup sweep turns embedding-less records back into search results."""
-    await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)  # embed fails
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A),
+    )  # embed fails
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)  # backend is back
     embedder.vectors[QUERY] = V_RIGHT
 
     swept = await service.resync_embeddings()
-    hits = await service.search(USER_ID, QUERY, k=TWO_HITS, kind=InstructionType.MEMORY)
+    hits = await service.search(
+        USER_ID,
+        InstructionSearchRequest(QUERY, TWO_HITS, InstructionType.MEMORY),
+    )
 
     assert swept == 1
     assert await service.resync_embeddings() == 0  # idempotent: nothing left
@@ -715,7 +862,10 @@ async def test_a_changed_embedding_model_re_embeds_everything(
     """
     old_model = build_local_service(session_factory, embedder, embedding_model=MODEL_A)
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
-    await old_model.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    await old_model.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     assert await old_model.resync_embeddings() == 0  # settled under the old model
 
     new_model = build_local_service(session_factory, embedder, embedding_model=MODEL_B)
@@ -729,7 +879,10 @@ async def test_a_record_saved_without_a_vector_claims_no_model(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """A failed embedding must leave the model NULL, or the sweep skips the record."""
-    await service.save(USER_ID, InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A)  # embed fails
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.MEMORY, TITLE_ALPHA, CONTENT_A),
+    )  # embed fails
 
     store = SqlAlchemyInstructionStore(session_factory)
 
@@ -745,12 +898,17 @@ async def test_resync_is_bounded_per_call(
     for index in range(THREE_RECORDS):
         title = f"{TITLE_ALPHA}-{index}"
         register_vector(embedder, title, CONTENT_A, V_RIGHT)
-        await seeding.save(USER_ID, InstructionType.KNOWLEDGE, title, CONTENT_A)
+        await seeding.save(
+            USER_ID,
+            InstructionDefinition(InstructionType.KNOWLEDGE, title, CONTENT_A),
+        )
 
     swept = LocalInstructionService(
         SqlAlchemyInstructionStore(session_factory),
         embedder,
-        policy=InstructionSearchPolicy(embedding_model=MODEL_B, resync_batch=1),
+        InstructionSearchOptions(
+            policy=InstructionSearchPolicy(embedding_model=MODEL_B, resync_batch=1)
+        ),
     )
 
     assert await swept.resync_embeddings() == 1  # one slice, not the table
@@ -767,12 +925,21 @@ async def test_search_hides_endpoints_unless_asked_explicitly(
     """Skills name endpoints; planning searches must not drown in their records."""
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_BETA, CONTENT_B, V_RIGHT)
-    await service.save(USER_ID, InstructionType.ENDPOINT, TITLE_ALPHA, CONTENT_A)
-    await service.save(USER_ID, InstructionType.SKILL, TITLE_BETA, CONTENT_B)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.ENDPOINT, TITLE_ALPHA, CONTENT_A),
+    )
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, TITLE_BETA, CONTENT_B),
+    )
     embedder.vectors[QUERY] = V_RIGHT
 
-    default = await service.search(USER_ID, QUERY, k=THREE_HITS)
-    explicit = await service.search(USER_ID, QUERY, k=THREE_HITS, kind=InstructionType.ENDPOINT)
+    default = await service.search(USER_ID, InstructionSearchRequest(QUERY, THREE_HITS))
+    explicit = await service.search(
+        USER_ID,
+        InstructionSearchRequest(QUERY, THREE_HITS, InstructionType.ENDPOINT),
+    )
 
     assert [hit.instruction.title for hit in default] == [TITLE_BETA]
     assert [hit.instruction.title for hit in explicit] == [TITLE_ALPHA]
@@ -786,12 +953,18 @@ async def test_mixed_search_caps_each_types_share(
     for index in range(4):
         title = f"skill {index}"
         register_vector(embedder, title, CONTENT_A, V_RIGHT)
-        await service.save(USER_ID, InstructionType.SKILL, title, CONTENT_A)
+        await service.save(
+            USER_ID,
+            InstructionDefinition(InstructionType.SKILL, title, CONTENT_A),
+        )
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_DIAGONAL)  # ranks below the skills
-    await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     embedder.vectors[QUERY] = V_RIGHT
 
-    hits = await service.search(USER_ID, QUERY, k=THREE_HITS)
+    hits = await service.search(USER_ID, InstructionSearchRequest(QUERY, THREE_HITS))
 
     types = [hit.instruction.type for hit in hits]
     # cap = ceil(3/2) = 2 skills; the knowledge record backfills the last slot
@@ -804,7 +977,10 @@ async def test_publish_preserves_authorship(
     embedder: StubEmbedder,
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
-    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     assert saved.author_id == USER_ID
 
     published = await service.publish(saved.id)
@@ -819,10 +995,16 @@ async def test_author_save_updates_their_published_record_in_place(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
-    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     await service.publish(saved.id)
 
-    updated = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
+    updated = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B),
+    )
 
     assert updated.id == saved.id  # the same record, not a private copy
     assert updated.owner_id is None  # still public for everyone
@@ -837,10 +1019,16 @@ async def test_non_author_save_still_creates_a_private_copy(
 ) -> None:
     register_vector(embedder, TITLE_ALPHA, CONTENT_A, V_RIGHT)
     register_vector(embedder, TITLE_ALPHA, CONTENT_B, V_UP)
-    saved = await service.save(USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A)
+    saved = await service.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_A),
+    )
     await service.publish(saved.id)
 
-    copy = await service.save(OTHER_USER_ID, InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B)
+    copy = await service.save(
+        OTHER_USER_ID,
+        InstructionDefinition(InstructionType.KNOWLEDGE, TITLE_ALPHA, CONTENT_B),
+    )
 
     assert copy.id != saved.id
     assert copy.owner_id == OTHER_USER_ID

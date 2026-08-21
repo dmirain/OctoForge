@@ -8,17 +8,26 @@ Covers the P5 seams: the default tool set assembled by `build_tool_registry`
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import httpx
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.agent.events import Cancelled, Failed, Finished
+from octoforge_core.agent.loop import AgentLoopConfig
 from octoforge_core.agent.prompts import StaticPromptProvider
 from octoforge_core.agent.router import ExchangeInfo, RouteDecision
-from octoforge_core.agent.runner import ConversationEvent, ManagerStores, OwnershipConfig
+from octoforge_core.agent.runner import (
+    ConversationEvent,
+    DialogSubmission,
+    ManagerStores,
+    OwnershipConfig,
+)
 from octoforge_core.composition import (
     RunnerOptions,
+    RunnerServices,
+    ToolDependencies,
     ToolLimits,
     ToolServices,
     ToolStores,
@@ -46,12 +55,14 @@ from octoforge_core.domain import ChatMessage, MessageRole
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
     Instruction,
+    InstructionDefinition,
     InstructionDraft,
     InstructionType,
 )
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
+from octoforge_core.net.external import ExternalCallServices
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
@@ -73,6 +84,7 @@ SAVED_CONTENT = "do the composed thing"
 FIRST_VERSION = 1
 MAX_ITERATIONS = 3
 MAX_PROCESSES = 5
+CUSTOM_MATERIAL_QUIET_SECONDS = 7.5
 WAIT_TIMEOUT_SECONDS = 2.0
 
 ALL_BASIC_TOOLS = {
@@ -297,41 +309,50 @@ def default_limits() -> ToolLimits:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RegistryOptions:
+    """Optional test doubles installed in a composed registry."""
+
+    search_provider: FakeSearchProvider | None = None
+    instruction_store: InMemoryInstructionStore | None = None
+
+
+DEFAULT_REGISTRY_OPTIONS = RegistryOptions()
+
+
 def build_registry(
     http_client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
-    *,
-    search_provider: FakeSearchProvider | None = None,
-    instruction_store: InMemoryInstructionStore | None = None,
+    options: RegistryOptions = DEFAULT_REGISTRY_OPTIONS,
 ) -> ToolRegistry:
     """Assemble a tool registry from the builders over in-memory/SQLite parts."""
-    store = instruction_store if instruction_store is not None else InMemoryInstructionStore()
+    store = options.instruction_store or InMemoryInstructionStore()
     instructions = build_instruction_service(store, LenientEmbedder())
     summary_store = SqlAlchemySummaryStore(session_factory)
     guard = SsrfGuard()
     return build_tool_registry(
-        http_client,
-        guard,
-        stores=ToolStores(
-            tasks=SqlAlchemyTaskStore(session_factory),
-            cron=SqlAlchemyCronStore(session_factory),
-            archive=summary_store,
-            summaries=summary_store,
-        ),
-        services=ToolServices(
-            instructions=instructions,
-            datasets=build_dataset_service(
-                SqlAlchemyDatasetStore(session_factory),
-                LenientEmbedder(),
+        ToolDependencies(
+            outbound_http=http_client,
+            guard=guard,
+            stores=ToolStores(
+                tasks=SqlAlchemyTaskStore(session_factory),
+                cron=SqlAlchemyCronStore(session_factory),
+                archive=summary_store,
+                summaries=summary_store,
             ),
-            executor=build_external_executor(
-                service=instructions,
-                http_client=http_client,
-                guard=guard,
+            services=ToolServices(
+                instructions=instructions,
+                datasets=build_dataset_service(
+                    SqlAlchemyDatasetStore(session_factory),
+                    LenientEmbedder(),
+                ),
+                executor=build_external_executor(
+                    ExternalCallServices(instructions, http_client, guard),
+                ),
+                search_provider=options.search_provider,
             ),
-            search_provider=search_provider,
         ),
-        limits=default_limits(),
+        default_limits(),
     )
 
 
@@ -339,7 +360,9 @@ async def test_build_tool_registry_registers_all_basic_tools(
     session_factory: async_sessionmaker[AsyncSession],
     http_client: httpx.AsyncClient,
 ) -> None:
-    registry = build_registry(http_client, session_factory, search_provider=FakeSearchProvider())
+    registry = build_registry(
+        http_client, session_factory, RegistryOptions(search_provider=FakeSearchProvider())
+    )
     assert {spec.name for spec in registry.specs()} == ALL_BASIC_TOOLS
 
 
@@ -359,11 +382,16 @@ async def test_skills_run_over_substituted_ports(
     registry = build_registry(
         http_client,
         session_factory,
-        search_provider=FakeSearchProvider(),
-        instruction_store=instruction_store,
+        RegistryOptions(
+            search_provider=FakeSearchProvider(),
+            instruction_store=instruction_store,
+        ),
     )
     instructions = build_instruction_service(instruction_store, LenientEmbedder())
-    await instructions.save(USER_ID, InstructionType.SKILL, SAVED_TITLE, SAVED_CONTENT)
+    await instructions.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, SAVED_TITLE, SAVED_CONTENT),
+    )
 
     search_output = await registry.get("web_search").execute({"query": SEARCH_QUERY}, CONTEXT)
     assert FAKE_ANSWER in search_output
@@ -375,14 +403,23 @@ async def test_build_conversation_manager_runs_a_dialog(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     llm = ScriptedLLM()
-    manager = build_conversation_manager(
-        config=build_runner_config(
-            build_agent_loop(llm, ToolRegistry(), max_iterations=MAX_ITERATIONS),
-            StaticPromptProvider(),
-            PassThroughRouter(),
-            NoopContextCompactor(),
-            options=RunnerOptions(max_processes=MAX_PROCESSES),
+    config = build_runner_config(
+        RunnerServices(
+            loop=build_agent_loop(
+                llm, ToolRegistry(), AgentLoopConfig(max_iterations=MAX_ITERATIONS)
+            ),
+            prompts=StaticPromptProvider(),
+            router=PassThroughRouter(),
+            compactor=NoopContextCompactor(),
         ),
+        RunnerOptions(
+            max_processes=MAX_PROCESSES,
+            material_quiet_seconds=CUSTOM_MATERIAL_QUIET_SECONDS,
+        ),
+    )
+    assert config.material_quiet_seconds == CUSTOM_MATERIAL_QUIET_SECONDS
+    manager = build_conversation_manager(
+        config=config,
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
             messages=SqlAlchemyMessageRepository(session_factory),
@@ -395,7 +432,7 @@ async def test_build_conversation_manager_runs_a_dialog(
     )
     runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
     queue = runner.subscribe()
-    await runner.submit(QUESTION)
+    await runner.submit(DialogSubmission(QUESTION))
 
     events: list[ConversationEvent] = []
     while True:

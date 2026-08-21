@@ -166,11 +166,12 @@ string: front the deployment with a proxy that authenticates people and sets tha
 
 ## Code anchors
 
-- `deploy/src/octoforge_deploy/main.py` — `create_app()`, the middleware gate, health probes, static mounts
+- `server/src/octoforge_server/app.py` — `build_app()`, health probes and static mounts
+- `server/src/octoforge_server/request_guard.py` — the middleware credential and cross-site gate
 - `server/src/octoforge_server/api/dialog.py` — messages, cancel, SSE
 - `server/src/octoforge_server/api/identity.py` — the profile mirror
 - `server/src/octoforge_server/api/sse.py` — frame encoding and event payloads
-- `server/src/octoforge_server/api/cron.py`, `surfaces/console/src/octoforge_console/routes.py`, `api/secrets.py` — the other routers
+- `server/src/octoforge_server/api/cron.py`, `surfaces/console/src/octoforge_console/routes/__init__.py`, `api/secrets.py` — the other routers
 - `server/src/octoforge_server/api/schemas.py` — request and response models
 - `server/src/octoforge_server/auth.py` — hashing, verification, the open-path rules
 - `server/src/octoforge_server/deps.py` — dependency providers

@@ -7,8 +7,8 @@ meaning that differs, the difference is stated.
 
 The per-dialog object that owns everything about one conversation: its narrative, its exchanges, its
 running processes, and delivery of results. Implemented as `ConversationRunner` in
-`agent/runner.py`, with a command inbox serialized by one asyncio task. One actor per dialog; a
-`ConversationManager` maps `(user_id, channel)` to it.
+`agent/runner_facade.py`, with the command inbox in `agent/runner_actor.py` serialized by one asyncio
+task. One actor per dialog; a `ConversationManager` maps `(user_id, channel)` to it.
 
 ### Answer run
 

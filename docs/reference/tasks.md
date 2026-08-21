@@ -107,5 +107,8 @@ Cron-specific settings are in [cron.md](cron.md).
 - `core/src/octoforge_core/tasks/store.py` — the `TaskStore` port, SQL and in-memory implementations
 - `core/src/octoforge_core/tasks/tools.py` — `task_create`, `task_list`, `task_delete`
 - `core/src/octoforge_core/tools/base.py` — the `TaskSpawner` / `TaskDeleter` ports the actor binds
-- `core/src/octoforge_core/agent/runner.py` — process lifecycle, delivery, recovery
+- `core/src/octoforge_core/agent/runner_processes.py`,
+  `core/src/octoforge_core/agent/runner_jobs.py`,
+  `core/src/octoforge_core/agent/runner_task_recovery.py` — process lifecycle and recovery
+- `core/src/octoforge_core/agent/runner_outbox.py` — result delivery
 - `core/tests/test_tasks.py`, `core/tests/test_conversation_runner.py` — behavior

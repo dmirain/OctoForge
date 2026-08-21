@@ -115,7 +115,7 @@ operator, not a product surface.
 
 - `core/src/octoforge_core/admin/api.py` — `AdminReadModel`, `Page[T]`, the DTOs
 - `core/src/octoforge_core/admin/store.py` — the SQL implementation (SELECT and count only)
-- `surfaces/console/src/octoforge_console/routes.py` — the HTTP surface and the two mutations
+- `surfaces/console/src/octoforge_console/routes/__init__.py` — the HTTP surface over resource routers
 - `surfaces/console/src/octoforge_console/static/admin.html` — the page
 - `surfaces/telegram/src/octoforge_telegram/admin.py` — the in-chat admin tool
 - `core/tests/test_admin_store.py`, `deploy/tests/test_admin_api.py`

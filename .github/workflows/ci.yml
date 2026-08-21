@@ -39,7 +39,7 @@ jobs:
       - name: Install
         run: make install
 
-      - name: Check (ruff + mypy + pytest, both projects)
+      - name: Check (Ruff + Pylint + mypy + docs + pytest)
         run: make check
 
       - name: Start Postgres with the search extensions

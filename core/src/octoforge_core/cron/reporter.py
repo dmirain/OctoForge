@@ -8,7 +8,7 @@ their single attempt (success or failure), keep the schedule otherwise.
 
 import logging
 
-from octoforge_core.cron.api import CronJobNotFoundError, CronStore
+from octoforge_core.cron.api import CronFireResult, CronJobNotFoundError, CronStore
 from octoforge_core.tasks.api import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -45,10 +45,7 @@ class CronOutcomeReporter:
             await self._store.delete_for_user(job.user_id, job.id)
             return
         await self._store.record_fire_result(
-            job_id,
-            status,
-            error=_error_for(task, status),
-            retry_at=None,
+            CronFireResult(job_id, status, _error_for(task, status), None)
         )
 
 

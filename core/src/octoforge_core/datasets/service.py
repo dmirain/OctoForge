@@ -6,26 +6,20 @@ process, an installer can substitute a pgvector/vector-DB store
 (implementing `DatasetVectorSearch`) without touching this service.
 """
 
-from datetime import datetime
 from typing import Any
 
-from octoforge_core.datasets.api import (
-    Dataset,
-    DatasetHit,
-    DatasetLexicalSearch,
-    DatasetNotFoundError,
-    DatasetQuotaError,
-    DatasetRecord,
-    DatasetSchema,
-    DatasetStore,
-    DatasetVectorSearch,
-    EmbeddedDataset,
+from octoforge_core.datasets._authoring import DatasetAuthor
+from octoforge_core.datasets._search import DatasetSearch
+from octoforge_core.datasets.requests import (
+    DatasetDefinition,
+    DatasetRecordQuery,
+    DatasetRecordScan,
 )
-from octoforge_core.datasets.ranking import fuse, rank
+from octoforge_core.datasets.store_ports import DatasetStore
+from octoforge_core.datasets.types import Dataset, DatasetHit, DatasetNotFoundError, DatasetRecord
 from octoforge_core.llm.embeddings import EmbeddingClient
 from octoforge_core.tariffs.api import LimitGate
 
-EMBEDDED_TEXT_SEPARATOR = "\n"
 # Upper bound of rows scanned per query: the store filters the created_at
 # range and caps the scan, the equals filter then applies in Python (tracker
 # datasets are small, so no JSON-field indexes are needed).
@@ -42,38 +36,16 @@ class LocalDatasetService:
         limits: LimitGate | None = None,
     ) -> None:
         self._store = store
-        self._embedder = embedder
-        self._limits = limits
+        self._author = DatasetAuthor(store, embedder, limits)
+        self._search = DatasetSearch(store, embedder)
 
-    async def create_dataset(  # noqa: PLR0913, PLR0917 — facade signature from the module boundary
-        self,
-        owner_user_id: str,
-        name: str,
-        description: str,
-        schema: DatasetSchema,
-        usage_notes: str = "",
-        retention: str = "",
-    ) -> Dataset:
+    async def create_dataset(self, definition: DatasetDefinition) -> Dataset:
         """Embed name + description + usage_notes and insert the descriptor.
 
         The plan cap is checked here so the agent's implicit creation on a
         first `data_put` goes through the same gate as an explicit one.
         """
-        await self._check_quota(owner_user_id)
-        (embedding,) = await self._embedder.embed((_embedded_text(name, description, usage_notes),))
-        return await self._store.create(
-            owner_user_id, name, description, schema, usage_notes, retention, embedding
-        )
-
-    async def _check_quota(self, owner_user_id: str) -> None:
-        if self._limits is None:
-            return
-        cap = await self._limits.max_datasets(owner_user_id)
-        if cap is None:
-            return
-        existing = len(await self._store.list_with_embeddings(owner_user_id))
-        if existing >= cap:
-            raise DatasetQuotaError(cap)
+        return await self._author.create(definition)
 
     async def get_dataset(self, owner_user_id: str, name: str) -> Dataset:
         """Return the descriptor of this owner by name."""
@@ -94,31 +66,23 @@ class LocalDatasetService:
             raise DatasetNotFoundError(dataset_name)
         return await self._store.add_record(dataset.id, owner_user_id, payload)
 
-    async def query_records(  # noqa: PLR0913, PLR0917 — facade signature from the module boundary
-        self,
-        owner_user_id: str,
-        dataset_name: str,
-        equals: dict[str, Any] | None,
-        date_from: datetime | None,
-        date_to: datetime | None,
-        limit: int,
-    ) -> list[DatasetRecord]:
+    async def query_records(self, request: DatasetRecordQuery) -> list[DatasetRecord]:
         """Scan the SQL-side date range, then apply the equals filter in Python.
 
         Tracker datasets are small, so the payload equality filter runs in
         memory over the bounded scan (MAX_SCAN_ROWS) instead of JSON indexes.
         """
-        dataset = await self._store.get(owner_user_id, dataset_name)
+        dataset = await self._store.get(request.owner_user_id, request.dataset_name)
         if dataset is None:
-            raise DatasetNotFoundError(dataset_name)
+            raise DatasetNotFoundError(request.dataset_name)
         candidates = await self._store.query_candidates(
-            dataset.id, date_from, date_to, MAX_SCAN_ROWS
+            DatasetRecordScan(dataset.id, request.date_from, request.date_to, MAX_SCAN_ROWS)
         )
-        if equals:
+        if request.equals:
             candidates = [
-                record for record in candidates if _matches_equals(record.payload, equals)
+                record for record in candidates if _matches_equals(record.payload, request.equals)
             ]
-        return candidates[:limit]
+        return candidates[: request.limit]
 
     async def delete_dataset(self, owner_user_id: str, name: str) -> int:
         """Delete the descriptor with its records; return the record count."""
@@ -134,45 +98,7 @@ class LocalDatasetService:
         on their side, the rest hand over all of the owner's descriptors for
         brute-force cosine.
         """
-        if not query.strip():
-            return []
-        (query_embedding,) = await self._embedder.embed((query,))
-        candidates = await self._candidates(owner_user_id, query_embedding, k)
-        lexical = await self._lexical_candidates(owner_user_id, query, k)
-        if lexical is None:
-            return rank(candidates, query, query_embedding, k)
-        return fuse([candidates, lexical], query, k)
-
-    async def _candidates(
-        self,
-        owner_user_id: str,
-        query_embedding: tuple[float, ...],
-        k: int,
-    ) -> list[EmbeddedDataset]:
-        """Fetch the ranking input: vector search on the store side when supported."""
-        if isinstance(self._store, DatasetVectorSearch):
-            return await self._store.search_by_vector(owner_user_id, query_embedding, k)
-        return await self._store.list_with_embeddings(owner_user_id)
-
-    async def _lexical_candidates(
-        self,
-        owner_user_id: str,
-        query: str,
-        k: int,
-    ) -> list[EmbeddedDataset] | None:
-        """BM25 candidates, or None when the store has no lexical capability.
-
-        None rather than an empty list: "this database cannot" and "nothing
-        matched the words" must not collapse into one, or an unmatched query
-        would silently halve the ranking evidence.
-        """
-        if not isinstance(self._store, DatasetLexicalSearch):
-            return None
-        return await self._store.search_by_text(owner_user_id, query, k)
-
-
-def _embedded_text(name: str, description: str, usage_notes: str) -> str:
-    return EMBEDDED_TEXT_SEPARATOR.join((name, description, usage_notes))
+        return await self._search.search(owner_user_id, query, k)
 
 
 def _matches_equals(payload: dict[str, Any], equals: dict[str, Any]) -> bool:

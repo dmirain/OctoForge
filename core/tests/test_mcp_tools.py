@@ -9,16 +9,20 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.identity.store import SqlAlchemyIdentityStore
-from octoforge_core.instructions.api import InstructionType
+from octoforge_core.instructions.api import InstructionDefinition, InstructionType
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
-from octoforge_core.mcp.api import McpError, McpToolDescriptor, McpToolResult
-from octoforge_core.mcp.executor import McpMirrorCallExecutor
+from octoforge_core.mcp.api import McpError, McpToolCall, McpToolDescriptor, McpToolResult
+from octoforge_core.mcp.executor import McpExecutorOptions, McpMirrorCallExecutor
 from octoforge_core.mcp.store import SqlAlchemyMcpServerStore
-from octoforge_core.mcp.sync import McpToolSync
-from octoforge_core.mcp.tools import McpAddTool
+from octoforge_core.mcp.sync import McpSyncServices, McpToolSync
+from octoforge_core.mcp.tools import McpAddServices, McpAddTool
 from octoforge_core.net.errors import ExternalCallError
-from octoforge_core.net.external import ExternalCallExecutor
+from octoforge_core.net.external import (
+    ExternalCallConfig,
+    ExternalCallExecutor,
+    ExternalCallServices,
+)
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.net.tools import ExternalCallTool
 from octoforge_core.secrets.api import (
@@ -62,10 +66,8 @@ class RecordingMcpClient:
     async def list_tools(self, url: str, headers: dict[str, str]) -> list[McpToolDescriptor]:
         return list(self.tools)
 
-    async def call_tool(
-        self, url: str, headers: dict[str, str], tool: str, arguments: dict[str, Any]
-    ) -> McpToolResult:
-        self.calls.append((url, tool, arguments, headers))
+    async def call_tool(self, request: McpToolCall) -> McpToolResult:
+        self.calls.append((request.url, request.tool, request.arguments, request.headers))
         if isinstance(self.result, McpError):
             raise self.result
         return self.result
@@ -100,17 +102,25 @@ class Installation:
         return ToolContext(user_id=user.id, channel=CHANNEL, dialog_id=DIALOG_ID)
 
     def add_tool(self, client: RecordingMcpClient) -> McpAddTool:
-        sync = McpToolSync(self.mcp_store, client, self.instructions)
-        return McpAddTool(self.mcp_store, sync, GUARD)
+        sync = McpToolSync(McpSyncServices(self.mcp_store, client, self.instructions))
+        return McpAddTool(McpAddServices(self.mcp_store, sync, GUARD))
 
     def call_tool(
         self, client: RecordingMcpClient, secrets: "OneSecretStore | None" = None
     ) -> ExternalCallTool:
         executor = ExternalCallExecutor(
-            service=self.instructions,
-            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_no_http)),
-            guard=GUARD,
-            delegates={"mcp": McpMirrorCallExecutor(self.mcp_store, client, secrets)},
+            ExternalCallServices(
+                self.instructions,
+                httpx.AsyncClient(transport=httpx.MockTransport(_no_http)),
+                GUARD,
+            ),
+            ExternalCallConfig(
+                delegates={
+                    "mcp": McpMirrorCallExecutor(
+                        self.mcp_store, client, McpExecutorOptions(secrets=secrets)
+                    )
+                }
+            ),
         )
         return ExternalCallTool(executor)
 
@@ -280,10 +290,12 @@ async def test_a_missing_token_answers_with_the_secrets_guidance(
 async def test_classic_endpoints_still_take_strings_only(installation: Installation) -> None:
     context = await installation.context()
     await installation.instructions.save_public(
-        InstructionType.ENDPOINT,
-        "wttr_in_weather",
-        '{"method": "GET", "url_template": "https://mcp.example.com/{city}", '
-        '"params_schema": {"city": {"type": "string", "required": true}}}',
+        InstructionDefinition(
+            InstructionType.ENDPOINT,
+            "wttr_in_weather",
+            '{"method": "GET", "url_template": "https://mcp.example.com/{city}", '
+            '"params_schema": {"city": {"type": "string", "required": true}}}',
+        )
     )
 
     with pytest.raises(ExternalCallError, match="must be strings"):
@@ -295,7 +307,11 @@ async def test_classic_endpoints_still_take_strings_only(installation: Installat
 async def test_an_unknown_kind_is_refused(installation: Installation) -> None:
     context = await installation.context()
     await installation.instructions.save_public(
-        InstructionType.ENDPOINT, "strange", '{"kind": "grpc", "service": "x"}'
+        InstructionDefinition(
+            InstructionType.ENDPOINT,
+            "strange",
+            '{"kind": "grpc", "service": "x"}',
+        )
     )
 
     with pytest.raises(ExternalCallError, match="no executor"):
@@ -307,9 +323,11 @@ async def test_an_unknown_kind_is_refused(installation: Installation) -> None:
 async def test_a_gone_server_is_reported_not_crashed(installation: Installation) -> None:
     context = await installation.context()
     await installation.instructions.save_public(
-        InstructionType.ENDPOINT,
-        "mcp/ghost/tool",
-        '{"kind": "mcp", "server": "ghost", "tool": "tool", "input_schema": {}}',
+        InstructionDefinition(
+            InstructionType.ENDPOINT,
+            "mcp/ghost/tool",
+            '{"kind": "mcp", "server": "ghost", "tool": "tool", "input_schema": {}}',
+        )
     )
 
     with pytest.raises(ExternalCallError, match="not registered"):

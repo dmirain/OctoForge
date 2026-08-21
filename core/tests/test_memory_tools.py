@@ -7,6 +7,7 @@ import pytest
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
     InstructionDraft,
+    InstructionSearchRequest,
     InstructionService,
     InstructionType,
 )
@@ -58,7 +59,10 @@ def delete_tool(service: InstructionService) -> MemoryDeleteTool:
 
 
 async def find_memory_keys(service: InstructionService, user_id: str) -> list[str]:
-    hits = await service.search(user_id, "memories", TOP_K, InstructionType.MEMORY)
+    hits = await service.search(
+        user_id,
+        InstructionSearchRequest("memories", TOP_K, InstructionType.MEMORY),
+    )
     return [hit.instruction.title for hit in hits]
 
 
@@ -108,9 +112,17 @@ async def test_memories_come_back_through_recall(
     """The storage merge's point: one ranked search (recall) covers memories too."""
     await store_tool.execute({"key": CITY_KEY, "content": CITY_CONTENT}, CTX_A)
 
-    unfiltered = await service.search(CTX_A.user_id, "where does the user live", TOP_K)
+    unfiltered = await service.search(
+        CTX_A.user_id,
+        InstructionSearchRequest("where does the user live", TOP_K),
+    )
     memory_only = await service.search(
-        CTX_A.user_id, "where does the user live", TOP_K, InstructionType.MEMORY
+        CTX_A.user_id,
+        InstructionSearchRequest(
+            "where does the user live",
+            TOP_K,
+            InstructionType.MEMORY,
+        ),
     )
 
     assert CITY_KEY in [hit.instruction.title for hit in unfiltered]

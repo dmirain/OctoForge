@@ -20,6 +20,7 @@ Run with: `make test-pg` (starts the compose service and points this at it).
 import asyncio
 import os
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -29,13 +30,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from octoforge_core.composition import build_collections
+from octoforge_core.composition_schema import bootstrap_schema
+from octoforge_core.context.api import ArchiveSearch
 from octoforge_core.context.pg_store import PostgresSummaryStore
-from octoforge_core.cron.api import CronJob
+from octoforge_core.cron.api import CronClaim, CronJob
 from octoforge_core.cron.store import SqlAlchemyCronStore
-from octoforge_core.datasets.api import DatasetSchema
+from octoforge_core.datasets.api import DatasetDefinition, DatasetRecordScan, DatasetSchema
 from octoforge_core.datasets.pg_store import PostgresDatasetStore
 from octoforge_core.datasets.store import SqlAlchemyDatasetStore
-from octoforge_core.db.engine import bootstrap_schema, create_engine, create_session_factory
+from octoforge_core.db.engine import create_engine, create_session_factory
 from octoforge_core.db.search_extensions import (
     UNACCENT,
     VECTOR,
@@ -43,7 +46,7 @@ from octoforge_core.db.search_extensions import (
     installed_search_extensions,
 )
 from octoforge_core.db.unit_of_work import UnitOfWork
-from octoforge_core.dialogs.api import ExchangeStatus
+from octoforge_core.dialogs.api import ExchangeStatus, MessageAppend
 from octoforge_core.dialogs.models import DialogRow, MessageRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyDialogRepository,
@@ -56,12 +59,15 @@ from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.instructions.api import (
     InstructionDraft,
     InstructionLexicalSearch,
+    InstructionTextQuery,
     InstructionType,
+    InstructionVectorQuery,
     InstructionVectorSearch,
 )
 from octoforge_core.instructions.pg_store import PostgresInstructionStore
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
 from octoforge_core.net.collections.api import (
+    CollectionAppend,
     CollectionConfig,
     CollectionKind,
     CollectionNotFoundError,
@@ -69,6 +75,7 @@ from octoforge_core.net.collections.api import (
     FilterOp,
     FilterPredicate,
     JoinSpec,
+    NewCollection,
     NewRecords,
     Query,
     QueryOp,
@@ -80,6 +87,7 @@ from octoforge_core.settings.api import max_active_users
 from octoforge_core.settings.store import SqlAlchemySettingsStore
 from octoforge_core.tariffs.api import (
     FeatureCode,
+    TariffDefinition,
     TariffLimits,
     UsageEvent,
     UsageKind,
@@ -210,14 +218,13 @@ def memory_draft(
     key: str,
     content: str,
     owner_id: str | None,
-    embedding: tuple[float, ...] = EMBEDDING,
 ) -> InstructionDraft:
     return InstructionDraft(
         kind=InstructionType.MEMORY,
         title=key,
         content=content,
         tags=(),
-        embedding=embedding,
+        embedding=EMBEDDING,
         owner_id=owner_id,
     )
 
@@ -310,7 +317,7 @@ async def test_datetimes_round_trip_as_aware_utc(
 ) -> None:
     dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
     await SqlAlchemyMessageRepository(session_factory).append(
-        dialog.id, ChatMessage(role=MessageRole.USER, content="hi")
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
     )
 
     async with session_factory() as session:
@@ -329,8 +336,12 @@ async def test_user_activity_aggregate_comes_back_as_aware_utc(
     hands the timestamptz back aware, `_as_utc` only normalizes it."""
     dialog = await SqlAlchemyDialogRepository(session_factory).get_or_create(USER_A, CHANNEL)
     messages = SqlAlchemyMessageRepository(session_factory)
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
-    await messages.append(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="hi"))
+    )
+    await messages.append(
+        MessageAppend(dialog.id, ChatMessage(role=MessageRole.ASSISTANT, content="reply"))
+    )
 
     activity = await messages.user_activity_by_channel(CHANNEL, utc_now() - timedelta(hours=24))
 
@@ -352,8 +363,12 @@ async def test_concurrent_appends_get_distinct_seq(
     messages = SqlAlchemyMessageRepository(session_factory)
 
     await asyncio.gather(
-        messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="one")),
-        messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="two")),
+        messages.append(
+            MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="one"))
+        ),
+        messages.append(
+            MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="two"))
+        ),
     )
 
     stored = await messages.list(dialog.id)
@@ -379,15 +394,17 @@ async def test_unit_of_work_savepoint_spares_earlier_writes(
     uow = UnitOfWork(session_factory)
     dialog = await dialogs.get_or_create(USER_A, CHANNEL)
     original = ChatMessage(role=MessageRole.USER, content="hi")
-    await messages.append(dialog.id, original, client_message_id="uow-dup")
+    await messages.append(MessageAppend(dialog.id, original, client_message_id="uow-dup"))
 
     async with uow():
         exchange = await exchanges.create(dialog.id, "question")
         with pytest.raises(IntegrityError):  # the idempotency key is taken
-            await messages.append(dialog.id, original, client_message_id="uow-dup")
+            await messages.append(MessageAppend(dialog.id, original, client_message_id="uow-dup"))
         # the violation cost the attempt alone: the unit is still usable
         await exchanges.set_title(exchange.id, "still alive")
-        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="again"))
+        await messages.append(
+            MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="again"))
+        )
 
     assert (await exchanges.get(exchange.id)).title == "still alive"
     assert [message.content for message in await messages.list(dialog.id)] == ["hi", "again"]
@@ -405,12 +422,14 @@ async def test_unit_of_work_first_append_survives_its_violation_bare(
     uow = UnitOfWork(session_factory)
     dialog = await dialogs.get_or_create(USER_A, CHANNEL)
     original = ChatMessage(role=MessageRole.USER, content="hi")
-    await messages.append(dialog.id, original, client_message_id="uow-dup")
+    await messages.append(MessageAppend(dialog.id, original, client_message_id="uow-dup"))
 
     async with uow():
         with pytest.raises(IntegrityError):  # first call of the unit, key taken
-            await messages.append(dialog.id, original, client_message_id="uow-dup")
-        await messages.append(dialog.id, ChatMessage(role=MessageRole.USER, content="again"))
+            await messages.append(MessageAppend(dialog.id, original, client_message_id="uow-dup"))
+        await messages.append(
+            MessageAppend(dialog.id, ChatMessage(role=MessageRole.USER, content="again"))
+        )
         exchange = await exchanges.create(dialog.id, "question")
 
     assert [message.content for message in await messages.list(dialog.id)] == ["hi", "again"]
@@ -422,8 +441,8 @@ async def test_cron_claim_is_won_once(session_factory: async_sessionmaker[AsyncS
     job = await store.create(cron_job("job-1", next_fire_at=NOW))
     stale_before = NOW - LEASE_STALE_AFTER
 
-    first = await store.claim(job.id, job.next_fire_at, "owner-1", NOW, stale_before)
-    second = await store.claim(job.id, job.next_fire_at, "owner-2", NOW, stale_before)
+    first = await store.claim(CronClaim(job.id, job.next_fire_at, "owner-1", NOW, stale_before))
+    second = await store.claim(CronClaim(job.id, job.next_fire_at, "owner-2", NOW, stale_before))
 
     assert first is True
     assert second is False  # the lease is taken; rowcount 0 on Postgres too
@@ -436,7 +455,9 @@ async def test_cron_claim_takes_over_a_stale_lease(
     dead_claim = NOW - timedelta(hours=1)
     job = await store.create(cron_job("job-1", next_fire_at=NOW, claimed_at=dead_claim))
 
-    claimed = await store.claim(job.id, job.next_fire_at, "owner-1", NOW, NOW - LEASE_STALE_AFTER)
+    claimed = await store.claim(
+        CronClaim(job.id, job.next_fire_at, "owner-1", NOW, NOW - LEASE_STALE_AFTER)
+    )
 
     assert claimed is True
 
@@ -466,7 +487,9 @@ async def test_stale_embeddings_roundtrip(
     ever show up here.
     """
     store = SqlAlchemyInstructionStore(session_factory)
-    saved = await store.upsert(memory_draft(SHARED_KEY, GLOBAL_CONTENT, USER_A, embedding=()))
+    saved = await store.upsert(
+        replace(memory_draft(SHARED_KEY, GLOBAL_CONTENT, USER_A), embedding=())
+    )
 
     pending = await store.list_stale_embeddings(EMBEDDING_MODEL, limit=SEARCH_LIMIT)
     stored = await store.set_embedding(saved.id, (1.0, 0.0), EMBEDDING_MODEL)
@@ -539,11 +562,17 @@ async def test_dataset_records_filter_by_date_range(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     store = SqlAlchemyDatasetStore(session_factory)
-    dataset = await store.create(OWNER, "meals", "meal log", DatasetSchema(()), "", "", EMBEDDING)
+    dataset = await store.create(
+        DatasetDefinition(OWNER, "meals", "meal log", DatasetSchema(())), EMBEDDING
+    )
     await store.add_record(dataset.id, OWNER, {"dish": "soup"})
 
-    inside = await store.query_candidates(dataset.id, NOW - timedelta(days=1), None, SCAN_LIMIT)
-    outside = await store.query_candidates(dataset.id, None, NOW - timedelta(days=1), SCAN_LIMIT)
+    inside = await store.query_candidates(
+        DatasetRecordScan(dataset.id, NOW - timedelta(days=1), None, SCAN_LIMIT)
+    )
+    outside = await store.query_candidates(
+        DatasetRecordScan(dataset.id, None, NOW - timedelta(days=1), SCAN_LIMIT)
+    )
 
     assert len(inside) == 1
     assert outside == []
@@ -554,13 +583,17 @@ async def test_vector_search_returns_the_nearest_records_first(
 ) -> None:
     """pgvector must order by cosine distance, not by insertion or id."""
     store = PostgresInstructionStore(session_factory)
-    near = await store.upsert(memory_draft("near", GLOBAL_CONTENT, USER_A, embedding=(1.0, 0.0)))
-    far = await store.upsert(memory_draft("far", GLOBAL_CONTENT, USER_A, embedding=(-1.0, 0.0)))
+    near = await store.upsert(
+        replace(memory_draft("near", GLOBAL_CONTENT, USER_A), embedding=(1.0, 0.0))
+    )
+    far = await store.upsert(
+        replace(memory_draft("far", GLOBAL_CONTENT, USER_A), embedding=(-1.0, 0.0))
+    )
     middle = await store.upsert(
-        memory_draft("middle", GLOBAL_CONTENT, USER_A, embedding=(0.7, 0.7))
+        replace(memory_draft("middle", GLOBAL_CONTENT, USER_A), embedding=(0.7, 0.7))
     )
 
-    hits = await store.search_by_vector((1.0, 0.0), limit=SEARCH_LIMIT, user_id=USER_A)
+    hits = await store.search_by_vector(InstructionVectorQuery((1.0, 0.0), SEARCH_LIMIT, USER_A))
 
     assert [hit.instruction.id for hit in hits] == [near.id, middle.id, far.id]
 
@@ -574,11 +607,17 @@ async def test_vector_search_honours_visibility(
     database must not quietly drop it.
     """
     store = PostgresInstructionStore(session_factory)
-    mine = await store.upsert(memory_draft("mine", GLOBAL_CONTENT, USER_A, embedding=(1.0, 0.0)))
-    public = await store.upsert(memory_draft("public", GLOBAL_CONTENT, None, embedding=(1.0, 0.0)))
-    await store.upsert(memory_draft("theirs", GLOBAL_CONTENT, USER_B, embedding=(1.0, 0.0)))
+    mine = await store.upsert(
+        replace(memory_draft("mine", GLOBAL_CONTENT, USER_A), embedding=(1.0, 0.0))
+    )
+    public = await store.upsert(
+        replace(memory_draft("public", GLOBAL_CONTENT, None), embedding=(1.0, 0.0))
+    )
+    await store.upsert(
+        replace(memory_draft("theirs", GLOBAL_CONTENT, USER_B), embedding=(1.0, 0.0))
+    )
 
-    hits = await store.search_by_vector((1.0, 0.0), limit=SEARCH_LIMIT, user_id=USER_A)
+    hits = await store.search_by_vector(InstructionVectorQuery((1.0, 0.0), SEARCH_LIMIT, USER_A))
 
     assert {hit.instruction.id for hit in hits} == {mine.id, public.id}
 
@@ -595,13 +634,16 @@ async def test_vector_search_skips_records_of_another_dimension(
     """
     store = PostgresInstructionStore(session_factory)
     current = await store.upsert(
-        memory_draft("current", GLOBAL_CONTENT, USER_A, embedding=(1.0, 0.0))
+        replace(memory_draft("current", GLOBAL_CONTENT, USER_A), embedding=(1.0, 0.0))
     )
     await store.upsert(
-        memory_draft("previous", GLOBAL_CONTENT, USER_A, embedding=tuple([0.1] * WIDER_DIMENSION))
+        replace(
+            memory_draft("previous", GLOBAL_CONTENT, USER_A),
+            embedding=tuple([0.1] * WIDER_DIMENSION),
+        )
     )
 
-    hits = await store.search_by_vector((1.0, 0.0), limit=SEARCH_LIMIT, user_id=USER_A)
+    hits = await store.search_by_vector(InstructionVectorQuery((1.0, 0.0), SEARCH_LIMIT, USER_A))
 
     assert [hit.instruction.id for hit in hits] == [current.id]
 
@@ -612,11 +654,11 @@ async def test_vector_search_skips_records_with_no_vector(
     """A record whose embedding failed is simply not a candidate."""
     store = PostgresInstructionStore(session_factory)
     embedded = await store.upsert(
-        memory_draft("embedded", GLOBAL_CONTENT, USER_A, embedding=(1.0, 0.0))
+        replace(memory_draft("embedded", GLOBAL_CONTENT, USER_A), embedding=(1.0, 0.0))
     )
-    await store.upsert(memory_draft("deferred", GLOBAL_CONTENT, USER_A, embedding=()))
+    await store.upsert(replace(memory_draft("deferred", GLOBAL_CONTENT, USER_A), embedding=()))
 
-    hits = await store.search_by_vector((1.0, 0.0), limit=SEARCH_LIMIT, user_id=USER_A)
+    hits = await store.search_by_vector(InstructionVectorQuery((1.0, 0.0), SEARCH_LIMIT, USER_A))
 
     assert [hit.instruction.id for hit in hits] == [embedded.id]
 
@@ -651,7 +693,7 @@ async def test_lexical_search_finds_the_exact_term_an_embedding_would_miss(
     )
     await store.upsert(text_draft("shipping", "Расчёт стоимости доставки по регионам", USER_A))
 
-    hits = await store.search_by_text("E_INVOICE_4021", limit=SEARCH_LIMIT, user_id=USER_A)
+    hits = await store.search_by_text(InstructionTextQuery("E_INVOICE_4021", SEARCH_LIMIT, USER_A))
 
     assert [hit.instruction.id for hit in hits] == [wanted.id]
 
@@ -665,7 +707,7 @@ async def test_lexical_search_matches_across_russian_inflection(
         text_draft("tasks", "Агент создаёт отложенные задачи и напоминания", USER_A)
     )
 
-    hits = await store.search_by_text("задача", limit=SEARCH_LIMIT, user_id=USER_A)
+    hits = await store.search_by_text(InstructionTextQuery("задача", SEARCH_LIMIT, USER_A))
 
     assert [hit.instruction.id for hit in hits] == [wanted.id]
 
@@ -683,9 +725,14 @@ async def test_lexical_search_honours_visibility_and_kind(
     mine = await store.upsert(text_draft("mine", "уникальное слово корвалол", USER_A))
     await store.upsert(text_draft("theirs", "уникальное слово корвалол", USER_B))
 
-    visible = await store.search_by_text("корвалол", limit=SEARCH_LIMIT, user_id=USER_A)
+    visible = await store.search_by_text(InstructionTextQuery("корвалол", SEARCH_LIMIT, USER_A))
     wrong_kind = await store.search_by_text(
-        "корвалол", limit=SEARCH_LIMIT, user_id=USER_A, kinds=(InstructionType.ENDPOINT,)
+        InstructionTextQuery(
+            "корвалол",
+            SEARCH_LIMIT,
+            USER_A,
+            (InstructionType.ENDPOINT,),
+        )
     )
 
     assert [hit.instruction.id for hit in visible] == [mine.id]
@@ -699,7 +746,9 @@ async def test_lexical_search_returns_nothing_when_no_word_matches(
     store = PostgresInstructionStore(session_factory)
     await store.upsert(text_draft("shipping", "Расчёт стоимости доставки", USER_A))
 
-    hits = await store.search_by_text("квазистационарный", limit=SEARCH_LIMIT, user_id=USER_A)
+    hits = await store.search_by_text(
+        InstructionTextQuery("квазистационарный", SEARCH_LIMIT, USER_A)
+    )
 
     assert hits == []
 
@@ -722,7 +771,7 @@ async def test_the_title_is_searched_as_a_document_of_its_own(
         text_draft("prose", " ".join(["наполнитель"] * 200) + " корвалол", USER_A)
     )
 
-    hits = await store.search_by_text("корвалол", limit=SEARCH_LIMIT, user_id=USER_A)
+    hits = await store.search_by_text(InstructionTextQuery("корвалол", SEARCH_LIMIT, USER_A))
 
     assert {hit.instruction.id for hit in hits} == {title_only.id, body_only.id}
 
@@ -773,7 +822,7 @@ async def test_history_search_matches_across_russian_inflection(
     )
     store = PostgresSummaryStore(session_factory)
 
-    hits = await store.search(dialog_id, "задача", limit=SEARCH_LIMIT)
+    hits = await store.search(ArchiveSearch(dialog_id, "задача", None, SEARCH_LIMIT))
 
     assert [hit.seq for hit in hits] == [1]
 
@@ -789,7 +838,7 @@ async def test_history_search_ranks_by_relevance_not_by_position(
     )
     store = PostgresSummaryStore(session_factory)
 
-    hits = await store.search(dialog_id, "корвалол", limit=SEARCH_LIMIT)
+    hits = await store.search(ArchiveSearch(dialog_id, "корвалол", None, SEARCH_LIMIT))
 
     assert [hit.seq for hit in hits] == [2, 1]
 
@@ -813,7 +862,7 @@ async def test_history_search_stays_inside_its_dialog(
         await session.commit()
     store = PostgresSummaryStore(session_factory)
 
-    hits = await store.search(dialog_id, "термин", limit=SEARCH_LIMIT)
+    hits = await store.search(ArchiveSearch(dialog_id, "термин", None, SEARCH_LIMIT))
 
     assert len(hits) == 1
 
@@ -824,7 +873,9 @@ async def test_history_search_returns_nothing_when_no_word_matches(
     dialog_id = await _dialog_with_messages(session_factory, ("совсем про другое",))
     store = PostgresSummaryStore(session_factory)
 
-    assert await store.search(dialog_id, "квазистационарный", limit=SEARCH_LIMIT) == []
+    assert (
+        await store.search(ArchiveSearch(dialog_id, "квазистационарный", None, SEARCH_LIMIT)) == []
+    )
 
 
 async def test_dataset_lexical_search_finds_a_word_the_embedding_would_not(
@@ -834,22 +885,17 @@ async def test_dataset_lexical_search_finds_a_word_the_embedding_would_not(
     vector space still names its dataset."""
     store = PostgresDatasetStore(session_factory)
     wanted = await store.create(
-        owner_user_id=USER_A,
-        name="meals",
-        description="Дневник питания и расчёт КБЖУ по каждому приёму пищи",
-        schema=DatasetSchema(fields=()),
-        usage_notes="",
-        retention="",
-        embedding=EMBEDDING,
+        DatasetDefinition(
+            USER_A,
+            "meals",
+            "Дневник питания и расчёт КБЖУ по каждому приёму пищи",
+            DatasetSchema(fields=()),
+        ),
+        EMBEDDING,
     )
     await store.create(
-        owner_user_id=USER_A,
-        name="expenses",
-        description="Учёт трат по категориям",
-        schema=DatasetSchema(fields=()),
-        usage_notes="",
-        retention="",
-        embedding=EMBEDDING,
+        DatasetDefinition(USER_A, "expenses", "Учёт трат по категориям", DatasetSchema(fields=())),
+        EMBEDDING,
     )
 
     hits = await store.search_by_text(USER_A, "КБЖУ", limit=SEARCH_LIMIT)
@@ -863,13 +909,8 @@ async def test_dataset_lexical_search_is_owner_scoped(
     """Owner isolation is the store's duty on every path, this one included."""
     store = PostgresDatasetStore(session_factory)
     await store.create(
-        owner_user_id=USER_B,
-        name="theirs",
-        description="Дневник питания и расчёт КБЖУ",
-        schema=DatasetSchema(fields=()),
-        usage_notes="",
-        retention="",
-        embedding=EMBEDDING,
+        DatasetDefinition(USER_B, "theirs", "Дневник питания и расчёт КБЖУ", DatasetSchema(())),
+        EMBEDDING,
     )
 
     assert await store.search_by_text(USER_A, "КБЖУ", limit=SEARCH_LIMIT) == []
@@ -881,10 +922,12 @@ async def test_tariff_roundtrip_and_assignment(
     token_limit = 1000
     store = SqlAlchemyTariffStore(session_factory)
     await store.put(
-        "basic",
-        "Basic",
-        frozenset({FeatureCode.WEB_SEARCH}),
-        TariffLimits(daily_tokens=token_limit),
+        TariffDefinition(
+            "basic",
+            "Basic",
+            frozenset({FeatureCode.WEB_SEARCH}),
+            TariffLimits(daily_tokens=token_limit),
+        )
     )
 
     await store.assign(USER_A, "basic")
@@ -974,16 +1017,18 @@ async def _contractor_collection(
 ) -> tuple[SqlAlchemyCollectionStore, str]:
     store = SqlAlchemyCollectionStore(session_factory)
     passport = await store.create(
-        owner_id=COLLECTION_OWNER,
-        label="contractors",
-        kind=CollectionKind.JSON,
-        source="endpoint:crm",
-        schema=infer_records(CONTRACTORS),
-        envelope={},
-        records=NewRecords(payloads=CONTRACTORS, source="endpoint:crm"),
-        byte_size=1000,
-        truncated=False,
-        expires_at=utc_now() + timedelta(hours=1),
+        NewCollection(
+            COLLECTION_OWNER,
+            "contractors",
+            CollectionKind.JSON,
+            "endpoint:crm",
+            infer_records(CONTRACTORS),
+            {},
+            NewRecords(payloads=CONTRACTORS, source="endpoint:crm"),
+            1000,
+            False,
+            utc_now() + timedelta(hours=1),
+        )
     )
     return store, passport.id
 
@@ -1105,12 +1150,14 @@ async def test_collections_source_tag_narrows_a_merged_collection(
     contacts = [{"contractor_id": 1, "email": "a@x"}, {"contractor_id": 2, "email": "b@x"}]
     merged_schema = infer_records(CONTRACTORS + contacts)
     await store.append(
-        COLLECTION_OWNER,
-        ref,
-        NewRecords(payloads=contacts, source="endpoint:contacts"),
-        schema=merged_schema,
-        byte_size=100,
-        expires_at=utc_now() + timedelta(hours=1),
+        CollectionAppend(
+            COLLECTION_OWNER,
+            ref,
+            NewRecords(payloads=contacts, source="endpoint:contacts"),
+            merged_schema,
+            100,
+            utc_now() + timedelta(hours=1),
+        )
     )
     engine_ = PostgresCollectionQueryEngine(session_factory)
 
@@ -1129,16 +1176,18 @@ async def test_collections_dotted_paths_reach_nested_fields(
     store = SqlAlchemyCollectionStore(session_factory)
     nested = [{"owner": {"city": "SPb"}}, {"owner": {"city": "Kazan"}}, {"owner": {"city": "SPb"}}]
     passport = await store.create(
-        owner_id=COLLECTION_OWNER,
-        label="",
-        kind=CollectionKind.JSON,
-        source="endpoint:crm",
-        schema=infer_records(nested),
-        envelope={},
-        records=NewRecords(payloads=nested),
-        byte_size=100,
-        truncated=False,
-        expires_at=utc_now() + timedelta(hours=1),
+        NewCollection(
+            COLLECTION_OWNER,
+            "",
+            CollectionKind.JSON,
+            "endpoint:crm",
+            infer_records(nested),
+            {},
+            NewRecords(payloads=nested),
+            100,
+            False,
+            utc_now() + timedelta(hours=1),
+        )
     )
     engine_ = PostgresCollectionQueryEngine(session_factory)
 
@@ -1172,16 +1221,18 @@ async def test_collections_join_pairs_records_across_collections(
     SQL and answers pairs — never a megabyte of both through the context."""
     store, left_ref = await _contractor_collection(session_factory)
     right = await store.create(
-        owner_id=COLLECTION_OWNER,
-        label="contacts",
-        kind=CollectionKind.JSON,
-        source="endpoint:contacts",
-        schema=infer_records(CONTACTS),
-        envelope={},
-        records=NewRecords(payloads=CONTACTS, source="endpoint:contacts"),
-        byte_size=300,
-        truncated=False,
-        expires_at=utc_now() + timedelta(hours=1),
+        NewCollection(
+            COLLECTION_OWNER,
+            "contacts",
+            CollectionKind.JSON,
+            "endpoint:contacts",
+            infer_records(CONTACTS),
+            {},
+            NewRecords(payloads=CONTACTS, source="endpoint:contacts"),
+            300,
+            False,
+            utc_now() + timedelta(hours=1),
+        )
     )
     engine_ = PostgresCollectionQueryEngine(session_factory)
 
@@ -1216,16 +1267,18 @@ async def test_collections_join_validates_both_sides(
 ) -> None:
     store, left_ref = await _contractor_collection(session_factory)
     right = await store.create(
-        owner_id=COLLECTION_OWNER,
-        label="",
-        kind=CollectionKind.JSON,
-        source="endpoint:contacts",
-        schema=infer_records(CONTACTS),
-        envelope={},
-        records=NewRecords(payloads=CONTACTS),
-        byte_size=300,
-        truncated=False,
-        expires_at=utc_now() + timedelta(hours=1),
+        NewCollection(
+            COLLECTION_OWNER,
+            "",
+            CollectionKind.JSON,
+            "endpoint:contacts",
+            infer_records(CONTACTS),
+            {},
+            NewRecords(payloads=CONTACTS),
+            300,
+            False,
+            utc_now() + timedelta(hours=1),
+        )
     )
     engine_ = PostgresCollectionQueryEngine(session_factory)
 
@@ -1260,26 +1313,30 @@ async def test_collections_concurrent_appends_do_not_lose_records(
     both land with distinct positions, not one clobber the other (bug E)."""
     store = SqlAlchemyCollectionStore(session_factory)
     passport = await store.create(
-        owner_id=COLLECTION_OWNER,
-        label="",
-        kind=CollectionKind.JSON,
-        source="endpoint:a",
-        schema=infer_records([{"id": 0}]),
-        envelope={},
-        records=NewRecords(payloads=[{"id": 0}]),
-        byte_size=100,
-        truncated=False,
-        expires_at=utc_now() + timedelta(hours=1),
+        NewCollection(
+            COLLECTION_OWNER,
+            "",
+            CollectionKind.JSON,
+            "endpoint:a",
+            infer_records([{"id": 0}]),
+            {},
+            NewRecords(payloads=[{"id": 0}]),
+            100,
+            False,
+            utc_now() + timedelta(hours=1),
+        )
     )
 
     async def append_one(marker: int) -> None:
         await store.append(
-            COLLECTION_OWNER,
-            passport.id,
-            NewRecords(payloads=[{"id": marker}], source=f"src-{marker}"),
-            schema=infer_records([{"id": marker}]),
-            byte_size=100,
-            expires_at=utc_now() + timedelta(hours=1),
+            CollectionAppend(
+                COLLECTION_OWNER,
+                passport.id,
+                NewRecords(payloads=[{"id": marker}], source=f"src-{marker}"),
+                infer_records([{"id": marker}]),
+                100,
+                utc_now() + timedelta(hours=1),
+            )
         )
 
     await asyncio.gather(*(append_one(n) for n in range(1, 6)))

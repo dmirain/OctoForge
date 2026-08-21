@@ -16,7 +16,7 @@ import logging
 import signal
 
 from octoforge_server.config import Settings
-from octoforge_server.logs import configure_logging
+from octoforge_server.logs import LoggingConfig, configure_logging
 from octoforge_telegram.config import TelegramSettings
 
 from octoforge_deploy.main import runtime
@@ -48,10 +48,12 @@ def main() -> None:
     """Console entry: configure logging and run the standalone surface."""
     settings = Settings()
     configure_logging(
-        PROCESS_LOG_NAME,
-        log_dir=settings.log_dir,
-        max_mb=settings.log_max_mb,
-        backups=settings.log_backups,
+        LoggingConfig(
+            PROCESS_LOG_NAME,
+            log_dir=settings.log_dir,
+            max_mb=settings.log_max_mb,
+            backups=settings.log_backups,
+        )
     )
     asyncio.run(run_standalone(settings))
 

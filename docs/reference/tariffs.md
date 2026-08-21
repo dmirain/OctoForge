@@ -157,6 +157,9 @@ The ledger joins the retention sweep through `OF_RETENTION_USAGE_DAYS`
 - `core/src/octoforge_core/tariffs/api.py` — `FeatureCode`, `UsageEvent`, the `LimitGate` port
 - `core/src/octoforge_core/tariffs/service.py` — `LimitService`: checks, caches, metering
 - `core/src/octoforge_core/tariffs/store.py` — the catalog store and the insert-only meter
-- `core/src/octoforge_core/agent/runner.py` — submit/wake/spawn checks and run metering
+- `core/src/octoforge_core/agent/runner_usage.py`,
+  `core/src/octoforge_core/agent/runner_tariffs.py` — run metering and notices
+- `core/src/octoforge_core/agent/runner_answer.py`,
+  `core/src/octoforge_core/agent/runner_jobs.py` — answer and background-work admission
 - `core/tests/test_limit_service.py`, `core/tests/test_tariffs_store.py`,
   `core/tests/test_conversation_runner.py`

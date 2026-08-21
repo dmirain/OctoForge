@@ -9,6 +9,7 @@ from octoforge_core.db.engine import create_engine, create_session_factory, init
 from octoforge_core.tariffs.api import (
     FeatureCode,
     InvalidTariffError,
+    TariffDefinition,
     TariffInUseError,
     TariffLimits,
     TariffNotFoundError,
@@ -76,16 +77,20 @@ async def meter(
 
 async def test_put_and_replace(tariffs: SqlAlchemyTariffStore) -> None:
     created = await tariffs.put(
-        "basic",
-        "Basic",
-        frozenset({FeatureCode.WEB_SEARCH}),
-        TariffLimits(daily_tokens=TOKEN_LIMIT),
+        TariffDefinition(
+            "basic",
+            "Basic",
+            frozenset({FeatureCode.WEB_SEARCH}),
+            TariffLimits(daily_tokens=TOKEN_LIMIT),
+        )
     )
     replaced = await tariffs.put(
-        "basic",
-        "Basic v2",
-        frozenset({FeatureCode.WEB_SEARCH, FeatureCode.VISION}),
-        TariffLimits(daily_user_messages=MESSAGE_LIMIT),
+        TariffDefinition(
+            "basic",
+            "Basic v2",
+            frozenset({FeatureCode.WEB_SEARCH, FeatureCode.VISION}),
+            TariffLimits(daily_user_messages=MESSAGE_LIMIT),
+        )
     )
 
     assert replaced.id == created.id
@@ -100,25 +105,31 @@ async def test_custom_feature_codes_roundtrip(tariffs: SqlAlchemyTariffStore) ->
     """Installer-defined codes are plain strings: the store accepts a code it
     has never heard of — the vocabulary check lives at the operator boundary,
     where the assembly's merged feature set is known."""
-    created = await tariffs.put("ext", "Ext", frozenset({"my_tool", FeatureCode.VISION}))
+    created = await tariffs.put(
+        TariffDefinition("ext", "Ext", frozenset({"my_tool", FeatureCode.VISION}))
+    )
 
     assert created.features == {"my_tool", "vision"}
     with pytest.raises(InvalidTariffError):  # grammar is still enforced
-        await tariffs.put("ext", "Ext", frozenset({"Bad Feature!"}))
+        await tariffs.put(TariffDefinition("ext", "Ext", frozenset({"Bad Feature!"})))
 
 
 async def test_validation(tariffs: SqlAlchemyTariffStore) -> None:
     with pytest.raises(InvalidTariffError):
-        await tariffs.put("Bad Code!", "x", frozenset())
+        await tariffs.put(TariffDefinition("Bad Code!", "x", frozenset()))
     with pytest.raises(InvalidTariffError):
-        await tariffs.put("basic", "", frozenset())
+        await tariffs.put(TariffDefinition("basic", "", frozenset()))
     with pytest.raises(InvalidTariffError):
-        await tariffs.put("basic", "Basic", frozenset(), TariffLimits(daily_tokens=-1))
+        await tariffs.put(
+            TariffDefinition("basic", "Basic", frozenset(), TariffLimits(daily_tokens=-1))
+        )
 
 
 async def test_assignment_lifecycle(tariffs: SqlAlchemyTariffStore) -> None:
-    await tariffs.put("basic", "Basic", frozenset(), TariffLimits(daily_tokens=TOKEN_LIMIT))
-    await tariffs.put("pro", "Pro", frozenset({FeatureCode.SKILL_CREATE}))
+    await tariffs.put(
+        TariffDefinition("basic", "Basic", frozenset(), TariffLimits(daily_tokens=TOKEN_LIMIT))
+    )
+    await tariffs.put(TariffDefinition("pro", "Pro", frozenset({FeatureCode.SKILL_CREATE})))
 
     assert await tariffs.tariff_for_user(USER_A) is None
 
@@ -142,13 +153,21 @@ async def test_assignment_lifecycle(tariffs: SqlAlchemyTariffStore) -> None:
 
 async def test_default_tariff_binds_the_unassigned(tariffs: SqlAlchemyTariffStore) -> None:
     """No binding falls back to the default plan; an explicit binding wins."""
-    await tariffs.put("free", "Free", frozenset(), TariffLimits(daily_tokens=TOKEN_LIMIT))
-    await tariffs.put("pro", "Pro", frozenset({FeatureCode.VISION}))
+    await tariffs.put(
+        TariffDefinition("free", "Free", frozenset(), TariffLimits(daily_tokens=TOKEN_LIMIT))
+    )
+    await tariffs.put(TariffDefinition("pro", "Pro", frozenset({FeatureCode.VISION})))
 
     assert await tariffs.tariff_for_user(USER_A) is None  # no default marked yet
 
     await tariffs.put(
-        "free", "Free", frozenset(), TariffLimits(daily_tokens=TOKEN_LIMIT), is_default=True
+        TariffDefinition(
+            "free",
+            "Free",
+            frozenset(),
+            TariffLimits(daily_tokens=TOKEN_LIMIT),
+            is_default=True,
+        )
     )
     fallback = await tariffs.tariff_for_user(USER_A)
     assert fallback is not None and fallback.code == "free" and fallback.is_default
@@ -160,20 +179,20 @@ async def test_default_tariff_binds_the_unassigned(tariffs: SqlAlchemyTariffStor
 
 async def test_at_most_one_default(tariffs: SqlAlchemyTariffStore) -> None:
     """Marking a new default demotes the previous one in the same put."""
-    await tariffs.put("free", "Free", frozenset(), is_default=True)
-    await tariffs.put("trial", "Trial", frozenset(), is_default=True)
+    await tariffs.put(TariffDefinition("free", "Free", frozenset(), is_default=True))
+    await tariffs.put(TariffDefinition("trial", "Trial", frozenset(), is_default=True))
 
     flags = {tariff.code: tariff.is_default for tariff in await tariffs.list()}
     assert flags == {"free": False, "trial": True}
 
     # a put without the flag drops it: the operator sees no default anywhere
-    await tariffs.put("trial", "Trial", frozenset())
+    await tariffs.put(TariffDefinition("trial", "Trial", frozenset()))
     assert not any(tariff.is_default for tariff in await tariffs.list())
     assert await tariffs.tariff_for_user(USER_A) is None
 
 
 async def test_delete_refuses_while_assigned(tariffs: SqlAlchemyTariffStore) -> None:
-    await tariffs.put("basic", "Basic", frozenset())
+    await tariffs.put(TariffDefinition("basic", "Basic", frozenset()))
     await tariffs.assign(USER_A, "basic")
 
     with pytest.raises(TariffInUseError):

@@ -19,12 +19,14 @@ from octoforge_core.net.collections.api import (
     CollectionKind,
     CollectionNotFoundError,
     CollectionStore,
+    NewCollection,
     NewRecords,
 )
 from octoforge_core.net.collections.schema_infer import infer_records
 from octoforge_core.net.response_memory import (
     REF_PREFIX,
     RENDER_IN_THREAD_CHARS,
+    DocumentDraft,
     ResponseMemoryConfig,
     ResponseNotFoundError,
     StoredDocument,
@@ -50,14 +52,7 @@ class DatabaseDocumentHome:
         self._config = config
         self._memory_config = memory_config or ResponseMemoryConfig()
 
-    async def park(
-        self,
-        owner_id: str,
-        scope: str,
-        source: str,
-        body: str,
-        document: Any = None,  # noqa: ANN401 — parsed JSON
-    ) -> str:
+    async def park(self, draft: DocumentDraft) -> str:
         """Store the document as a one-record collection; answer its passport.
 
         `scope` is deliberately unused: lifetime here is the TTL, not the
@@ -66,31 +61,37 @@ class DatabaseDocumentHome:
         # the DB home only ever receives a single JSON OBJECT or raw text:
         # arrays go to real collections, and the array-fallback exists only
         # where there is no database tier at all (the RAM home's case)
-        parked_json = isinstance(document, dict)
+        parked_json = isinstance(draft.document, dict)
         kind = CollectionKind.DOC_JSON if parked_json else CollectionKind.DOC_TEXT
-        payload: dict[str, Any] = document if parked_json else {TEXT_PAYLOAD_KEY: body}
+        payload: dict[str, Any]
+        if isinstance(draft.document, dict):
+            payload = draft.document
+        else:
+            payload = {TEXT_PAYLOAD_KEY: draft.body}
         passport = await self._store.create(
-            owner_id=owner_id,
-            label="",
-            kind=kind,
-            source=source,
-            schema=infer_records([payload]),
-            envelope={},
-            records=NewRecords(payloads=[payload], source=source),
-            byte_size=len(body),
-            truncated=False,
-            expires_at=self._expiry(),
+            NewCollection(
+                owner_id=draft.owner_id,
+                label="",
+                kind=kind,
+                source=draft.source,
+                schema=infer_records([payload]),
+                envelope={},
+                records=NewRecords(payloads=[payload], source=draft.source),
+                byte_size=len(draft.body),
+                truncated=False,
+                expires_at=self._expiry(),
+            )
         )
         doc = StoredDocument(
             ref=f"{REF_PREFIX}{passport.id}",
             kind="json" if parked_json else "text",
-            source=source,
-            body=body,
-            document=document if parked_json else None,
+            source=draft.source,
+            body=draft.body,
+            document=draft.document if parked_json else None,
         )
         minutes = max(1, int(self._config.ttl_seconds // 60))
         note = f"expires in {minutes} min"
-        if len(body) > RENDER_IN_THREAD_CHARS:
+        if len(draft.body) > RENDER_IN_THREAD_CHARS:
             return await asyncio.to_thread(render_document_passport, doc, self._memory_config, note)
         return render_document_passport(doc, self._memory_config, note)
 

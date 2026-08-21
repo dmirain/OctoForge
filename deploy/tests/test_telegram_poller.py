@@ -4,12 +4,15 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
 import httpx
 import pytest
 from octoforge_core import (
     AgentLoop,
+    AgentLoopConfig,
     Attachment,
     AttachmentKind,
     ChatMessage,
@@ -42,17 +45,22 @@ from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
-from octoforge_core.media.service import INGESTION_PROMPT, MediaService
+from octoforge_core.media.service import (
+    INGESTION_PROMPT,
+    AudioUnderstanding,
+    ImageUnderstanding,
+    MediaService,
+)
 from octoforge_core.speech.api import AudioData, TranscriptionClient
 from octoforge_core.tariffs.api import LimitGate, LimitVerdict, UsageEvent, UsageKind
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
 from octoforge_core.vision.api import ImageData, VisionClient
 from octoforge_telegram.audio import TelegramAudioResolver
-from octoforge_telegram.bridge import RunnerProvider
-from octoforge_telegram.client import USER_ID_PREFIX, TelegramApiError
-from octoforge_telegram.gateway import AccessRefusedError
+from octoforge_telegram.bridge import RunnerProvider, TelegramBridgeOptions
+from octoforge_telegram.client import USER_ID_PREFIX, EditMessage, SendMessage, TelegramApiError
+from octoforge_telegram.gateway import AccessRefusedError, DialogSubmission
 from octoforge_telegram.images import REF_PREFIX, TelegramImageResolver
-from octoforge_telegram.invites.api import MemberProfile
+from octoforge_telegram.invites.api import MemberProfile, MemberProfileUpdate
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyReferralStore
 from octoforge_telegram.models import (
     TelegramChat,
@@ -94,7 +102,9 @@ from octoforge_telegram.poller import (
     VOICE_TAG,
     VOICE_TOO_SHORT_NOTICE,
     WELCOME_TEXT,
+    BridgeRegistryServices,
     MembershipDecision,
+    MembershipOptions,
     TelegramBridgeRegistry,
     TelegramMembership,
     TelegramPoller,
@@ -102,7 +112,7 @@ from octoforge_telegram.poller import (
     chat_id_from_user_id,
 )
 from octoforge_telegram.schema import TelegramSurfaceBase
-from octoforge_telegram.surface import TelegramSurface
+from octoforge_telegram.surface import TelegramSurface, TelegramSurfaceConfig
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 TELEGRAM_USER_ID = 12345
@@ -158,22 +168,14 @@ class FakeTelegramClient:
         await asyncio.sleep(IDLE_BATCH_SECONDS)
         return []
 
-    async def send_message(
-        self,
-        chat_id: int,
-        text: str,
-        parse_mode: str | None = None,
-        reply_to_message_id: int | None = None,
-    ) -> int:
+    async def send_message(self, request: SendMessage) -> int:
         self._next_message_id += 1
-        self.sent.append((chat_id, text, parse_mode))
-        self.replies.append(reply_to_message_id)
+        self.sent.append((request.chat_id, request.text, request.parse_mode))
+        self.replies.append(request.reply_to_message_id)
         return self._next_message_id
 
-    async def edit_message_text(
-        self, chat_id: int, message_id: int, text: str, parse_mode: str | None = None
-    ) -> None:
-        self.edited.append((chat_id, message_id, text, parse_mode))
+    async def edit_message_text(self, request: EditMessage) -> None:
+        self.edited.append((request.chat_id, request.message_id, request.text, request.parse_mode))
 
     async def send_rich_message(
         self, chat_id: int, markdown: str, reply_to_message_id: int | None = None
@@ -213,29 +215,22 @@ class RecordingBridge:
         self.kinds: list[tuple[MessageKind, str | None]] = []
         self.attachments: list[tuple[Attachment, ...]] = []
 
-    async def handle_text(  # noqa: PLR0913, PLR0917 — mirrors TelegramBridge.handle_text
-        self,
-        content: str,
-        client_message_id: str | None = None,
-        reply_to_message_id: int | None = None,
-        kind: MessageKind = MessageKind.OWN,
-        origin: str | None = None,
-        attachments: tuple[Attachment, ...] = (),
-    ) -> None:
-        self.calls.append((content, client_message_id, reply_to_message_id))
-        self.kinds.append((kind, origin))
-        self.attachments.append(attachments)
+    async def handle_text(self, submission: DialogSubmission) -> None:
+        self.calls.append(
+            (
+                submission.content,
+                submission.client_message_id,
+                submission.reply_to_message_id,
+            )
+        )
+        self.kinds.append((submission.kind, submission.origin))
+        self.attachments.append(submission.attachments)
 
 
 class ExplodingBridge:
     """TelegramBridge stub whose `handle_text` always raises (resilience tests only)."""
 
-    async def handle_text(
-        self,
-        content: str,
-        client_message_id: str | None = None,
-        reply_to_message_id: int | None = None,
-    ) -> None:
+    async def handle_text(self, submission: DialogSubmission) -> None:
         raise RuntimeError("boom")
 
     async def cancel(self) -> None:
@@ -297,32 +292,44 @@ class RaisingVisionClient:
         raise RuntimeError("vision boom")
 
 
+@dataclass(frozen=True, slots=True)
+class UpdateOptions:
+    chat_type: TelegramChatType = TelegramChatType.PRIVATE
+    message_id: int | None = None
+    sender_id: int = TELEGRAM_USER_ID
+
+
+DEFAULT_UPDATE_OPTIONS = UpdateOptions()
+
+
 def make_update(
-    update_id: int,
-    text: str | None = "hi",
-    chat_type: TelegramChatType = TelegramChatType.PRIVATE,
-    message_id: int | None = None,
-    sender_id: int = TELEGRAM_USER_ID,
+    update_id: int, text: str | None = "hi", options: UpdateOptions = DEFAULT_UPDATE_OPTIONS
 ) -> TelegramUpdate:
     # message_id defaults to update_id for convenience but is an INDEPENDENT
     # value in Telegram: tests probing the dedup/reply key pass it explicitly
     return TelegramUpdate(
         update_id=update_id,
         message=TelegramMessage(
-            message_id=message_id if message_id is not None else update_id,
-            from_user=TelegramUser(id=sender_id),
-            chat=TelegramChat(id=sender_id, type=chat_type),
+            message_id=options.message_id if options.message_id is not None else update_id,
+            from_user=TelegramUser(id=options.sender_id),
+            chat=TelegramChat(id=options.sender_id, type=options.chat_type),
             text=text,
         ),
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PhotoOptions:
+    caption: str | None = None
+    forward_origin: TelegramForwardOrigin | None = None
+    media_group_id: str | None = None
+
+
+DEFAULT_PHOTO_OPTIONS = PhotoOptions()
+
+
 def make_photo_update(
-    update_id: int,
-    file_id: str = "photo-1",
-    caption: str | None = None,
-    forward_origin: TelegramForwardOrigin | None = None,
-    media_group_id: str | None = None,
+    update_id: int, file_id: str = "photo-1", options: PhotoOptions = DEFAULT_PHOTO_OPTIONS
 ) -> TelegramUpdate:
     """An update carrying a single-size photo (own, forwarded or an album item)."""
     return TelegramUpdate(
@@ -331,10 +338,10 @@ def make_photo_update(
             message_id=update_id,
             from_user=TelegramUser(id=TELEGRAM_USER_ID),
             chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
-            caption=caption,
+            caption=options.caption,
             photo=[TelegramPhotoSize(file_id=file_id, width=800, height=600)],
-            forward_origin=forward_origin,
-            media_group_id=media_group_id,
+            forward_origin=options.forward_origin,
+            media_group_id=options.media_group_id,
         ),
     )
 
@@ -344,8 +351,8 @@ async def forbidden_provider(user_id: str, channel: str) -> ConversationRunner:
 
 
 @pytest.fixture
-async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_engine(MEMORY_DATABASE_URL)
+async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'poller.db'}")
     await init_db(engine)
     yield create_session_factory(engine)
     await engine.dispose()
@@ -358,7 +365,7 @@ async def make_manager(
     loop = AgentLoop(
         llm_client=ScriptedLLM(replies),
         registry=ToolRegistry(),
-        max_iterations=MAX_ITERATIONS,
+        config=AgentLoopConfig(MAX_ITERATIONS),
     )
     return ConversationManager(
         config=RunnerConfig(
@@ -380,19 +387,27 @@ async def make_manager(
     )
 
 
-def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options bundle
+@dataclass(frozen=True, slots=True)
+class PollerFixtureOptions:
+    membership: TelegramMembership | None = None
+    secrets_link: Callable[[str], str] | None = None
+    vision: VisionClient | None = None
+    speech: TranscriptionClient | None = None
+    feature_gate: LimitGate | None = None
+    access: AccessService | None = None
+    identities: IdentityStore | None = None
+    referrals: SqlAlchemyReferralStore | None = None
+    bot_username: str | None = None
+    voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS
+
+
+DEFAULT_POLLER_FIXTURE_OPTIONS = PollerFixtureOptions()
+
+
+def make_poller(
     client: FakeTelegramClient,
     provider: RunnerProvider = forbidden_provider,
-    membership: TelegramMembership | None = None,
-    secrets_link: Callable[[str], str] | None = None,
-    vision: VisionClient | None = None,
-    speech: TranscriptionClient | None = None,
-    feature_gate: LimitGate | None = None,
-    access: AccessService | None = None,
-    identities: IdentityStore | None = None,
-    referrals: SqlAlchemyReferralStore | None = None,
-    bot_username: str | None = None,
-    voice_max_seconds: float = DEFAULT_VOICE_MAX_SECONDS,
+    options: PollerFixtureOptions = DEFAULT_POLLER_FIXTURE_OPTIONS,
 ) -> TelegramPoller:
     """A poller whose album window is short enough for a test to wait it out.
 
@@ -404,10 +419,8 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
     fake Bot API client, so `downloaded_file_ids` still tells the truth.
     """
     registry = TelegramBridgeRegistry(
-        runner_provider=provider,
-        client=client,
-        edit_throttle_seconds=NO_THROTTLE,
-        identities=identities,
+        BridgeRegistryServices(provider, client, options.identities),
+        TelegramBridgeOptions(NO_THROTTLE),
     )
     return TelegramPoller(
         client=client,
@@ -415,13 +428,13 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
         options=TelegramPollerOptions(
             poll_timeout_seconds=POLL_TIMEOUT,
             error_backoff_seconds=NO_BACKOFF,
-            membership=membership,
-            secrets_link=secrets_link,
-            media=make_media(client, vision, speech, feature_gate),
-            access=access,
-            referrals=referrals,
-            bot_username=bot_username,
-            voice_max_seconds=voice_max_seconds,
+            membership=options.membership,
+            secrets_link=options.secrets_link,
+            media=make_media(client, options),
+            access=options.access,
+            referrals=options.referrals,
+            bot_username=options.bot_username,
+            voice_max_seconds=options.voice_max_seconds,
             album_quiet_seconds=ALBUM_TEST_QUIET_SECONDS,
         ),
     )
@@ -429,23 +442,23 @@ def make_poller(  # noqa: PLR0913, PLR0917 — a builder mirroring the options b
 
 def make_media(
     client: FakeTelegramClient,
-    vision: VisionClient | None,
-    speech: TranscriptionClient | None,
-    limits: LimitGate | None,
+    options: PollerFixtureOptions,
 ) -> MediaService | None:
     """The core's media understanding over the test's model stubs.
 
     None when the deployment understands no media at all — the poller then
     keeps the placeholder/text-only paths and never asks anything.
     """
-    if vision is None and speech is None:
+    if options.vision is None and options.speech is None:
         return None
     return MediaService(
-        vision=vision,
-        images=TelegramImageResolver(client),
-        speech=speech,
-        audio=TelegramAudioResolver(client),
-        limits=limits,
+        images=None
+        if options.vision is None
+        else ImageUnderstanding(options.vision, TelegramImageResolver(client)),
+        audio=None
+        if options.speech is None
+        else AudioUnderstanding(options.speech, TelegramAudioResolver(client)),
+        limits=options.feature_gate,
     )
 
 
@@ -490,6 +503,21 @@ async def wait_until(predicate: Callable[[], bool]) -> None:
     await asyncio.wait_for(poll(), WAIT_TIMEOUT_SECONDS)
 
 
+async def close_poller_manager(poller: TelegramPoller, manager: ConversationManager) -> None:
+    runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+    async def settled() -> None:
+        while await runner._stores.exchanges.list_live(runner.dialog_id):
+            await asyncio.sleep(POLL_SECONDS)
+
+    await asyncio.wait_for(settled(), WAIT_TIMEOUT_SECONDS)
+    workers = tuple(inbox.worker for inbox in poller._inboxes.values() if inbox.worker is not None)
+    poller._workers.close()
+    await asyncio.gather(*workers, return_exceptions=True)
+    await cast(TelegramBridgeRegistry, poller._registry).aclose()
+    await manager.stop_all()
+
+
 async def test_start_command_greets_without_runner() -> None:
     client = FakeTelegramClient()
     poller = make_poller(client)
@@ -503,7 +531,10 @@ async def test_group_chat_gets_a_notice() -> None:
     client = FakeTelegramClient()
     poller = make_poller(client)
 
-    await deliver(poller, make_update(FIRST_UPDATE_ID, chat_type=TelegramChatType.GROUP))
+    await deliver(
+        poller,
+        make_update(FIRST_UPDATE_ID, options=UpdateOptions(chat_type=TelegramChatType.GROUP)),
+    )
 
     assert client.sent == [(TELEGRAM_USER_ID, GROUP_NOTICE, None)]
 
@@ -529,7 +560,7 @@ async def test_text_message_reaches_the_dialog_and_renders_the_reply(
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_redelivered_update_is_not_answered_twice(
@@ -545,18 +576,25 @@ async def test_redelivered_update_is_not_answered_twice(
     client = FakeTelegramClient()
     poller = make_poller(client, manager.get_or_create_runner)
 
-    await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping", message_id=1001))
+    await deliver(
+        poller, make_update(FIRST_UPDATE_ID, text="ping", options=UpdateOptions(message_id=1001))
+    )
     await wait_until(lambda: len(client.sent) == 1)
     # a Telegram redelivery carries a NEW update_id but the SAME message_id:
     # the chat-level message id is the idempotency key now
-    await deliver(poller, make_update(FIRST_UPDATE_ID + 7, text="ping", message_id=1001))
-    await deliver(poller, make_update(SECOND_UPDATE_ID, text="ping", message_id=1002))
+    await deliver(
+        poller,
+        make_update(FIRST_UPDATE_ID + 7, text="ping", options=UpdateOptions(message_id=1001)),
+    )
+    await deliver(
+        poller, make_update(SECOND_UPDATE_ID, text="ping", options=UpdateOptions(message_id=1002))
+    )
     await wait_until(lambda: len(client.sent) == EXPECTED_TWO_REPLIES)
 
     assert len(client.sent) == EXPECTED_TWO_REPLIES
     # end-to-end: each answer replies to the message that asked it
     assert client.replies == [1001, 1002]
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_run_advances_the_offset_per_update() -> None:
@@ -628,6 +666,20 @@ async def test_a_poison_message_kills_neither_the_worker_nor_the_loop(
     assert inbox.worker is not None and not inbox.worker.done()  # still draining
 
 
+def _install_flaky_poll_once(poller: TelegramPoller) -> list[int]:
+    calls = [0]
+    original_poll_once = poller._poll_once
+
+    async def flaky_poll_once() -> None:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise RuntimeError("unexpected blip")
+        await original_poll_once()
+
+    poller._poll_once = flaky_poll_once  # type: ignore[method-assign]
+    return calls
+
+
 async def test_run_forever_survives_an_unexpected_poll_exception() -> None:
     """`run_forever`'s own top-level catch-all outlives whatever escapes `_poll_once`.
 
@@ -637,20 +689,10 @@ async def test_run_forever_survives_an_unexpected_poll_exception() -> None:
     """
     client = FakeTelegramClient(batches=[[]])  # drains cleanly
     poller = make_poller(client)
-    calls = 0
-    original_poll_once = poller._poll_once
-
-    async def flaky_poll_once() -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("unexpected blip")
-        await original_poll_once()
-
-    poller._poll_once = flaky_poll_once  # type: ignore[method-assign]
+    calls = _install_flaky_poll_once(poller)
     task = asyncio.create_task(poller.run_forever())
     try:
-        await wait_until(lambda: calls >= MIN_POLL_ONCE_CALLS_AFTER_FAILURE)
+        await wait_until(lambda: calls[0] >= MIN_POLL_ONCE_CALLS_AFTER_FAILURE)
         assert not task.done()  # the loop kept polling despite the exception
     finally:
         task.cancel()
@@ -717,7 +759,31 @@ async def invite_store() -> AsyncIterator[SqlAlchemyInviteStore]:
 def make_membership(
     invite_store: SqlAlchemyInviteStore, admin_ids: list[int] | None = None
 ) -> TelegramMembership:
-    return TelegramMembership(invite_store, admin_ids or [])
+    return TelegramMembership(invite_store, MembershipOptions(frozenset(admin_ids or [])))
+
+
+async def test_group_chat_never_reaches_the_membership_gate(
+    invite_store: SqlAlchemyInviteStore,
+) -> None:
+    invite = await invite_store.create(INVITE_NOTE)
+    client = FakeTelegramClient()
+    poller = make_poller(
+        client,
+        forbidden_provider,
+        PollerFixtureOptions(membership=make_membership(invite_store)),
+    )
+
+    await deliver(
+        poller,
+        make_update(
+            FIRST_UPDATE_ID,
+            text=f"{COMMAND_START} {invite.code}",
+            options=UpdateOptions(chat_type=TelegramChatType.GROUP),
+        ),
+    )
+
+    assert client.sent == [(TELEGRAM_USER_ID, GROUP_NOTICE, None)]
+    assert await invite_store.get_by_user(USER_ID) is None
 
 
 async def test_admin_passes_the_gate_without_invite(
@@ -730,21 +796,25 @@ async def test_admin_passes_the_gate_without_invite(
     poller = make_poller(
         client,
         manager.get_or_create_runner,
-        membership=make_membership(invite_store, [TELEGRAM_USER_ID]),
+        PollerFixtureOptions(membership=make_membership(invite_store, [TELEGRAM_USER_ID])),
     )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_stranger_is_denied_and_gets_no_runner(
     invite_store: SqlAlchemyInviteStore,
 ) -> None:
     client = FakeTelegramClient()
-    poller = make_poller(client, forbidden_provider, membership=make_membership(invite_store))
+    poller = make_poller(
+        client,
+        forbidden_provider,
+        PollerFixtureOptions(membership=make_membership(invite_store)),
+    )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
 
@@ -763,14 +833,19 @@ async def test_open_registration_lets_a_stranger_straight_in(
     poller = make_poller(
         client,
         manager.get_or_create_runner,
-        membership=TelegramMembership(invite_store, [], open_registration=True),
+        PollerFixtureOptions(
+            membership=TelegramMembership(
+                invite_store,
+                MembershipOptions(frozenset(), open_registration=True),
+            )
+        ),
     )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_open_registration_does_not_dead_end_a_bad_code(
@@ -782,7 +857,12 @@ async def test_open_registration_does_not_dead_end_a_bad_code(
     poller = make_poller(
         client,
         forbidden_provider,
-        membership=TelegramMembership(invite_store, [], open_registration=True),
+        PollerFixtureOptions(
+            membership=TelegramMembership(
+                invite_store,
+                MembershipOptions(frozenset(), open_registration=True),
+            )
+        ),
     )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} nonsense"))
@@ -799,7 +879,12 @@ async def test_open_registration_still_welcomes_a_real_invite(
     poller = make_poller(
         client,
         forbidden_provider,
-        membership=TelegramMembership(invite_store, [], open_registration=True),
+        PollerFixtureOptions(
+            membership=TelegramMembership(
+                invite_store,
+                MembershipOptions(frozenset(), open_registration=True),
+            )
+        ),
     )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} {invite.code}"))
@@ -817,14 +902,16 @@ async def test_claimed_invite_passes_the_gate(
     manager = await make_manager([reply], session_factory)
     client = FakeTelegramClient()
     poller = make_poller(
-        client, manager.get_or_create_runner, membership=make_membership(invite_store)
+        client,
+        manager.get_or_create_runner,
+        PollerFixtureOptions(membership=make_membership(invite_store)),
     )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_revoked_invite_is_denied(
@@ -834,7 +921,11 @@ async def test_revoked_invite_is_denied(
     await invite_store.claim(invite.code, USER_ID)
     await invite_store.revoke(invite.id)
     client = FakeTelegramClient()
-    poller = make_poller(client, forbidden_provider, membership=make_membership(invite_store))
+    poller = make_poller(
+        client,
+        forbidden_provider,
+        PollerFixtureOptions(membership=make_membership(invite_store)),
+    )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
 
@@ -850,7 +941,9 @@ async def test_start_with_code_claims_and_welcomes(
     manager = await make_manager([reply], session_factory)
     client = FakeTelegramClient()
     poller = make_poller(
-        client, manager.get_or_create_runner, membership=make_membership(invite_store)
+        client,
+        manager.get_or_create_runner,
+        PollerFixtureOptions(membership=make_membership(invite_store)),
     )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} {invite.code}"))
@@ -863,14 +956,18 @@ async def test_start_with_code_claims_and_welcomes(
     await wait_until(lambda: len(client.sent) == EXPECTED_TWO_REPLIES)
 
     assert client.sent[1] == (TELEGRAM_USER_ID, REPLY, RICH)
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_start_with_invalid_code_is_denied(
     invite_store: SqlAlchemyInviteStore,
 ) -> None:
     client = FakeTelegramClient()
-    poller = make_poller(client, forbidden_provider, membership=make_membership(invite_store))
+    poller = make_poller(
+        client,
+        forbidden_provider,
+        PollerFixtureOptions(membership=make_membership(invite_store)),
+    )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} wrong-code"))
 
@@ -884,7 +981,11 @@ async def test_start_with_expired_code_is_denied() -> None:
     expiring = SqlAlchemyInviteStore(create_session_factory(engine), ttl_seconds=0)
     invite = await expiring.create(INVITE_NOTE)
     client = FakeTelegramClient()
-    poller = make_poller(client, forbidden_provider, membership=make_membership(expiring))
+    poller = make_poller(
+        client,
+        forbidden_provider,
+        PollerFixtureOptions(membership=make_membership(expiring)),
+    )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text=f"{COMMAND_START} {invite.code}"))
 
@@ -902,7 +1003,7 @@ async def test_secrets_command_replies_with_a_link_and_never_reaches_the_dialog(
         return f"https://example.com/secrets.html?token=tok-{external_id}"
 
     # forbidden_provider raises if the message ever reaches the dialog pipeline
-    poller = make_poller(client, secrets_link=link)
+    poller = make_poller(client, options=PollerFixtureOptions(secrets_link=link))
 
     await deliver(poller, make_update(1, "/secrets"))
 
@@ -933,10 +1034,10 @@ class RecordingDirectory:
     def __init__(self) -> None:
         self.records: list[tuple[str, str, str, str | None]] = []
 
-    async def record(
-        self, user_id: str, first_name: str, last_name: str, username: str | None
-    ) -> None:
-        self.records.append((user_id, first_name, last_name, username))
+    async def record(self, profile: MemberProfileUpdate) -> None:
+        self.records.append(
+            (profile.user_id, profile.first_name, profile.last_name, profile.username)
+        )
 
     async def get(self, user_id: str) -> None:
         return None
@@ -954,9 +1055,8 @@ async def test_gated_member_profile_is_recorded_on_contact(
     client = FakeTelegramClient()
     directory = RecordingDirectory()
     registry = TelegramBridgeRegistry(
-        runner_provider=manager.get_or_create_runner,
-        client=client,
-        edit_throttle_seconds=NO_THROTTLE,
+        BridgeRegistryServices(manager.get_or_create_runner, client),
+        TelegramBridgeOptions(NO_THROTTLE),
     )
     poller = TelegramPoller(
         client=client,
@@ -980,7 +1080,7 @@ async def test_gated_member_profile_is_recorded_on_contact(
     )
     await deliver(poller, update)
     assert directory.records == [(USER_ID, "Alice", "Smith", "alice")]
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_gated_member_profile_reaches_the_identity(
@@ -997,10 +1097,8 @@ async def test_gated_member_profile_reaches_the_identity(
     client = FakeTelegramClient()
     identities = SqlAlchemyIdentityStore(session_factory)
     registry = TelegramBridgeRegistry(
-        runner_provider=manager.get_or_create_runner,
-        client=client,
-        edit_throttle_seconds=NO_THROTTLE,
-        identities=identities,
+        BridgeRegistryServices(manager.get_or_create_runner, client, identities),
+        TelegramBridgeOptions(NO_THROTTLE),
     )
     poller = TelegramPoller(
         client=client,
@@ -1027,7 +1125,7 @@ async def test_gated_member_profile_reaches_the_identity(
     assert identity is not None
     assert (identity.name, identity.username) == ("Alice Smith", "alice")
     assert (await identities.get_user(identity.user_id)).name == "Alice Smith"
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_stranger_denied_by_the_gate_is_not_recorded(
@@ -1036,9 +1134,8 @@ async def test_stranger_denied_by_the_gate_is_not_recorded(
     client = FakeTelegramClient()
     directory = RecordingDirectory()
     registry = TelegramBridgeRegistry(
-        runner_provider=forbidden_provider,
-        client=client,
-        edit_throttle_seconds=NO_THROTTLE,
+        BridgeRegistryServices(forbidden_provider, client),
+        TelegramBridgeOptions(NO_THROTTLE),
     )
     poller = TelegramPoller(
         client=client,
@@ -1054,12 +1151,20 @@ async def test_stranger_denied_by_the_gate_is_not_recorded(
     assert directory.records == []
 
 
+@dataclass(frozen=True, slots=True)
+class ForwardOptions:
+    origin: dict[str, object] | None = None
+    media_group_id: str | None = None
+    caption: str | None = None
+
+
+DEFAULT_FORWARD_OPTIONS = ForwardOptions()
+
+
 def make_forward_update(
     update_id: int,
     text: str | None = "чужой текст",
-    origin: dict[str, object] | None = None,
-    media_group_id: str | None = None,
-    caption: str | None = None,
+    options: ForwardOptions = DEFAULT_FORWARD_OPTIONS,
 ) -> TelegramUpdate:
     """An update carrying a forwarded message (optionally an album item)."""
     return TelegramUpdate(
@@ -1069,10 +1174,10 @@ def make_forward_update(
             from_user=TelegramUser(id=TELEGRAM_USER_ID),
             chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
             text=text,
-            caption=caption,
-            media_group_id=media_group_id,
+            caption=options.caption,
+            media_group_id=options.media_group_id,
             forward_origin=TelegramForwardOrigin.model_validate(
-                origin
+                options.origin
                 or {"type": "user", "date": 1, "sender_user": {"id": 5, "first_name": "Иван"}}
             ),
         ),
@@ -1102,10 +1207,18 @@ async def test_forwarded_attachment_becomes_one_placeholder_per_album() -> None:
     use_bridge(poller, bridge)
 
     await poller.dispatch(
-        make_forward_update(1, text=None, media_group_id="album", caption="гляди")
+        make_forward_update(
+            1,
+            text=None,
+            options=ForwardOptions(media_group_id="album", caption="гляди"),
+        )
     )
-    await poller.dispatch(make_forward_update(2, text=None, media_group_id="album"))
-    await poller.dispatch(make_forward_update(3, text=None, media_group_id="album"))
+    await poller.dispatch(
+        make_forward_update(2, text=None, options=ForwardOptions(media_group_id="album"))
+    )
+    await poller.dispatch(
+        make_forward_update(3, text=None, options=ForwardOptions(media_group_id="album"))
+    )
     await settle(poller)
 
     assert [call[0] for call in bridge.calls] == ["[переслано от Иван] гляди"]
@@ -1117,7 +1230,11 @@ async def test_non_text_message_is_answered_only_past_the_gate(
 ) -> None:
     """A stranger's photo must not make the bot reply at all."""
     client = FakeTelegramClient()
-    poller = make_poller(client, forbidden_provider, membership=make_membership(invite_store))
+    poller = make_poller(
+        client,
+        forbidden_provider,
+        PollerFixtureOptions(membership=make_membership(invite_store)),
+    )
 
     await deliver(poller, make_update(1, text=None))
 
@@ -1148,7 +1265,7 @@ async def test_bare_photo_is_material_like_a_forward() -> None:
     client = FakeTelegramClient()
     vision = FakeVisionClient(VISION_DESCRIPTION)
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=vision)
+    poller = make_poller(client, options=PollerFixtureOptions(vision=vision))
     use_bridge(poller, bridge)
 
     await deliver(poller, make_photo_update(1, file_id=PHOTO_FILE_ID))
@@ -1171,10 +1288,10 @@ async def test_captioned_photo_is_the_user_speaking() -> None:
     client = FakeTelegramClient()
     vision = FakeVisionClient(VISION_DESCRIPTION)
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=vision)
+    poller = make_poller(client, options=PollerFixtureOptions(vision=vision))
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_photo_update(1, caption="что это?"))
+    await deliver(poller, make_photo_update(1, options=PhotoOptions(caption="что это?")))
 
     content = bridge.calls[0][0]
     assert content == f"{IMAGE_TAG} {VISION_DESCRIPTION}\n\n{CAPTION_LABEL} что это?"
@@ -1185,10 +1302,13 @@ async def test_forwarded_photo_with_vision_is_material_with_attribution() -> Non
     client = FakeTelegramClient()
     vision = FakeVisionClient(VISION_DESCRIPTION)
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=vision)
+    poller = make_poller(client, options=PollerFixtureOptions(vision=vision))
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_photo_update(1, forward_origin=make_forward_origin()))
+    await deliver(
+        poller,
+        make_photo_update(1, options=PhotoOptions(forward_origin=make_forward_origin())),
+    )
 
     (content, _, _), (kind, call_origin) = bridge.calls[0], bridge.kinds[0]
     assert content == f"[переслано от Иван] {IMAGE_TAG} {VISION_DESCRIPTION}"
@@ -1214,7 +1334,10 @@ async def test_forwarded_photo_without_vision_keeps_the_placeholder() -> None:
     poller = make_poller(client)  # vision=None
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_photo_update(1, forward_origin=make_forward_origin()))
+    await deliver(
+        poller,
+        make_photo_update(1, options=PhotoOptions(forward_origin=make_forward_origin())),
+    )
 
     content = bridge.calls[0][0]
     assert content == f"[переслано от Иван] {MATERIAL_PLACEHOLDER}"
@@ -1223,7 +1346,7 @@ async def test_forwarded_photo_without_vision_keeps_the_placeholder() -> None:
 
 async def test_own_photo_vision_failure_falls_back_without_propagating() -> None:
     client = FakeTelegramClient()
-    poller = make_poller(client, vision=RaisingVisionClient())
+    poller = make_poller(client, options=PollerFixtureOptions(vision=RaisingVisionClient()))
 
     await deliver(poller, make_photo_update(1))
 
@@ -1233,7 +1356,9 @@ async def test_own_photo_vision_failure_falls_back_without_propagating() -> None
 async def test_own_photo_download_failure_falls_back_without_propagating() -> None:
     client = FakeTelegramClient()
     client.download_error = TelegramApiError("boom")
-    poller = make_poller(client, vision=FakeVisionClient(VISION_DESCRIPTION))
+    poller = make_poller(
+        client, options=PollerFixtureOptions(vision=FakeVisionClient(VISION_DESCRIPTION))
+    )
 
     await deliver(poller, make_photo_update(1))
 
@@ -1243,10 +1368,13 @@ async def test_own_photo_download_failure_falls_back_without_propagating() -> No
 async def test_forwarded_photo_vision_failure_falls_back_to_the_placeholder() -> None:
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=RaisingVisionClient())
+    poller = make_poller(client, options=PollerFixtureOptions(vision=RaisingVisionClient()))
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_photo_update(1, forward_origin=make_forward_origin()))
+    await deliver(
+        poller,
+        make_photo_update(1, options=PhotoOptions(forward_origin=make_forward_origin())),
+    )
 
     content = bridge.calls[0][0]
     assert content == f"[переслано от Иван] {MATERIAL_PLACEHOLDER}"
@@ -1257,7 +1385,7 @@ async def test_image_document_is_treated_as_a_photo() -> None:
     client = FakeTelegramClient()
     vision = FakeVisionClient(VISION_DESCRIPTION)
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=vision)
+    poller = make_poller(client, options=PollerFixtureOptions(vision=vision))
     use_bridge(poller, bridge)
     update = TelegramUpdate(
         update_id=1,
@@ -1308,8 +1436,10 @@ def make_album(caption: str | None = "вот меню в картинках") ->
         make_photo_update(
             index + 1,
             file_id=file_id,
-            caption=caption if index == 0 else None,
-            media_group_id=ALBUM_ID,
+            options=PhotoOptions(
+                caption=caption if index == 0 else None,
+                media_group_id=ALBUM_ID,
+            ),
         )
         for index, file_id in enumerate(PAGES)
     ]
@@ -1326,7 +1456,7 @@ async def test_album_becomes_one_message_with_every_page_described() -> None:
     client = FakeTelegramClient()
     vision = PerImageVisionClient(client)
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=vision)
+    poller = make_poller(client, options=PollerFixtureOptions(vision=vision))
     use_bridge(poller, bridge)
 
     for update in make_album():
@@ -1353,7 +1483,7 @@ async def test_album_without_a_caption_is_material() -> None:
     """Same rule as a single bare photo: nothing was asked, so it collects."""
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=PerImageVisionClient(client))
+    poller = make_poller(client, options=PollerFixtureOptions(vision=PerImageVisionClient(client)))
     use_bridge(poller, bridge)
 
     for update in make_album(caption=None):
@@ -1370,7 +1500,7 @@ async def test_album_page_that_could_not_be_described_keeps_its_slot() -> None:
     client = FakeTelegramClient()
     vision = PerImageVisionClient(client, failing=frozenset({"page-2"}))
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=vision)
+    poller = make_poller(client, options=PollerFixtureOptions(vision=vision))
     use_bridge(poller, bridge)
 
     for update in make_album():
@@ -1388,7 +1518,7 @@ async def test_a_following_message_submits_the_album_before_itself() -> None:
     """Order is what the user typed: the album, then the question about it."""
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=PerImageVisionClient(client))
+    poller = make_poller(client, options=PollerFixtureOptions(vision=PerImageVisionClient(client)))
     use_bridge(poller, bridge)
 
     for update in make_album(caption=None):
@@ -1413,7 +1543,10 @@ async def test_there_is_no_stop_command_left_in_the_loop() -> None:
     poller = make_poller(client)
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_update(FIRST_UPDATE_ID, text="/cancel", message_id=1001))
+    await deliver(
+        poller,
+        make_update(FIRST_UPDATE_ID, text="/cancel", options=UpdateOptions(message_id=1001)),
+    )
 
     assert [call[0] for call in bridge.calls] == ["/cancel"]
     assert client.sent == []
@@ -1430,14 +1563,18 @@ async def test_one_users_slow_ingestion_does_not_stall_another() -> None:
     client = FakeTelegramClient()
     vision = SlowVisionClient()
     bridges = {USER_ID: RecordingBridge(), f"{USER_ID_PREFIX}{other_id}": RecordingBridge()}
-    poller = make_poller(client, vision=vision)
+    poller = make_poller(client, options=PollerFixtureOptions(vision=vision))
     poller._registry.get_or_create = lambda user_id, chat_id: bridges[user_id]  # type: ignore[assignment,method-assign,return-value]
 
-    await poller.dispatch(make_photo_update(1, caption="что это?"))
+    await poller.dispatch(make_photo_update(1, options=PhotoOptions(caption="что это?")))
     await asyncio.wait_for(vision.entered.wait(), WAIT_TIMEOUT_SECONDS)
 
     other_user = f"{USER_ID_PREFIX}{other_id}"
-    await deliver(poller, make_update(2, text="привет", sender_id=other_id), other_user)
+    await deliver(
+        poller,
+        make_update(2, text="привет", options=UpdateOptions(sender_id=other_id)),
+        other_user,
+    )
 
     assert [call[0] for call in bridges[other_user].calls] == ["привет"]
     assert bridges[USER_ID].calls == []  # still blocked on its own picture
@@ -1480,7 +1617,7 @@ async def test_a_message_typed_mid_description_still_lands_after_the_album() -> 
     client = FakeTelegramClient()
     vision = SlowVisionClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=vision)
+    poller = make_poller(client, options=PollerFixtureOptions(vision=vision))
     use_bridge(poller, bridge)
 
     for update in make_album(caption=None):
@@ -1554,7 +1691,10 @@ async def test_a_plan_without_voice_gets_a_notice_and_no_transcription() -> None
     client = FakeTelegramClient()
     speech = FakeTranscriptionClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, speech=speech, feature_gate=NoVoiceGate())
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(speech=speech, feature_gate=NoVoiceGate()),
+    )
     use_bridge(poller, bridge)
 
     await deliver(poller, make_voice_update(1))
@@ -1568,10 +1708,13 @@ async def test_a_plan_without_voice_gets_a_notice_and_no_transcription() -> None
 async def test_a_denied_voice_message_still_delivers_its_caption() -> None:
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, speech=FakeTranscriptionClient(), feature_gate=NoVoiceGate())
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(speech=FakeTranscriptionClient(), feature_gate=NoVoiceGate()),
+    )
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_voice_update(1, caption="посмотри меню"))
+    await deliver(poller, make_voice_update(1, VoiceOptions(caption="посмотри меню")))
 
     assert VOICE_PLAN_NOTICE in [text for _, text, _ in client.sent]
     (content, _, _) = bridge.calls[0]
@@ -1595,7 +1738,7 @@ async def test_a_full_house_queues_the_newcomer_without_a_position(
     """No slot: one queue notice, no position named, and nothing dispatched."""
     client = FakeTelegramClient()
     access, identities = make_access(session_factory, cap=0)
-    poller = make_poller(client, access=access, identities=identities)
+    poller = make_poller(client, options=PollerFixtureOptions(access=access, identities=identities))
 
     await deliver(poller, make_update(1))
     await deliver(poller, make_update(2, text="ещё раз"))
@@ -1614,7 +1757,7 @@ async def test_a_free_slot_activates_the_newcomer_on_first_contact(
     client = FakeTelegramClient()
     bridge = RecordingBridge()
     access, identities = make_access(session_factory, cap=1)
-    poller = make_poller(client, access=access, identities=identities)
+    poller = make_poller(client, options=PollerFixtureOptions(access=access, identities=identities))
     use_bridge(poller, bridge)
 
     await deliver(poller, make_update(1, text="привет"))
@@ -1631,7 +1774,7 @@ async def test_a_banned_user_is_told_the_door_is_closed_once(
 ) -> None:
     client = FakeTelegramClient()
     access, identities = make_access(session_factory, cap=None)
-    poller = make_poller(client, access=access, identities=identities)
+    poller = make_poller(client, options=PollerFixtureOptions(access=access, identities=identities))
     person = await identities.resolve_or_create(CHANNEL, str(TELEGRAM_USER_ID))
     await identities.set_status(person, UserStatus.BANNED)
 
@@ -1654,7 +1797,7 @@ async def test_the_queue_drains_as_its_people_knock(
         return cap_holder[0]
 
     access = AccessService(identities, read_cap)
-    poller = make_poller(client, access=access, identities=identities)
+    poller = make_poller(client, options=PollerFixtureOptions(access=access, identities=identities))
     use_bridge(poller, bridge)
 
     await deliver(poller, make_update(1))  # queued: no slots
@@ -1718,13 +1861,20 @@ async def test_an_unknown_refusal_verdict_says_nothing() -> None:
     assert client.sent == []
 
 
-def make_voice_update(  # noqa: PLR0913, PLR0917 — a test builder mirroring the API shape
-    update_id: int,
-    file_id: str = VOICE_FILE_ID,
-    duration: int = VOICE_DURATION,
-    caption: str | None = None,
-    forward_origin: TelegramForwardOrigin | None = None,
-    reply_to_message_id: int | None = None,
+@dataclass(frozen=True, slots=True)
+class VoiceOptions:
+    file_id: str = VOICE_FILE_ID
+    duration: int = VOICE_DURATION
+    caption: str | None = None
+    forward_origin: TelegramForwardOrigin | None = None
+    reply_to_message_id: int | None = None
+
+
+DEFAULT_VOICE_OPTIONS = VoiceOptions()
+
+
+def make_voice_update(
+    update_id: int, options: VoiceOptions = DEFAULT_VOICE_OPTIONS
 ) -> TelegramUpdate:
     """An update carrying a recorded voice note (own or forwarded)."""
     return TelegramUpdate(
@@ -1733,12 +1883,14 @@ def make_voice_update(  # noqa: PLR0913, PLR0917 — a test builder mirroring th
             message_id=update_id,
             from_user=TelegramUser(id=TELEGRAM_USER_ID),
             chat=TelegramChat(id=TELEGRAM_USER_ID, type=TelegramChatType.PRIVATE),
-            caption=caption,
-            voice=TelegramVoice(file_id=file_id, duration=duration, mime_type="audio/ogg"),
-            forward_origin=forward_origin,
+            caption=options.caption,
+            voice=TelegramVoice(
+                file_id=options.file_id, duration=options.duration, mime_type="audio/ogg"
+            ),
+            forward_origin=options.forward_origin,
             reply_to_message=(
-                TelegramReplyToMessage(message_id=reply_to_message_id)
-                if reply_to_message_id is not None
+                TelegramReplyToMessage(message_id=options.reply_to_message_id)
+                if options.reply_to_message_id is not None
                 else None
             ),
         ),
@@ -1755,7 +1907,7 @@ async def test_own_voice_message_is_the_user_speaking() -> None:
     client = FakeTelegramClient()
     speech = FakeTranscriptionClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, speech=speech)
+    poller = make_poller(client, options=PollerFixtureOptions(speech=speech))
     use_bridge(poller, bridge)
 
     await deliver(poller, make_voice_update(1))
@@ -1776,10 +1928,13 @@ async def test_a_voice_reply_keeps_its_reply_target() -> None:
     """Answering by voice must resolve back to the exchange it replies to."""
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, speech=FakeTranscriptionClient())
+    poller = make_poller(client, options=PollerFixtureOptions(speech=FakeTranscriptionClient()))
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_voice_update(1, reply_to_message_id=REPLIED_TO_MESSAGE_ID))
+    await deliver(
+        poller,
+        make_voice_update(1, VoiceOptions(reply_to_message_id=REPLIED_TO_MESSAGE_ID)),
+    )
 
     assert bridge.calls[0][2] == REPLIED_TO_MESSAGE_ID
 
@@ -1788,10 +1943,13 @@ async def test_forwarded_voice_is_someone_elses_words() -> None:
     """A forwarded recording is material with attribution, like forwarded text."""
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, speech=FakeTranscriptionClient())
+    poller = make_poller(client, options=PollerFixtureOptions(speech=FakeTranscriptionClient()))
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_voice_update(1, forward_origin=make_forward_origin()))
+    await deliver(
+        poller,
+        make_voice_update(1, VoiceOptions(forward_origin=make_forward_origin())),
+    )
 
     (content, _, _), (kind, origin) = bridge.calls[0], bridge.kinds[0]
     assert content == f"[переслано от Иван] {VOICE_TAG} {TRANSCRIPT}"
@@ -1803,7 +1961,7 @@ async def test_the_recording_travels_with_a_name_the_provider_accepts() -> None:
     """Telegram voice notes have no file name; the fallback must be a usable one."""
     client = FakeTelegramClient()
     speech = FakeTranscriptionClient()
-    poller = make_poller(client, speech=speech)
+    poller = make_poller(client, options=PollerFixtureOptions(speech=speech))
     use_bridge(poller, RecordingBridge())
 
     await deliver(poller, make_voice_update(1))
@@ -1822,10 +1980,10 @@ async def test_a_mistap_is_refused_before_anything_is_downloaded() -> None:
     client = FakeTelegramClient()
     speech = FakeTranscriptionClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, speech=speech)
+    poller = make_poller(client, options=PollerFixtureOptions(speech=speech))
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_voice_update(1, duration=0))
+    await deliver(poller, make_voice_update(1, VoiceOptions(duration=0)))
 
     assert [text for _, text, _ in client.sent] == [VOICE_TOO_SHORT_NOTICE]
     assert client.downloaded_file_ids == []
@@ -1837,10 +1995,13 @@ async def test_a_recording_over_the_cap_is_refused_before_the_download() -> None
     """The cap protects latency and the provider's daily audio quota alike."""
     client = FakeTelegramClient()
     speech = FakeTranscriptionClient()
-    poller = make_poller(client, speech=speech, voice_max_seconds=60.0)
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(speech=speech, voice_max_seconds=60.0),
+    )
     use_bridge(poller, RecordingBridge())
 
-    await deliver(poller, make_voice_update(1, duration=600))
+    await deliver(poller, make_voice_update(1, VoiceOptions(duration=600)))
 
     assert client.sent and "минут" in client.sent[0][1]
     assert client.downloaded_file_ids == []
@@ -1851,7 +2012,10 @@ async def test_an_unintelligible_recording_asks_instead_of_guessing() -> None:
     """An empty transcript must not become an empty user message."""
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, speech=FakeTranscriptionClient(transcript="   "))
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(speech=FakeTranscriptionClient(transcript="   ")),
+    )
     use_bridge(poller, bridge)
 
     await deliver(poller, make_voice_update(1))
@@ -1873,7 +2037,7 @@ async def test_voice_without_speech_configured_keeps_todays_notice() -> None:
 
 async def test_transcription_failure_falls_back_without_propagating() -> None:
     client = FakeTelegramClient()
-    poller = make_poller(client, speech=RaisingTranscriptionClient())
+    poller = make_poller(client, options=PollerFixtureOptions(speech=RaisingTranscriptionClient()))
 
     await deliver(poller, make_voice_update(1))
 
@@ -1889,10 +2053,8 @@ async def test_a_person_who_changed_telegram_keeps_their_dialog(
     manager = await make_manager([], session_factory)
     identities = SqlAlchemyIdentityStore(session_factory)
     registry = TelegramBridgeRegistry(
-        runner_provider=manager.get_or_create_runner,
-        client=FakeTelegramClient(),
-        edit_throttle_seconds=NO_THROTTLE,
-        identities=identities,
+        BridgeRegistryServices(manager.get_or_create_runner, FakeTelegramClient(), identities),
+        TelegramBridgeOptions(NO_THROTTLE),
     )
     try:
         person = await identities.resolve_or_create(CHANNEL, "111")
@@ -1917,10 +2079,8 @@ async def test_the_delivery_address_comes_from_the_identity(
     manager = await make_manager([], session_factory)
     identities = SqlAlchemyIdentityStore(session_factory)
     registry = TelegramBridgeRegistry(
-        runner_provider=manager.get_or_create_runner,
-        client=FakeTelegramClient(),
-        edit_throttle_seconds=NO_THROTTLE,
-        identities=identities,
+        BridgeRegistryServices(manager.get_or_create_runner, FakeTelegramClient(), identities),
+        TelegramBridgeOptions(NO_THROTTLE),
     )
     try:
         person = await identities.resolve_or_create(CHANNEL, str(RESEAT_ACCOUNT))
@@ -1945,14 +2105,13 @@ async def test_a_pod_that_only_renders_never_polls(
 
     manager = await make_manager([], session_factory)
     registry = TelegramBridgeRegistry(
-        runner_provider=manager.get_or_create_runner,
-        client=FakeTelegramClient(),
-        edit_throttle_seconds=0.0,
+        BridgeRegistryServices(manager.get_or_create_runner, FakeTelegramClient()),
+        TelegramBridgeOptions(0.0),
     )
     surface = TelegramSurface(
-        registry=registry,
-        poller=cast(TelegramPoller, WatchfulPoller()),
-        polls=False,
+        registry,
+        cast(TelegramPoller, WatchfulPoller()),
+        TelegramSurfaceConfig(polls=False),
     )
     try:
         await surface.start()
@@ -1989,7 +2148,14 @@ async def test_a_referral_link_opens_the_gate_and_records_who_brought_whom(
     code = await referrals.code_of(REFERRER_HANDLE)
     client = FakeTelegramClient()
     poller = make_poller(
-        client, forbidden_provider, membership=TelegramMembership(invites, [], referrals=referrals)
+        client,
+        forbidden_provider,
+        PollerFixtureOptions(
+            membership=TelegramMembership(
+                invites,
+                MembershipOptions(frozenset(), referrals),
+            )
+        ),
     )
 
     await deliver(
@@ -2014,14 +2180,19 @@ async def test_a_referral_member_passes_the_gate_on_later_messages(
     poller = make_poller(
         client,
         manager.get_or_create_runner,
-        membership=TelegramMembership(invites, [], referrals=referrals),
+        PollerFixtureOptions(
+            membership=TelegramMembership(
+                invites,
+                MembershipOptions(frozenset(), referrals),
+            )
+        ),
     )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text="ping"))
     await wait_until(lambda: bool(client.sent))
 
     assert client.sent[0] == (TELEGRAM_USER_ID, REPLY, RICH)
-    await manager.stop_all()
+    await close_poller_manager(poller, manager)
 
 
 async def test_a_referral_code_is_reusable_but_never_self_serving(
@@ -2029,7 +2200,7 @@ async def test_a_referral_code_is_reusable_but_never_self_serving(
 ) -> None:
     invites, referrals = telegram_stores
     code = await referrals.code_of(REFERRER_HANDLE)
-    membership = TelegramMembership(invites, [], referrals=referrals)
+    membership = TelegramMembership(invites, MembershipOptions(frozenset(), referrals))
 
     first = await membership.check("tg:1001", f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
     second = await membership.check("tg:1002", f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
@@ -2048,7 +2219,7 @@ async def test_the_first_attribution_stands(
     invites, referrals = telegram_stores
     first_code = await referrals.code_of(REFERRER_HANDLE)
     other_code = await referrals.code_of("tg:888")
-    membership = TelegramMembership(invites, [], referrals=referrals)
+    membership = TelegramMembership(invites, MembershipOptions(frozenset(), referrals))
 
     await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}{first_code}")
     later = await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}{other_code}")
@@ -2067,7 +2238,10 @@ async def test_a_referral_still_attributes_when_registration_is_open(
     operator's map — and that must not get lost in the open-door shortcut."""
     invites, referrals = telegram_stores
     code = await referrals.code_of(REFERRER_HANDLE)
-    membership = TelegramMembership(invites, [], referrals=referrals, open_registration=True)
+    membership = TelegramMembership(
+        invites,
+        MembershipOptions(frozenset(), referrals, True),
+    )
 
     decision = await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
 
@@ -2087,7 +2261,10 @@ async def test_a_bare_entrant_can_be_attributed_later(
     works at any time."""
     invites, referrals = telegram_stores
     code = await referrals.code_of(REFERRER_HANDLE)
-    membership = TelegramMembership(invites, [], referrals=referrals, open_registration=True)
+    membership = TelegramMembership(
+        invites,
+        MembershipOptions(frozenset(), referrals, True),
+    )
 
     bare = await membership.check(USER_ID, "привет")
     later = await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}{code}")
@@ -2108,7 +2285,10 @@ async def test_a_lost_attribution_is_loud_when_the_door_is_open(
     the only witness; twelve days of silently lost attributions looked
     exactly like 'nobody uses the links'."""
     invites, referrals = telegram_stores
-    membership = TelegramMembership(invites, [], referrals=referrals, open_registration=True)
+    membership = TelegramMembership(
+        invites,
+        MembershipOptions(frozenset(), referrals, True),
+    )
 
     with caplog.at_level(logging.WARNING, logger="octoforge_telegram.poller"):
         decision = await membership.check(USER_ID, f"{COMMAND_START} {REFERRAL_PREFIX}mangled")
@@ -2123,7 +2303,13 @@ async def test_invite_command_hands_out_a_stable_personal_link(
 ) -> None:
     _, referrals = telegram_stores
     client = FakeTelegramClient()
-    poller = make_poller(client, referrals=referrals, bot_username=TEST_BOT_USERNAME)
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(
+            referrals=referrals,
+            bot_username=TEST_BOT_USERNAME,
+        ),
+    )
 
     await deliver(poller, make_update(FIRST_UPDATE_ID, text=COMMAND_INVITE))
     await deliver(poller, make_update(SECOND_UPDATE_ID, text=COMMAND_INVITE))
@@ -2151,7 +2337,11 @@ async def test_the_command_menu_lists_only_the_wired_commands(
     _, referrals = telegram_stores
     client = FakeTelegramClient()
     poller = make_poller(
-        client, secrets_link=lambda account: f"https://forms.example/{account}", referrals=referrals
+        client,
+        options=PollerFixtureOptions(
+            secrets_link=lambda account: f"https://forms.example/{account}",
+            referrals=referrals,
+        ),
     )
 
     await poller._register_commands()
@@ -2187,7 +2377,12 @@ async def test_a_bare_deployment_publishes_an_empty_menu() -> None:
 async def test_a_menu_registration_failure_does_not_stop_the_surface() -> None:
     client = FakeTelegramClient()
     client.menu_failure = TelegramApiError("flood control")
-    poller = make_poller(client, secrets_link=lambda account: f"https://forms.example/{account}")
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(
+            secrets_link=lambda account: f"https://forms.example/{account}"
+        ),
+    )
 
     await poller._register_commands()
 
@@ -2230,7 +2425,10 @@ async def test_a_plan_without_vision_gets_a_notice_before_any_download() -> None
     client = FakeTelegramClient()
     vision = FakeVisionClient(VISION_DESCRIPTION)
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=vision, feature_gate=NoVoiceGate())
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(vision=vision, feature_gate=NoVoiceGate()),
+    )
     use_bridge(poller, bridge)
 
     await deliver(poller, make_photo_update(1, file_id=PHOTO_FILE_ID))
@@ -2245,11 +2443,14 @@ async def test_a_denied_photo_still_delivers_its_caption() -> None:
     client = FakeTelegramClient()
     bridge = RecordingBridge()
     poller = make_poller(
-        client, vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=NoVoiceGate()
+        client,
+        options=PollerFixtureOptions(
+            vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=NoVoiceGate()
+        ),
     )
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_photo_update(1, caption="что на фото?"))
+    await deliver(poller, make_photo_update(1, options=PhotoOptions(caption="что на фото?")))
 
     assert VISION_PLAN_NOTICE in [text for _, text, _ in client.sent]
     assert bridge.calls[0][0] == "что на фото?"
@@ -2260,11 +2461,17 @@ async def test_a_denied_forwarded_photo_keeps_its_material_path() -> None:
     client = FakeTelegramClient()
     bridge = RecordingBridge()
     poller = make_poller(
-        client, vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=NoVoiceGate()
+        client,
+        options=PollerFixtureOptions(
+            vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=NoVoiceGate()
+        ),
     )
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_photo_update(1, forward_origin=make_forward_origin()))
+    await deliver(
+        poller,
+        make_photo_update(1, options=PhotoOptions(forward_origin=make_forward_origin())),
+    )
 
     assert client.downloaded_file_ids == []
     assert VISION_PLAN_NOTICE in [text for _, text, _ in client.sent]
@@ -2276,7 +2483,12 @@ async def test_described_images_are_ledgered_on_the_person() -> None:
     gate = RecordingUsageGate()
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=gate)
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(
+            vision=FakeVisionClient(VISION_DESCRIPTION), feature_gate=gate
+        ),
+    )
     use_bridge(poller, bridge)
 
     await deliver(poller, make_photo_update(1, file_id=PHOTO_FILE_ID))
@@ -2291,10 +2503,13 @@ async def test_transcribed_seconds_are_ledgered() -> None:
     gate = RecordingUsageGate()
     client = FakeTelegramClient()
     bridge = RecordingBridge()
-    poller = make_poller(client, speech=FakeTranscriptionClient(), feature_gate=gate)
+    poller = make_poller(
+        client,
+        options=PollerFixtureOptions(speech=FakeTranscriptionClient(), feature_gate=gate),
+    )
     use_bridge(poller, bridge)
 
-    await deliver(poller, make_voice_update(1, duration=VOICE_DURATION))
+    await deliver(poller, make_voice_update(1, VoiceOptions(duration=VOICE_DURATION)))
 
     (event,) = gate.events
     assert event.kind is UsageKind.VOICE_TRANSCRIPTION

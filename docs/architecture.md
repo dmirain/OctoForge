@@ -94,8 +94,8 @@ persisted.
 | Shared vocabulary | `core/src/octoforge_core/domain.py`, `ports.py`, `errors.py`, `time.py`, `config.py` | `ChatMessage`, `Dialog`, `ToolCall`, enums, the `LLMClient` port, error types, `utc_now()` |
 | Framework | `core/src/octoforge_core/tools/`, `db/`, `llm/` | tool protocol and registry, engine and migrations, provider clients |
 | Domain modules | `core/src/octoforge_core/agent/`, `dialogs/`, `instructions/`, `datasets/`, `memory/`, `context/`, `tasks/`, `cron/`, `secrets/`, `net/`, `search/`, `vision/`, `speech/`, `admin/` | one concern each, with an `api.py` boundary and a local SQL store |
-| Composition | `core/src/octoforge_core/composition.py` | reusable builders over ports and configs, no web dependencies |
-| Adapters | `server/src/octoforge_server/` | FastAPI app, Telegram bot, settings, the default composition root in `main.py` |
+| Composition | `core/src/octoforge_core/composition.py` and its sibling modules | reusable builders over ports and configs, no web dependencies |
+| Adapters | `server/`, `surfaces/`, `deploy/` | HTTP service, installable interfaces and the default staged composition root |
 
 A domain module is a package with the same internal anatomy: `api.py` (its `Protocol`s, DTOs and
 errors — the only thing neighbours import), `models.py` (its ORM rows), `store.py` (the SQL
@@ -130,12 +130,13 @@ Everything the core needs from the outside world, and what ships as the default 
 
 ## The composition root
 
-`core/src/octoforge_core/composition.py` holds builder functions — `build_llm_client`,
+`core/src/octoforge_core/composition.py` exposes builder functions — `build_llm_client`,
 `build_tool_registry`, `build_agent_loop`, `build_router`, `build_compactor`, `build_runner_config`,
 `build_conversation_manager`, `build_instruction_service`, `build_dataset_service`,
 `build_external_executor`, `build_cron_scheduler`, `build_collecting_sweeper`,
 `build_cron_outcome_reporter`. They take ports and dataclass configs, never a web settings object,
-and they are what an alternative composition root reuses.
+and they are what an alternative composition root reuses. Their implementations live in the
+responsibility-specific modules with the `composition_` prefix behind that stable facade.
 
 The HTTP service itself is `server/src/octoforge_server/app.py:build_app()`: the application, its
 credential guard, its probes, and the mounting of whatever it is handed. It is given the runtime and
@@ -145,12 +146,13 @@ it. The service is meant to answer the interfaces installed in front of it rathe
 internet, though it is guarded either way: "internal" is a deployment promise, not a property of the
 code.
 
-`deploy/src/octoforge_deploy/main.py:runtime()` is the default assembly on top of them: it opens the
-database engine, runs migrations, creates the HTTP clients, chooses backends from `Settings`, builds
-the registry, starts the cron scheduler and the material sweep, starts the Telegram surface if
-configured, and yields a `Runtime` dataclass. Both the FastAPI lifespan and the standalone Telegram
-entry point (`python -m octoforge_deploy.telegram_only`) use that same function — the surfaces differ, the
-graph does not.
+`deploy/src/octoforge_deploy/main.py:runtime()` is the stable entry point for the default assembly.
+The staged implementation in modules with the `runtime_` prefix opens the database engine, runs
+migrations, creates the
+HTTP clients, chooses backends from `Settings`, builds the registry, starts background work and the
+configured surfaces, and yields a `Runtime` dataclass. Both the FastAPI lifespan and the standalone
+Telegram entry point (`python -m octoforge_deploy.telegram_only`) use that same function; the
+surfaces differ, the graph does not.
 
 Optional capabilities are decided here and nowhere else: an empty setting means the port is `None`
 and the feature is absent, which the startup capability report states explicitly
@@ -216,8 +218,14 @@ process, since SQLite allows exactly one writer.
 
 ## Code anchors
 
-- `core/src/octoforge_core/composition.py` — the builders
+- `core/src/octoforge_core/composition.py` — the stable builder facade
+- `core/src/octoforge_core/composition_agent.py`,
+  `core/src/octoforge_core/composition_runtime.py`,
+  `core/src/octoforge_core/composition_tools.py` — representative builder implementations
 - `core/src/octoforge_core/ports.py`, each module's `api.py` — the ports
-- `deploy/src/octoforge_deploy/main.py` — `runtime()`, the default composition root
+- `deploy/src/octoforge_deploy/main.py` — the stable entry point
+- `deploy/src/octoforge_deploy/runtime_entry.py`,
+  `deploy/src/octoforge_deploy/runtime_assembly.py`,
+  `deploy/src/octoforge_deploy/runtime_lifecycle.py` — the staged default composition root
 - `core/tests/test_boundaries.py` — the enforced import rules
 - `deploy/tests/test_modularity.py` — a third-party composition root, end to end

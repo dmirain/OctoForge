@@ -13,54 +13,27 @@ from typing import Any
 
 from octoforge_core.instructions.api import (
     Instruction,
+    InstructionDefinition,
     InstructionNotFoundError,
     InstructionService,
     InstructionType,
 )
+from octoforge_core.memory.quota import MemoryQuota
+from octoforge_core.memory.tool_args import non_empty_string, tags
+from octoforge_core.memory.tool_contract import (
+    DELETE_DESCRIPTION,
+    DELETE_NAME,
+    DELETE_SCHEMA,
+    DELETED_TEMPLATE,
+    NOT_FOUND_TEMPLATE,
+    STORE_DESCRIPTION,
+    STORE_NAME,
+    STORE_SCHEMA,
+    STORED_TEMPLATE,
+)
 from octoforge_core.tariffs.api import LimitGate
 from octoforge_core.tools.base import ToolContext, ToolSpec
 from octoforge_core.tools.errors import ToolArgumentsError
-
-STORE_NAME = "memory_store"
-STORE_DESCRIPTION = (
-    "Store a personal note or a durable fact about the user (birthdays, relatives, "
-    'preferences — e.g. "my wife\'s birthday is March 5") under a key (upsert: an '
-    "existing key is replaced). The memory belongs to this user and follows them "
-    "across every surface; it is never shared with other users. Facts useful to "
-    "everyone are saved as knowledge records via instruction_save instead. "
-    "Stored memories come back through recall."
-)
-STORED_TEMPLATE = "memory stored (key={key}, version={version})"
-MEMORY_LIMIT_REFUSAL_TEMPLATE = (
-    "cannot store: this would take the memory to {projected} of the plan's "
-    "{limit} characters. Delete something via memory_delete, shorten the "
-    "content, or upgrade to a bigger plan."
-)
-STORE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "key": {"type": "string", "description": "Memory key (upsert target)"},
-        "content": {"type": "string", "description": "Memory content"},
-        "tags": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Optional tags",
-        },
-    },
-    "required": ["key", "content"],
-}
-
-DELETE_NAME = "memory_delete"
-DELETE_DESCRIPTION = "Delete one of this user's memories by key."
-DELETED_TEMPLATE = "memory '{key}' deleted"
-NOT_FOUND_TEMPLATE = "memory '{key}' not found"
-DELETE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "key": {"type": "string", "description": "Memory key"},
-    },
-    "required": ["key"],
-}
 
 
 class MemoryStoreTool:
@@ -68,7 +41,7 @@ class MemoryStoreTool:
 
     def __init__(self, service: InstructionService, limits: LimitGate | None = None) -> None:
         self._service = service
-        self._limits = limits
+        self._quota = MemoryQuota(service, limits)
 
     @property
     def spec(self) -> ToolSpec:
@@ -86,42 +59,17 @@ class MemoryStoreTool:
         record plus the admin's publish, not an instantly-global write that any
         user could use to color every other user's answers.
         """
-        key = _non_empty_string(arguments.get("key"), "key")
-        content = _non_empty_string(arguments.get("content"), "content")
-        tags = _tags(arguments.get("tags"))
-        refusal = await self._over_the_cap(context.user_id, key, content)
+        key = non_empty_string(arguments.get("key"), "key")
+        content = non_empty_string(arguments.get("content"), "content")
+        parsed_tags = tags(arguments.get("tags"))
+        refusal = await self._quota.refusal(context.user_id, key, content)
         if refusal is not None:
             return refusal
         record = await self._service.save(
-            context.user_id, InstructionType.MEMORY, key, content, tags
+            context.user_id,
+            InstructionDefinition(InstructionType.MEMORY, key, content, parsed_tags),
         )
         return STORED_TEMPLATE.format(key=record.title, version=record.version)
-
-    async def _over_the_cap(self, user_id: str, key: str, content: str) -> str | None:
-        """The plan's memory-size refusal, or None to go ahead.
-
-        Replacement-aware: an upsert releases the old content of the same
-        key, so a shrinking rewrite always passes even over a full memory —
-        the cap must never wedge the user out of freeing space.
-        """
-        if self._limits is None:
-            return None
-        cap = await self._limits.max_memory_chars(user_id)
-        if cap is None:
-            return None
-        used = await self._service.memory_chars(user_id)
-        replaced = await self._own_content_length(user_id, key)
-        projected = used - replaced + len(content)
-        if projected <= cap:
-            return None
-        return MEMORY_LIMIT_REFUSAL_TEMPLATE.format(projected=projected, limit=cap)
-
-    async def _own_content_length(self, user_id: str, key: str) -> int:
-        try:
-            record = await self._service.get_by_name(key, InstructionType.MEMORY, user_id)
-        except InstructionNotFoundError:
-            return 0
-        return len(record.content) if record.owner_id == user_id else 0
 
 
 class MemoryDeleteTool:
@@ -159,17 +107,3 @@ class MemoryDeleteTool:
         except InstructionNotFoundError:
             return None
         return record if record.owner_id == user_id else None
-
-
-def _non_empty_string(raw: object, argument: str) -> str:
-    if not isinstance(raw, str) or not raw.strip():
-        raise ToolArgumentsError(f"{argument} must be a non-empty string")
-    return raw
-
-
-def _tags(raw: object) -> tuple[str, ...]:
-    if raw is None:
-        return ()
-    if not isinstance(raw, list) or not all(isinstance(tag, str) for tag in raw):
-        raise ToolArgumentsError("tags must be an array of strings")
-    return tuple(raw)

@@ -15,6 +15,7 @@ from octoforge_core.instructions.ranking import (
     fuse,
     fuse_rankings,
 )
+from octoforge_core.instructions.requests import InstructionFusionRequest
 
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
 TOP_K = 10
@@ -92,7 +93,13 @@ def test_exact_title_still_wins_over_any_fused_score() -> None:
     # everything else is ranked above it by both retrievers
     noise = [candidate("a"), candidate("b"), candidate("c")]
 
-    hits = fuse([[*noise, wanted], [*noise, wanted]], "morning_briefing", TOP_K)
+    hits = fuse(
+        InstructionFusionRequest(
+            [[*noise, wanted], [*noise, wanted]],
+            "morning_briefing",
+            TOP_K,
+        )
+    )
 
     assert hits[0].instruction.title == "morning_briefing"
     assert hits[0].score > EXACT_TITLE_BOOST
@@ -100,12 +107,20 @@ def test_exact_title_still_wins_over_any_fused_score() -> None:
 
 def test_fused_scores_follow_the_reciprocal_rank_formula() -> None:
     """Pin the arithmetic, so a refactor cannot quietly change the ranking."""
-    hits = fuse([[candidate("top")], [candidate("top")]], "unrelated", TOP_K)
+    hits = fuse(
+        InstructionFusionRequest([[candidate("top")], [candidate("top")]], "unrelated", TOP_K)
+    )
 
     assert hits[0].score == 2 / (RRF_SMOOTHING + 1)
 
 
 def test_fusion_respects_the_requested_size() -> None:
-    hits = fuse([[candidate(str(index)) for index in range(OVERSUPPLY)]], "unrelated", SMALL_K)
+    hits = fuse(
+        InstructionFusionRequest(
+            [[candidate(str(index)) for index in range(OVERSUPPLY)]],
+            "unrelated",
+            SMALL_K,
+        )
+    )
 
     assert len(hits) == SMALL_K

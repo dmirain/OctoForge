@@ -6,6 +6,7 @@ import pytest
 
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
+    InstructionDefinition,
     InstructionNotFoundError,
     InstructionService,
     InstructionType,
@@ -115,7 +116,13 @@ async def test_sync_creates_system_records(service: InstructionService) -> None:
 
 async def test_sync_adopts_a_legacy_user_record(service: InstructionService) -> None:
     legacy = await service.save(
-        USER_ID, InstructionType.SKILL, ENTRY_ALPHA.title, "legacy scenario", ("legacy",)
+        USER_ID,
+        InstructionDefinition(
+            InstructionType.SKILL,
+            ENTRY_ALPHA.title,
+            "legacy scenario",
+            ("legacy",),
+        ),
     )
     # rows written before ownership existed migrate to public; only those are adopted
     await service.publish(legacy.id)
@@ -142,7 +149,15 @@ async def test_sync_deletes_system_records_missing_from_the_registry(
 
 
 async def test_sync_never_touches_user_records(service: InstructionService) -> None:
-    await service.save(USER_ID, InstructionType.SKILL, "my scenario", "user content", ("mine",))
+    await service.save(
+        USER_ID,
+        InstructionDefinition(
+            InstructionType.SKILL,
+            "my scenario",
+            "user content",
+            ("mine",),
+        ),
+    )
 
     await sync_system_registry(service, (ENTRY_ALPHA,))
 

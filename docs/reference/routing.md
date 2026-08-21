@@ -125,8 +125,11 @@ untrusted input, not an instruction from the user.
 
 ## Code anchors
 
-- `core/src/octoforge_core/agent/router.py` — `MessageRouter`, `LLMRouter`, `RouteDecision`,
-  `ROUTE_TOOL_SPEC`, the fallbacks
-- `core/src/octoforge_core/agent/runner.py` — the deterministic paths and what happens to a decision
+- `core/src/octoforge_core/agent/router.py` — the stable `LLMRouter` facade and fallback orchestration
+- `core/src/octoforge_core/agent/router_types.py`,
+  `core/src/octoforge_core/agent/router_contract.py`,
+  `core/src/octoforge_core/agent/router_decision.py` — route types, tool contract and validation
+- `core/src/octoforge_core/agent/runner_routing.py`,
+  `core/src/octoforge_core/agent/runner_route_application.py` — deterministic paths and application
 - `core/src/octoforge_core/agent/prompts.py` — the router prompt template
 - `core/tests/test_router.py` — parsing, validation and fallback behavior

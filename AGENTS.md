@@ -22,7 +22,7 @@ over it, `surfaces/` holds the interfaces, `deploy/` assembles a deployment from
 
 | Path | What |
 |---|---|
-| `core/src/octoforge_core/` | the library: domain modules (`agent/`, `dialogs/`, `instructions/`, `datasets/`, `memory/`, `context/`, `tasks/`, `cron/`, `secrets/`, `net/`, `search/`, `vision/`, `speech/`, `admin/`), framework packages (`tools/`, `llm/`, `db/`) and the builders in `composition.py` |
+| `core/src/octoforge_core/` | the library: domain modules (`agent/`, `dialogs/`, `instructions/`, `datasets/`, `memory/`, `context/`, `tasks/`, `cron/`, `secrets/`, `net/`, `search/`, `vision/`, `speech/`, `admin/`), framework packages (`tools/`, `llm/`, `db/`) and builders exposed by the `composition.py` facade |
 | `server/src/octoforge_server/` | the HTTP service: `app.py`, `api/`, `auth.py`, `deps.py`, `config.py`, `capabilities.py`, and the `Surface` port in `surfaces.py`. Imports no interface |
 | `surfaces/telegram/`, `surfaces/console/`, `surfaces/webui/` | the interfaces, one package each. None imports another |
 | `deploy/src/octoforge_deploy/` | the composition root `main.py:runtime()`, the HTTP entry point, and the Telegram-only one. The only package that may import every other |
@@ -38,7 +38,7 @@ neighbours import), `models.py` (ORM rows), `store.py` (SQL), `tools.py` (its ag
 
 | Command | What it does |
 |---|---|
-| `make check` | the gate: ruff → mypy strict → `tools/check_docs.py` → pytest, both projects |
+| `make check` | the gate: Ruff check/format -> Pylint -> mypy strict -> docs -> pytest, both projects |
 | `make lint` / `make format` / `make typecheck` / `make test` / `make docs` | the individual steps |
 | `make install` | create `.venv` with both projects editable (includes the local-embeddings extra) |
 | `make upgrade` | bring an existing `.venv` up to what CI resolves — use it when `make check` disagrees with CI on unchanged code |
@@ -52,8 +52,8 @@ neighbours import), `models.py` (ORM rows), `store.py` (SQL), `tools.py` (its ag
 One test: `cd core && ../.venv/bin/pytest tests/test_router.py -k name` — pytest and mypy config live
 in each project's `pyproject.toml`, so the working directory matters.
 
-ruff and mypy are version-capped in the dev extras on purpose: their releases change verdicts on
-unchanged code. Bump a cap deliberately, with the fallout in the same change.
+Ruff, Pylint and mypy are version-capped in the dev extras on purpose: their releases change verdicts
+on unchanged code. Bump a cap deliberately, with the fallout in the same change.
 
 ### Runtime reference
 
@@ -80,10 +80,13 @@ unchanged code. Bump a cap deliberately, with the fallout in the same change.
    `HTTPStatus`.
 5. **Dependencies point inward.** `core/` never imports fastapi, external clients arrive through
    `Protocol` ports, and nothing constructs its own dependencies — the graph is assembled in the
-   composition root (`deploy/src/octoforge_deploy/main.py`, builders in `composition.py`). Enforced by
-   `core/tests/test_boundaries.py`.
-6. **Complexity limits are enforced** (`C901` ≤ 10, `PLR0915` ≤ 50 statements, `PLR0911` ≤ 6
-   returns). Split the function; do not disable the rule.
+   composition root (`deploy/src/octoforge_deploy/runtime_entry.py`, behind `main.py`), using builders
+   behind the `composition.py` facade. Enforced by `core/tests/test_boundaries.py`.
+6. **Complexity budgets are enforced.** Production modules have at most 120 lines; functions have at
+   most 20 statements, 3 arguments, McCabe complexity 10, 12 branches, 6 returns, 4 nested blocks and
+   3 boolean terms. Ruff keeps `E501`, `PLR0913` and `PLR0917` active. Tests only relax Pylint's
+   statement budget to 40 and module length. Split by responsibility; do not add `noqa`, per-file
+   ignores or baselines to evade a budget.
 7. **Tests ship with the change.** pytest + pytest-asyncio, with the LLM and HTTP mocked.
 8. **Migrations are append-only.** A `PreToolUse` hook blocks edits to any migration already in git
    HEAD — add a new one. Write them dialect-neutrally (`sa.false()` rather than `sa.text('0')`; both
@@ -122,7 +125,7 @@ unchanged code. Bump a cap deliberately, with the fallout in the same change.
 
 ## Tooling
 
-ruff (lint + format; rules `E, F, I, UP, B, SIM, ANN, C90, PL, RUF`, line length 100), mypy strict,
-pytest + pytest-asyncio, `pip-audit`. The `Makefile` is the entry point — prefer it over ad-hoc
-command lines. `gh` is installed and authenticated for this repository; check `gh auth status` before
-assuming otherwise.
+Ruff (lint + format; rules `E, W, F, I, UP, B, C4, N, SIM, RET, ANN, C90, PL, RUF`, line length
+100), Pylint (the structural budgets above), mypy strict, pytest + pytest-asyncio, `pip-audit`. The
+`Makefile` is the entry point; prefer it over ad-hoc command lines. `gh` is installed and
+authenticated for this repository; check `gh auth status` before assuming otherwise.

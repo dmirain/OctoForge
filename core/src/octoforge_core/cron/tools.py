@@ -9,10 +9,12 @@ removed. What stays registered from here is pause/resume — the operations
 with no task-side counterpart.
 """
 
+from dataclasses import replace
 from typing import Any
 
 from octoforge_core.cron.api import (
     JOB_NOT_FOUND_MESSAGE,
+    CronEnablement,
     CronJobNotFoundError,
     CronScheduleError,
     CronStore,
@@ -52,7 +54,10 @@ class CronPauseTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        return await _set_enabled(self._store, context, str(arguments["job_id"]), enabled=False)
+        return await _set_enabled(
+            self._store,
+            CronEnablement(context.user_id, str(arguments["job_id"]), False),
+        )
 
 
 class CronResumeTool:
@@ -70,23 +75,26 @@ class CronResumeTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        return await _set_enabled(self._store, context, str(arguments["job_id"]), enabled=True)
+        return await _set_enabled(
+            self._store,
+            CronEnablement(context.user_id, str(arguments["job_id"]), True),
+        )
 
 
-async def _set_enabled(store: CronStore, context: ToolContext, job_id: str, enabled: bool) -> str:
+async def _set_enabled(store: CronStore, request: CronEnablement) -> str:
     """Shared pause/resume flow with ownership and schedule checks."""
     try:
-        job = await store.get(job_id)
+        job = await store.get(request.job_id)
     except CronJobNotFoundError:
         return JOB_NOT_FOUND_MESSAGE
-    if job.user_id != context.user_id:
+    if job.user_id != request.user_id:
         return JOB_NOT_FOUND_MESSAGE
     next_fire_at = None
-    if enabled:
+    if request.enabled:
         try:
             next_fire_at = compute_next_fire(job.schedule, job.timezone, utc_now())
         except CronScheduleError as exc:
             return f"error: {exc}"
-    updated = await store.set_enabled(context.user_id, job_id, enabled, next_fire_at)
-    verb = "resumed" if enabled else "paused"
+    updated = await store.set_enabled(replace(request, next_fire_at=next_fire_at))
+    verb = "resumed" if request.enabled else "paused"
     return f"{verb} cron job {updated.id}\n" + format_job(updated)

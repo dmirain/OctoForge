@@ -12,6 +12,7 @@ import httpx
 import pytest
 from fastapi import HTTPException, Request
 from octoforge_core.domain import Attachment, AttachmentKind, MessageKind
+from octoforge_core.identity.api import IdentityKey, IdentityProfile
 from octoforge_server.auth import AuthGate, allows_service_credential, hash_password
 from octoforge_server.config import Settings
 from octoforge_telegram.config import TelegramSettings
@@ -20,9 +21,11 @@ from octoforge_telegram.gateway import (
     AccessRefusedError,
     ApiGatewayRegistry,
     ApiProfileMirror,
+    DialogSubmission,
     basic_auth_header,
 )
 from octoforge_telegram.ingest import __main__ as ingest_main
+from octoforge_telegram.ingest import setup as ingest_setup
 from octoforge_telegram.ingest.__main__ import _build, run_ingest, service_headers
 from octoforge_telegram.media_client import ApiMediaUnderstanding
 
@@ -43,7 +46,7 @@ def instant_media_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     startup probe's full retry budget — thirty seconds each of waiting for a
     balancer that was never there.
     """
-    monkeypatch.setattr(ingest_main, "MEDIA_PROBE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(ingest_setup, "MEDIA_PROBE_DELAY_SECONDS", 0.0)
 
 
 def recording_client(seen: list[httpx.Request]) -> httpx.AsyncClient:
@@ -65,7 +68,7 @@ async def test_the_node_sends_the_account_not_a_person() -> None:
     seen: list[httpx.Request] = []
     async with recording_client(seen) as client:
         gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
-        await gateway.handle_text("привет")
+        await gateway.handle_text(DialogSubmission("привет"))
 
     assert seen[0].headers["X-User-Id"] == str(CHAT_ID)
     assert seen[0].headers["X-Channel"] == "telegram"
@@ -78,10 +81,12 @@ async def test_forwarded_material_and_files_survive_the_boundary() -> None:
     async with recording_client(seen) as client:
         gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
         await gateway.handle_text(
-            "смотри",
-            kind=MessageKind.MATERIAL,
-            origin="Иван",
-            attachments=(Attachment(kind=AttachmentKind.IMAGE, ref="tgfile:abc"),),
+            DialogSubmission(
+                "смотри",
+                kind=MessageKind.MATERIAL,
+                origin="Иван",
+                attachments=(Attachment(kind=AttachmentKind.IMAGE, ref="tgfile:abc"),),
+            )
         )
 
     body = json.loads(seen[0].content)
@@ -98,7 +103,7 @@ async def test_the_node_mirrors_the_senders_profile_to_the_service() -> None:
     seen: list[httpx.Request] = []
     async with recording_client(seen) as client:
         await ApiProfileMirror(client).update_profile(
-            "telegram", str(CHAT_ID), "Alice Smith", "alice"
+            IdentityProfile(IdentityKey("telegram", str(CHAT_ID)), "Alice Smith", "alice")
         )
 
     assert seen[0].method == "PUT"
@@ -127,7 +132,7 @@ async def test_the_node_is_assembled_with_the_profile_mirror() -> None:
     async with AsyncExitStack() as stack:
         poller = await _build(stack, settings, telegram)
 
-    assert isinstance(poller._identities, ApiProfileMirror)
+    assert isinstance(poller._options.identities, ApiProfileMirror)
 
 
 async def test_the_node_carries_a_credential() -> None:
@@ -135,7 +140,7 @@ async def test_the_node_carries_a_credential() -> None:
     seen: list[httpx.Request] = []
     async with recording_client(seen) as client:
         gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
-        await gateway.handle_text("привет")
+        await gateway.handle_text(DialogSubmission("привет"))
 
     assert seen[0].headers["Authorization"].startswith("Basic ")
 
@@ -214,7 +219,7 @@ async def test_a_refusal_is_not_swallowed() -> None:
         gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
 
         with pytest.raises(httpx.HTTPStatusError):
-            await gateway.handle_text("привет")
+            await gateway.handle_text(DialogSubmission("привет"))
 
 
 async def test_a_status_refusal_arrives_as_a_verdict_the_surface_can_speak() -> None:
@@ -236,7 +241,7 @@ async def test_a_status_refusal_arrives_as_a_verdict_the_surface_can_speak() -> 
         gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
 
         with pytest.raises(AccessRefusedError) as refusal:
-            await gateway.handle_text("привет")
+            await gateway.handle_text(DialogSubmission("привет"))
 
     assert refusal.value.status == "waiting"
 
@@ -254,7 +259,7 @@ async def test_a_403_without_the_header_stays_an_ordinary_failure() -> None:
         gateway = await ApiGatewayRegistry(client).gateway_for(HANDLE, CHAT_ID)
 
         with pytest.raises(httpx.HTTPStatusError):
-            await gateway.handle_text("привет")
+            await gateway.handle_text(DialogSubmission("привет"))
 
 
 async def test_the_node_hands_out_referral_links() -> None:
@@ -270,8 +275,8 @@ async def test_the_node_hands_out_referral_links() -> None:
     )
     async with AsyncExitStack() as stack:
         poller = await _build(stack, settings, telegram)
-        assert poller._referrals is not None
-        assert poller._bot_username == "octoforge_test_bot"
+        assert poller._options.referrals is not None
+        assert poller._options.bot_username == "octoforge_test_bot"
 
 
 async def test_the_node_owns_no_model_client_of_its_own() -> None:
@@ -294,7 +299,7 @@ async def test_the_node_owns_no_model_client_of_its_own() -> None:
     async with AsyncExitStack() as stack:
         poller = await _build(stack, settings, telegram)
 
-    assert isinstance(poller._media, ApiMediaUnderstanding)
+    assert isinstance(poller._options.media, ApiMediaUnderstanding)
 
 
 async def test_the_node_says_what_media_it_will_actually_get() -> None:

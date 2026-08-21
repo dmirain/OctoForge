@@ -120,7 +120,10 @@ not the loop.
 
 ## Code anchors
 
-- `core/src/octoforge_core/agent/loop.py` — `AgentLoop`, `_ToolRunTracker`, the stream pump
+- `core/src/octoforge_core/agent/loop.py` — the public `AgentLoop` coordinator and its config
+- `core/src/octoforge_core/agent/loop_assistant.py`,
+  `core/src/octoforge_core/agent/loop_stream_pump.py` — one streamed assistant turn and its races
+- `core/src/octoforge_core/agent/loop_tools.py` — eager tool execution and ordered transcript writes
 - `core/src/octoforge_core/agent/events.py` — the event union
 - `core/src/octoforge_core/agent/control.py` — `LoopControl`
 - `core/src/octoforge_core/llm/events.py` — the provider-level stream events the loop consumes

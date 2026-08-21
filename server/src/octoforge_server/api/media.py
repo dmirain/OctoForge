@@ -19,7 +19,7 @@ from http import HTTPStatus
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from octoforge_core.media.api import MediaOutcome, MediaResult
+from octoforge_core.media.api import AudioDuration, MediaOutcome, MediaResult, TranscriptionRequest
 from octoforge_core.media.service import MediaService
 from pydantic import BaseModel, Field
 
@@ -96,7 +96,11 @@ async def transcribe(
     """Transcribe one recording; the plan is answered before the duration."""
     return MediaResultResponse.of(
         await media.transcribe(
-            user_id, request.ref, request.seconds, request.min_seconds, request.max_seconds
+            TranscriptionRequest(
+                user_id,
+                request.ref,
+                AudioDuration(request.seconds, request.min_seconds, request.max_seconds),
+            )
         )
     )
 

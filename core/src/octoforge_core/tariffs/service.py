@@ -1,12 +1,4 @@
-"""Limit checks and metering over the tariff catalog and the usage ledger.
-
-One instance serves every dialog on the node, so a check must stay cheap. The
-tariff lookup is a single SELECT by unique key per user action (a message, a
-run start) and is deliberately uncached — an operator's change applies at
-once. The day's totals are the sum-over-window query, so they are cached for
-a few seconds and invalidated by the node's own metering; cross-node spend
-converges within the TTL — limits are guardrails, not accounting.
-"""
+"""Cheap tariff checks and short-lived usage totals for every dialog on a node."""
 
 import logging
 import time
@@ -65,8 +57,7 @@ class LimitService:
             return LimitVerdict.ok()
         totals = await self._totals_today(user_id)
         messages_cap = tariff.limits.daily_user_messages
-        # strict ">": the message being answered was already ledgered at
-        # intake, so the N-th message under a limit of N still gets its run
+        # The message is ledgered at intake, so its N-th run is still allowed.
         if messages_cap is not None and totals.user_messages > messages_cap:
             return LimitVerdict(
                 allowed=False,

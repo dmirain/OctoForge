@@ -2,6 +2,7 @@
 
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.context.api import DialogueSummary
 from octoforge_core.context.store import SqlAlchemySummaryStore
-from octoforge_core.context.tools import NO_HITS_MESSAGE, HistorySearchTool
+from octoforge_core.context.tools import NO_HITS_MESSAGE, HistorySearchLimits, HistorySearchTool
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.dialogs.models import MessageRow
 from octoforge_core.dialogs.store import SqlAlchemyDialogRepository
@@ -45,7 +46,9 @@ def store(session_factory: async_sessionmaker[AsyncSession]) -> SqlAlchemySummar
 @pytest.fixture
 def tool(store: SqlAlchemySummaryStore) -> HistorySearchTool:
     return HistorySearchTool(
-        archive=store, summaries=store, default_limit=DEFAULT_LIMIT, max_limit=MAX_LIMIT
+        archive=store,
+        summaries=store,
+        limits=HistorySearchLimits(default=DEFAULT_LIMIT, maximum=MAX_LIMIT),
     )
 
 
@@ -57,50 +60,69 @@ async def dialogs(
     repository = SqlAlchemyDialogRepository(session_factory)
     dialog_a = await repository.get_or_create(CTX_A.user_id, CHANNEL)
     dialog_b = await repository.get_or_create(CTX_B.user_id, CHANNEL)
-    await _add_message(session_factory, dialog_a.id, 1, "we flew to Berlin", DAY_ONE)
-    await _add_message(session_factory, dialog_a.id, 2, "hotel in Berlin booked", DAY_TWO)
-    await _add_message(session_factory, dialog_a.id, 3, "unrelated note", DAY_TWO)
-    await _add_message(session_factory, dialog_b.id, 1, "Berlin from another dialog", DAY_ONE)
+    await _add_message(
+        session_factory,
+        MessageFixture(dialog_a.id, 1, "we flew to Berlin", DAY_ONE),
+    )
+    await _add_message(
+        session_factory,
+        MessageFixture(dialog_a.id, 2, "hotel in Berlin booked", DAY_TWO),
+    )
+    await _add_message(session_factory, MessageFixture(dialog_a.id, 3, "unrelated note", DAY_TWO))
+    await _add_message(
+        session_factory,
+        MessageFixture(dialog_b.id, 1, "Berlin from another dialog", DAY_ONE),
+    )
     ctx_a = ToolContext(user_id=CTX_A.user_id, channel=CHANNEL, dialog_id=dialog_a.id)
     ctx_b = ToolContext(user_id=CTX_B.user_id, channel=CHANNEL, dialog_id=dialog_b.id)
     return ctx_a, ctx_b
 
 
+@dataclass(frozen=True, slots=True)
+class MessageFixture:
+    dialog_id: str
+    seq: int
+    content: str
+    created_at: datetime
+
+
 async def _add_message(
     session_factory: async_sessionmaker[AsyncSession],
-    dialog_id: str,
-    seq: int,
-    content: str,
-    created_at: datetime,
+    message: MessageFixture,
 ) -> None:
     async with session_factory() as session:
         session.add(
             MessageRow(
                 id=uuid.uuid4().hex,
-                dialog_id=dialog_id,
-                seq=seq,
+                dialog_id=message.dialog_id,
+                seq=message.seq,
                 role=MessageRole.USER.value,
-                content=content,
-                created_at=created_at,
+                content=message.content,
+                created_at=message.created_at,
             )
         )
         await session.commit()
 
 
+@dataclass(frozen=True, slots=True)
+class SummaryFixture:
+    dialog_id: str
+    seq_from: int
+    seq_to: int
+    topics: tuple[str, ...]
+
+
 async def _add_summary(
     store: SqlAlchemySummaryStore,
-    dialog_id: str,
-    seq_from: int,
-    seq_to: int,
-    topics: tuple[str, ...],
+    summary: SummaryFixture,
 ) -> None:
     await store.create(
         DialogueSummary(
             id=uuid.uuid4().hex,
-            dialog_id=dialog_id,
-            seq_from=seq_from,
-            seq_to=seq_to,
-            topics=topics,
+            dialog_id=summary.dialog_id,
+            seq_from=summary.seq_from,
+            seq_to=summary.seq_to,
+            topics=summary.topics,
             content="compressed",
             created_at=CREATED,
         )
@@ -175,7 +197,7 @@ async def test_topic_filter_restricts_hits_to_summary_ranges(
     dialogs: tuple[ToolContext, ToolContext],
 ) -> None:
     ctx_a, _ = dialogs
-    await _add_summary(store, ctx_a.dialog_id, 2, 3, topics=("booking",))
+    await _add_summary(store, SummaryFixture(ctx_a.dialog_id, 2, 3, ("booking",)))
 
     result = await tool.execute({"query": "berlin", "topic": "Booking"}, ctx_a)
 

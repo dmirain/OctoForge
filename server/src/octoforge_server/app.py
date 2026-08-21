@@ -1,28 +1,12 @@
-"""The HTTP service: the application, its guard, its probes, and nothing else.
-
-This is what serves core over HTTP. It knows how to authenticate a request,
-how to answer whether it is alive, and how to mount whatever it is handed —
-but not what a Telegram bot is, nor how a database engine is opened. Both of
-those belong to the deployment above it (`main.py`), which passes in the
-runtime and the routes.
-
-The separation is what makes an interface optional. As long as the thing
-building the application also knows how to build a bot, a deployment without
-one means editing this file.
-
-The service is not meant to face the open internet: it answers the interfaces
-installed in front of it. It is still guarded — one credential for the
-operator, a narrower one for a relay — because "internal" is a deployment
-promise, not a property of the code.
-"""
+"""The HTTP service, probes and installed routes, independent of deployment wiring."""
 
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Response, status
+from fastapi.responses import FileResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -32,14 +16,8 @@ from octoforge_server.api.dialog import router as dialog_router
 from octoforge_server.api.identity import router as identity_router
 from octoforge_server.api.media import router as media_router
 from octoforge_server.api.secrets import router as secrets_router
-from octoforge_server.auth import (
-    CROSS_SITE_MESSAGE,
-    AuthGate,
-    allows_service_credential,
-    is_cross_site_mutation,
-    is_open_path,
-)
 from octoforge_server.config import Settings
+from octoforge_server.request_guard import install_guard
 from octoforge_server.runtime_state import Runtime
 from octoforge_server.surfaces import StaticFile, SurfaceRoutes
 
@@ -54,9 +32,6 @@ APP_TITLE = "OctoForge"
 HEALTH_STATUS = "ok"
 READY_STATUS = "ready"
 NOT_READY_STATUS = "not-ready"
-
-# Signature of the next handler in Starlette's middleware chain.
-NextCall = Callable[[Request], Awaitable[Response]]
 
 #: How the deployment hands over its assembled services.
 RuntimeFactory = Callable[[Settings], AbstractAsyncContextManager[Runtime]]
@@ -77,7 +52,7 @@ def build_app(
             yield
 
     app = FastAPI(title=APP_TITLE, lifespan=lifespan)
-    _install_guard(app, settings)
+    install_guard(app, settings)
     _install_probes(app)
     # the service's own endpoints, present in every deployment
     app.include_router(dialog_router)
@@ -91,53 +66,6 @@ def build_app(
         for item in surface.static_files:
             serve_file(app, item)
     return app
-
-
-def _install_guard(app: FastAPI, settings: Settings) -> None:
-    """Put the credential check in front of everything but the health probes."""
-    gate = AuthGate(
-        username=settings.admin_username,
-        password_hash=settings.admin_password_hash,
-        service_username=settings.service_username,
-        service_password_hash=settings.service_password_hash,
-    )
-    # the admin router's own dependency resolves the same object, so a request
-    # verified by the middleware does not hash again
-    app.state.auth_gate = gate
-
-    @app.middleware("http")
-    async def authenticate(request: Request, call_next: NextCall) -> Response:
-        """Require a credential for everything but the health probes.
-
-        A middleware rather than per-router dependencies because it has to cover
-        what routers do not: static pages, `/docs` and `/openapi.json`.
-        Exceptions raised here bypass the app's handlers, so the responses are
-        built by hand.
-
-        Two checks, in order. The first refuses state-changing requests a
-        browser sends from another site: with Basic auth the credential rides
-        along automatically, so a form on an attacker's page would otherwise
-        act as the operator. The second is the credential itself, and which
-        credentials are acceptable is decided by the path.
-        """
-        if is_cross_site_mutation(request):
-            logger.warning("cross-site %s to %s refused", request.method, request.url.path)
-            return JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content={"detail": CROSS_SITE_MESSAGE},
-            )
-        if not is_open_path(request.url.path):
-            try:
-                await gate.authenticate(
-                    request, service_allowed=allows_service_credential(request.url.path)
-                )
-            except HTTPException as denied:
-                return JSONResponse(
-                    status_code=denied.status_code,
-                    content={"detail": denied.detail},
-                    headers=denied.headers,
-                )
-        return await call_next(request)
 
 
 def _install_probes(app: FastAPI) -> None:

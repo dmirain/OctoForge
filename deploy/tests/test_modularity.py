@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 from octoforge_core.agent.events import Cancelled, Failed, Finished, ToolCallCompleted
+from octoforge_core.agent.loop import AgentLoopConfig
 from octoforge_core.agent.prompts import (
     ROUTER_PROMPT_NAME,
     SYSTEM_PROMPT_NAME,
@@ -27,11 +28,14 @@ from octoforge_core.agent.router import ROUTE_TOOL_NAME
 from octoforge_core.agent.runner import (
     ConversationEvent,
     ConversationManager,
+    DialogSubmission,
     ManagerStores,
     OwnershipConfig,
 )
 from octoforge_core.composition import (
     RunnerOptions,
+    RunnerServices,
+    ToolDependencies,
     ToolLimits,
     ToolServices,
     ToolStores,
@@ -60,6 +64,7 @@ from octoforge_core.domain import ChatMessage, MessageRole, ToolCall
 from octoforge_core.instructions.api import (
     EmbeddedInstruction,
     Instruction,
+    InstructionDefinition,
     InstructionDraft,
     InstructionService,
     InstructionType,
@@ -67,6 +72,7 @@ from octoforge_core.instructions.api import (
 from octoforge_core.llm.events import StreamEvent, StreamFinished
 from octoforge_core.llm.events import TextDelta as LlmTextDelta
 from octoforge_core.llm.usage import Completion
+from octoforge_core.net.external import ExternalCallServices
 from octoforge_core.net.guard import SsrfGuard
 from octoforge_core.search.api import SearchResponse, SearchResult
 from octoforge_core.tasks.store import SqlAlchemyTaskStore
@@ -309,28 +315,28 @@ def build_third_party_root(
     summary_store = SqlAlchemySummaryStore(session_factory)
     guard = SsrfGuard()
     registry = build_tool_registry(
-        http_client,
-        guard,
-        stores=ToolStores(
-            tasks=SqlAlchemyTaskStore(session_factory),
-            cron=SqlAlchemyCronStore(session_factory),
-            archive=summary_store,
-            summaries=summary_store,
-        ),
-        services=ToolServices(
-            instructions=instructions,
-            datasets=build_dataset_service(
-                SqlAlchemyDatasetStore(session_factory),
-                LenientEmbedder(),
+        ToolDependencies(
+            outbound_http=http_client,
+            guard=guard,
+            stores=ToolStores(
+                tasks=SqlAlchemyTaskStore(session_factory),
+                cron=SqlAlchemyCronStore(session_factory),
+                archive=summary_store,
+                summaries=summary_store,
             ),
-            executor=build_external_executor(
-                service=instructions,
-                http_client=http_client,
-                guard=guard,
+            services=ToolServices(
+                instructions=instructions,
+                datasets=build_dataset_service(
+                    SqlAlchemyDatasetStore(session_factory),
+                    LenientEmbedder(),
+                ),
+                executor=build_external_executor(
+                    ExternalCallServices(instructions, http_client, guard),
+                ),
+                search_provider=FakeSearchProvider(),
             ),
-            search_provider=FakeSearchProvider(),
         ),
-        limits=ToolLimits(
+        ToolLimits(
             instructions_top_k=DEFAULT_K,
             datasets_query_default_limit=QUERY_LIMIT,
             datasets_query_max_limit=QUERY_LIMIT,
@@ -341,11 +347,15 @@ def build_third_party_root(
     llm = RootLLM()
     manager = build_conversation_manager(
         config=build_runner_config(
-            build_agent_loop(llm, registry, max_iterations=MAX_ITERATIONS),
-            prompts,
-            build_router(llm, prompts, timeout_seconds=ROUTER_TIMEOUT_SECONDS),
-            NoopContextCompactor(),
-            options=RunnerOptions(max_processes=MAX_PROCESSES),
+            RunnerServices(
+                loop=build_agent_loop(
+                    llm, registry, AgentLoopConfig(max_iterations=MAX_ITERATIONS)
+                ),
+                prompts=prompts,
+                router=build_router(llm, prompts, timeout_seconds=ROUTER_TIMEOUT_SECONDS),
+                compactor=NoopContextCompactor(),
+            ),
+            RunnerOptions(max_processes=MAX_PROCESSES),
         ),
         stores=ManagerStores(
             dialogs=SqlAlchemyDialogRepository(session_factory),
@@ -402,40 +412,49 @@ def tool_outputs(events: list[ConversationEvent]) -> list[str]:
     ]
 
 
+async def _run_installer_dialog(root: "ThirdPartyRoot") -> list[ConversationEvent]:
+    runner = await root.manager.get_or_create_runner(USER_ID, CHANNEL)
+    queue = runner.subscribe()
+    await runner.submit(DialogSubmission(FIRST_QUESTION))
+    await wait_until(lambda: len(root.llm.stream_requests) == FIRST_CALL)
+    await runner.submit(DialogSubmission(SECOND_QUESTION))
+    await wait_until(lambda: len(root.llm.complete_requests) == ROUTER_CALLS_ONE)
+    root.llm.first_stream_gate.set()
+    return await collect_until_terminal(queue)
+
+
+def _assert_custom_prompts(root: "ThirdPartyRoot") -> None:
+    first_system = root.llm.stream_requests[0][0]
+    router_system, router_user = root.llm.complete_requests[0]
+
+    assert first_system.role is MessageRole.SYSTEM
+    assert first_system.content.startswith(CUSTOM_SYSTEM_PROMPT)
+    assert "CUSTOM ROUTER PROMPT FROM FILE" in router_system.content
+    assert router_user == ChatMessage(role=MessageRole.USER, content=SECOND_QUESTION)
+    assert router_system.role is MessageRole.SYSTEM
+    assert FIRST_QUESTION in router_system.content
+
+
+def _assert_tool_outputs(events: list[ConversationEvent]) -> None:
+    outputs = tool_outputs(events)
+
+    assert any(FAKE_ANSWER in output for output in outputs)
+    assert any(SAVED_TITLE in output for output in outputs)
+    assert isinstance(events[-1].payload, Finished)
+    assert events[-1].payload.message.content == FINAL_REPLY
+
+
 async def test_third_party_root_overrides_prompts_search_and_instruction_store(
     session_factory: async_sessionmaker[AsyncSession],
     http_client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
     root = build_third_party_root(session_factory, http_client, tmp_path)
-    await root.instructions.save(USER_ID, InstructionType.SKILL, SAVED_TITLE, SAVED_CONTENT)
-    runner = await root.manager.get_or_create_runner(USER_ID, CHANNEL)
-    queue = runner.subscribe()
+    await root.instructions.save(
+        USER_ID,
+        InstructionDefinition(InstructionType.SKILL, SAVED_TITLE, SAVED_CONTENT),
+    )
+    events = await _run_installer_dialog(root)
 
-    await runner.submit(FIRST_QUESTION)
-    await wait_until(lambda: len(root.llm.stream_requests) == 1)
-    await runner.submit(SECOND_QUESTION)
-    # no LLM router call for the first message (no active processes); the
-    # second message routes over the first question's process
-    await wait_until(lambda: len(root.llm.complete_requests) == ROUTER_CALLS_ONE)
-    root.llm.first_stream_gate.set()
-    events = await collect_until_terminal(queue)
-
-    # the conversation system prompt came from the installer's file
-    first_system = root.llm.stream_requests[0][0]
-    assert first_system.role is MessageRole.SYSTEM
-    assert first_system.content.startswith(CUSTOM_SYSTEM_PROMPT)
-    # the router prompt came from the installer's file too; its only call is
-    # for the second message and lists the first question's process
-    router_system, router_user = root.llm.complete_requests[0]
-    assert "CUSTOM ROUTER PROMPT FROM FILE" in router_system.content
-    assert router_user == ChatMessage(role=MessageRole.USER, content=SECOND_QUESTION)
-    assert router_system.role is MessageRole.SYSTEM
-    assert FIRST_QUESTION in router_system.content
-    # the tools ran over the substituted provider and instruction store
-    outputs = tool_outputs(events)
-    assert any(FAKE_ANSWER in output for output in outputs)
-    assert any(SAVED_TITLE in output for output in outputs)
-    # the dialog ran to a final answer
-    assert isinstance(events[-1].payload, Finished)
-    assert events[-1].payload.message.content == FINAL_REPLY
+    _assert_custom_prompts(root)
+    _assert_tool_outputs(events)

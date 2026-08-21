@@ -13,9 +13,11 @@ from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from octoforge_core import (
     AgentLoop,
+    AgentLoopConfig,
     ChatMessage,
     ConversationEvent,
     ConversationManager,
+    DialogSubmission,
     MessageRole,
     ToolRegistry,
     ToolSpec,
@@ -43,6 +45,7 @@ from octoforge_server.api.dialog import SSE_MEDIA_TYPE, STATUS_ACCEPTED
 from octoforge_server.api.dialog import cancel as cancel_endpoint
 from octoforge_server.api.dialog import events as events_endpoint
 from octoforge_server.api.dialog import post_message as post_message_endpoint
+from octoforge_server.api.dialog_deps import DialogActor
 from octoforge_server.api.schemas import AttachmentSpec, PostMessageRequest
 from octoforge_server.auth import hash_password
 from octoforge_server.config import Settings
@@ -76,6 +79,10 @@ EXPECTED_HISTORY_LEN = 4
 POLL_SECONDS = 0.01
 EXPECTED_TWO_DIALOGS = 2
 USER_ID_HEADER = "X-User-Id"
+
+
+def actor(manager: ConversationManager, user_id: str = USER_A) -> DialogActor:
+    return DialogActor(manager, user_id, CHANNEL)
 
 
 class ScriptedLLM:
@@ -128,7 +135,7 @@ async def make_manager(
     loop = AgentLoop(
         llm_client=ScriptedLLM(replies),
         registry=ToolRegistry(),
-        max_iterations=MAX_ITERATIONS,
+        config=AgentLoopConfig(MAX_ITERATIONS),
     )
     return ConversationManager(
         config=RunnerConfig(
@@ -242,11 +249,11 @@ async def test_dialog_is_get_or_created_per_user(
     queue_a = runner_a.subscribe()
     queue_b = runner_b.subscribe()
 
-    await post_message_endpoint(PostMessageRequest(content="one"), USER_A, CHANNEL, manager)
+    await post_message_endpoint(PostMessageRequest(content="one"), actor(manager))
     await collect_until_terminal(queue_a)
-    await post_message_endpoint(PostMessageRequest(content="two"), USER_A, CHANNEL, manager)
+    await post_message_endpoint(PostMessageRequest(content="two"), actor(manager))
     await collect_until_terminal(queue_a)
-    await post_message_endpoint(PostMessageRequest(content="three"), USER_B, CHANNEL, manager)
+    await post_message_endpoint(PostMessageRequest(content="three"), actor(manager, USER_B))
     await collect_until_terminal(queue_b)
 
     assert await manager.get_or_create_runner(USER_A, CHANNEL) is runner_a
@@ -270,22 +277,16 @@ async def test_post_message_deduplicates_client_message_id(
 
     await post_message_endpoint(
         PostMessageRequest(content="one", client_message_id=FIRST_CLIENT_KEY),
-        USER_A,
-        CHANNEL,
-        manager,
+        actor(manager),
     )
     await collect_until_terminal(queue)
     await post_message_endpoint(  # a client retry with the same key
         PostMessageRequest(content="one", client_message_id=FIRST_CLIENT_KEY),
-        USER_A,
-        CHANNEL,
-        manager,
+        actor(manager),
     )
     await post_message_endpoint(
         PostMessageRequest(content="two", client_message_id=SECOND_CLIENT_KEY),
-        USER_A,
-        CHANNEL,
-        manager,
+        actor(manager),
     )
     await collect_until_terminal(queue)
 
@@ -312,7 +313,7 @@ async def test_users_are_isolated(session_factory: async_sessionmaker[AsyncSessi
     queue_a = runner_a.subscribe()
     queue_b = runner_b.subscribe()
 
-    await post_message_endpoint(PostMessageRequest(content=SECRET_A), USER_A, CHANNEL, manager)
+    await post_message_endpoint(PostMessageRequest(content=SECRET_A), actor(manager))
     await collect_until_terminal(queue_a)
 
     assert queue_b.empty()
@@ -332,36 +333,64 @@ async def test_post_message_forwards_reply_to_exchange_id(
     """
     manager = await make_manager([], session_factory)
     runner = await manager.get_or_create_runner(USER_A, CHANNEL)
-    submitted: list[tuple[str, str | None, str | None]] = []
+    submitted: list[DialogSubmission] = []
 
-    async def fake_submit(
-        content: str,
-        client_message_id: str | None = None,
-        reply_to_exchange_id: str | None = None,
-        source: MessageSource | None = None,
-    ) -> None:
-        submitted.append((content, client_message_id, reply_to_exchange_id))
+    async def fake_submit(submission: DialogSubmission) -> None:
+        submitted.append(submission)
 
     monkeypatch.setattr(runner, "submit", fake_submit)
 
     await post_message_endpoint(
         PostMessageRequest(content="hi", reply_to_exchange_id="ex-1"),
-        USER_A,
-        CHANNEL,
-        manager,
+        actor(manager),
     )
 
-    assert submitted == [("hi", None, "ex-1")]
+    assert submitted == [
+        DialogSubmission(
+            "hi",
+            reply_to_exchange_id="ex-1",
+            source=MessageSource(),
+        )
+    ]
     await manager.stop_all()
 
 
 async def test_cancel_accepted(session_factory: async_sessionmaker[AsyncSession]) -> None:
     manager = await make_manager([], session_factory)
 
-    result = await cancel_endpoint(USER_A, CHANNEL, manager)
+    result = await cancel_endpoint(actor(manager))
 
     assert result.status == STATUS_ACCEPTED
     await manager.stop_all()
+
+
+async def _collect_event_payloads(
+    response: SimpleNamespace, manager: ConversationManager
+) -> list[dict[str, object]]:
+    runner = await manager.get_or_create_runner(USER_A, CHANNEL)
+    await runner.submit(DialogSubmission("hi"))
+    payloads: list[dict[str, object]] = []
+    async for frame in response.body_iterator:
+        text = frame if isinstance(frame, str) else frame.decode()
+        if not text.startswith(SSE_DATA_PREFIX):
+            continue
+        payload = json.loads(text[len(SSE_DATA_PREFIX) :])
+        payloads.append(payload)
+        if payload["type"] == FINISHED_TYPE or len(payloads) >= MAX_FRAMES:
+            return payloads
+    return payloads
+
+
+def _assert_event_payloads(payloads: list[dict[str, object]]) -> None:
+    types = [payload["type"] for payload in payloads]
+    seqs = [payload["seq"] for payload in payloads]
+
+    assert "text_delta" in types
+    assert "assistant_message" in types
+    assert types[-1] == FINISHED_TYPE
+    assert payloads[-1]["content"] == REPLY_CONTENT
+    assert all(payload["dialog_id"] for payload in payloads)
+    assert seqs == sorted(seqs)
 
 
 async def test_events_endpoint_streams_frames(
@@ -369,34 +398,15 @@ async def test_events_endpoint_streams_frames(
 ) -> None:
     manager = await make_manager([reply()], session_factory)
 
-    response = await events_endpoint(USER_A, CHANNEL, manager)
+    response = await events_endpoint(actor(manager))
 
     assert response.media_type == SSE_MEDIA_TYPE
+    payloads = await asyncio.wait_for(
+        _collect_event_payloads(response, manager),
+        timeout=EVENTS_TIMEOUT_SECONDS,
+    )
 
-    async def collect_frames() -> list[dict[str, object]]:
-        runner = await manager.get_or_create_runner(USER_A, CHANNEL)
-        await runner.submit("hi")
-        payloads: list[dict[str, object]] = []
-        async for frame in response.body_iterator:
-            text = frame if isinstance(frame, str) else frame.decode()
-            if not text.startswith(SSE_DATA_PREFIX):
-                continue
-            payload = json.loads(text[len(SSE_DATA_PREFIX) :])
-            payloads.append(payload)
-            if payload["type"] == FINISHED_TYPE or len(payloads) >= MAX_FRAMES:
-                break
-        return payloads
-
-    payloads = await asyncio.wait_for(collect_frames(), timeout=EVENTS_TIMEOUT_SECONDS)
-
-    types = [payload["type"] for payload in payloads]
-    assert "text_delta" in types
-    assert "assistant_message" in types
-    assert types[-1] == FINISHED_TYPE
-    assert payloads[-1]["content"] == REPLY_CONTENT
-    assert all(payload["dialog_id"] for payload in payloads)
-    seqs = [payload["seq"] for payload in payloads]
-    assert seqs == sorted(seqs)
+    _assert_event_payloads(payloads)
     await manager.stop_all()
 
 
@@ -429,7 +439,7 @@ async def test_events_endpoint_ends_the_stream_when_the_dialog_moves(
     routes it to whoever runs the dialog now.
     """
     manager = await make_manager([reply()], session_factory)
-    response = await events_endpoint(USER_A, CHANNEL, manager)
+    response = await events_endpoint(actor(manager))
     runner = await manager.get_or_create_runner(USER_A, CHANNEL)
 
     await SqlAlchemyClaimRepository(session_factory).claim(runner.dialog_id, "another-node")
@@ -515,15 +525,10 @@ async def test_a_submit_carries_what_only_the_surface_knows(
     files that arrived with it."""
     manager = await make_manager([reply()], session_factory)
     runner = await manager.get_or_create_runner(USER_A, CHANNEL)
-    submitted: list[MessageSource | None] = []
+    submitted: list[DialogSubmission] = []
 
-    async def record(
-        content: str,
-        client_message_id: str | None = None,
-        reply_to_exchange_id: str | None = None,
-        source: MessageSource | None = None,
-    ) -> None:
-        submitted.append(source)
+    async def record(submission: DialogSubmission) -> None:
+        submitted.append(submission)
 
     runner.submit = record  # type: ignore[method-assign]
     await post_message_endpoint(
@@ -533,16 +538,17 @@ async def test_a_submit_carries_what_only_the_surface_knows(
             origin="Иван",
             attachments=(AttachmentSpec(kind=AttachmentKind.IMAGE, ref="tgfile:abc"),),
         ),
-        USER_A,
-        CHANNEL,
-        manager,
+        actor(manager),
     )
 
     assert submitted == [
-        MessageSource(
-            kind=MessageKind.MATERIAL,
-            origin="Иван",
-            attachments=(Attachment(kind=AttachmentKind.IMAGE, ref="tgfile:abc"),),
+        DialogSubmission(
+            content="[переслано от Иван] смотри",
+            source=MessageSource(
+                kind=MessageKind.MATERIAL,
+                origin="Иван",
+                attachments=(Attachment(kind=AttachmentKind.IMAGE, ref="tgfile:abc"),),
+            ),
         )
     ]
     await manager.stop_all()

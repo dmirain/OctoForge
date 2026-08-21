@@ -14,16 +14,31 @@ Never log a value: an audit line names what was touched, not its contents.
 """
 
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger("octoforge.audit")
 
 UNKNOWN_TARGET = "-"
 
 
-def record(action: str, actor: str, target: str = UNKNOWN_TARGET, outcome: str = "ok") -> None:
+@dataclass(frozen=True, slots=True)
+class AuditEvent:
+    action: str
+    actor: str
+    target: str = UNKNOWN_TARGET
+    outcome: str = "ok"
+
+
+def record(event: AuditEvent) -> None:
     """Write one audit line.
 
     `actor` is the operator credential's username for HTTP, or `tg:<id>` for the
     in-chat admin tool; `target` is the id of whatever was acted upon.
     """
-    logger.info("audit action=%s actor=%s target=%s outcome=%s", action, actor, target, outcome)
+    logger.info(
+        "audit action=%s actor=%s target=%s outcome=%s",
+        event.action,
+        event.actor,
+        event.target,
+        event.outcome,
+    )

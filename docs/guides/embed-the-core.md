@@ -27,8 +27,10 @@ missing.
 ### Depth 1: just the loop
 
 ```python
-loop = AgentLoop(llm_client=llm, registry=registry, max_iterations=10)
-async for event in loop.stream(messages, LoopControl(), ToolContext(user_id="u", channel="cli", dialog_id="d")):
+loop = AgentLoop(llm, registry, AgentLoopConfig(max_iterations=10))
+async for event in loop.stream(
+    messages, LoopControl(), ToolContext(user_id="u", channel="cli", dialog_id="d")
+):
     ...
 ```
 
@@ -45,25 +47,39 @@ subscribe, submit, print deltas. Two details it depends on:
 
 ### Depth 3: the platform
 
-Use `core/src/octoforge_core/composition.py` and follow `deploy/src/octoforge_deploy/main.py:runtime()` as the
-reference wiring. The builders take ports and dataclass configs only — never a web settings object — so your
-composition root reuses them instead of copying:
+Use the facade in `core/src/octoforge_core/composition.py` and follow
+`deploy/src/octoforge_deploy/main.py:runtime()` as the reference wiring. The builders take ports and
+dataclass configs only, never a web settings object, so your composition root reuses them instead of
+copying:
 
 ```python
 registry = build_tool_registry(
-    outbound_http, guard,
-    stores=ToolStores(tasks=task_store, cron=cron_store, archive=summaries, summaries=summaries),
-    services=ToolServices(instructions=instructions, datasets=datasets, executor=executor, search_provider=None),
-    limits=_your_limits,
+    ToolDependencies(
+        outbound_http=outbound_http,
+        guard=guard,
+        stores=ToolStores(
+            tasks=task_store, cron=cron_store, archive=summaries, summaries=summaries
+        ),
+        services=ToolServices(
+            instructions=instructions, datasets=datasets, executor=executor
+        ),
+    ),
+    _your_limits,
 )
 manager = build_conversation_manager(
     config=build_runner_config(
-        build_agent_loop(llm, registry, max_iterations=10),
-        prompts, build_router(llm, prompts, timeout_seconds=10.0),
-        build_compactor(store=summaries, archive=summaries, llm=llm, config=CompactorConfig(...)),
-        options=RunnerOptions(max_processes=5),
+        RunnerServices(
+            loop=build_agent_loop(llm, registry, AgentLoopConfig(max_iterations=10)),
+            prompts=prompts,
+            router=build_router(llm, prompts, timeout_seconds=10.0),
+            compactor=build_compactor(
+                CompactorServices(summaries, summaries, llm), CompactorConfig(...)
+            ),
+        ),
+        RunnerOptions(max_processes=5),
     ),
-    dialogs=dialogs, messages=messages, tasks=task_store, exchanges=exchanges,
+    stores=ManagerStores(...),
+    ownership=OwnershipConfig(node_id="my-node"),
 )
 ```
 
@@ -104,8 +120,11 @@ append-only and shared by every installation.
 
 ## Code anchors
 
-- `core/src/octoforge_core/composition.py` — the builders
-- `deploy/src/octoforge_deploy/main.py` — `runtime()`, the reference composition root
+- `core/src/octoforge_core/composition.py` — the stable builder facade
+- `core/src/octoforge_core/composition_agent.py`,
+  `core/src/octoforge_core/composition_runtime.py` — agent and runtime builders
+- `deploy/src/octoforge_deploy/main.py`, `deploy/src/octoforge_deploy/runtime_entry.py` — `runtime()`
+  and the reference composition root
 - `deploy/tests/test_modularity.py` — a third-party composition root, executable
 - `core/src/octoforge_core/__init__.py` — the public surface of the package
 - [../architecture.md](../architecture.md) — the port table and the dependency rule

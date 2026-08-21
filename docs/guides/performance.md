@@ -189,7 +189,9 @@ above are the thing to drive down.
 
 - `tools/bench_latency.py` — the harness behind the table
 - `core/src/octoforge_core/instructions/ranking.py` — the vectorized, chunked, off-loop ranking
-- `core/src/octoforge_core/agent/loop.py` — eager tools, cancellation races, the idle watchdog
-- `core/src/octoforge_core/agent/runner.py` — the date envelope, per-dialog builds, delivery
+- `core/src/octoforge_core/agent/loop_tools.py`,
+  `core/src/octoforge_core/agent/loop_stream_pump.py` — eager tools and cancellation races
+- `core/src/octoforge_core/agent/runner_manager_pool.py`,
+  `core/src/octoforge_core/agent/runner_broadcast.py` — per-dialog builds and delivery
 - `core/src/octoforge_core/context/compactor.py` — bounded reads, background compaction
 - [../AGENTS.md](../../AGENTS.md) — the same rules as coding conventions

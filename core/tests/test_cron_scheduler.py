@@ -3,21 +3,24 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from octoforge_core.cron import scheduler as scheduler_module
 from octoforge_core.cron.api import (
+    CronClaim,
     CronJob,
     CronScheduleError,
+    CronWake,
+    MissedRuns,
     Scheduler,
     WakeOutcome,
     compute_next_fire,
     count_missed,
 )
-from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig
+from octoforge_core.cron.scheduler import CronScheduler, CronSchedulerConfig, CronSchedulerTiming
 from octoforge_core.cron.store import SqlAlchemyCronStore
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 
@@ -65,17 +68,6 @@ BASE_JOB = CronJob(
 )
 
 
-@dataclass(frozen=True, slots=True)
-class WakeCall:
-    """One delivered cron firing."""
-
-    user_id: str
-    channel: str
-    title: str
-    prompt: str
-    cron_job_id: str
-
-
 class RecordingWaker:
     """CronWaker stub recording delivered wakes.
 
@@ -84,32 +76,17 @@ class RecordingWaker:
     """
 
     def __init__(self) -> None:
-        self.calls: list[WakeCall] = []
+        self.calls: list[CronWake] = []
         self.fail = False
         self.skip = False
         self.foreign = False
 
-    async def wake(
-        self,
-        user_id: str,
-        channel: str,
-        title: str,
-        prompt: str,
-        cron_job_id: str,
-    ) -> WakeOutcome:
+    async def wake(self, request: CronWake) -> WakeOutcome:
         if self.fail:
             raise RuntimeError(WAKE_FAILURE)
         if self.foreign:
             return WakeOutcome.NOT_OURS  # nothing started, so nothing recorded
-        self.calls.append(
-            WakeCall(
-                user_id=user_id,
-                channel=channel,
-                title=title,
-                prompt=prompt,
-                cron_job_id=cron_job_id,
-            )
-        )
+        self.calls.append(request)
         return WakeOutcome.LIMITED if self.skip else WakeOutcome.DELIVERED
 
 
@@ -126,11 +103,13 @@ def make_scheduler(
     return CronScheduler(
         store=store,
         waker=waker,
-        owner=OWNER,
         config=CronSchedulerConfig(
-            poll_interval_seconds=POLL_INTERVAL_SECONDS,
-            lease_ttl_seconds=LEASE_TTL_SECONDS,
-            replay_limit=replay_limit,
+            owner=OWNER,
+            timing=CronSchedulerTiming(
+                poll_interval_seconds=POLL_INTERVAL_SECONDS,
+                lease_ttl_seconds=LEASE_TTL_SECONDS,
+                replay_limit=replay_limit,
+            ),
         ),
     )
 
@@ -164,7 +143,7 @@ async def test_due_job_fires_and_reschedules(
     await make_scheduler(store, waker).tick(now=NOW)
 
     assert waker.calls == [
-        WakeCall(
+        CronWake(
             user_id=USER_A,
             channel=CHANNEL,
             title=BASE_JOB.title,
@@ -375,11 +354,13 @@ async def test_run_forever_survives_a_tick_failure(
     scheduler = CronScheduler(
         store=ExplodingStore(),  # type: ignore[arg-type]
         waker=waker,
-        owner=OWNER,
         config=CronSchedulerConfig(
-            poll_interval_seconds=POLL_INTERVAL_SECONDS,
-            lease_ttl_seconds=LEASE_TTL_SECONDS,
-            replay_limit=REPLAY_LIMIT,
+            owner=OWNER,
+            timing=CronSchedulerTiming(
+                poll_interval_seconds=POLL_INTERVAL_SECONDS,
+                lease_ttl_seconds=LEASE_TTL_SECONDS,
+                replay_limit=REPLAY_LIMIT,
+            ),
         ),
     )
     task = asyncio.create_task(scheduler.run_forever())
@@ -451,7 +432,7 @@ async def test_a_fresh_claim_by_another_owner_skips_the_job(
     no_stagger: None,
 ) -> None:
     await store.create(BASE_JOB)
-    await store.claim(BASE_JOB.id, DUE_AT, OTHER_OWNER, NOW, STALE_BEFORE)
+    await store.claim(CronClaim(BASE_JOB.id, DUE_AT, OTHER_OWNER, NOW, STALE_BEFORE))
 
     await make_scheduler(store, waker).tick(now=NOW)
 
@@ -491,24 +472,24 @@ def test_compute_next_fire_rejects_invalid_input() -> None:
 def test_count_missed_counts_slots_minus_the_current_shot() -> None:
     since = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 
-    assert count_missed(DAILY_9AM, "UTC", since, NOW) == MISSED_TWO
+    assert count_missed(MissedRuns(DAILY_9AM, "UTC", since, NOW)) == MISSED_TWO
 
 
 def test_count_missed_is_zero_for_an_on_time_job() -> None:
     since = datetime(2026, 7, 17, 9, 0, tzinfo=UTC)
 
-    assert count_missed(DAILY_9AM, "UTC", since, NOW) == 0
+    assert count_missed(MissedRuns(DAILY_9AM, "UTC", since, NOW)) == 0
 
 
 def test_count_missed_is_capped() -> None:
     since = NOW - timedelta(hours=1)  # 60 minutely slots
 
-    assert count_missed(EVERY_MINUTE, "UTC", since, NOW, cap=MISSED_CAP) == MISSED_CAP
+    assert count_missed(MissedRuns(EVERY_MINUTE, "UTC", since, NOW, MISSED_CAP)) == MISSED_CAP
 
 
 def test_count_missed_rejects_invalid_input() -> None:
     with pytest.raises(CronScheduleError):
-        count_missed("bogus", "UTC", CREATED_AT, NOW)
+        count_missed(MissedRuns("bogus", "UTC", CREATED_AT, NOW))
 
 
 class ManualScheduler:

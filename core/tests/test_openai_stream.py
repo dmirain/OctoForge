@@ -5,6 +5,7 @@ import socket
 import threading
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from http import HTTPStatus
 
 import httpx
@@ -60,16 +61,27 @@ def content_chunk(text: str) -> dict[str, object]:
     return {"choices": [{"delta": {"content": text}}]}
 
 
-def tool_call_chunk(index: int, call_id: str, name: str, arguments: str) -> dict[str, object]:
+@dataclass(frozen=True, slots=True)
+class ToolCallChunk:
+    index: int
+    call_id: str
+    name: str
+    arguments: str
+
+
+def tool_call_chunk(chunk: ToolCallChunk) -> dict[str, object]:
     return {
         "choices": [
             {
                 "delta": {
                     "tool_calls": [
                         {
-                            "index": index,
-                            "id": call_id,
-                            "function": {"name": name, "arguments": arguments},
+                            "index": chunk.index,
+                            "id": chunk.call_id,
+                            "function": {
+                                "name": chunk.name,
+                                "arguments": chunk.arguments,
+                            },
                         }
                     ]
                 }
@@ -145,8 +157,8 @@ async def test_stream_reads_deepseeks_own_reasoning_field_too() -> None:
 async def test_stream_accumulates_tool_calls() -> None:
     client = make_client(
         [
-            tool_call_chunk(0, CALL_ID, TOOL_NAME, '{"method": "GE'),
-            tool_call_chunk(0, "", "", 'T", "url": "https://x"}'),
+            tool_call_chunk(ToolCallChunk(0, CALL_ID, TOOL_NAME, '{"method": "GE')),
+            tool_call_chunk(ToolCallChunk(0, "", "", 'T", "url": "https://x"}')),
         ]
     )
 
@@ -198,9 +210,9 @@ async def test_stream_aclose_stops_iteration() -> None:
 async def test_stream_emits_tool_call_events_on_index_transition() -> None:
     client = make_client(
         [
-            tool_call_chunk(0, CALL_ID, TOOL_NAME, '{"method": "GE'),
-            tool_call_chunk(0, "", "", 'T"}'),
-            tool_call_chunk(1, SECOND_CALL_ID, SECOND_TOOL_NAME, '{"q": "x"}'),
+            tool_call_chunk(ToolCallChunk(0, CALL_ID, TOOL_NAME, '{"method": "GE')),
+            tool_call_chunk(ToolCallChunk(0, "", "", 'T"}')),
+            tool_call_chunk(ToolCallChunk(1, SECOND_CALL_ID, SECOND_TOOL_NAME, '{"q": "x"}')),
         ]
     )
 
@@ -254,7 +266,7 @@ async def test_stream_emits_events_for_single_delta_batch() -> None:
 
 
 async def test_stream_broken_arguments_emit_broken_and_keep_message() -> None:
-    client = make_client([tool_call_chunk(0, CALL_ID, TOOL_NAME, '{"method": ')])
+    client = make_client([tool_call_chunk(ToolCallChunk(0, CALL_ID, TOOL_NAME, '{"method": '))])
 
     events = await collect(client.stream([USER_MESSAGE]))
 

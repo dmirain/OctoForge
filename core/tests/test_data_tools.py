@@ -10,10 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from octoforge_core.datasets.api import (
     Dataset,
+    DatasetDefinition,
     DatasetField,
     DatasetHit,
     DatasetNotFoundError,
     DatasetRecord,
+    DatasetRecordQuery,
     DatasetSchema,
     DatasetService,
     FieldType,
@@ -24,6 +26,8 @@ from octoforge_core.datasets.tools import DataForgetTool, DataPutTool, DataQuery
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.instructions.api import (
     Instruction,
+    InstructionDefinition,
+    InstructionSearchRequest,
     InstructionType,
     SearchHit,
 )
@@ -84,14 +88,16 @@ def service(session_factory: async_sessionmaker[AsyncSession]) -> DatasetService
 
 async def create_food_dataset(service: DatasetService) -> Dataset:
     return await service.create_dataset(
-        CTX.user_id,
-        FOOD_DATASET,
-        FOOD_DESCRIPTION,
-        DatasetSchema(
-            (
-                DatasetField(name="item", type=FieldType.STRING, required=True),
-                DatasetField(name="kcal", type=FieldType.INTEGER, required=False),
-            )
+        DatasetDefinition(
+            CTX.user_id,
+            FOOD_DATASET,
+            FOOD_DESCRIPTION,
+            DatasetSchema(
+                (
+                    DatasetField(name="item", type=FieldType.STRING, required=True),
+                    DatasetField(name="kcal", type=FieldType.INTEGER, required=False),
+                )
+            ),
         ),
     )
 
@@ -126,7 +132,9 @@ async def test_put_creates_dataset_and_record(service: DatasetService) -> None:
     dataset = await service.get_dataset(CTX.user_id, FOOD_DATASET)
     assert dataset.usage_notes == "one record per meal"
     assert dataset.retention == "keep forever"
-    records = await service.query_records(CTX.user_id, FOOD_DATASET, None, None, None, 10)
+    records = await service.query_records(
+        DatasetRecordQuery(CTX.user_id, FOOD_DATASET, None, None, None, 10)
+    )
     assert [record.payload for record in records] == [APPLE]
 
 
@@ -429,19 +437,14 @@ class FakeInstructionService:
     async def search(
         self,
         user_id: str,
-        query: str,
-        k: int,
-        kind: InstructionType | None = None,
+        request: InstructionSearchRequest,
     ) -> list[SearchHit]:
         return self.hits
 
     async def save(
         self,
         user_id: str,
-        kind: InstructionType,
-        title: str,
-        content: str,
-        tags: tuple[str, ...] = (),
+        definition: InstructionDefinition,
     ) -> Instruction:
         raise NotImplementedError
 
@@ -465,15 +468,7 @@ class FakeDatasetService:
         self.search_calls.append((owner_user_id, query, k))
         return self.hits
 
-    async def create_dataset(  # noqa: PLR0913, PLR0917 — protocol-shaped stub
-        self,
-        owner_user_id: str,
-        name: str,
-        description: str,
-        schema: DatasetSchema,
-        usage_notes: str = "",
-        retention: str = "",
-    ) -> Dataset:
+    async def create_dataset(self, definition: DatasetDefinition) -> Dataset:
         raise NotImplementedError
 
     async def get_dataset(self, owner_user_id: str, name: str) -> Dataset:
@@ -487,15 +482,7 @@ class FakeDatasetService:
     ) -> DatasetRecord:
         raise NotImplementedError
 
-    async def query_records(  # noqa: PLR0913, PLR0917 — protocol-shaped stub
-        self,
-        owner_user_id: str,
-        dataset_name: str,
-        equals: dict[str, Any] | None,
-        date_from: datetime | None,
-        date_to: datetime | None,
-        limit: int,
-    ) -> list[DatasetRecord]:
+    async def query_records(self, request: DatasetRecordQuery) -> list[DatasetRecord]:
         raise NotImplementedError
 
     async def delete_dataset(self, owner_user_id: str, name: str) -> int:

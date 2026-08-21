@@ -1,20 +1,10 @@
-"""Telegram as an installed surface: what it adds to the service.
-
-Everything Telegram contributes is declared here rather than wired into the
-composition root by hand — the routes for its console page, the renderer for
-its channel, the admin tool it gives the agent, and the polling it runs in
-the background.
-
-The point is not tidiness. As long as the root knows *how* Telegram is put
-together, a deployment without it means editing the root, and "optional"
-means "commented out". Behind this port, a deployment without Telegram is one
-that does not construct this object.
-"""
+"""Telegram's routes, renderer, tools and background work as one surface."""
 
 import asyncio
 import logging
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 
 from octoforge_core.agent.runner import DialogSurface
 from octoforge_core.tools.base import Tool
@@ -36,6 +26,15 @@ ROUTERS = (telegram_admin_router,)
 STATIC_FILES: tuple[StaticFile, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramSurfaceConfig:
+    admin_tool: Tool | None = None
+    polls: bool = True
+
+
+DEFAULT_SURFACE_CONFIG = TelegramSurfaceConfig()
+
+
 class TelegramSurface:
     """The Telegram bot, plugged into the service (`Surface`)."""
 
@@ -43,16 +42,15 @@ class TelegramSurface:
         self,
         registry: TelegramBridgeRegistry,
         poller: TelegramPoller,
-        admin_tool: Tool | None = None,
-        polls: bool = True,
+        config: TelegramSurfaceConfig = DEFAULT_SURFACE_CONFIG,
     ) -> None:
         self._registry = registry
         self._poller = poller
-        self._admin_tool = admin_tool
+        self._admin_tool = config.admin_tool
         # A token may be long-polled by exactly one process. With a separate
         # ingestion node this pod renders and does not read — two readers
         # would steal each other's updates.
-        self._polls = polls
+        self._polls = config.polls
         self._task: asyncio.Task[None] | None = None
 
     @property

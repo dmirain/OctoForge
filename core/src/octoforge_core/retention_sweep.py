@@ -1,24 +1,4 @@
-"""The sweep that applies a `RetentionPolicy`, with the guards that make it safe.
-
-Deleting history unattended is the kind of feature that is either correct or a
-disaster, so every rule here is a refusal:
-
-- **Nothing runs unless an operator configured a limit.** The default policy
-  deletes nothing, and the sweep returns immediately.
-- **A message at or after its dialog's compaction boundary is never deleted.**
-  Those are the rows the runner reloads to rebuild its narrative after a
-  restart; removing one would silently change what the agent believes happened.
-  Only history that already lives behind a summary can age out.
-- **A live exchange is never deleted**, whatever its age. An obligation that is
-  still open, collecting or awaiting the user is work in flight, and an old
-  timestamp on it usually means it has been *neglected*, which is the last
-  thing to clean up silently.
-- **An undelivered task is never deleted.** Its result has not reached the user
-  yet; age is not consent to drop it.
-
-Age-based rather than count-based on purpose: a quiet week must never empty a
-dialog, which a "keep the last N" rule would happily do.
-"""
+"""Apply age limits without deleting hot history, live work or undelivered results."""
 
 import logging
 from dataclasses import dataclass

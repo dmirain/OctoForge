@@ -3,7 +3,7 @@
 import json
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from dataclasses import dataclass
 
 import pytest
 
@@ -12,11 +12,12 @@ from octoforge_core.identity.store import SqlAlchemyIdentityStore
 from octoforge_core.instructions.api import InstructionType
 from octoforge_core.instructions.local import LocalInstructionService
 from octoforge_core.instructions.store import SqlAlchemyInstructionStore
-from octoforge_core.mcp.api import McpError, McpServer, McpToolDescriptor
+from octoforge_core.mcp.api import McpError, McpServer, McpToolCall, McpToolDescriptor
 from octoforge_core.mcp.store import SqlAlchemyMcpServerStore
 from octoforge_core.mcp.sync import (
     DESCRIPTION_MAX_CHARS,
     MAX_TOOLS_PER_SERVER,
+    McpSyncServices,
     McpToolSync,
 )
 
@@ -48,9 +49,7 @@ class ScriptedMcpClient:
             raise self.tools
         return list(self.tools)
 
-    async def call_tool(
-        self, url: str, headers: dict[str, str], tool: str, arguments: dict[str, Any]
-    ) -> None:
+    async def call_tool(self, request: McpToolCall) -> None:
         raise AssertionError("the sync must never call tools")
 
 
@@ -62,23 +61,17 @@ def tool(name: str, description: str = "does things") -> McpToolDescriptor:
     )
 
 
+@dataclass
 class SyncHarness:
     """One in-memory installation: stores, embedder, and a re-scriptable client."""
 
-    def __init__(
-        self,
-        store: SqlAlchemyMcpServerStore,
-        instructions: LocalInstructionService,
-        identities: SqlAlchemyIdentityStore,
-        embedder: LenientEmbedder,
-    ) -> None:
-        self.store = store
-        self.instructions = instructions
-        self.identities = identities
-        self.embedder = embedder
+    store: SqlAlchemyMcpServerStore
+    instructions: LocalInstructionService
+    identities: SqlAlchemyIdentityStore
+    embedder: LenientEmbedder
 
     def sync(self, tools: list[McpToolDescriptor] | McpError) -> McpToolSync:
-        return McpToolSync(self.store, ScriptedMcpClient(tools), self.instructions)
+        return McpToolSync(McpSyncServices(self.store, ScriptedMcpClient(tools), self.instructions))
 
     async def server(self, name: str = "example", url: str = URL) -> McpServer:
         user = await self.identities.create_user()
@@ -225,7 +218,7 @@ async def test_sync_all_survives_a_broken_server(harness: SyncHarness) -> None:
                 raise McpError("down")
             return [tool("translate")]
 
-    sync = McpToolSync(harness.store, SplitClient([]), harness.instructions)
+    sync = McpToolSync(McpSyncServices(harness.store, SplitClient([]), harness.instructions))
     await sync.sync_all()
 
     assert await harness.mirror_titles("other") == ["mcp/other/translate"]

@@ -11,6 +11,7 @@ from octoforge_telegram.invites.api import (
     InviteExpiredError,
     InviteNotFoundError,
     InviteStatus,
+    MemberProfileUpdate,
 )
 from octoforge_telegram.invites.store import SqlAlchemyInviteStore, SqlAlchemyMemberDirectory
 from octoforge_telegram.schema import TelegramSurfaceBase
@@ -185,13 +186,13 @@ async def directory() -> AsyncIterator[SqlAlchemyMemberDirectory]:
 async def test_record_creates_then_refreshes_the_profile(
     directory: SqlAlchemyMemberDirectory,
 ) -> None:
-    await directory.record(USER_ID, "Alice", "Smith", "alice")
+    await directory.record(MemberProfileUpdate(USER_ID, "Alice", "Smith", "alice"))
     created = await directory.get(USER_ID)
     assert created is not None
     assert created.display_name == "Alice Smith (@alice)"
     assert created.first_seen_at == created.last_seen_at
 
-    await directory.record(USER_ID, "Alicia", "Smith", None)
+    await directory.record(MemberProfileUpdate(USER_ID, "Alicia", "Smith", None))
     updated = await directory.get(USER_ID)
     assert updated is not None
     assert updated.first_name == "Alicia"
@@ -205,9 +206,9 @@ async def test_unknown_member_is_none_and_listing_is_recent_first(
     directory: SqlAlchemyMemberDirectory,
 ) -> None:
     assert await directory.get("tg:404") is None
-    await directory.record(USER_ID, "Alice", "", None)
-    await directory.record(OTHER_USER_ID, "Bob", "", "bob")
-    await directory.record(USER_ID, "Alice", "", None)  # Alice seen again, later
+    await directory.record(MemberProfileUpdate(USER_ID, "Alice", "", None))
+    await directory.record(MemberProfileUpdate(OTHER_USER_ID, "Bob", "", "bob"))
+    await directory.record(MemberProfileUpdate(USER_ID, "Alice", "", None))
     listed = await directory.list_all()
     assert [profile.user_id for profile in listed] == [USER_ID, OTHER_USER_ID]
     assert listed[1].display_name == "Bob (@bob)"

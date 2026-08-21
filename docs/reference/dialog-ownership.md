@@ -165,9 +165,11 @@ a dead process.
 - `core/src/octoforge_core/dialogs/api.py` — `DialogClaim`, `ClaimRepository`
 - `core/src/octoforge_core/dialogs/store.py` — `SqlAlchemyClaimRepository`
 - `core/src/octoforge_core/dialogs/models.py` — `DialogClaimRow`
-- `core/src/octoforge_core/agent/runner.py` — `OwnershipConfig`, `ConversationManager._beat_once`,
-  `ConversationManager.recover_interrupted`, `ConversationManager._runner_for_background`,
-  `ConversationRunner.stand_down`, `STREAM_CLOSED`
+- `core/src/octoforge_core/agent/runner_manager_state.py` — `OwnershipConfig`
+- `core/src/octoforge_core/agent/runner_manager_ownership.py`,
+  `core/src/octoforge_core/agent/runner_manager_recovery.py`,
+  `core/src/octoforge_core/agent/runner_manager_background.py` — heartbeats, recovery and claims
+- `core/src/octoforge_core/agent/runner_lifecycle.py` — stand-down and stream closure
 - `core/src/octoforge_core/cron/api.py` — `WakeOutcome`
 - `core/src/octoforge_core/db/migrations/versions/a4e9c2b7f513_dialog_claims.py` — the table
 - `core/tests/test_dialog_claims.py` — the claim rules

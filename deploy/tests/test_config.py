@@ -53,35 +53,36 @@ WHITELIST_JSON = (
     '[{"base_url_prefix": "https://internal.example.com/", '
     '"header_name": "X-Api-Key", "header_value": "s3cret"}]'
 )
+DEFAULT_ENV_VARS = (
+    "OF_EMBEDDING_BASE_URL",
+    "OF_EMBEDDING_API_KEY",
+    "OF_EMBEDDING_MODEL",
+    "OF_EMBEDDING_BACKEND",
+    "OF_EMBEDDING_BATCH_SIZE",
+    "OF_RERANKER_MODEL",
+    "OF_RERANKER_CANDIDATES",
+    "OF_INSTRUCTIONS_TOP_K",
+    "OF_EXTERNAL_CALL_AUTH_WHITELIST",
+    "OF_DATASETS_QUERY_DEFAULT_LIMIT",
+    "OF_DATASETS_QUERY_MAX_LIMIT",
+    "OF_MAX_PROCESSES",
+    "OF_ROUTER_TIMEOUT_SECONDS",
+    "OF_SELF_BASE_URL",
+    "OF_CRON_POLL_INTERVAL_SECONDS",
+    "OF_CRON_LEASE_TTL_SECONDS",
+    "OF_CRON_REPLAY_LIMIT",
+    "OF_TELEGRAM_BOT_TOKEN",
+    "OF_TELEGRAM_POLL_TIMEOUT_SECONDS",
+    "OF_TELEGRAM_EDIT_THROTTLE_SECONDS",
+)
 
 
-def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    for variable in (
-        "OF_EMBEDDING_BASE_URL",
-        "OF_EMBEDDING_API_KEY",
-        "OF_EMBEDDING_MODEL",
-        "OF_EMBEDDING_BACKEND",
-        "OF_EMBEDDING_BATCH_SIZE",
-        "OF_RERANKER_MODEL",
-        "OF_RERANKER_CANDIDATES",
-        "OF_INSTRUCTIONS_TOP_K",
-        "OF_EXTERNAL_CALL_AUTH_WHITELIST",
-        "OF_DATASETS_QUERY_DEFAULT_LIMIT",
-        "OF_DATASETS_QUERY_MAX_LIMIT",
-        "OF_MAX_PROCESSES",
-        "OF_ROUTER_TIMEOUT_SECONDS",
-        "OF_SELF_BASE_URL",
-        "OF_CRON_POLL_INTERVAL_SECONDS",
-        "OF_CRON_LEASE_TTL_SECONDS",
-        "OF_CRON_REPLAY_LIMIT",
-        "OF_TELEGRAM_BOT_TOKEN",
-        "OF_TELEGRAM_POLL_TIMEOUT_SECONDS",
-        "OF_TELEGRAM_EDIT_THROTTLE_SECONDS",
-    ):
+def _clear_default_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in DEFAULT_ENV_VARS:
         monkeypatch.delenv(variable, raising=False)
 
-    settings = Settings(_env_file=None)  # defaults must not read the developer's .env
 
+def _assert_default_settings(settings: Settings) -> None:
     assert settings.embedding_base_url == DEFAULT_EMBEDDING_BASE_URL
     assert settings.embedding_api_key == ""
     assert settings.embedding_model == DEFAULT_EMBEDDING_MODEL
@@ -95,14 +96,34 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.cron_poll_interval_seconds == DEFAULT_CRON_POLL_INTERVAL_SECONDS
     assert settings.cron_lease_ttl_seconds == DEFAULT_CRON_LEASE_TTL_SECONDS
     assert settings.cron_replay_limit == DEFAULT_CRON_REPLAY_LIMIT
-    assert TelegramSettings().telegram_bot_token == ""
-    assert TelegramSettings().telegram_poll_timeout_seconds == DEFAULT_POLL_TIMEOUT_SECONDS
-    assert TelegramSettings().telegram_edit_throttle_seconds == DEFAULT_EDIT_THROTTLE_SECONDS
-    assert settings.to_embedding_config().model == DEFAULT_EMBEDDING_MODEL
-    assert settings.to_embedding_config().backend == EmbeddingBackend.OPENAI
     assert settings.reranker_model == ""
     assert not settings.embeddings_configured()
     assert settings.to_external_call_auth_whitelist() == ()
+
+
+def _assert_default_embedding_config(settings: Settings) -> None:
+    config = settings.to_embedding_config()
+
+    assert config.model == DEFAULT_EMBEDDING_MODEL
+    assert config.backend == EmbeddingBackend.OPENAI
+
+
+def _assert_default_telegram_settings() -> None:
+    telegram = TelegramSettings()
+
+    assert telegram.telegram_bot_token == ""
+    assert telegram.telegram_poll_timeout_seconds == DEFAULT_POLL_TIMEOUT_SECONDS
+    assert telegram.telegram_edit_throttle_seconds == DEFAULT_EDIT_THROTTLE_SECONDS
+
+
+def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_default_env(monkeypatch)
+
+    settings = Settings(_env_file=None)  # defaults must not read the developer's .env
+
+    _assert_default_settings(settings)
+    _assert_default_embedding_config(settings)
+    _assert_default_telegram_settings()
 
 
 def test_embedding_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
