@@ -94,7 +94,7 @@ never appears in a URL a proxy would log. See [secrets.md](secrets.md).
 | `/secrets.html` | The secret-entry form (token-authenticated) |
 | `/docs`, `/openapi.json` | FastAPI's own documentation |
 | `/health` | Liveness |
-| `/health/ready` | Readiness — checks the database |
+| `/health/ready` | Readiness — checks the database and that the claim heartbeat still runs |
 
 ### Authentication
 
@@ -139,7 +139,9 @@ string: front the deployment with a proxy that authenticates people and sets tha
   paths bypass it.
 - **An empty credential means 503**, not open access.
 - **`/health` needs no credential** (container healthchecks and uptime monitors depend on it), and
-  `/health/ready` additionally touches the database.
+  `/health/ready` additionally touches the database and reports `ownership: stale` (503) when the
+  process holds dialogs whose claims it stopped refreshing — see
+  [dialog-ownership.md](dialog-ownership.md).
 - **Cron creation takes query parameters**, because the agent's own `external_call` cannot send a body.
 
 ## Configuration
@@ -163,6 +165,7 @@ string: front the deployment with a proxy that authenticates people and sets tha
 | Client disconnects mid-stream | Subscription removed; the run keeps going and its result is delivered through the outbox on the next subscribe |
 | Slow client | Stream events dropped for that subscriber; terminals still delivered |
 | Database unavailable | `/health/ready` fails (logged), `/health` still answers |
+| Claim heartbeat stalled | `/health/ready` answers 503 with `ownership: stale`; the balancer drops the pod until a beat completes |
 
 ## Code anchors
 

@@ -33,6 +33,13 @@ somewhere to land; a bridge needs its dialog's actor, so every pod took every di
 and the last one to boot owned them all. Nothing was gained for it: the manager attaches the surface
 to each actor it builds, on every path that can produce an answer.
 
+A contact also **replaces a cached actor that can no longer answer**: one that stood down, refused a
+run, or whose claim a peer took while this process's heartbeat was down. The balancer pins a user to
+a pod, so every message of theirs keeps landing on the same actor; handing it to one that lost the
+dialog would refuse each one, and the owner — which already has a live actor and therefore never
+rebuilds it — would never come for the exchanges left `OPEN`. The check is one primary-key read
+per contact, and it fails open like the per-run check below.
+
 The identity of a claim is the **pair** `(owner, generation)`, never the number alone. Two processes
 racing to take the same dialog may compute the same next generation, but only one owner survives in
 the row, so the other fails its next check. This is also what retires an older actor in the *same*
@@ -55,6 +62,14 @@ database round trip on the hot loop.
 
 The check fails **open**. A database hiccup must not stop the single-process installation from
 answering, and the heartbeat is what ultimately notices a lost dialog.
+
+A beat is bounded by `CLAIM_STALE_AFTER_SECONDS`: a query stuck on a connection whose peer vanished
+without closing the socket (a rebooted database host) would otherwise hold every claim in memory
+forever while peers already treat them as stale. The cut-off is logged and the next tick retries
+on a fresh connection — the engine pings pooled connections on checkout for exactly this case. The
+manager remembers when a beat last completed, and `/health/ready` answers 503 while dialogs are
+held and that moment is older than the staleness window, so the balancer stops routing to a process
+that accepts messages it cannot answer.
 
 ### Recovery happens on claim
 
@@ -151,7 +166,9 @@ a dead process.
 | Situation | Outcome |
 |---|---|
 | Another process claims a dialog mid-answer | The old actor stands down within one heartbeat; its streams close, clients reconnect, the exchange is left for the new owner's recovery |
-| A message is submitted just after a handover | The run is refused before it starts; the exchange stays `OPEN`, which is work the new owner picks up |
+| A message is submitted just after a handover | The run is refused before it starts; the exchange stays `OPEN`, and the next contact on either side picks it up: the owner through its recovery, this process by taking the dialog back |
+| A message arrives on a process whose actor lost the dialog | The actor is stood down and rebuilt: the claim moves here, recovery resumes what was left `OPEN`, and the message is answered |
+| The heartbeat hangs on a dead connection | Cut off after `CLAIM_STALE_AFTER_SECONDS`; `/health/ready` reports `ownership: stale` until a beat completes |
 | A dialog moves mid-answer | The new owner reopens the exchange and answers it. The old owner may still be streaming until its next heartbeat, so the text can visibly restart |
 | A process dies without releasing | Its claims go stale after `CLAIM_STALE_AFTER_SECONDS`, then recovery may take them |
 | Two instances share an `OF_NODE_ID` | They treat each other's live dialogs as abandoned, and recovery corrupts running conversations |

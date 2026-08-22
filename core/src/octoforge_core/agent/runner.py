@@ -17,6 +17,7 @@ delivery never involves an LLM call.
 
 import asyncio
 import logging
+import time
 from collections import deque
 from collections.abc import Sequence
 from contextlib import suppress
@@ -1038,6 +1039,11 @@ class ConversationRunner:
         """The claim this actor holds on its dialog."""
         return self._claim
 
+    @property
+    def retired(self) -> bool:
+        """Stood down or refused a run: this actor will not speak for its dialog again."""
+        return self._stood_down or self._preempted
+
     async def stand_down(self) -> None:
         """Stop for good: another process owns this dialog now.
 
@@ -1085,6 +1091,16 @@ class ConversationRunner:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:  # drained concurrently; try the put again
                     continue
+
+    async def can_still_answer(self) -> bool:
+        """Whether a message landing on this actor would be answered by it.
+
+        False once it stood down, refused a run, or its claim moved to a peer
+        — the manager replaces such an actor instead of feeding it.
+        """
+        if self._stood_down or self._preempted:
+            return False
+        return await self._still_owns_dialog()
 
     async def _still_owns_dialog(self) -> bool:
         """Whether this actor's claim is still the current one.
@@ -2809,6 +2825,8 @@ class ConversationManager:
         self._heartbeat_seconds = ownership.heartbeat_seconds
         self._stale_after_seconds = ownership.stale_after_seconds
         self._heartbeat_task: asyncio.Task[None] | None = None
+        # `time.monotonic()` of the last completed beat; None until the heartbeat starts
+        self._last_beat_at: float | None = None
         self._surface: DialogSurface | None = None
         self._runners: dict[str, ConversationRunner] = {}
         # (user_id, channel) -> the build task, memoized: concurrent callers
@@ -2827,6 +2845,7 @@ class ConversationManager:
         audit) — now only callers of the *same* dialog share a build.
         """
         key = (user_id, channel)
+        await self._replace_retired(key)
         async with self._lock:
             build = self._builds.get(key)
             ours = build is None
@@ -2852,6 +2871,23 @@ class ConversationManager:
             # build attaches, so concurrent ones do not attach twice.
             await self._attach_surface(runner)
         return runner
+
+    async def _replace_retired(self, key: tuple[str, str]) -> None:
+        """Stand down the cached actor for `key` if it can no longer answer.
+
+        A message arrived here, so this process should own the dialog. The
+        balancer pins a user to a pod, so every message of theirs lands on
+        the same cached actor; one that stood down, refused a run, or lost
+        its claim while the heartbeat was down would refuse each of them —
+        and the owner, which already has a live actor and never rebuilds it,
+        would never come for the exchanges left OPEN. One primary-key read
+        per contact, failing open like the per-run check.
+        """
+        build = self._builds.get(key)
+        runner = None if build is None else _finished_build(build)
+        if runner is None or await runner.can_still_answer():
+            return
+        await self._drop_preempted(runner)
 
     async def _build_runner(self, user_id: str, channel: str) -> ConversationRunner:
         # one transaction: finding the dialog and claiming it are the same
@@ -2984,7 +3020,7 @@ class ConversationManager:
         """
         dialog = await self._dialogs.get_or_create(user_id, channel)
         existing = self._runners.get(dialog.id)
-        if existing is not None:
+        if existing is not None and not existing.retired:
             return existing  # ours already; the heartbeat stands it down if that changes
         if await self._held_elsewhere(frozenset({dialog.id})):
             return None
@@ -3029,6 +3065,7 @@ class ConversationManager:
     def start(self) -> None:
         """Start the claim heartbeat; call once, after `recover_interrupted`."""
         if self._heartbeat_task is None:
+            self._last_beat_at = time.monotonic()
             self._heartbeat_task = asyncio.create_task(self._run_heartbeat())
 
     async def _run_heartbeat(self) -> None:
@@ -3042,23 +3079,45 @@ class ConversationManager:
         """
         while True:
             await asyncio.sleep(self._heartbeat_seconds)
-            try:
-                await self._beat_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("claim heartbeat failed")
+            await self._beat_guarded()
+
+    async def _beat_guarded(self) -> None:
+        """One beat that can neither raise nor hang past the staleness window.
+
+        A beat stuck on a connection whose peer vanished without closing the
+        socket (a rebooted database host) would hold every claim in memory
+        forever while peers already treat them as stale — the worst of both
+        worlds. Cut it off and let the next tick retry on a fresh connection.
+        """
+        try:
+            await asyncio.wait_for(self._beat_once(), timeout=self._stale_after_seconds)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            logger.error("claim heartbeat timed out after %.0fs", self._stale_after_seconds)
+        except Exception:
+            logger.exception("claim heartbeat failed")
 
     async def _beat_once(self) -> None:
         """Refresh every live runner's claim; stand down the preempted ones."""
         runners = tuple(self._runners.values())
-        if not runners:
-            return
-        claims: DialogClaimList = [runner.claim for runner in runners]
-        kept = await self._claims.heartbeat(claims)
-        for runner in runners:
-            if runner.dialog_id not in kept:
-                await self._drop_preempted(runner)
+        if runners:
+            claims: DialogClaimList = [runner.claim for runner in runners]
+            kept = await self._claims.heartbeat(claims)
+            for runner in runners:
+                if runner.dialog_id not in kept:
+                    await self._drop_preempted(runner)
+        self._last_beat_at = time.monotonic()
+
+    def heartbeat_fresh(self) -> bool:
+        """Whether the claims this process holds are still being refreshed.
+
+        False means this process accepts messages it can no longer answer;
+        readiness reports it so the balancer stops routing here.
+        """
+        if self._last_beat_at is None or not self._runners:
+            return True
+        return time.monotonic() - self._last_beat_at < self._stale_after_seconds
 
     async def _drop_preempted(self, runner: ConversationRunner) -> None:
         """Deregister and stand down a runner whose dialog moved elsewhere."""

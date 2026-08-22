@@ -411,7 +411,23 @@ def test_health_ready_reports_database(client: TestClient) -> None:
     response = client.get("/health/ready")
 
     assert response.status_code == HTTPStatus.OK
-    assert response.json() == {"status": "ready", "database": "ok"}
+    assert response.json() == {"status": "ready", "database": "ok", "ownership": "ok"}
+
+
+def test_health_ready_fails_once_the_claim_heartbeat_stalls(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The database answering is not enough: a pod that stopped refreshing its
+    claims accepts messages it will never answer, and the balancer must stop
+    sending it any. The process stays alive — `/health` is untouched."""
+    manager = client.app.state.conversation_manager  # type: ignore[attr-defined]
+    monkeypatch.setattr(manager, "heartbeat_fresh", lambda: False)
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json() == {"status": "not-ready", "database": "ok", "ownership": "stale"}
+    assert client.get("/health").status_code == HTTPStatus.OK
 
 
 def test_index_page_is_served(client: TestClient) -> None:

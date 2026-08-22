@@ -5,7 +5,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Connection, event, inspect
+from sqlalchemy import Connection, event, inspect, make_url
 from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -106,10 +106,14 @@ def create_engine(database_url: str) -> AsyncEngine:
         )
         event.listen(engine.sync_engine, "connect", _enable_read_uncommitted)
         return engine
-    engine = create_async_engine(database_url)
-    if engine.dialect.name == SQLITE_DIALECT:
+    if make_url(database_url).get_backend_name() == SQLITE_DIALECT:
+        engine = create_async_engine(database_url)
         event.listen(engine.sync_engine, "connect", _enable_wal)
-    return engine
+        return engine
+    # A pooled connection outlives a database restart or a host that vanished
+    # without closing the socket; pinging it on checkout replaces it instead
+    # of handing a hung connection to the claim heartbeat or a cron tick.
+    return create_async_engine(database_url, pool_pre_ping=True)
 
 
 def _enable_wal(dbapi_connection: DBAPIConnection, _record: ConnectionPoolEntry) -> None:

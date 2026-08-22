@@ -72,7 +72,10 @@ class CronScheduler:
         """
         while True:
             try:
-                await self.tick()
+                await asyncio.wait_for(self.tick(), timeout=self._lease_ttl_seconds)
+            except TimeoutError:
+                # a tick hung on a dead connection would stop cron for good
+                logger.error("cron scheduler tick timed out after %.0fs", self._lease_ttl_seconds)
             except Exception:
                 logger.exception("cron scheduler tick failed")
             await asyncio.sleep(self._poll_interval_seconds)

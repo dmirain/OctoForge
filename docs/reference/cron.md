@@ -96,6 +96,7 @@ Outcomes always flow back through `record_fire_result`.
 
 | Situation | Outcome |
 |---|---|
+| A tick hangs on a dead database connection | Abandoned after `OF_CRON_LEASE_TTL_SECONDS` (logged); the next poll runs on a fresh connection |
 | Instance dies mid-firing | The claim expires; another instance (or the same one after restart) fires it. The RUN task itself is recovered by task recovery |
 | Long downtime | One coalesced firing per job, with the missed count in the prompt |
 | Job prompt depends on dialog context that is gone | The run does the wrong thing — hence the tool description insists prompts be self-contained |

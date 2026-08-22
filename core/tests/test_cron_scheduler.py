@@ -29,6 +29,7 @@ OTHER_OWNER = "scheduler-other"
 WAKE_FAILURE = "wake delivery failed"
 POLL_INTERVAL_SECONDS = 0.01
 LEASE_TTL_SECONDS = 60.0
+SHORT_LEASE_TTL_SECONDS = 0.05
 REPLAY_LIMIT = 5
 SMALL_REPLAY_LIMIT = 2
 THREE_JOBS = 3
@@ -386,6 +387,38 @@ async def test_run_forever_survives_a_tick_failure(
     await asyncio.sleep(POLL_INTERVAL_SECONDS * 3)
 
     assert not task.done()  # the loop kept polling despite the exception
+
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_run_forever_cuts_off_a_tick_stuck_on_a_dead_connection(
+    waker: RecordingWaker,
+) -> None:
+    """A `list_due` that never returns (a peer that vanished without closing
+    the socket) must not stop cron for good: the tick is abandoned at the
+    lease TTL and polling resumes."""
+
+    class HangingStore:
+        async def list_due(self, *args: object, **kwargs: object) -> list[CronJob]:
+            await asyncio.Event().wait()
+            return []
+
+    scheduler = CronScheduler(
+        store=HangingStore(),  # type: ignore[arg-type]
+        waker=waker,
+        owner=OWNER,
+        config=CronSchedulerConfig(
+            poll_interval_seconds=POLL_INTERVAL_SECONDS,
+            lease_ttl_seconds=SHORT_LEASE_TTL_SECONDS,
+            replay_limit=REPLAY_LIMIT,
+        ),
+    )
+    task = asyncio.create_task(scheduler.run_forever())
+    await asyncio.sleep(SHORT_LEASE_TTL_SECONDS * 5)
+
+    assert not task.done()  # the loop kept polling past the hung tick
 
     task.cancel()
     with suppress(asyncio.CancelledError):

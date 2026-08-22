@@ -13,6 +13,7 @@ every installation, and none of this may change it.
 """
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
 
@@ -36,7 +37,7 @@ from octoforge_core.composition import build_agent_loop
 from octoforge_core.context.compactor import NoopContextCompactor
 from octoforge_core.db.engine import create_engine, create_session_factory, init_db
 from octoforge_core.db.unit_of_work import UnitOfWork
-from octoforge_core.dialogs.api import ExchangeStatus
+from octoforge_core.dialogs.api import DialogClaimList, ExchangeStatus
 from octoforge_core.dialogs.models import DialogClaimRow
 from octoforge_core.dialogs.store import (
     SqlAlchemyClaimRepository,
@@ -66,6 +67,7 @@ REPLY = "done"
 MAX_ITERATIONS = 3
 MAX_PROCESSES = 4
 STALE_AFTER_SECONDS = 30.0
+SHORT_STALE_SECONDS = 0.05
 # far enough past the staleness window that a peer's claim reads as abandoned
 LONG_SILENCE = timedelta(seconds=STALE_AFTER_SECONDS * 4)
 TIMEOUT_SECONDS = 5.0
@@ -366,6 +368,93 @@ async def test_a_run_refuses_to_start_once_the_dialog_has_moved(
         assert [exchange.status for exchange in live] == [ExchangeStatus.OPEN]
     finally:
         await manager.stop_all()
+
+
+async def test_a_contact_after_the_dialog_moved_takes_it_back_here(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The balancer pins a user to a pod. If a peer adopted the dialog while
+    this pod's heartbeat was down, the cached actor has lost its claim but is
+    still what every new message lands on — and it would refuse each one.
+    A message arrived here, so this process takes the dialog back."""
+    manager = make_manager(session_factory)
+    try:
+        first = await manager.get_or_create_runner(USER_ID, CHANNEL)
+        queue = first.subscribe()
+        await SqlAlchemyClaimRepository(session_factory).claim(first.dialog_id, PEER_NODE)
+        # no heartbeat ran: nothing has noticed yet
+
+        second = await manager.get_or_create_runner(USER_ID, CHANNEL)
+
+        assert second is not first
+        assert second.claim.generation > first.claim.generation
+        assert queue.get_nowait() is STREAM_CLOSED
+    finally:
+        await manager.stop_all()
+
+
+async def test_the_next_contact_answers_what_a_refused_run_left_open(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Without this, a message refused on the wrong pod stays `OPEN` forever
+    when the owner already has a live actor: nothing there rebuilds it."""
+    exchanges = SqlAlchemyExchangeRepository(session_factory)
+    manager = make_manager(session_factory)
+    try:
+        runner = await manager.get_or_create_runner(USER_ID, CHANNEL)
+        await SqlAlchemyClaimRepository(session_factory).claim(runner.dialog_id, PEER_NODE)
+        await runner.submit("what is the budget?")
+        await _wait_for(lambda: _only_open(exchanges, runner.dialog_id))
+
+        await manager.get_or_create_runner(USER_ID, CHANNEL)
+        await _wait_for(lambda: _nothing_live(exchanges, runner.dialog_id))
+    finally:
+        await manager.stop_all()
+
+
+async def _nothing_live(exchanges: SqlAlchemyExchangeRepository, dialog_id: str) -> bool:
+    return not await exchanges.list_live(dialog_id)
+
+
+class HangingClaims(SqlAlchemyClaimRepository):
+    """A claim table behind a connection the peer silently dropped."""
+
+    async def heartbeat(self, claims: DialogClaimList) -> set[str]:
+        await asyncio.Event().wait()
+        return set()
+
+
+async def test_a_hung_heartbeat_is_cut_off_and_reported_as_stale(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A beat stuck on a dead socket would hold every claim in memory while
+    peers already treat them as stale. It is cut at the staleness window,
+    and readiness can tell the balancer this process stopped refreshing."""
+    manager = make_manager(session_factory)
+    manager._stale_after_seconds = SHORT_STALE_SECONDS
+    manager._heartbeat_seconds = POLL_SECONDS
+    manager._claims = HangingClaims(session_factory)
+    try:
+        assert manager.heartbeat_fresh()
+        await manager.get_or_create_runner(USER_ID, CHANNEL)
+        manager.start()
+
+        await asyncio.wait_for(manager._beat_guarded(), timeout=TIMEOUT_SECONDS)
+
+        async def _stale() -> bool:
+            return not manager.heartbeat_fresh()
+
+        await _wait_for(_stale)
+    finally:
+        await manager.stop_all()
+
+
+def test_freshness_only_matters_while_dialogs_are_held(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = make_manager(session_factory)
+    manager._last_beat_at = time.monotonic() - STALE_AFTER_SECONDS * 2
+    assert manager.heartbeat_fresh()  # nothing held: nothing to refresh
 
 
 async def test_one_process_answers_exactly_as_it_always_did(

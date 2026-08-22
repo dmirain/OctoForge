@@ -23,6 +23,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
+from octoforge_core.agent.runner import ConversationManager
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -54,6 +55,8 @@ APP_TITLE = "OctoForge"
 HEALTH_STATUS = "ok"
 READY_STATUS = "ready"
 NOT_READY_STATUS = "not-ready"
+OWNERSHIP_OK = "ok"
+OWNERSHIP_STALE = "stale"
 
 # Signature of the next handler in Starlette's middleware chain.
 NextCall = Callable[[Request], Awaitable[Response]]
@@ -149,7 +152,11 @@ def _install_probes(app: FastAPI) -> None:
 
     @app.get("/health/ready")
     async def ready(response: Response) -> dict[str, str]:
-        """Readiness probe: verify the database answers a trivial query."""
+        """Readiness probe: the database answers, and the claim heartbeat still runs.
+
+        A process whose heartbeat stalled keeps accepting messages it can no
+        longer answer; reporting it unready pulls it out of the balancer.
+        """
         session_factory: async_sessionmaker[AsyncSession] = app.state.session_factory
         try:
             async with session_factory() as session:
@@ -158,7 +165,12 @@ def _install_probes(app: FastAPI) -> None:
             logger.warning("readiness check failed: database unavailable", exc_info=True)
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
             return {"status": NOT_READY_STATUS, "database": "down"}
-        return {"status": READY_STATUS, "database": "ok"}
+        manager: ConversationManager | None = getattr(app.state, "conversation_manager", None)
+        if manager is not None and not manager.heartbeat_fresh():
+            logger.warning("readiness check failed: claim heartbeat stalled")
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"status": NOT_READY_STATUS, "database": "ok", "ownership": OWNERSHIP_STALE}
+        return {"status": READY_STATUS, "database": "ok", "ownership": OWNERSHIP_OK}
 
 
 def serve_file(app: FastAPI, item: StaticFile) -> None:
