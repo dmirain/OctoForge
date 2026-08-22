@@ -253,6 +253,28 @@ def test_own_embedding_base_url_disables_inheritance(monkeypatch: pytest.MonkeyP
     assert not settings.embeddings_configured()
 
 
+CALL_TIMEOUT_SECONDS = 45.0
+IDLE_TIMEOUT_SECONDS = 300.0
+
+
+def test_the_stream_read_budget_follows_the_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OF_LLM_TIMEOUT_SECONDS", str(CALL_TIMEOUT_SECONDS))
+    monkeypatch.setenv("OF_LLM_STREAM_IDLE_TIMEOUT_SECONDS", str(IDLE_TIMEOUT_SECONDS))
+
+    llm = Settings().to_llm_config()
+
+    assert llm.timeout_seconds == CALL_TIMEOUT_SECONDS
+    assert llm.stream_read_timeout_seconds == IDLE_TIMEOUT_SECONDS
+
+
+def test_a_disabled_idle_timeout_leaves_the_stream_on_the_call_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OF_LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0")
+
+    assert Settings().to_llm_config().stream_read_timeout_seconds is None
+
+
 def test_local_backend_never_inherits_the_llm_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OF_LLM_BASE_URL", CUSTOM_LLM_BASE_URL)
     monkeypatch.setenv("OF_LLM_API_KEY", CUSTOM_LLM_KEY)

@@ -138,6 +138,14 @@ class OpenAICompatibleClient:
             raise LLMResponseError(PARSE_ERROR_MESSAGE) from exc
         return Completion(message=self._parse_reply(data), usage=parse_usage(data.get("usage")))
 
+    def _stream_timeout(self) -> httpx.Timeout:
+        """Connect/write budgets as for any call; the read budget is the stream's own."""
+        read = self._config.stream_read_timeout_seconds
+        return httpx.Timeout(
+            self._config.timeout_seconds,
+            read=self._config.timeout_seconds if read is None else read,
+        )
+
     async def stream(
         self,
         messages: list[ChatMessage],
@@ -150,7 +158,7 @@ class OpenAICompatibleClient:
                 CHAT_COMPLETIONS_PATH,
                 json=self._build_payload(messages, tools, stream=True),
                 headers={"Authorization": f"Bearer {self._config.api_key}"},
-                timeout=self._config.timeout_seconds,
+                timeout=self._stream_timeout(),
             ) as response:
                 await araise_for_error_status(response)
                 accumulator = _StreamAccumulator()

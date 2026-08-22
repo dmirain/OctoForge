@@ -61,7 +61,8 @@ a glance.
 | `OF_LLM_API_KEY` | *(empty)* | Without it nothing can be generated |
 | `OF_LLM_MODEL` | `gpt-4o-mini` | Model id for answers and for the router |
 | `OF_AGENT_MAX_ITERATIONS` | `10` | Iterations (model call + tool round) per run; a runaway backstop, not a target |
-| `OF_LLM_STREAM_IDLE_TIMEOUT_SECONDS` | `120.0` | Longest silence between stream events before the run fails; `0` disables |
+| `OF_LLM_TIMEOUT_SECONDS` | `30.0` | HTTP timeout of a model call (connect, write, and the read of a non-streaming reply) |
+| `OF_LLM_STREAM_IDLE_TIMEOUT_SECONDS` | `120.0` | Longest silence between stream events before the run fails; also the read timeout of the streaming HTTP call, so a reasoning model may think that long before its first chunk; `0` disables both |
 | `OF_LLM_MAX_RETRIES` | `3` | Attempts on transient provider failures (rate limit, 5xx, transport) |
 | `OF_LLM_RETRY_BASE_SECONDS` | `1.0` | Backoff base |
 | `OF_LLM_RETRY_MAX_SECONDS` | `30.0` | Backoff ceiling |

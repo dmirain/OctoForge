@@ -42,6 +42,7 @@ DEFAULT_MODEL_CONTEXT_TOKENS = 0
 DEFAULT_CONTEXT_BUFFER_TOKENS = 2000
 DEFAULT_MAX_PROCESSES = 5
 DEFAULT_ROUTER_TIMEOUT_SECONDS = 10.0
+DEFAULT_LLM_TIMEOUT_SECONDS = 30.0
 DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_LLM_MAX_RETRIES = 3
 DEFAULT_LLM_RETRY_BASE_SECONDS = 1.0
@@ -154,6 +155,7 @@ class Settings(BaseSettings):
     # ingestion node sets this, and neither needs the other's.
     service_password: str = ""
     router_timeout_seconds: float = DEFAULT_ROUTER_TIMEOUT_SECONDS
+    llm_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
     llm_stream_idle_timeout_seconds: float = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS
     # Wall-clock ceiling on one tool call. A tool that never returns holds its
     # iteration open forever and freezes that dialog until the process restarts.
@@ -303,9 +305,14 @@ class Settings(BaseSettings):
 
     def to_llm_config(self) -> LLMConfig:
         """Build the core LLM configuration."""
+        # the stream's read budget follows the idle timeout the loop enforces:
+        # a stricter HTTP read timeout would cut a thinking model off first
+        # and make the idle setting dead
         return LLMConfig(
             api_key=self.llm_api_key,
             model=self.llm_model,
+            timeout_seconds=self.llm_timeout_seconds,
+            stream_read_timeout_seconds=self.llm_stream_idle_timeout_seconds or None,
             max_retries=self.llm_max_retries,
             retry_base_seconds=self.llm_retry_base_seconds,
             retry_max_seconds=self.llm_retry_max_seconds,

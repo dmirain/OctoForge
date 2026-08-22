@@ -50,6 +50,35 @@ def make_config() -> LLMConfig:
     return LLMConfig(api_key=API_KEY, model=MODEL)
 
 
+STREAM_READ_TIMEOUT_SECONDS = 120.0
+CALL_TIMEOUT_SECONDS = 30.0
+
+
+async def test_a_stream_reads_with_its_own_budget_not_the_call_timeout() -> None:
+    """A reasoning model may stay silent past the call timeout before its
+    first chunk; with one budget for both, the stream was cut at 30s and
+    retried as a transport failure while the idle timeout never got a say."""
+    seen: list[httpx.Timeout] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(httpx.Timeout(**request.extensions["timeout"]))
+        return httpx.Response(HTTPStatus.OK, text=sse_body([content_chunk("hi")]))
+
+    config = LLMConfig(
+        api_key=API_KEY,
+        model=MODEL,
+        timeout_seconds=CALL_TIMEOUT_SECONDS,
+        stream_read_timeout_seconds=STREAM_READ_TIMEOUT_SECONDS,
+    )
+    async with httpx.AsyncClient(base_url=BASE_URL, transport=httpx.MockTransport(handler)) as http:
+        client = OpenAICompatibleClient(http, config)
+        async for _ in client.stream([USER_MESSAGE]):
+            pass
+
+    assert seen[0].read == STREAM_READ_TIMEOUT_SECONDS
+    assert seen[0].connect == CALL_TIMEOUT_SECONDS
+
+
 def sse_body(chunks: list[dict[str, object]]) -> str:
     lines = [f"data: {json.dumps(chunk)}\n" for chunk in chunks]
     lines.append("data: [DONE]\n")

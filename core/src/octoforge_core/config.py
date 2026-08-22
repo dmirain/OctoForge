@@ -39,6 +39,11 @@ class LLMConfig:
     api_key: str
     model: str
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    #: Read timeout of a streaming call, between two chunks. A reasoning
+    #: model may stay silent well past `timeout_seconds` before its first
+    #: chunk; cutting it there reads as a transport failure and retries the
+    #: whole run. None keeps `timeout_seconds`.
+    stream_read_timeout_seconds: float | None = None
     max_retries: int = DEFAULT_MAX_RETRIES
     retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS
     retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS
